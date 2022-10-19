@@ -1,0 +1,16 @@
+[package]
+name = "nissan_connect3_emulator"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+unicorn-engine = "2.0.0"
+capstone = "0.11.0"
+xmas-elf = "0.8.0"
+elfloader = { path = "../rust-elfloader", version = "0.16.0" }
+byteorder = "1.4.3"
+log = "0.4.17"
+pretty_env_logger = "0.4.0"
+libc = "0.2.135"
