@@ -5,6 +5,7 @@ This project is an attempt to emulate and run firmware from Nissan Qashqai 2017.
 _**It's in a very early stage and the project is not usable yet**_. And probably never will be because of the amout of work needed. But it is fun to start and learn about executable and operating system interaction.
 
 Similar projects:
+- https://github.com/zeropointdynamics/zelos (Python)
 - https://github.com/qilingframework/qiling (Python)
 - https://github.com/ant4g0nist/rudroid (Rust, Android, ARM64) - looks like it is a copy of Qiling code (but with bugs)
 - https://github.com/lunixbochs/usercorn (Go)

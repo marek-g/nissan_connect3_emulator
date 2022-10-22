@@ -6,12 +6,14 @@ use unicorn_engine::Unicorn;
 
 pub struct Mmu {
     map_infos: HashMap<u32, MapInfo>,
+    pub heap_mem_end: u32,
 }
 
 impl Mmu {
     pub fn new() -> Self {
         Self {
             map_infos: HashMap::new(),
+            heap_mem_end: 0u32,
         }
     }
 }

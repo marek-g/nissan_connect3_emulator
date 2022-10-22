@@ -176,6 +176,8 @@ pub fn load_elf(
     log::debug!("mem_start: {:#x}", mem_start);
     log::debug!("mem_end: {:#x}", mem_end);
 
+    unicorn.get_data_mut().mmu.heap_mem_end = mem_end;
+
     // load interpreter
     let interp_address = 0u32;
     let mut interp_entry_point = 0u32;
