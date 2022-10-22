@@ -5,7 +5,6 @@ use crate::emulator::mmu::{Mmu, MmuExtension};
 use capstone::arch::arm::ArchMode;
 use capstone::prelude::*;
 use capstone::Endian;
-use std::path::Path;
 use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Permission};
 use unicorn_engine::{RegisterARM, Unicorn};
 

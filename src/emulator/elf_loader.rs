@@ -1,11 +1,11 @@
 use crate::emulator::context::Context;
 use crate::emulator::memory_map::*;
 use crate::emulator::mmu::MmuExtension;
+use crate::emulator::users::{EGID, EUID, GID, UID};
 use crate::emulator::utils::{
-    mem_align_down, mem_align_up, pack_32, push_text_on_stack, to_unicorn_permissions,
+    mem_align_down, mem_align_up, pack_u32, push_text_on_stack, to_unicorn_permissions,
 };
 use elfloader::*;
-use std::path::Path;
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::Unicorn;
 use xmas_elf::header;
@@ -253,29 +253,29 @@ fn setup_stack(
     let mut elf_table = Vec::new();
 
     // argc
-    elf_table.extend_from_slice(&pack_32(program_args.len() as u32 + 1));
+    elf_table.extend_from_slice(&pack_u32(program_args.len() as u32 + 1));
 
     // argv[0]
     stack_ptr = push_text_on_stack(unicorn, stack_ptr, elf_filepath);
-    elf_table.extend_from_slice(&pack_32(stack_ptr));
+    elf_table.extend_from_slice(&pack_u32(stack_ptr));
 
     // argv[1..n]
     for argv in program_args {
         stack_ptr = push_text_on_stack(unicorn, stack_ptr, argv);
-        elf_table.extend_from_slice(&pack_32(stack_ptr));
+        elf_table.extend_from_slice(&pack_u32(stack_ptr));
     }
 
     // null sentinel
-    elf_table.extend_from_slice(&pack_32(0));
+    elf_table.extend_from_slice(&pack_u32(0));
 
     // env[0..n - 1]
     for env in program_envs {
         stack_ptr = push_text_on_stack(unicorn, stack_ptr, &format!("{}={}", env.0, env.1));
-        elf_table.extend_from_slice(&pack_32(stack_ptr));
+        elf_table.extend_from_slice(&pack_u32(stack_ptr));
     }
 
     // null sentinel
-    elf_table.extend_from_slice(&pack_32(0));
+    elf_table.extend_from_slice(&pack_u32(0));
 
     // auxv strings
     stack_ptr = push_text_on_stack(unicorn, stack_ptr, &"a".repeat(16));
@@ -296,8 +296,8 @@ fn setup_stack(
         platformaddr,
     );
     for auxv in auxvs {
-        elf_table.extend_from_slice(&pack_32(auxv.0));
-        elf_table.extend_from_slice(&pack_32(auxv.1));
+        elf_table.extend_from_slice(&pack_u32(auxv.0));
+        elf_table.extend_from_slice(&pack_u32(auxv.1));
     }
 
     // place elf_table on the stack aligned to 16 bytes
@@ -338,10 +338,10 @@ fn get_auxv_data(
             AUX::AtEntry as u32,
             load_address + binary.file.header.pt2.entry_point() as u32,
         ),
-        (AUX::AtUid as u32, 0),
-        (AUX::AtEuid as u32, 0),
-        (AUX::AtGid as u32, 0),
-        (AUX::AtEgid as u32, 0),
+        (AUX::AtUid as u32, UID),
+        (AUX::AtEuid as u32, EUID),
+        (AUX::AtGid as u32, GID),
+        (AUX::AtEgid as u32, EGID),
         (AUX::AtSecure as u32, 0),
         (AUX::AtRandom as u32, randstraddr),
         (AUX::AtHwcap2 as u32, 0),

@@ -1,7 +1,7 @@
 use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
 use unicorn_engine::unicorn_const::Permission;
-use unicorn_engine::Unicorn;
+use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn mmap(
     unicorn: &mut Unicorn<Context>,
@@ -13,7 +13,8 @@ pub fn mmap(
     off_t: u32,
 ) -> u32 {
     let res = mmapx(unicorn, addr, length, prot, flags, fd, off_t);
-    log::trace!("mmap(addr = {:#x}, length = {:#x}, prot = {:#x}, flags = {:#x}, fd = {:#x}, off_t: {:#x}) => {:#x}",
+    log::trace!("{:#x} [SYSCALL] mmap(addr = {:#x}, length = {:#x}, prot = {:#x}, flags = {:#x}, fd = {:#x}, off_t: {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
         addr, length, prot, flags, fd, off_t, res);
     res
 }
@@ -28,7 +29,8 @@ pub fn mmap2(
     pgoffset: u32,
 ) -> u32 {
     let res = mmapx(unicorn, addr, length, prot, flags, fd, pgoffset * 0x1000);
-    log::trace!("mmap2(addr = {:#x}, length = {:#x}, prot = {:#x}, flags = {:#x}, fd = {:#x}, pgoffset: {:#x}) => {:#x}",
+    log::trace!("{:#x} [SYSCALL] mmap2(addr = {:#x}, length = {:#x}, prot = {:#x}, flags = {:#x}, fd = {:#x}, pgoffset: {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
         addr, length, prot, flags, fd, pgoffset, res);
     res
 }

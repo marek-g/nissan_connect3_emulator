@@ -57,6 +57,18 @@ pub fn push_text_on_stack(unicorn: &mut Unicorn<Context>, address: u32, text: &s
     address
 }
 
-pub fn pack_32(value: u32) -> Vec<u8> {
+pub fn pack_i32(value: i32) -> Vec<u8> {
+    value.to_le_bytes().to_vec()
+}
+
+pub fn pack_u32(value: u32) -> Vec<u8> {
+    value.to_le_bytes().to_vec()
+}
+
+pub fn pack_i64(value: i64) -> Vec<u8> {
+    value.to_le_bytes().to_vec()
+}
+
+pub fn pack_u64(value: u64) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
