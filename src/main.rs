@@ -1,4 +1,5 @@
 use crate::emulator::emulator::Emulator;
+use crate::emulator::file_system::FileSystem;
 use std::path::PathBuf;
 use unicorn_engine::unicorn_const::{Arch, Mode, Permission, SECOND_SCALE};
 use unicorn_engine::{RegisterARM, Unicorn};
@@ -22,7 +23,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     //let procmapengine_path = root_path.join("opt/bosch/processes/procmapengine.out");
     //let procmapengine_bin = std::fs::read(procmapengine_path)?;
 
-    let mut emulator = Emulator::new(root_path.clone(), sd_card_path).unwrap();
+    let file_system = FileSystem::new(root_path.clone(), sd_card_path);
+    let mut emulator = Emulator::new(file_system).unwrap();
 
     let pwd_path = root_path.join("bin/pwd.coreutils");
     let pwd_bin = std::fs::read(pwd_path.clone())?;

@@ -1,10 +1,11 @@
 use crate::emulator::context::Context;
 use crate::emulator::elf_loader::load_elf;
+use crate::emulator::file_system::FileSystem;
 use crate::emulator::mmu::{Mmu, MmuExtension};
 use capstone::arch::arm::ArchMode;
 use capstone::prelude::*;
 use capstone::Endian;
-use std::path::PathBuf;
+use std::path::Path;
 use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Permission};
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -13,15 +14,14 @@ pub struct Emulator<'a> {
 }
 
 impl<'a> Emulator<'a> {
-    pub fn new(root_path: PathBuf, sd_card_path: PathBuf) -> Result<Emulator<'a>, uc_error> {
+    pub fn new(file_system: FileSystem) -> Result<Emulator<'a>, uc_error> {
         Ok(Self {
             unicorn: Unicorn::new_with_data(
                 Arch::ARM,
                 Mode::LITTLE_ENDIAN,
                 Context {
                     mmu: Mmu::new(),
-                    root_path,
-                    sd_card_path,
+                    file_system,
                 },
             )?,
         })

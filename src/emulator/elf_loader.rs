@@ -5,6 +5,7 @@ use crate::emulator::utils::{
     mem_align_down, mem_align_up, pack_32, push_text_on_stack, to_unicorn_permissions,
 };
 use elfloader::*;
+use std::path::Path;
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::Unicorn;
 use xmas_elf::header;
@@ -64,10 +65,8 @@ impl<'a, 'b> ElfLoader for ArmElfLoader<'a, 'b> {
             self.mem_start = self.mem_start.min(mem_start);
             self.mem_end = self.mem_end.max(mem_end);
 
-            let desc = self.filepath.clone();
-
             self.unicorn
-                .mmu_map(mem_start, mem_end - mem_start, perms, &desc);
+                .mmu_map(mem_start, mem_end - mem_start, perms, self.filepath);
 
             // clear allocated memory
             let buf = vec![0; (mem_end - mem_start) as usize];
@@ -185,16 +184,15 @@ pub fn load_elf(
     let interp_address = 0u32;
     let mut interp_entry_point = 0u32;
     if let Some(interp_path) = binary.interpreter() {
-        let interp_full_path = format!(
-            "{}{}",
-            unicorn.get_data().root_path.to_str().unwrap(),
-            interp_path
-        );
-        log::debug!("Load interpreter: {}", &interp_full_path);
+        let interp_full_path = unicorn
+            .get_data()
+            .file_system
+            .path_transform_to_real(interp_path);
+        log::debug!("Load interpreter: {:?}", &interp_full_path);
 
         let mut interp_loader = ArmElfLoader {
             unicorn,
-            filepath: &interp_full_path,
+            filepath: interp_path,
             load_address: interp_address,
             mem_start: 0xFFFFFFFFu32,
             mem_end: 0u32,

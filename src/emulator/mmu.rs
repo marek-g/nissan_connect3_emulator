@@ -26,6 +26,8 @@ pub trait MmuExtension {
     fn is_mapped(&mut self, address: u32, size: u32) -> bool;
 
     fn heap_alloc(&mut self, size: u32, perms: Permission) -> u32;
+
+    fn read_string(&mut self, addr: u32) -> String;
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -137,5 +139,19 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
         self.get_data_mut().mmu.heap_mem_end = heap_addr + size;
 
         heap_addr
+    }
+
+    fn read_string(&mut self, mut addr: u32) -> String {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            self.mem_read(addr as u64, &mut byte).unwrap();
+            if byte[0] == 0 {
+                break;
+            }
+            buf.push(byte[0]);
+            addr += 1;
+        }
+        String::from_utf8(buf).unwrap()
     }
 }
