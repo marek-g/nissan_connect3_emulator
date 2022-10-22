@@ -1,5 +1,5 @@
 use crate::emulator::context::Context;
-use crate::os::syscalls::{unistd, utsname};
+use crate::os::syscalls::{mmap, unistd, utsname};
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
@@ -12,7 +12,25 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
     // - /home/marek/Ext/Src/emu/qiling/qiling/os/posix/syscall/
     let res = match unicorn.get_syscall_number() {
         45 => unistd::brk(unicorn, unicorn.get_u32_arg(0)),
+        90 => mmap::mmap(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+            unicorn.get_u32_arg(3),
+            unicorn.get_u32_arg(4),
+            unicorn.get_u32_arg(5),
+        ),
         122 => utsname::uname(unicorn, unicorn.get_u32_arg(0)),
+        192 => mmap::mmap2(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+            unicorn.get_u32_arg(3),
+            unicorn.get_u32_arg(4),
+            unicorn.get_u32_arg(5),
+        ),
         _ => {
             panic!(
                 "{:#x}: not implemented syscall #{} (int {}), args: {:#x}, {:#x}, {:#x}, ...",

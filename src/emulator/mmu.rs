@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::emulator::context::Context;
+use crate::emulator::utils::mem_align_up;
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::Unicorn;
 
@@ -19,10 +20,12 @@ impl Mmu {
 }
 
 pub trait MmuExtension {
-    fn mmu_map(&mut self, address: u32, size: u32, perms: Permission, description: &str) -> bool;
+    fn mmu_map(&mut self, address: u32, size: u32, perms: Permission, description: &str);
     fn add_mapinfo(&mut self, map_info: MapInfo);
     fn mmu_unmap(&mut self, address: u32, size: usize);
     fn is_mapped(&mut self, address: u32, size: u32) -> bool;
+
+    fn heap_alloc(&mut self, size: u32, perms: Permission) -> u32;
 }
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -60,9 +63,9 @@ impl std::fmt::Display for MapInfo {
 }
 
 impl<'a> MmuExtension for Unicorn<'a, Context> {
-    fn mmu_map(&mut self, address: u32, size: u32, perms: Permission, description: &str) -> bool {
+    fn mmu_map(&mut self, address: u32, size: u32, perms: Permission, description: &str) {
         if self.is_mapped(address, size as u32) {
-            return true;
+            return;
         }
 
         let _ = self
@@ -91,8 +94,6 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
             perms,
             desc
         );
-
-        true
     }
 
     fn add_mapinfo(&mut self, map_info: MapInfo) {
@@ -125,5 +126,16 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
         }
 
         false
+    }
+
+    fn heap_alloc(&mut self, size: u32, perms: Permission) -> u32 {
+        let heap_addr = self.get_data().mmu.heap_mem_end;
+
+        let size = mem_align_up(size, None);
+        self.mmu_map(heap_addr, size, perms, "[heap]");
+
+        self.get_data_mut().mmu.heap_mem_end = heap_addr + size;
+
+        heap_addr
     }
 }
