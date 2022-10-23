@@ -7,6 +7,7 @@ use unicorn_engine::Unicorn;
 
 pub struct Mmu {
     map_infos: HashMap<u32, MapInfo>,
+    pub brk_mem_end: u32,
     pub heap_mem_end: u32,
 }
 
@@ -14,6 +15,7 @@ impl Mmu {
     pub fn new() -> Self {
         Self {
             map_infos: HashMap::new(),
+            brk_mem_end: 0u32,
             heap_mem_end: 0u32,
         }
     }
@@ -22,7 +24,7 @@ impl Mmu {
 pub trait MmuExtension {
     fn mmu_map(&mut self, address: u32, size: u32, perms: Permission, description: &str);
     fn add_mapinfo(&mut self, map_info: MapInfo);
-    fn mmu_unmap(&mut self, address: u32, size: usize);
+    fn mmu_unmap(&mut self, address: u32, size: u32);
     fn is_mapped(&mut self, address: u32, size: u32) -> bool;
 
     fn heap_alloc(&mut self, size: u32, perms: Permission) -> u32;
@@ -116,9 +118,10 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
             .insert(map_info.memory_start, map_info);
     }
 
-    fn mmu_unmap(&mut self, address: u32, size: usize) {
+    fn mmu_unmap(&mut self, address: u32, size: u32) {
         _ = self.get_data_mut().mmu.map_infos.remove_entry(&address);
-        self.mem_unmap(address as u64, size).unwrap();
+        self.mem_unmap(address as u64, size as libc::size_t)
+            .unwrap();
     }
 
     fn is_mapped(&mut self, address: u32, size: u32) -> bool {

@@ -1,13 +1,28 @@
 use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
+use crate::emulator::utils::mem_align_up;
 use std::io::{Read, Seek};
+use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn brk(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
     let res = if addr == 0 {
-        unicorn.get_data().mmu.heap_mem_end
+        unicorn.get_data().mmu.brk_mem_end
     } else {
-        panic!("not implemented");
+        let brk_mem_end = unicorn.get_data().mmu.brk_mem_end;
+        let new_brk_mem_end = mem_align_up(addr, None);
+        if new_brk_mem_end > brk_mem_end {
+            unicorn.mmu_map(
+                brk_mem_end,
+                new_brk_mem_end - brk_mem_end,
+                Permission::all(),
+                "[brk]",
+            );
+        } else if new_brk_mem_end < brk_mem_end {
+            unicorn.mmu_unmap(new_brk_mem_end, brk_mem_end - new_brk_mem_end);
+        }
+        unicorn.get_data_mut().mmu.brk_mem_end = new_brk_mem_end;
+        new_brk_mem_end
     };
 
     log::trace!(
