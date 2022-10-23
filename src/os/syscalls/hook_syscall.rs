@@ -1,5 +1,5 @@
 use crate::emulator::context::Context;
-use crate::os::syscalls::{fcntl, mmap, stat, unistd, utsname};
+use crate::os::syscalls::{fcntl, mman, stat, unistd, utsname};
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
@@ -26,7 +26,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
         6 => unistd::close(unicorn, unicorn.get_u32_arg(0)),
         33 => unistd::access(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         45 => unistd::brk(unicorn, unicorn.get_u32_arg(0)),
-        90 => mmap::mmap(
+        90 => mman::mmap(
             unicorn,
             unicorn.get_u32_arg(0),
             unicorn.get_u32_arg(1),
@@ -36,7 +36,13 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
             unicorn.get_u32_arg(5),
         ),
         122 => utsname::uname(unicorn, unicorn.get_u32_arg(0)),
-        192 => mmap::mmap2(
+        125 => mman::mprotect(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
+        192 => mman::mmap2(
             unicorn,
             unicorn.get_u32_arg(0),
             unicorn.get_u32_arg(1),

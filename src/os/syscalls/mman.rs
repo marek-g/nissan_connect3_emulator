@@ -1,5 +1,6 @@
 use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
+use crate::emulator::utils::{mem_align_down, mem_align_up};
 use std::io::{Read, Seek, SeekFrom};
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::{RegisterARM, Unicorn};
@@ -36,36 +37,57 @@ pub fn mmap2(
     res
 }
 
+pub fn mprotect(unicorn: &mut Unicorn<Context>, addr: u32, len: u32, prot: u32) -> u32 {
+    let res = 0u32; //mmapx(unicorn, addr, length, prot, flags, fd, pgoffset * 0x1000);
+
+    unicorn
+        .mem_protect(
+            addr as u64,
+            mem_align_up(len, None) as libc::size_t,
+            prot_to_permission(prot),
+        )
+        .unwrap();
+
+    log::trace!(
+        "{:#x} [SYSCALL] mprotect(addr = {:#x}, len = {:#x}, prot = {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        addr,
+        len,
+        prot,
+        res
+    );
+    res
+}
+
 fn mmapx(
     unicorn: &mut Unicorn<Context>,
     addr: u32,
-    length: u32,
+    mut length: u32,
     prot: u32,
     flags: u32,
     mut fd: u32,
     off_t: u32,
 ) -> u32 {
-    if addr != 0 {
-        panic!("not implemented");
-    }
-
-    let mut permissions = Permission::NONE;
-    if prot & 1 != 0 {
-        permissions |= Permission::READ;
-    }
-    if prot & 2 != 0 {
-        permissions |= Permission::WRITE;
-    }
-    if prot & 4 != 0 {
-        permissions |= Permission::EXEC;
-    }
+    let perms = prot_to_permission(prot);
 
     // MAP_ANONYMOUS - do not use fd
     if flags & 0x20u32 != 0 {
         fd = 0xFFFFFFFFu32;
     }
 
-    let addr = unicorn.heap_alloc(length, permissions);
+    if addr != mem_align_down(addr, None) {
+        panic!("wrong address alignment for mmap");
+    }
+
+    length = mem_align_up(length, None);
+
+    let addr = if flags & 0x10 != 0 || addr != 0 {
+        // MAP_FIXED - don't interpret addr as a hint
+        unicorn.mmu_map(addr, length, perms, "[fixed heap]");
+        addr
+    } else {
+        unicorn.heap_alloc(length, perms)
+    };
 
     let mut buf = Vec::new();
     if let Some(file) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
@@ -83,4 +105,19 @@ fn mmapx(
     }
 
     addr
+}
+
+fn prot_to_permission(prot: u32) -> Permission {
+    let mut perms = Permission::NONE;
+    if prot & 1 != 0 {
+        perms |= Permission::READ;
+    }
+    if prot & 2 != 0 {
+        perms |= Permission::WRITE;
+    }
+    if prot & 4 != 0 {
+        perms |= Permission::EXEC;
+    }
+
+    perms
 }

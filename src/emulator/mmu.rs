@@ -67,6 +67,13 @@ impl std::fmt::Display for MapInfo {
 impl<'a> MmuExtension for Unicorn<'a, Context> {
     fn mmu_map(&mut self, address: u32, size: u32, perms: Permission, description: &str) {
         if self.is_mapped(address, size as u32) {
+            self.mem_protect(
+                address as u64,
+                mem_align_up(size, None) as libc::size_t,
+                perms,
+            )
+            .unwrap();
+
             return;
         }
 
@@ -116,22 +123,9 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
 
     fn is_mapped(&mut self, address: u32, size: u32) -> bool {
         let regions = self.mem_regions().unwrap();
-        if regions.len() <= 1 {
-            return false;
-        }
-
-        if let Ok(region) = self.mem_regions() {
-            let val = (region[0].begin >= address as u64)
-                & ((address + size - 1) as u64 <= region[1].begin);
-            match val {
-                true => {
-                    return true;
-                }
-                _ => {}
-            }
-        }
-
-        false
+        regions
+            .iter()
+            .any(|r| r.begin <= address as u64 && r.end >= address as u64 + size as u64 - 1)
     }
 
     fn heap_alloc(&mut self, size: u32, perms: Permission) -> u32 {

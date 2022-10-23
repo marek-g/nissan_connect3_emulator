@@ -1,7 +1,7 @@
 pub mod hook_syscall;
 
 mod fcntl;
-mod mmap;
+mod mman;
 mod stat;
 mod unistd;
 mod utsname;

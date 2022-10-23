@@ -52,6 +52,12 @@ impl<'a> Emulator<'a> {
         self.unicorn
             .add_mem_hook(HookType::MEM_READ_UNMAPPED, 1, 0, Self::callback_mem_rw)
             .unwrap();
+        self.unicorn
+            .add_mem_hook(HookType::MEM_WRITE_UNMAPPED, 1, 0, Self::callback_mem_rw)
+            .unwrap();
+        self.unicorn
+            .add_mem_hook(HookType::MEM_WRITE_PROT, 1, 0, Self::callback_mem_rw)
+            .unwrap();
 
         self.unicorn
             .reg_write(RegisterARM::SP as i32, stack_ptr as u64)
