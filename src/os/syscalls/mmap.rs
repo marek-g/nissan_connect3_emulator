@@ -1,5 +1,6 @@
 use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
+use std::io::{Read, Seek, SeekFrom};
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -40,9 +41,9 @@ fn mmapx(
     addr: u32,
     length: u32,
     prot: u32,
-    _flags: u32,
-    _fd: u32,
-    _off_t: u32,
+    flags: u32,
+    mut fd: u32,
+    off_t: u32,
 ) -> u32 {
     if addr != 0 {
         panic!("not implemented");
@@ -59,5 +60,26 @@ fn mmapx(
         permissions |= Permission::EXEC;
     }
 
-    unicorn.heap_alloc(length, permissions)
+    // MAP_ANONYMOUS - do not use fd
+    if flags & 0x20u32 != 0 {
+        fd = 0xFFFFFFFFu32;
+    }
+
+    let addr = unicorn.heap_alloc(length, permissions);
+
+    let mut buf = Vec::new();
+    if let Some(file) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
+        let file_pos = file.stream_position().unwrap();
+        file.seek(SeekFrom::Start(off_t as u64)).unwrap();
+
+        buf.resize(length as usize, 0u8);
+        file.read_exact(&mut buf).unwrap();
+
+        file.seek(SeekFrom::Start(file_pos)).unwrap();
+    }
+    if buf.len() > 0 {
+        unicorn.mem_write(addr as u64, &buf).unwrap();
+    }
+
+    addr
 }

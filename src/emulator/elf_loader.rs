@@ -67,10 +67,6 @@ impl<'a, 'b> ElfLoader for ArmElfLoader<'a, 'b> {
 
             self.unicorn
                 .mmu_map(mem_start, mem_end - mem_start, perms, self.filepath);
-
-            // clear allocated memory
-            let buf = vec![0; (mem_end - mem_start) as usize];
-            self.unicorn.mem_write(mem_start as u64, &buf).unwrap();
         }
         Ok(())
     }

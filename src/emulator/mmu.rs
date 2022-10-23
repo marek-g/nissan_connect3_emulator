@@ -74,6 +74,10 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
             .mem_map(address as u64, size as libc::size_t, perms)
             .unwrap();
 
+        // clear allocated memory
+        let buf = vec![0; size as usize];
+        self.mem_write(address as u64, &buf).unwrap();
+
         let desc = match description.len() {
             0 => String::from("[mapped]"),
             _ => String::from(description),
