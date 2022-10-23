@@ -37,6 +37,23 @@ pub fn mmap2(
     res
 }
 
+pub fn munmap(unicorn: &mut Unicorn<Context>, addr: u32, length: u32) -> u32 {
+    let res = 0u32;
+
+    unicorn
+        .mem_unmap(addr as u64, mem_align_up(length, None) as libc::size_t)
+        .unwrap();
+
+    log::trace!(
+        "{:#x} [SYSCALL] munmap(addr = {:#x}, len = {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        addr,
+        length,
+        res
+    );
+    res
+}
+
 pub fn mprotect(unicorn: &mut Unicorn<Context>, addr: u32, len: u32, prot: u32) -> u32 {
     let res = 0u32; //mmapx(unicorn, addr, length, prot, flags, fd, pgoffset * 0x1000);
 

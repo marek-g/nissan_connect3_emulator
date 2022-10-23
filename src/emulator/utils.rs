@@ -22,11 +22,7 @@ pub fn mem_align_down(address: u32, alignment: Option<u32>) -> u32 {
 /// to page size.
 pub fn mem_align_up(address: u32, alignment: Option<u32>) -> u32 {
     let align = alignment.unwrap_or(0x1000);
-    if address % align != 0 {
-        (address / align + 1) * align
-    } else {
-        address
-    }
+    ((address + align - 1) / align) * align
 }
 
 pub fn to_unicorn_permissions(perms: program::Flags) -> Permission {
