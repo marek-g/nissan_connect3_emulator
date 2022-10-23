@@ -31,7 +31,8 @@ impl FileSystem {
         if guest_path.starts_with("/") {
             self.root_path.join(&guest_path[1..])
         } else {
-            panic!("not implemented");
+            // TODO: rewrite using pwd
+            self.root_path.join(&guest_path)
         }
     }
 
