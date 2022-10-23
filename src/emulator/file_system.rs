@@ -38,6 +38,10 @@ impl FileSystem {
         }
     }
 
+    pub fn close(&mut self, fd: u32) -> bool {
+        self.opened_files.remove(&fd).map(|_| true).unwrap_or(false)
+    }
+
     pub fn fd_to_file(&mut self, fd: u32) -> Option<&mut File> {
         self.opened_files.get_mut(&fd)
     }

@@ -1,8 +1,6 @@
 use crate::emulator::context::Context;
-use crate::emulator::mmu::MmuExtension;
 use crate::emulator::users::{GID, UID};
-use crate::emulator::utils::{pack_i32, pack_i64, pack_u32, pack_u64};
-use std::fs::Permissions;
+use crate::emulator::utils::{pack_i32, pack_u32, pack_u64};
 use std::time::SystemTime;
 use unicorn_engine::{RegisterARM, Unicorn};
 

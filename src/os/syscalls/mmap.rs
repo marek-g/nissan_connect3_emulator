@@ -72,7 +72,8 @@ fn mmapx(
         let file_pos = file.stream_position().unwrap();
         file.seek(SeekFrom::Start(off_t as u64)).unwrap();
 
-        buf.resize(length as usize, 0u8);
+        let bytes_to_read = length.min(file.metadata().unwrap().len() as u32 - off_t);
+        buf.resize(bytes_to_read as usize, 0u8);
         file.read_exact(&mut buf).unwrap();
 
         file.seek(SeekFrom::Start(file_pos)).unwrap();
