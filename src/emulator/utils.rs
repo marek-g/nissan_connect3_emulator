@@ -1,4 +1,5 @@
 use crate::emulator::context::Context;
+use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::Unicorn;
 use xmas_elf::program;
@@ -63,6 +64,10 @@ pub fn pack_i32(value: i32) -> Vec<u8> {
 
 pub fn pack_u32(value: u32) -> Vec<u8> {
     value.to_le_bytes().to_vec()
+}
+
+pub fn unpack_u32(value: &[u8]) -> u32 {
+    LittleEndian::read_u32(value)
 }
 
 pub fn pack_i64(value: i64) -> Vec<u8> {

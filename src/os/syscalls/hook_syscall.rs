@@ -1,5 +1,5 @@
 use crate::emulator::context::Context;
-use crate::os::syscalls::{fcntl, linux, mman, stat, unistd, utsname};
+use crate::os::syscalls::{fcntl, linux, mman, stat, uio, unistd, utsname};
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
@@ -38,6 +38,12 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
         91 => mman::munmap(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         122 => utsname::uname(unicorn, unicorn.get_u32_arg(0)),
         125 => mman::mprotect(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
+        146 => uio::writev(
             unicorn,
             unicorn.get_u32_arg(0),
             unicorn.get_u32_arg(1),
