@@ -73,11 +73,11 @@ pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
 
 pub fn read(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u32 {
     let mut buf2 = Vec::new();
-    if let Some(file) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
-        let file_pos = file.stream_position().unwrap() as u32;
-        let bytes_to_read = length.min(file.metadata().unwrap().len() as u32 - file_pos);
+    if let Some(fileinfo) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
+        let file_pos = fileinfo.file.stream_position().unwrap() as u32;
+        let bytes_to_read = length.min(fileinfo.file.metadata().unwrap().len() as u32 - file_pos);
         buf2.resize(bytes_to_read as usize, 0u8);
-        file.read_exact(&mut buf2).unwrap();
+        fileinfo.file.read_exact(&mut buf2).unwrap();
     }
     let res = if buf2.len() > 0 {
         unicorn.mem_write(buf as u64, &buf2).unwrap();

@@ -2,11 +2,18 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
 
+pub struct FileInfo {
+    pub file: File,
+    pub filepath: String,
+    pub inode: u64,
+}
+
 pub struct FileSystem {
     pub root_path: PathBuf,
     pub sd_card_path: PathBuf,
 
-    opened_files: HashMap<u32, File>,
+    opened_files: HashMap<u32, FileInfo>,
+    inodes: HashMap<String, u64>,
 }
 
 impl FileSystem {
@@ -16,6 +23,7 @@ impl FileSystem {
             sd_card_path,
 
             opened_files: HashMap::new(),
+            inodes: HashMap::new(),
         }
     }
 
@@ -31,7 +39,12 @@ impl FileSystem {
         let fullpathname = self.path_transform_to_real(&filepath);
         if let Ok(file) = File::open(fullpathname) {
             let fd = self.get_next_fd();
-            self.opened_files.insert(fd, file);
+            let fileinfo = FileInfo {
+                file,
+                filepath: filepath.to_string(),
+                inode: self.get_inode_for_filepath(filepath.to_string()),
+            };
+            self.opened_files.insert(fd, fileinfo);
             fd
         } else {
             -2i32 as u32 // no such file or directory
@@ -42,7 +55,7 @@ impl FileSystem {
         self.opened_files.remove(&fd).map(|_| true).unwrap_or(false)
     }
 
-    pub fn fd_to_file(&mut self, fd: u32) -> Option<&mut File> {
+    pub fn fd_to_file(&mut self, fd: u32) -> Option<&mut FileInfo> {
         self.opened_files.get_mut(&fd)
     }
 
@@ -52,5 +65,11 @@ impl FileSystem {
             res += 1;
         }
         res
+    }
+
+    fn get_inode_for_filepath(&mut self, filepath: String) -> u64 {
+        let next_inode = self.inodes.len() as u64 + 1;
+        let entry = self.inodes.entry(filepath).or_insert(next_inode);
+        *entry
     }
 }

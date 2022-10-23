@@ -107,15 +107,15 @@ fn mmapx(
     };
 
     let mut buf = Vec::new();
-    if let Some(file) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
-        let file_pos = file.stream_position().unwrap();
-        file.seek(SeekFrom::Start(off_t as u64)).unwrap();
+    if let Some(fileinfo) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
+        let file_pos = fileinfo.file.stream_position().unwrap();
+        fileinfo.file.seek(SeekFrom::Start(off_t as u64)).unwrap();
 
-        let bytes_to_read = length.min(file.metadata().unwrap().len() as u32 - off_t);
+        let bytes_to_read = length.min(fileinfo.file.metadata().unwrap().len() as u32 - off_t);
         buf.resize(bytes_to_read as usize, 0u8);
-        file.read_exact(&mut buf).unwrap();
+        fileinfo.file.read_exact(&mut buf).unwrap();
 
-        file.seek(SeekFrom::Start(file_pos)).unwrap();
+        fileinfo.file.seek(SeekFrom::Start(file_pos)).unwrap();
     }
     if buf.len() > 0 {
         unicorn.mem_write(addr as u64, &buf).unwrap();

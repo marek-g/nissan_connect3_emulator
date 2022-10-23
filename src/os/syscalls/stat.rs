@@ -5,8 +5,8 @@ use std::time::SystemTime;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn fstat64(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u32 {
-    let res = if let Some(file) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
-        let metadata = file.metadata().unwrap();
+    let res = if let Some(fileinfo) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
+        let metadata = fileinfo.file.metadata().unwrap();
 
         let mut stat_data = Vec::new();
 
@@ -89,7 +89,7 @@ pub fn fstat64(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u32 {
         stat_data.extend_from_slice(&pack_u32(0));
 
         // st_ino
-        stat_data.extend_from_slice(&pack_u64(1));
+        stat_data.extend_from_slice(&pack_u64(fileinfo.inode));
 
         unicorn.mem_write(statbuf as u64, &stat_data).unwrap();
 
