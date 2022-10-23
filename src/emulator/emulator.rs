@@ -1,6 +1,7 @@
 use crate::emulator::context::Context;
 use crate::emulator::elf_loader::load_elf;
 use crate::emulator::file_system::FileSystem;
+use crate::emulator::memory_map::GET_TLS_ADDR;
 use crate::emulator::mmu::{Mmu, MmuExtension};
 use capstone::arch::arm::ArchMode;
 use capstone::prelude::*;
@@ -113,10 +114,10 @@ impl<'a> Emulator<'a> {
             .unwrap();
 
         // get_tls
-        log::debug!("Set kernel trap: get_tls at 0xFFFF0FE0");
+        log::debug!("Set kernel trap: get_tls at {:#X}", GET_TLS_ADDR);
         self.unicorn
             .mem_write(
-                0xFFFF0FE0,
+                GET_TLS_ADDR as u64,
                 // ldr   r0, [pc, #(16 - 8)]
                 // mov   pc, lr
                 // mrc   p15, 0, r0, c13, c0, 3

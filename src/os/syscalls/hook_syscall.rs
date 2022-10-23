@@ -1,5 +1,5 @@
 use crate::emulator::context::Context;
-use crate::os::syscalls::{fcntl, mman, stat, unistd, utsname};
+use crate::os::syscalls::{fcntl, linux, mman, stat, unistd, utsname};
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
@@ -52,6 +52,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
             unicorn.get_u32_arg(5),
         ),
         197 => stat::fstat64(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        983045 => linux::set_tls(unicorn, unicorn.get_u32_arg(0)),
         _ => {
             panic!(
                 "{:#x}: not implemented syscall #{} (int {}), args: {:#x}, {:#x}, {:#x}, ...",
