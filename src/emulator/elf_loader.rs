@@ -93,7 +93,7 @@ impl<'a, 'b> ElfLoader for ArmElfLoader<'a, 'b> {
 
         //let addr: *mut u32 = (self.load_address + entry.offset as u32) as *mut u32;
 
-        println!("relocation: {:?}", entry.rtype);
+        //println!("relocation: {:?}", entry.rtype);
 
         // TODO:
 

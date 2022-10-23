@@ -150,7 +150,7 @@ impl<'a> Emulator<'a> {
 
     fn run_linker(&mut self, interp_entry_point: u32, elf_entry: u32) {
         log::info!("========== Start linker ==========");
-        self.disasm(interp_entry_point, 100);
+        //self.disasm(interp_entry_point, 100);
         let result = self
             .unicorn
             .emu_start(interp_entry_point as u64, elf_entry as u64, 0, 0);

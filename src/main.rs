@@ -28,10 +28,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
 
     let pwd_path = root_path.join("bin/pwd.coreutils");
     let pwd_bin = std::fs::read(pwd_path.clone())?;
-    display_binary_information(&pwd_bin);
+    //display_binary_information(&pwd_bin);
     emulator.run_elf("/bin/pwd.coreutils", &pwd_bin, &Vec::new(), &Vec::new())?;
 
-    let arm_code32: Vec<u8> = vec![0x17, 0x00, 0x40, 0xe2]; // sub r0, #23
+    /*let arm_code32: Vec<u8> = vec![0x17, 0x00, 0x40, 0xe2]; // sub r0, #23
     let mut unicorn =
         Unicorn::new(Arch::ARM, Mode::LITTLE_ENDIAN).expect("failed to initialize Unicorn");
     let emu = &mut unicorn;
@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
         1000,
     );
     assert_eq!(emu.reg_read(RegisterARM::R0), Ok(100));
-    assert_eq!(emu.reg_read(RegisterARM::R5), Ok(1337));
+    assert_eq!(emu.reg_read(RegisterARM::R5), Ok(1337));*/
 
     Ok(())
 }
