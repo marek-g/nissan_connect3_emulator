@@ -63,7 +63,9 @@ impl<'a> Emulator<'a> {
         self.unicorn
             .reg_write(RegisterARM::SP as i32, stack_ptr as u64)
             .unwrap();
+
         self.run_linker(interp_entry_point, elf_entry);
+        self.run_program(elf_entry);
 
         Ok(())
     }
@@ -160,6 +162,19 @@ impl<'a> Emulator<'a> {
         }
 
         log::info!("========== Linker done ==========");
+    }
+
+    fn run_program(&mut self, elf_entry: u32) {
+        log::info!("========== Start program ==========");
+        let result = self.unicorn.emu_start(elf_entry as u64, 0, 0, 0);
+
+        log::debug!("PC: {:#x}", self.unicorn.reg_read(RegisterARM::PC).unwrap());
+
+        if let Err(error) = result {
+            log::error!("Execution error: {:?}", error);
+        }
+
+        log::info!("========== Program end ==========");
     }
 
     fn disasm(&mut self, address: u32, len: u32) {
