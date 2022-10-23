@@ -147,7 +147,7 @@ impl<'a> Emulator<'a> {
     }
 
     fn run_linker(&mut self, interp_entry_point: u32, elf_entry: u32) {
-        log::debug!("Start linker");
+        log::info!("========== Start linker ==========");
         self.disasm(interp_entry_point, 100);
         let result = self
             .unicorn
@@ -159,7 +159,7 @@ impl<'a> Emulator<'a> {
             log::error!("Execution error: {:?}", error);
         }
 
-        log::debug!("Linker done");
+        log::info!("========== Linker done ==========");
     }
 
     fn disasm(&mut self, address: u32, len: u32) {
