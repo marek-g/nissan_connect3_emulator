@@ -7,6 +7,7 @@ mod mman;
 mod resource;
 mod signal;
 mod stat;
+mod time;
 mod uio;
 mod unistd;
 mod utsname;

@@ -1,6 +1,6 @@
 use crate::emulator::context::Context;
 use crate::os::syscalls::{
-    fcntl, futex, linux, mman, resource, signal, stat, uio, unistd, utsname,
+    fcntl, futex, linux, mman, resource, signal, stat, time, uio, unistd, utsname,
 };
 use libc::signal;
 use unicorn_engine::{RegisterARM, Unicorn};
@@ -85,6 +85,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
             unicorn.get_u32_arg(2),
         ),
         256 => unistd::set_tid_address(unicorn, unicorn.get_u32_arg(0)),
+        263 => time::clock_gettime(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         322 => fcntl::openat(
             unicorn,
             unicorn.get_u32_arg(0),
