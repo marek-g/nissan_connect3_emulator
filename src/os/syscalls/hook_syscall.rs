@@ -90,6 +90,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
             unicorn.get_u32_arg(1),
             unicorn.get_u32_arg(2),
         ),
+        248 => unistd::exit_group(unicorn, unicorn.get_u32_arg(0)),
         256 => unistd::set_tid_address(unicorn, unicorn.get_u32_arg(0)),
         263 => time::clock_gettime(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         322 => fcntl::openat(

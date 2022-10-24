@@ -142,3 +142,16 @@ pub fn set_tid_address(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
 
     res
 }
+
+pub fn exit_group(unicorn: &mut Unicorn<Context>, status: u32) -> u32 {
+    unicorn.emu_stop().unwrap();
+
+    log::trace!(
+        "{:#x}: [SYSCALL] exit_group(status: {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        status,
+        0u32
+    );
+
+    0u32
+}
