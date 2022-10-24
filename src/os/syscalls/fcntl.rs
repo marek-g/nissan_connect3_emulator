@@ -58,6 +58,7 @@ pub fn openat(
             .to_owned();
     }
 
+    // TODO: handle symbolic links
     let fd = open_internal(unicorn, &pathname, flags, mode);
 
     log::trace!(

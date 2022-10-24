@@ -24,7 +24,7 @@ impl FileSystem {
             root_path,
             sd_card_path,
 
-            current_working_dir: "/opt/process".to_string(),
+            current_working_dir: "/".to_string(),
 
             opened_files: HashMap::new(),
             inodes: HashMap::new(),

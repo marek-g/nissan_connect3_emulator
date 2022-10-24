@@ -5,7 +5,23 @@ use crate::emulator::utils::{pack_i32, pack_u32, pack_u64};
 use std::time::SystemTime;
 use unicorn_engine::{RegisterARM, Unicorn};
 
+pub fn stat64(unicorn: &mut Unicorn<Context>, path: u32, statbuf: u32) -> u32 {
+    let pathstr = unicorn.read_string(path);
+    let fd = unicorn.get_data_mut().file_system.open(&pathstr);
+    let res = fstat64_internal(unicorn, fd, statbuf);
+    unicorn.get_data_mut().file_system.close(fd);
+    log::trace!(
+        "{:#x}: [SYSCALL] lstat64(path = {}, statbuf = {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        pathstr,
+        statbuf,
+        res
+    );
+    res
+}
+
 pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, statbuf: u32) -> u32 {
+    // TODO: handle symbolic links
     let pathstr = unicorn.read_string(path);
     let fd = unicorn.get_data_mut().file_system.open(&pathstr);
     let res = fstat64_internal(unicorn, fd, statbuf);
