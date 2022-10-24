@@ -12,6 +12,8 @@ pub struct FileSystem {
     pub root_path: PathBuf,
     pub sd_card_path: PathBuf,
 
+    pub current_working_dir: String,
+
     opened_files: HashMap<u32, FileInfo>,
     inodes: HashMap<String, u64>,
 }
@@ -21,6 +23,8 @@ impl FileSystem {
         Self {
             root_path,
             sd_card_path,
+
+            current_working_dir: "/opt/process".to_string(),
 
             opened_files: HashMap::new(),
             inodes: HashMap::new(),
