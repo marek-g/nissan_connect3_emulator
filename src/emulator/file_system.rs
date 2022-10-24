@@ -6,6 +6,7 @@ pub struct FileInfo {
     pub file: File,
     pub filepath: String,
     pub inode: u64,
+    pub file_status_flags: u32,
 }
 
 pub struct FileSystem {
@@ -48,6 +49,7 @@ impl FileSystem {
                 file,
                 filepath: filepath.to_string(),
                 inode: self.get_inode_for_filepath(filepath.to_string()),
+                file_status_flags: 0,
             };
             self.opened_files.insert(fd, fileinfo);
             fd

@@ -74,6 +74,40 @@ pub fn openat(
     fd
 }
 
+pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> u32 {
+    let res = match cmd {
+        2 => {
+            // F_SETFD
+            if let Some(fileinfo) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
+                fileinfo.file_status_flags = arg1;
+                0u32
+            } else {
+                -1i32 as u32
+            }
+        }
+        3 => {
+            // F_GETFD
+            if let Some(fileinfo) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
+                fileinfo.file_status_flags
+            } else {
+                -1i32 as u32
+            }
+        }
+        _ => panic!("unsupported command"),
+    };
+
+    log::trace!(
+        "{:#x}: [SYSCALL] fcntl64(fd = {:#x}, cmd = {:#x}, arg1: {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        fd,
+        cmd,
+        arg1,
+        res
+    );
+
+    res
+}
+
 fn open_internal(unicorn: &mut Unicorn<Context>, pathname: &str, flags: u32, mode: u32) -> u32 {
     let fd = unicorn.get_data_mut().file_system.open(&pathname);
 
