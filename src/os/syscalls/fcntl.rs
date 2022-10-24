@@ -22,3 +22,18 @@ pub fn open(unicorn: &mut Unicorn<Context>, pathname: u32, flags: u32, mode: u32
 
     fd
 }
+
+pub fn openat(unicorn: &mut Unicorn<Context>, pathname: u32, flags: u32, mode: u32) -> u32 {
+    let fd = open(unicorn, pathname, flags, mode);
+
+    log::trace!(
+        "{:#x}: [SYSCALL] openat(pathname = {}, flags: {:#x}, mode: {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        pathname,
+        flags,
+        mode,
+        fd
+    );
+
+    fd
+}

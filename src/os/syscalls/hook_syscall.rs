@@ -60,6 +60,12 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
         ),
         196 => stat::lstat64(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         197 => stat::fstat64(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        322 => fcntl::openat(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
         983045 => linux::set_tls(unicorn, unicorn.get_u32_arg(0)),
         _ => {
             panic!(

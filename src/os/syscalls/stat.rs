@@ -8,7 +8,7 @@ use unicorn_engine::{RegisterARM, Unicorn};
 pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, statbuf: u32) -> u32 {
     let pathstr = unicorn.read_string(path);
     let fd = unicorn.get_data_mut().file_system.open(&pathstr);
-    let res = fstat64(unicorn, fd, statbuf);
+    let res = fstat64_internal(unicorn, fd, statbuf);
     unicorn.get_data_mut().file_system.close(fd);
     log::trace!(
         "{:#x}: [SYSCALL] lstat64(path = {}, statbuf = {:#x}) => {:#x}",
@@ -21,7 +21,20 @@ pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, statbuf: u32) -> u32 {
 }
 
 pub fn fstat64(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u32 {
-    let res = if let Some(fileinfo) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
+    let res = fstat64_internal(unicorn, fd, statbuf);
+
+    log::trace!(
+        "{:#x}: [SYSCALL] fstat64(fd = {:#x}, statbuf = {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        fd,
+        statbuf,
+        res
+    );
+    res
+}
+
+fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u32 {
+    if let Some(fileinfo) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
         let metadata = fileinfo.file.metadata().unwrap();
 
         let mut stat_data = Vec::new();
@@ -80,7 +93,7 @@ pub fn fstat64(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u32 {
         stat_data.extend_from_slice(&pack_u32(0));
 
         // st_blocks
-        stat_data.extend_from_slice(&pack_u64((metadata.len() + 4095) / 4096));
+        stat_data.extend_from_slice(&pack_u64((metadata.len() + 511) / 512));
 
         // st_atime
         let time = SystemTime::now()
@@ -112,14 +125,5 @@ pub fn fstat64(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u32 {
         0u32
     } else {
         -1i32 as u32
-    };
-
-    log::trace!(
-        "{:#x}: [SYSCALL] fstat64(fd = {:#x}, statbuf = {:#x}) => {:#x}",
-        unicorn.reg_read(RegisterARM::PC).unwrap(),
-        fd,
-        statbuf,
-        res
-    );
-    res
+    }
 }

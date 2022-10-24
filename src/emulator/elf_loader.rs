@@ -66,7 +66,7 @@ impl<'a, 'b> ElfLoader for ArmElfLoader<'a, 'b> {
             self.mem_end = self.mem_end.max(mem_end);
 
             self.unicorn
-                .mmu_map(mem_start, mem_end - mem_start, perms, self.filepath);
+                .mmu_map(mem_start, mem_end - mem_start, perms, "", self.filepath);
         }
         Ok(())
     }
@@ -239,6 +239,7 @@ fn setup_stack(
         STACK_SIZE,
         Permission::READ | Permission::WRITE,
         "[stack]",
+        "",
     );
 
     // About ELF Auxiliary Vectors: http://articles.manugarg.com/aboutelfauxiliaryvectors.html

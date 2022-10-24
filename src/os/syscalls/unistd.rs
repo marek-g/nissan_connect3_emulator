@@ -17,6 +17,7 @@ pub fn brk(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
                 new_brk_mem_end - brk_mem_end,
                 Permission::all(),
                 "[brk]",
+                "",
             );
         } else if new_brk_mem_end < brk_mem_end {
             unicorn.mmu_unmap(new_brk_mem_end, brk_mem_end - new_brk_mem_end);

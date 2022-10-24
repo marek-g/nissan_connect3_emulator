@@ -6,6 +6,9 @@ use crate::emulator::mmu::{Mmu, MmuExtension};
 use capstone::arch::arm::ArchMode;
 use capstone::prelude::*;
 use capstone::Endian;
+use libc::fflush;
+use std::io;
+use std::io::Write;
 use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Permission};
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -41,7 +44,6 @@ impl<'a> Emulator<'a> {
             program_args,
             program_envs,
         )?;
-        //self.mmu.display_mapped();
 
         self.set_kernel_traps();
         self.enable_vfp();
@@ -65,6 +67,9 @@ impl<'a> Emulator<'a> {
             .unwrap();
 
         self.run_linker(interp_entry_point, elf_entry);
+
+        log::info!("{}", self.unicorn.display_mapped());
+
         self.run_program(elf_entry);
 
         Ok(())
@@ -82,6 +87,7 @@ impl<'a> Emulator<'a> {
             0x1000,
             Permission::READ | Permission::EXEC,
             "[arm_traps]",
+            "",
         );
 
         // memory_barrier

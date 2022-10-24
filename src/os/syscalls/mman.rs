@@ -98,16 +98,12 @@ fn mmapx(
 
     length = mem_align_up(length, None);
 
-    let addr = if flags & 0x10 != 0 || addr != 0 {
-        // MAP_FIXED - don't interpret addr as a hint
-        unicorn.mmu_map(addr, length, perms, "[fixed heap]");
-        addr
-    } else {
-        unicorn.heap_alloc(length, perms)
-    };
-
+    // load file
     let mut buf = Vec::new();
+    let mut filepath = String::new();
     if let Some(fileinfo) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
+        filepath = fileinfo.filepath.clone();
+
         let file_pos = fileinfo.file.stream_position().unwrap();
         fileinfo.file.seek(SeekFrom::Start(off_t as u64)).unwrap();
 
@@ -117,6 +113,17 @@ fn mmapx(
 
         fileinfo.file.seek(SeekFrom::Start(file_pos)).unwrap();
     }
+
+    // allocate memory
+    let addr = if flags & 0x10 != 0 || addr != 0 {
+        // MAP_FIXED - don't interpret addr as a hint
+        unicorn.mmu_map(addr, length, perms, "[heap (fixed addr)]", &filepath);
+        addr
+    } else {
+        unicorn.heap_alloc(length, perms, &filepath)
+    };
+
+    // write file
     if buf.len() > 0 {
         unicorn.mem_write(addr as u64, &buf).unwrap();
     }
