@@ -20,6 +20,12 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
             unicorn.get_u32_arg(1),
             unicorn.get_u32_arg(2),
         ),
+        4 => unistd::write(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
         5 => fcntl::open(
             unicorn,
             unicorn.get_u32_arg(0),

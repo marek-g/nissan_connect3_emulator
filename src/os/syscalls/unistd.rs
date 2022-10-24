@@ -1,6 +1,6 @@
 use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
-use crate::emulator::utils::mem_align_up;
+use crate::emulator::utils::{mem_align_up, unpack_u32};
 use std::io::{Read, Seek};
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::{RegisterARM, Unicorn};
@@ -89,6 +89,36 @@ pub fn read(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u
 
     log::trace!(
         "{:#x}: [SYSCALL] read(fd: {:#x}, buf: {:#x}, length: {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        fd,
+        buf,
+        length,
+        res
+    );
+
+    res
+}
+
+pub fn write(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u32 {
+    let res = if let Some(file) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
+        log::warn!("Writing to file ignored! ({})", file.filepath);
+        length
+    } else if fd == 1 || fd == 2 {
+        let mut buf2 = vec![0u8; length as usize];
+        unicorn.mem_read(buf as u64, &mut buf2).unwrap();
+        let str = String::from_utf8(buf2).unwrap();
+        if fd == 1 {
+            print!("{}", str);
+        } else {
+            eprint!("{}", str);
+        }
+        length
+    } else {
+        -1i32 as u32
+    };
+
+    log::trace!(
+        "{:#x}: [SYSCALL] write(fd: {:#x}, buf: {:#x}, length: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         fd,
         buf,

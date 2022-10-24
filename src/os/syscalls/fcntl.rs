@@ -111,8 +111,9 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
 fn open_internal(unicorn: &mut Unicorn<Context>, pathname: &str, flags: u32, mode: u32) -> u32 {
     let fd = unicorn.get_data_mut().file_system.open(&pathname);
 
-    if mode != 0x0 && mode != 0x1 {
-        panic!("mode not implemented");
+    if mode & 0x002 != 0 {
+        // F_WRITE
+        log::warn!("Open file for saving ignored! ({})", pathname);
     }
 
     fd
