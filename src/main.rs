@@ -26,12 +26,19 @@ fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     let file_system = FileSystem::new(root_path.clone(), sd_card_path);
     let mut emulator = Emulator::new(file_system).unwrap();
 
+    let pwd_path = root_path.join("bin/echo.coreutils");
     //let pwd_path = root_path.join("bin/date.coreutils");
     //let pwd_path = root_path.join("bin/pwd.coreutils");
-    let pwd_path = root_path.join("opt/bosch/processes/procmapengine.out");
+    //let pwd_path = root_path.join("opt/bosch/processes/procmapengine.out");
     let pwd_bin = std::fs::read(pwd_path.clone())?;
     //display_binary_information(&pwd_bin);
-    emulator.run_elf("/bin/pwd.coreutils", &pwd_bin, &Vec::new(), &Vec::new())?;
+    //emulator.run_elf("/bin/pwd.coreutils", &pwd_bin, &Vec::new(), &Vec::new())?;
+    emulator.run_elf(
+        "/bin/echo.coreutils",
+        &pwd_bin,
+        &vec!["Hello World!".to_string()],
+        &Vec::new(),
+    )?;
 
     /*let arm_code32: Vec<u8> = vec![0x17, 0x00, 0x40, 0xe2]; // sub r0, #23
     let mut unicorn =

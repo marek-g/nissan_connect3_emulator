@@ -57,7 +57,9 @@ pub fn access(unicorn: &mut Unicorn<Context>, pathname: u32, mode: u32) -> u32 {
 
 pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
     let res = if unicorn.get_data_mut().file_system.close(fd) {
-        0
+        0u32
+    } else if fd < 3 {
+        0u32
     } else {
         -1i32 as u32
     };
