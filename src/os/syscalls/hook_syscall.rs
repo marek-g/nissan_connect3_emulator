@@ -1,5 +1,8 @@
 use crate::emulator::context::Context;
-use crate::os::syscalls::{fcntl, linux, mman, stat, uio, unistd, utsname};
+use crate::os::syscalls::{
+    fcntl, futex, linux, mman, resource, signal, stat, uio, unistd, utsname,
+};
+use libc::signal;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
@@ -49,6 +52,20 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
             unicorn.get_u32_arg(1),
             unicorn.get_u32_arg(2),
         ),
+        174 => signal::rt_sigaction(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
+        175 => signal::rt_sigprocmask(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+            unicorn.get_u32_arg(3),
+        ),
+        191 => resource::ugetrlimit(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         192 => mman::mmap2(
             unicorn,
             unicorn.get_u32_arg(0),
@@ -67,6 +84,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
             unicorn.get_u32_arg(1),
             unicorn.get_u32_arg(2),
         ),
+        256 => unistd::set_tid_address(unicorn, unicorn.get_u32_arg(0)),
         322 => fcntl::openat(
             unicorn,
             unicorn.get_u32_arg(0),
@@ -74,6 +92,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
             unicorn.get_u32_arg(2),
             unicorn.get_u32_arg(3),
         ),
+        338 => futex::set_robust_list(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         983045 => linux::set_tls(unicorn, unicorn.get_u32_arg(0)),
         _ => {
             panic!(

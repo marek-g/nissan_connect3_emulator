@@ -98,3 +98,17 @@ pub fn read(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u
 
     res
 }
+
+pub fn set_tid_address(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
+    // TODO: implement
+    let res = 1;
+
+    log::trace!(
+        "{:#x}: [SYSCALL] set_tid_address(addr: {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        addr,
+        res
+    );
+
+    res
+}
