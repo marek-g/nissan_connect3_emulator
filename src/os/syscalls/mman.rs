@@ -76,6 +76,20 @@ pub fn mprotect(unicorn: &mut Unicorn<Context>, addr: u32, len: u32, prot: u32) 
     res
 }
 
+pub fn mincore(unicorn: &mut Unicorn<Context>, addr: u32, length: u32, vec: u32) -> u32 {
+    let bytes = vec![1u8; ((length + 0x1000 - 1) / 0x1000) as usize];
+    unicorn.mem_write(vec as u64, &bytes).unwrap();
+    log::trace!(
+        "{:#x} [SYSCALL] mincore(addr = {:#x}, length = {:#x}, vec = {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        addr,
+        length,
+        vec,
+        0
+    );
+    0
+}
+
 fn mmapx(
     unicorn: &mut Unicorn<Context>,
     addr: u32,
@@ -101,7 +115,7 @@ fn mmapx(
     // load file
     let mut buf = Vec::new();
     let mut filepath = String::new();
-    if let Some(fileinfo) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
+    if let Some(fileinfo) = unicorn..get_data_mut().file_system.fd_to_file(fd) {
         filepath = fileinfo.filepath.clone();
 
         let file_pos = fileinfo.file.stream_position().unwrap();

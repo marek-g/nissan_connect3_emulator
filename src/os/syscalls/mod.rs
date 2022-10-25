@@ -6,6 +6,7 @@ mod linux;
 mod mman;
 mod resource;
 mod signal;
+mod socket;
 mod stat;
 mod time;
 mod uio;

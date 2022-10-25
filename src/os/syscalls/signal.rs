@@ -44,3 +44,18 @@ pub fn rt_sigprocmask(
 
     res
 }
+
+pub fn sigaltstack(unicorn: &mut Unicorn<Context>, ss: u32, old_ss: u32) -> u32 {
+    // TODO: implement
+    let res = 0;
+
+    log::trace!(
+        "{:#x}: [SYSCALL] sigaltstack(ss: {:#x}, old_ss: {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        ss,
+        old_ss,
+        res
+    );
+
+    res
+}

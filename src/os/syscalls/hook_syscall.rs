@@ -1,6 +1,7 @@
 use crate::emulator::context::Context;
+use crate::os::syscalls::socket::socket;
 use crate::os::syscalls::{
-    fcntl, futex, linux, mman, resource, signal, stat, time, uio, unistd, utsname,
+    fcntl, futex, linux, mman, resource, signal, socket, stat, time, uio, unistd, utsname,
 };
 use libc::signal;
 use unicorn_engine::{RegisterARM, Unicorn};
@@ -46,8 +47,15 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
             unicorn.get_u32_arg(5),
         ),
         91 => mman::munmap(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        99 => stat::statfs(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         122 => utsname::uname(unicorn, unicorn.get_u32_arg(0)),
         125 => mman::mprotect(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
+        140 => resource::set_priority(
             unicorn,
             unicorn.get_u32_arg(0),
             unicorn.get_u32_arg(1),
@@ -72,6 +80,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
             unicorn.get_u32_arg(2),
             unicorn.get_u32_arg(3),
         ),
+        186 => signal::sigaltstack(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         191 => resource::ugetrlimit(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         192 => mman::mmap2(
             unicorn,
@@ -85,15 +94,50 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
         195 => stat::stat64(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         196 => stat::lstat64(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         197 => stat::fstat64(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        219 => mman::mincore(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
         221 => fcntl::fcntl64(
             unicorn,
             unicorn.get_u32_arg(0),
             unicorn.get_u32_arg(1),
             unicorn.get_u32_arg(2),
         ),
+        224 => unistd::get_tid(unicorn),
+        240 => futex::futex(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+            unicorn.get_u32_arg(3),
+            unicorn.get_u32_arg(4),
+            unicorn.get_u32_arg(5),
+        ),
         248 => unistd::exit_group(unicorn, unicorn.get_u32_arg(0)),
         256 => unistd::set_tid_address(unicorn, unicorn.get_u32_arg(0)),
         263 => time::clock_gettime(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        281 => socket::socket(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
+        283 => socket::connect(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
+        289 => socket::send(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+            unicorn.get_u32_arg(3),
+        ),
         322 => fcntl::openat(
             unicorn,
             unicorn.get_u32_arg(0),

@@ -49,6 +49,37 @@ pub fn fstat64(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u32 {
     res
 }
 
+pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
+    let pathstr = unicorn.read_string(path);
+
+    let mut vec = Vec::new();
+
+    // f_type
+    vec.extend_from_slice(&pack_u32(0x01021994)); // TMPFS
+
+    unicorn.mem_write(buf as u64, &vec).unwrap();
+
+    //let mut bytes = vec![0u8; 21 * 4 as usize];
+
+    /*let mut bytes = vec![0u8; 12 * 8 as usize];
+    for i in 0..12 * 8 {
+        bytes[i] = i as u8;
+    }*/
+
+    //unicorn.mem_write(buf as u64, &bytes).unwrap();
+
+    let res = 0;
+
+    log::trace!(
+        "{:#x}: [SYSCALL] statfs(path = {}, buf = {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        pathstr,
+        buf,
+        res
+    );
+    res
+}
+
 fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u32 {
     if let Some(fileinfo) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
         let metadata = fileinfo.file.metadata().unwrap();
