@@ -3,19 +3,7 @@ use crate::emulator::utils::unpack_u32;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn writev(unicorn: &mut Unicorn<Context>, fd: u32, iov: u32, iovcnt: u32) -> u32 {
-    let res = if let Some(file) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
-        log::warn!("Writing to file ignored! ({})", file.filepath);
-
-        let mut written_bytes = 0;
-        let mut iov_buf = vec![0u8; (iovcnt * 8) as usize];
-        unicorn.mem_read(iov as u64, &mut iov_buf).unwrap();
-        for index in 0..iovcnt as usize {
-            let addr = unpack_u32(&iov_buf[index * 8..index * 8 + 4]);
-            let len = unpack_u32(&iov_buf[index * 8 + 4..index * 8 + 8]);
-            written_bytes += len;
-        }
-        written_bytes
-    } else if fd == 1 || fd == 2 {
+    let res = if unicorn.get_data_mut().file_system.is_open(fd as i32) {
         let mut written_bytes = 0;
         let mut iov_buf = vec![0u8; (iovcnt * 8) as usize];
         unicorn.mem_read(iov as u64, &mut iov_buf).unwrap();
@@ -24,13 +12,17 @@ pub fn writev(unicorn: &mut Unicorn<Context>, fd: u32, iov: u32, iovcnt: u32) ->
             let len = unpack_u32(&iov_buf[index * 8 + 4..index * 8 + 8]);
             let mut buf = vec![0u8; len as usize];
             unicorn.mem_read(addr as u64, &mut buf).unwrap();
-            let str = String::from_utf8(buf).unwrap();
-            if fd == 1 {
-                print!("{}", str);
-            } else {
-                eprint!("{}", str);
+
+            match unicorn
+                .get_data_mut()
+                .file_system
+                .write_all(fd as i32, &buf)
+            {
+                Ok(_) => {
+                    written_bytes += len;
+                }
+                Err(_) => {}
             }
-            written_bytes += len;
         }
         written_bytes
     } else {

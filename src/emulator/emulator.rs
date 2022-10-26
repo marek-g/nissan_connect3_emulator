@@ -1,14 +1,9 @@
 use crate::emulator::context::Context;
 use crate::emulator::elf_loader::load_elf;
-use crate::emulator::file_system::FileSystem;
 use crate::emulator::memory_map::GET_TLS_ADDR;
 use crate::emulator::mmu::{Mmu, MmuExtension};
-use capstone::arch::arm::ArchMode;
-use capstone::prelude::*;
-use capstone::Endian;
-use libc::fflush;
-use std::io;
-use std::io::Write;
+use crate::emulator::utils::load_binary;
+use crate::file_system::MountFileSystem;
 use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Permission};
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -17,7 +12,7 @@ pub struct Emulator<'a> {
 }
 
 impl<'a> Emulator<'a> {
-    pub fn new(file_system: FileSystem) -> Result<Emulator<'a>, uc_error> {
+    pub fn new(file_system: MountFileSystem) -> Result<Emulator<'a>, uc_error> {
         Ok(Self {
             unicorn: Unicorn::new_with_data(
                 Arch::ARM,
@@ -33,14 +28,15 @@ impl<'a> Emulator<'a> {
     pub fn run_elf(
         &mut self,
         elf_filepath: &str,
-        buf: &[u8],
         program_args: &Vec<String>,
         program_envs: &Vec<(String, String)>,
     ) -> Result<(), &'static str> {
+        let buf = load_binary(&mut self.unicorn, elf_filepath);
+
         let (interp_entry_point, elf_entry, stack_ptr) = load_elf(
             &mut self.unicorn,
             elf_filepath,
-            buf,
+            &buf,
             program_args,
             program_envs,
         )?;
@@ -183,7 +179,7 @@ impl<'a> Emulator<'a> {
         log::info!("========== Program end ==========");
     }
 
-    fn disasm(&mut self, address: u32, len: u32) {
+    /*fn disasm(&mut self, address: u32, len: u32) {
         let cs = Capstone::new()
             .arm()
             .mode(ArchMode::Arm)
@@ -196,7 +192,7 @@ impl<'a> Emulator<'a> {
         self.unicorn.mem_read(address as u64, &mut vec).unwrap();
         let disasm = cs.disasm_all(&vec, address as u64).unwrap();
         println!("{}", disasm);
-    }
+    }*/
 
     pub fn callback_mem_error(
         unicorn: &mut Unicorn<Context>,

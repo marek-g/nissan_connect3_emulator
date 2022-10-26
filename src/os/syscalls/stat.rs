@@ -2,16 +2,25 @@ use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
 use crate::emulator::users::{GID, UID};
 use crate::emulator::utils::{pack_i32, pack_u32, pack_u64};
+use crate::file_system::OpenFileFlags;
 use std::time::SystemTime;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn stat64(unicorn: &mut Unicorn<Context>, path: u32, statbuf: u32) -> u32 {
     let pathstr = unicorn.read_string(path);
-    let fd = unicorn.get_data_mut().file_system.open(&pathstr);
-    let res = fstat64_internal(unicorn, fd, statbuf);
-    unicorn.get_data_mut().file_system.close(fd);
+    let res = if let Ok(fd) = unicorn
+        .get_data_mut()
+        .file_system
+        .open(&pathstr, OpenFileFlags::READ)
+    {
+        let res = fstat64_internal(unicorn, fd as u32, statbuf);
+        unicorn.get_data_mut().file_system.close(fd).unwrap();
+        res
+    } else {
+        -1i32 as u32
+    };
     log::trace!(
-        "{:#x}: [SYSCALL] lstat64(path = {}, statbuf = {:#x}) => {:#x}",
+        "{:#x}: [SYSCALL] stat64(path = {}, statbuf = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         pathstr,
         statbuf,
@@ -23,9 +32,17 @@ pub fn stat64(unicorn: &mut Unicorn<Context>, path: u32, statbuf: u32) -> u32 {
 pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, statbuf: u32) -> u32 {
     // TODO: handle symbolic links
     let pathstr = unicorn.read_string(path);
-    let fd = unicorn.get_data_mut().file_system.open(&pathstr);
-    let res = fstat64_internal(unicorn, fd, statbuf);
-    unicorn.get_data_mut().file_system.close(fd);
+    let res = if let Ok(fd) = unicorn
+        .get_data_mut()
+        .file_system
+        .open(&pathstr, OpenFileFlags::READ | OpenFileFlags::NO_FOLLOW)
+    {
+        let res = fstat64_internal(unicorn, fd as u32, statbuf);
+        unicorn.get_data_mut().file_system.close(fd).unwrap();
+        res
+    } else {
+        -1i32 as u32
+    };
     log::trace!(
         "{:#x}: [SYSCALL] lstat64(path = {}, statbuf = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -81,9 +98,7 @@ pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
 }
 
 fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u32 {
-    if let Some(fileinfo) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
-        let metadata = fileinfo.file.metadata().unwrap();
-
+    if let Some(file_info) = unicorn.get_data_mut().file_system.get_file_info(fd as i32) {
         let mut stat_data = Vec::new();
 
         // st_dev
@@ -97,17 +112,17 @@ fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u3
 
         // st_mode
         let mut st_mode = 0u32;
-        if metadata.is_file() {
+        if file_info.file_details.is_file {
             st_mode |= 0o0100000u32;
-        } else if metadata.is_symlink() {
+        } else if file_info.file_details.is_symlink {
             st_mode |= 0o0120000u32;
-        } else if metadata.is_dir() {
+        } else if file_info.file_details.is_dir {
             st_mode |= 0o0040000u32;
         } else {
             panic!("st_mode not implemented");
         }
 
-        if metadata.permissions().readonly() {
+        if file_info.file_details.is_readonly {
             st_mode |= 0o000555;
         } else {
             st_mode |= 0o000777;
@@ -131,7 +146,7 @@ fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u3
         stat_data.extend_from_slice(&pack_u64(0));
 
         // st_size
-        stat_data.extend_from_slice(&pack_u64(metadata.len()));
+        stat_data.extend_from_slice(&pack_u64(file_info.file_details.length));
 
         // st_blksize
         stat_data.extend_from_slice(&pack_i32(4096));
@@ -140,7 +155,7 @@ fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u3
         stat_data.extend_from_slice(&pack_u32(0));
 
         // st_blocks
-        stat_data.extend_from_slice(&pack_u64((metadata.len() + 511) / 512));
+        stat_data.extend_from_slice(&pack_u64((file_info.file_details.length + 511) / 512));
 
         // st_atime
         let time = SystemTime::now()
@@ -165,7 +180,7 @@ fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u3
         stat_data.extend_from_slice(&pack_u32(0));
 
         // st_ino
-        stat_data.extend_from_slice(&pack_u64(fileinfo.inode));
+        stat_data.extend_from_slice(&pack_u64(file_info.inode));
 
         unicorn.mem_write(statbuf as u64, &stat_data).unwrap();
 

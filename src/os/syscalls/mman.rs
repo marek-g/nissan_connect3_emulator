@@ -1,7 +1,7 @@
 use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
 use crate::emulator::utils::{mem_align_down, mem_align_up};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::SeekFrom;
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -115,17 +115,22 @@ fn mmapx(
     // load file
     let mut buf = Vec::new();
     let mut filepath = String::new();
-    if let Some(fileinfo) = unicorn..get_data_mut().file_system.fd_to_file(fd) {
+    let file_system = &mut unicorn.get_data_mut().file_system;
+    if let Some(fileinfo) = file_system.get_file_info(fd as i32) {
         filepath = fileinfo.filepath.clone();
 
-        let file_pos = fileinfo.file.stream_position().unwrap();
-        fileinfo.file.seek(SeekFrom::Start(off_t as u64)).unwrap();
+        let file_pos = file_system.stream_position(fd as i32).unwrap();
+        file_system
+            .seek(fd as i32, SeekFrom::Start(off_t as u64))
+            .unwrap();
 
-        let bytes_to_read = length.min(fileinfo.file.metadata().unwrap().len() as u32 - off_t);
+        let bytes_to_read = length.min(file_system.get_length(fd as i32) as u32 - off_t);
         buf.resize(bytes_to_read as usize, 0u8);
-        fileinfo.file.read_exact(&mut buf).unwrap();
+        file_system.read_all(fd as i32, &mut buf).unwrap();
 
-        fileinfo.file.seek(SeekFrom::Start(file_pos)).unwrap();
+        file_system
+            .seek(fd as i32, SeekFrom::Start(file_pos))
+            .unwrap();
     }
 
     // allocate memory

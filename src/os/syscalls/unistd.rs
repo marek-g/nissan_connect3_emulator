@@ -1,7 +1,6 @@
 use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
-use crate::emulator::utils::{mem_align_up, unpack_u32};
-use std::io::{Read, Seek};
+use crate::emulator::utils::mem_align_up;
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -35,19 +34,15 @@ pub fn brk(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
     res
 }
 
-pub fn access(unicorn: &mut Unicorn<Context>, pathname: u32, mode: u32) -> u32 {
-    let pathname = unicorn.read_string(pathname);
-    let fullpathname = unicorn
-        .get_data()
-        .file_system
-        .path_transform_to_real(&pathname);
-    let exists = fullpathname.exists();
+pub fn access(unicorn: &mut Unicorn<Context>, path_name: u32, mode: u32) -> u32 {
+    let path_name = unicorn.read_string(path_name);
+    let exists = unicorn.get_data_mut().file_system.exists(&path_name);
     let res = if exists { 0 } else { -1i32 as u32 };
 
     log::trace!(
         "{:#x}: [SYSCALL] access(pathname = {}, mode = {:#x}) => {:#x} [{}]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        pathname,
+        path_name,
         mode,
         res,
         if exists { "FOUND" } else { "NOT FOUND" }
@@ -56,9 +51,7 @@ pub fn access(unicorn: &mut Unicorn<Context>, pathname: u32, mode: u32) -> u32 {
 }
 
 pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
-    let res = if unicorn.get_data_mut().file_system.close(fd) {
-        0u32
-    } else if fd < 3 {
+    let res = if let Ok(_) = unicorn.get_data_mut().file_system.close(fd as i32) {
         0u32
     } else {
         -1i32 as u32
@@ -75,16 +68,18 @@ pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
 }
 
 pub fn read(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u32 {
-    let mut buf2 = Vec::new();
-    if let Some(fileinfo) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
-        let file_pos = fileinfo.file.stream_position().unwrap() as u32;
-        let bytes_to_read = length.min(fileinfo.file.metadata().unwrap().len() as u32 - file_pos);
-        buf2.resize(bytes_to_read as usize, 0u8);
-        fileinfo.file.read_exact(&mut buf2).unwrap();
-    }
-    let res = if buf2.len() > 0 {
-        unicorn.mem_write(buf as u64, &buf2).unwrap();
-        buf2.len() as u32
+    let mut buf2 = vec![0u8; length as usize];
+    let file_system = &mut unicorn.get_data_mut().file_system;
+    let res = if file_system.is_open(fd as i32) {
+        match file_system.read(fd as i32, &mut buf2) {
+            Ok(len) => {
+                unicorn
+                    .mem_write(buf as u64, &buf2[0..len as usize])
+                    .unwrap();
+                len as u32
+            }
+            Err(_) => -1i32 as u32,
+        }
     } else {
         -1i32 as u32
     };
@@ -102,19 +97,19 @@ pub fn read(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u
 }
 
 pub fn write(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u32 {
-    let res = if let Some(file) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
-        log::warn!("Writing to file ignored! ({})", file.filepath);
-        length
-    } else if fd == 1 || fd == 2 {
-        let mut buf2 = vec![0u8; length as usize];
-        unicorn.mem_read(buf as u64, &mut buf2).unwrap();
-        let str = String::from_utf8(buf2).unwrap();
-        if fd == 1 {
-            print!("{}", str);
-        } else {
-            eprint!("{}", str);
+    let mut buf2 = vec![0u8; length as usize];
+    unicorn.mem_read(buf as u64, &mut buf2).unwrap();
+    let file_system = &mut unicorn.get_data_mut().file_system;
+    let res = if file_system.is_open(fd as i32) {
+        match file_system.write(fd as i32, &buf2) {
+            Ok(len) => {
+                unicorn
+                    .mem_write(buf as u64, &buf2[0..len as usize])
+                    .unwrap();
+                len as u32
+            }
+            Err(_) => -1i32 as u32,
         }
-        length
     } else {
         -1i32 as u32
     };

@@ -3,7 +3,7 @@ use crate::emulator::memory_map::*;
 use crate::emulator::mmu::MmuExtension;
 use crate::emulator::users::{EGID, EUID, GID, UID};
 use crate::emulator::utils::{
-    mem_align_down, mem_align_up, pack_u32, push_text_on_stack, to_unicorn_permissions,
+    load_binary, mem_align_down, mem_align_up, pack_u32, push_text_on_stack, to_unicorn_permissions,
 };
 use elfloader::*;
 use unicorn_engine::unicorn_const::Permission;
@@ -87,7 +87,7 @@ impl<'a, 'b> ElfLoader for ArmElfLoader<'a, 'b> {
         Ok(())
     }
 
-    fn relocate(&mut self, entry: RelocationEntry) -> Result<(), ElfLoaderErr> {
+    fn relocate(&mut self, _entry: RelocationEntry) -> Result<(), ElfLoaderErr> {
         //use elfloader::arch::arm::RelocationTypes::*;
         //use RelocationType::Arm;
 
@@ -181,11 +181,10 @@ pub fn load_elf(
     let interp_address = 0u32;
     let mut interp_entry_point = 0u32;
     if let Some(interp_path) = binary.interpreter() {
-        let interp_full_path = unicorn
-            .get_data()
-            .file_system
-            .path_transform_to_real(interp_path);
-        log::debug!("Load interpreter: {:?}", &interp_full_path);
+        log::debug!("Load interpreter: {:?}", &interp_path);
+
+        let interp_bin = load_binary(unicorn, &interp_path);
+        let binary = ElfBinary::new(&interp_bin).expect("Got proper ELF file");
 
         let mut interp_loader = ArmElfLoader {
             unicorn,
@@ -194,10 +193,6 @@ pub fn load_elf(
             mem_start: 0xFFFFFFFFu32,
             mem_end: 0u32,
         };
-
-        let interp_bin = std::fs::read(&interp_full_path).map_err(|_| "Cannot load interp")?;
-        let binary = ElfBinary::new(&interp_bin).expect("Got proper ELF file");
-
         binary
             .load(&mut interp_loader)
             .expect("Can't load the binary?");

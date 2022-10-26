@@ -1,5 +1,6 @@
 use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
+use crate::file_system::OpenFileFlags;
 use std::path::PathBuf;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -40,7 +41,11 @@ pub fn openat(
                 .current_working_dir
                 .clone()
         } else {
-            if let Some(dirinfo) = unicorn.get_data_mut().file_system.fd_to_file(dirfd) {
+            if let Some(dirinfo) = unicorn
+                .get_data_mut()
+                .file_system
+                .get_file_info(dirfd as i32)
+            {
                 dirinfo.filepath.clone()
             } else {
                 unicorn
@@ -78,8 +83,11 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
     let res = match cmd {
         2 => {
             // F_SETFD
-            if let Some(fileinfo) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
-                fileinfo.file_status_flags = arg1;
+            if let Ok(_) = unicorn
+                .get_data_mut()
+                .file_system
+                .set_file_status_flags(fd as i32, arg1)
+            {
                 0u32
             } else {
                 -1i32 as u32
@@ -87,7 +95,7 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
         }
         3 => {
             // F_GETFD
-            if let Some(fileinfo) = unicorn.get_data_mut().file_system.fd_to_file(fd) {
+            if let Some(fileinfo) = unicorn.get_data_mut().file_system.get_file_info(fd as i32) {
                 fileinfo.file_status_flags
             } else {
                 -1i32 as u32
@@ -108,13 +116,54 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
     res
 }
 
-fn open_internal(unicorn: &mut Unicorn<Context>, pathname: &str, flags: u32, mode: u32) -> u32 {
-    let fd = unicorn.get_data_mut().file_system.open(&pathname);
+fn open_internal(unicorn: &mut Unicorn<Context>, pathname: &str, flags: u32, _mode: u32) -> u32 {
+    let open_file_flags = convert_open_file_flags(flags);
 
-    if mode & 0x002 != 0 {
-        // F_WRITE
-        log::warn!("Open file for saving ignored! ({})", pathname);
+    if let Ok(fd) = unicorn
+        .get_data_mut()
+        .file_system
+        .open(&pathname, open_file_flags)
+    {
+        fd as u32
+    } else {
+        -1i32 as u32
+    }
+}
+
+fn convert_open_file_flags(flags: u32) -> OpenFileFlags {
+    let mut open_file_flags = OpenFileFlags::NONE;
+
+    if flags & 0x2 == 0 {
+        open_file_flags |= OpenFileFlags::READ;
+    } else if flags & 0x2 == 1 {
+        open_file_flags |= OpenFileFlags::WRITE;
+    } else if flags & 0x2 == 2 {
+        open_file_flags |= OpenFileFlags::READ | OpenFileFlags::WRITE;
     }
 
-    fd
+    if flags & 0x100 != 0 {
+        open_file_flags |= OpenFileFlags::CREATE;
+    }
+
+    if flags & 0x200 != 0 {
+        open_file_flags |= OpenFileFlags::EXCLUSIVE;
+    }
+
+    if flags & 0x1000 != 0 {
+        open_file_flags |= OpenFileFlags::TRUNC;
+    }
+
+    if flags & 0x2000 != 0 {
+        open_file_flags |= OpenFileFlags::APPEND;
+    }
+
+    if flags & 0x200000 != 0 {
+        open_file_flags |= OpenFileFlags::DIRECTORY;
+    }
+
+    if flags & 0x400000 != 0 {
+        open_file_flags |= OpenFileFlags::NO_FOLLOW;
+    }
+
+    open_file_flags
 }

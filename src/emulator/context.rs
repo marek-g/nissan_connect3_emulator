@@ -1,7 +1,8 @@
-use crate::emulator::file_system::FileSystem;
 use crate::emulator::mmu::Mmu;
+use crate::file_system::MountFileSystem;
 
 pub struct Context {
     pub mmu: Mmu,
-    pub file_system: FileSystem,
+
+    pub file_system: MountFileSystem,
 }

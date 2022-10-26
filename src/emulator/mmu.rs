@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::emulator::context::Context;
 use crate::emulator::utils::mem_align_up;
-use unicorn_engine::unicorn_const::{MemRegion, Permission};
+use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::Unicorn;
 
 pub struct Mmu {
@@ -170,8 +170,8 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
     }
 
     fn update_map_info_filepath(&mut self, address: u32, size: u32, filepath: &str) {
-        let mut map_infos = &mut self.get_data_mut().mmu.map_infos;
-        for (key, value) in map_infos {
+        let map_infos = &mut self.get_data_mut().mmu.map_infos;
+        for (_key, value) in map_infos {
             if value.memory_start <= address && value.memory_end >= address + size {
                 value.filepath = filepath.to_string();
             }
@@ -186,7 +186,7 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
         v.sort_by(|x, y| x.0.cmp(&y.0));
 
         let mut str = String::from("Memory layout:");
-        for (addr, map_info) in v {
+        for (_addr, map_info) in v {
             str.push_str(&format!("\n{}", map_info));
         }
         str

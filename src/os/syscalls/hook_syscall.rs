@@ -1,9 +1,7 @@
 use crate::emulator::context::Context;
-use crate::os::syscalls::socket::socket;
 use crate::os::syscalls::{
     fcntl, futex, linux, mman, resource, signal, socket, stat, time, uio, unistd, utsname,
 };
-use libc::signal;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {

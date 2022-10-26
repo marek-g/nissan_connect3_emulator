@@ -1,8 +1,22 @@
 use crate::emulator::context::Context;
-use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
+use crate::file_system::OpenFileFlags;
+use byteorder::{ByteOrder, LittleEndian};
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::Unicorn;
 use xmas_elf::program;
+
+pub fn load_binary(unicorn: &mut Unicorn<Context>, filepath: &str) -> Vec<u8> {
+    let file_system = &mut unicorn.get_data_mut().file_system;
+    if let Ok(fd) = file_system.open(filepath, OpenFileFlags::READ) {
+        let size = file_system.get_length(fd);
+        let mut content = vec![0u8; size as usize];
+        file_system.read_all(fd, &mut content).unwrap();
+        file_system.close(fd).unwrap();
+        content
+    } else {
+        panic!("Cannot load file: {}", filepath);
+    }
+}
 
 /// Converts NULL terminated string to rust string
 /*pub fn null_str(input: &str) -> String {

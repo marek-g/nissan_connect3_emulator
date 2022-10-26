@@ -1,0 +1,57 @@
+use crate::file_system::file_info::FileDetails;
+use bitflags::bitflags;
+use std::io::SeekFrom;
+
+bitflags! {
+    pub struct OpenFileFlags: u32 {
+        const NONE = 0x00000000;
+        const READ = 0x00000001;
+        const WRITE = 0x00000002;
+        const CREATE = 0x00000004;
+        const EXCLUSIVE = 0x00000008;
+        const TRUNC = 0x00000010;
+        const APPEND = 0x00000020;
+        const DIRECTORY = 0x00000040;
+        const TEMP_FILE = 0x00000080;
+        const NO_FOLLOW = 0x00000100;
+    }
+}
+
+#[derive(Debug)]
+pub enum OpenFileError {
+    FileSystemNotMounted,
+    NoSuchFileOrDirectory,
+    NoPermission,
+}
+
+#[derive(Debug)]
+pub enum CloseFileError {
+    FileNotOpened,
+}
+
+pub trait FileSystem {
+    fn support_file_paths(&self) -> bool;
+
+    fn exists(&mut self, file_path: &str) -> bool;
+
+    /// Open file from specified path and assign it with the provided `fd` file descriptor id.
+    fn open(&mut self, file_path: &str, flags: OpenFileFlags, fd: i32)
+        -> Result<(), OpenFileError>;
+
+    /// Close the file.
+    fn close(&mut self, fd: i32) -> Result<(), CloseFileError>;
+
+    fn get_file_details(&mut self, fd: i32) -> Option<FileDetails>;
+
+    fn is_open(&self, fd: i32) -> bool;
+
+    fn get_length(&mut self, fd: i32) -> u64;
+
+    fn stream_position(&mut self, fd: i32) -> Result<u64, ()>;
+
+    fn seek(&mut self, fd: i32, pos: SeekFrom) -> Result<u64, ()>;
+
+    fn read(&mut self, fd: i32, content: &mut [u8]) -> Result<u64, ()>;
+
+    fn write(&mut self, fd: i32, content: &[u8]) -> Result<u64, ()>;
+}
