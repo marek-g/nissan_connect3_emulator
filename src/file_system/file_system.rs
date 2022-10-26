@@ -29,8 +29,19 @@ pub enum CloseFileError {
     FileNotOpened,
 }
 
+#[derive(Debug)]
+pub enum FileSystemType {
+    Normal,
+    Dev,
+    Proc,
+    Temp,
+    Stream,
+}
+
 pub trait FileSystem {
     fn support_file_paths(&self) -> bool;
+
+    fn file_system_type(&self) -> FileSystemType;
 
     fn exists(&mut self, file_path: &str) -> bool;
 

@@ -1,5 +1,7 @@
 use crate::file_system::file_info::FileDetails;
-use crate::file_system::{CloseFileError, FileSystem, OpenFileError, OpenFileFlags};
+use crate::file_system::{
+    CloseFileError, FileSystem, FileSystemType, OpenFileError, OpenFileFlags,
+};
 use std::io;
 use std::io::{Read, SeekFrom, Write};
 
@@ -14,6 +16,10 @@ impl StdFileSystem {
 impl FileSystem for StdFileSystem {
     fn support_file_paths(&self) -> bool {
         false
+    }
+
+    fn file_system_type(&self) -> FileSystemType {
+        FileSystemType::Stream
     }
 
     fn exists(&mut self, _file_path: &str) -> bool {

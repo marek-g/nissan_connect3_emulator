@@ -33,12 +33,39 @@ impl MountFileSystem {
         mount_points.sort_by(|a, b| b.mount_point.cmp(&a.mount_point));
 
         Self {
-            current_working_dir: "/".to_string(),
+            current_working_dir: "/bin".to_string(),
 
             mount_points,
             inodes: HashMap::new(),
             file_data: HashMap::new(),
         }
+    }
+
+    pub fn get_mount_point(&self, fd: i32) -> Option<&MountPoint> {
+        self.mount_points
+            .iter()
+            .find(|mp| mp.file_system.is_open(fd))
+    }
+
+    pub fn get_mount_point_mut(&mut self, fd: i32) -> Option<&mut MountPoint> {
+        self.mount_points
+            .iter_mut()
+            .find(|mp| mp.file_system.is_open(fd))
+    }
+
+    pub fn get_mount_point_from_filepath_mut(
+        &mut self,
+        filepath: &str,
+    ) -> Option<(&mut MountPoint, String)> {
+        let filepath = self.path_convert_to_absolute(filepath);
+        self.mount_points
+            .iter_mut()
+            .filter(|mp| mp.file_system.support_file_paths())
+            .find(|mp| filepath.starts_with(&mp.mount_point))
+            .map(|mp| {
+                let filepath = filepath[mp.mount_point.len() - 1..].to_string();
+                (mp, filepath)
+            })
     }
 
     pub fn exists(&mut self, filepath: &str) -> bool {
@@ -228,33 +255,6 @@ impl MountFileSystem {
 }
 
 impl MountFileSystem {
-    fn get_mount_point(&self, fd: i32) -> Option<&MountPoint> {
-        self.mount_points
-            .iter()
-            .find(|mp| mp.file_system.is_open(fd))
-    }
-
-    fn get_mount_point_mut(&mut self, fd: i32) -> Option<&mut MountPoint> {
-        self.mount_points
-            .iter_mut()
-            .find(|mp| mp.file_system.is_open(fd))
-    }
-
-    fn get_mount_point_from_filepath_mut(
-        &mut self,
-        filepath: &str,
-    ) -> Option<(&mut MountPoint, String)> {
-        let filepath = self.path_convert_to_absolute(filepath);
-        self.mount_points
-            .iter_mut()
-            .filter(|mp| mp.file_system.support_file_paths())
-            .find(|mp| filepath.starts_with(&mp.mount_point))
-            .map(|mp| {
-                let filepath = filepath[mp.mount_point.len() - 1..].to_string();
-                (mp, filepath)
-            })
-    }
-
     fn get_unique_fd(&self) -> i32 {
         let mut fd = 0i32;
         while let Some(_) = self.get_mount_point(fd) {

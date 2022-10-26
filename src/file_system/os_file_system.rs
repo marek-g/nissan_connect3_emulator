@@ -1,6 +1,6 @@
 use crate::file_system::file_info::FileDetails;
 use crate::file_system::file_system::FileSystem;
-use crate::file_system::{CloseFileError, OpenFileError, OpenFileFlags};
+use crate::file_system::{CloseFileError, FileSystemType, OpenFileError, OpenFileFlags};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -21,6 +21,10 @@ pub struct OsFileSystem {
 impl FileSystem for OsFileSystem {
     fn support_file_paths(&self) -> bool {
         true
+    }
+
+    fn file_system_type(&self) -> FileSystemType {
+        FileSystemType::Normal
     }
 
     fn exists(&mut self, file_path: &str) -> bool {

@@ -2,7 +2,7 @@ use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
 use crate::emulator::users::{GID, UID};
 use crate::emulator::utils::{pack_i32, pack_u32, pack_u64};
-use crate::file_system::OpenFileFlags;
+use crate::file_system::{FileSystemType, OpenFileFlags};
 use std::time::SystemTime;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -67,30 +67,75 @@ pub fn fstat64(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u32 {
 }
 
 pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
-    let pathstr = unicorn.read_string(path);
+    let file_path = unicorn.read_string(path);
 
     let mut vec = Vec::new();
 
-    // f_type
-    vec.extend_from_slice(&pack_u32(0x01021994)); // TMPFS
+    let res = if let Some((mount_point, _path)) = unicorn
+        .get_data_mut()
+        .file_system
+        .get_mount_point_from_filepath_mut(&file_path)
+    {
+        // f_type - type of filesystem
+        vec.extend_from_slice(&pack_u32(
+            match mount_point.file_system.file_system_type() {
+                FileSystemType::Normal => 0xef53, // EXT4
+                FileSystemType::Dev => 0x1373,
+                FileSystemType::Proc => 0x9fa0,
+                FileSystemType::Temp => 0x01021994,
+                FileSystemType::Stream => 0,
+            },
+        ));
 
-    unicorn.mem_write(buf as u64, &vec).unwrap();
+        // f_bsize - optimal transfer block size
+        vec.extend_from_slice(&pack_u32(4096));
 
-    //let mut bytes = vec![0u8; 21 * 4 as usize];
+        // f_blocks - total data blocks in file system
+        vec.extend_from_slice(&pack_u64(100000u64));
 
-    /*let mut bytes = vec![0u8; 12 * 8 as usize];
-    for i in 0..12 * 8 {
-        bytes[i] = i as u8;
-    }*/
+        // f_bfree - free blocks in fs
+        vec.extend_from_slice(&pack_u64(100000000u64));
 
-    //unicorn.mem_write(buf as u64, &bytes).unwrap();
+        // f_bavail - free blocks available to unprivileged user
+        vec.extend_from_slice(&pack_u64(100000000u64));
 
-    let res = 0;
+        // f_files - total file nodes in file system
+        vec.extend_from_slice(&pack_u64(100000u64));
+
+        // f_ffree - free file nodes in fs
+        vec.extend_from_slice(&pack_u64(100000000u64));
+
+        // f_fsid - file system id
+        vec.extend_from_slice(&pack_u64(1u64));
+
+        // f_namelen - maximum length of filenames
+        vec.extend_from_slice(&pack_u32(4096u32));
+
+        // f_frsize - fragment size
+        vec.extend_from_slice(&pack_u32(0u32));
+
+        // f_flags
+        vec.extend_from_slice(&pack_u32(0u32));
+
+        // spare
+        vec.extend_from_slice(&pack_u32(0u32));
+        vec.extend_from_slice(&pack_u32(0u32));
+        vec.extend_from_slice(&pack_u32(0u32));
+        vec.extend_from_slice(&pack_u32(0u32));
+
+        0u32
+    } else {
+        -1i32 as u32
+    };
+
+    if res == 0u32 {
+        unicorn.mem_write(buf as u64, &vec).unwrap();
+    }
 
     log::trace!(
         "{:#x}: [SYSCALL] statfs(path = {}, buf = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        pathstr,
+        file_path,
         buf,
         res
     );

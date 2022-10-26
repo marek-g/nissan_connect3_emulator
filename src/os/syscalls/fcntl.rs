@@ -4,15 +4,15 @@ use crate::file_system::OpenFileFlags;
 use std::path::PathBuf;
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn open(unicorn: &mut Unicorn<Context>, pathname: u32, flags: u32, mode: u32) -> u32 {
-    let pathname = unicorn.read_string(pathname);
+pub fn open(unicorn: &mut Unicorn<Context>, path_name: u32, flags: u32, mode: u32) -> u32 {
+    let path_name = unicorn.read_string(path_name);
 
-    let fd = open_internal(unicorn, &pathname, flags, mode);
+    let fd = open_internal(unicorn, &path_name, flags, mode);
 
     log::trace!(
         "{:#x}: [SYSCALL] open(pathname = {}, flags: {:#x}, mode: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        pathname,
+        path_name,
         flags,
         mode,
         fd
@@ -24,13 +24,13 @@ pub fn open(unicorn: &mut Unicorn<Context>, pathname: u32, flags: u32, mode: u32
 pub fn openat(
     unicorn: &mut Unicorn<Context>,
     dirfd: u32,
-    pathname: u32,
+    path_name: u32,
     flags: u32,
     mode: u32,
 ) -> u32 {
-    let mut pathname = unicorn.read_string(pathname);
+    let mut path_name = unicorn.read_string(path_name);
 
-    if !pathname.starts_with("/") {
+    if !path_name.starts_with("/") {
         // relative path
         let base_dir = if dirfd == 0xFFFFFF9C {
             // AT_FDCWD - pathname is interpreted relative to the current working directory
@@ -56,21 +56,21 @@ pub fn openat(
             }
         };
 
-        pathname = PathBuf::from(base_dir)
-            .join(pathname)
+        path_name = PathBuf::from(base_dir)
+            .join(path_name)
             .to_str()
             .unwrap()
             .to_owned();
     }
 
     // TODO: handle symbolic links
-    let fd = open_internal(unicorn, &pathname, flags, mode);
+    let fd = open_internal(unicorn, &path_name, flags, mode);
 
     log::trace!(
         "{:#x}: [SYSCALL] openat(dirfd = {:#x}, pathname = {}, flags: {:#x}, mode: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         dirfd,
-        pathname,
+        path_name,
         flags,
         mode,
         fd
@@ -116,13 +116,13 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
     res
 }
 
-fn open_internal(unicorn: &mut Unicorn<Context>, pathname: &str, flags: u32, _mode: u32) -> u32 {
+fn open_internal(unicorn: &mut Unicorn<Context>, path_name: &str, flags: u32, _mode: u32) -> u32 {
     let open_file_flags = convert_open_file_flags(flags);
 
     if let Ok(fd) = unicorn
         .get_data_mut()
         .file_system
-        .open(&pathname, open_file_flags)
+        .open(&path_name, open_file_flags)
     {
         fd as u32
     } else {

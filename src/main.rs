@@ -46,10 +46,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
 
     let mut emulator = Emulator::new(file_system).unwrap();
 
-    //let pwd_path = root_path.join("bin/echo.coreutils");
-    //let pwd_path = root_path.join("bin/date.coreutils");
-    //let pwd_path = root_path.join("bin/pwd.coreutils");
-    //let pwd_path = root_path.join("bin/ls.coreutils");
+    /*emulator.run_elf(
+        "/bin/echo.coreutils",
+        &vec!["Hello".to_string(), "World!".to_string()],
+        &envs,
+    )?;*/
+    //emulator.run_elf("/bin/date.coreutils", &vec![], &envs)?;
+    //emulator.run_elf("/bin/pwd.coreutils", &vec![], &envs)?;
+    //emulator.run_elf("/bin/ls.coreutils", &vec![], &envs)?;
     emulator.run_elf("/opt/bosch/processes/procmapengine.out", &vec![], &envs)?;
 
     Ok(())
