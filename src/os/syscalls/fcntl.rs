@@ -28,9 +28,31 @@ pub fn openat(
     flags: u32,
     mode: u32,
 ) -> u32 {
-    let mut path_name = unicorn.read_string(path_name);
+    let path_name = unicorn.read_string(path_name);
+    let path_name_new = get_path_relative_to_dir(unicorn, dirfd, &path_name);
 
-    if !path_name.starts_with("/") {
+    // TODO: handle symbolic links
+    let fd = open_internal(unicorn, &path_name_new, flags, mode);
+
+    log::trace!(
+        "{:#x}: [SYSCALL] openat(dirfd = {:#x}, pathname = {}, flags: {:#x}, mode: {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        dirfd,
+        path_name,
+        flags,
+        mode,
+        fd
+    );
+
+    fd
+}
+
+pub fn get_path_relative_to_dir(
+    unicorn: &mut Unicorn<Context>,
+    dirfd: u32,
+    path_name: &str,
+) -> String {
+    let path_name = if !path_name.starts_with("/") {
         // relative path
         let base_dir = if dirfd == 0xFFFFFF9C {
             // AT_FDCWD - pathname is interpreted relative to the current working directory
@@ -56,27 +78,15 @@ pub fn openat(
             }
         };
 
-        path_name = PathBuf::from(base_dir)
+        PathBuf::from(base_dir)
             .join(path_name)
             .to_str()
             .unwrap()
-            .to_owned();
-    }
-
-    // TODO: handle symbolic links
-    let fd = open_internal(unicorn, &path_name, flags, mode);
-
-    log::trace!(
-        "{:#x}: [SYSCALL] openat(dirfd = {:#x}, pathname = {}, flags: {:#x}, mode: {:#x}) => {:#x}",
-        unicorn.reg_read(RegisterARM::PC).unwrap(),
-        dirfd,
-        path_name,
-        flags,
-        mode,
-        fd
-    );
-
-    fd
+            .to_owned()
+    } else {
+        path_name.to_string()
+    };
+    path_name
 }
 
 pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> u32 {

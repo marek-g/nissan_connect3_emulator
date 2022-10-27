@@ -1,7 +1,7 @@
 use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
 use crate::emulator::utils::{mem_align_up, pack_u16, pack_u64};
-use crate::file_system::{FileType, OpenFileFlags};
+use crate::file_system::FileType;
 use std::path::Path;
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::{RegisterARM, Unicorn};

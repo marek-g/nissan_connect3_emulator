@@ -3,33 +3,68 @@ use crate::emulator::mmu::MmuExtension;
 use crate::emulator::users::{GID, UID};
 use crate::emulator::utils::{pack_i32, pack_u32, pack_u64};
 use crate::file_system::{FileSystemType, FileType, OpenFileFlags};
+use crate::os::syscalls::fcntl::get_path_relative_to_dir;
 use std::time::SystemTime;
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn stat64(unicorn: &mut Unicorn<Context>, path: u32, statbuf: u32) -> u32 {
+pub fn stat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
     let pathstr = unicorn.read_string(path);
     let res = if let Ok(fd) = unicorn
         .get_data_mut()
         .file_system
         .open(&pathstr, OpenFileFlags::READ)
     {
-        let res = fstat64_internal(unicorn, fd as u32, statbuf);
+        let res = fstat64_internal(unicorn, fd as u32, stat_buf);
         unicorn.get_data_mut().file_system.close(fd).unwrap();
         res
     } else {
         -1i32 as u32
     };
     log::trace!(
-        "{:#x}: [SYSCALL] stat64(path = {}, statbuf = {:#x}) => {:#x}",
+        "{:#x}: [SYSCALL] stat64(path = {}, stat_buf = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         pathstr,
-        statbuf,
+        stat_buf,
         res
     );
     res
 }
 
-pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, statbuf: u32) -> u32 {
+pub fn fstatat64(
+    unicorn: &mut Unicorn<Context>,
+    dir_fd: u32,
+    path: u32,
+    stat_buf: u32,
+    flags: u32,
+) -> u32 {
+    let path_name = unicorn.read_string(path);
+    let path_name_new = get_path_relative_to_dir(unicorn, dir_fd, &path_name);
+
+    let res = if let Ok(fd) = unicorn
+        .get_data_mut()
+        .file_system
+        .open(&path_name_new, OpenFileFlags::READ)
+    {
+        let res = fstat64_internal(unicorn, fd as u32, stat_buf);
+        unicorn.get_data_mut().file_system.close(fd).unwrap();
+        res
+    } else {
+        -1i32 as u32
+    };
+
+    log::trace!(
+        "{:#x}: [SYSCALL] fstatat64(dir_fd: {:#x}, path = {}, stat_buf = {:#x}, flags = {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        dir_fd,
+        path_name,
+        stat_buf,
+        flags,
+        res
+    );
+    res
+}
+
+pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
     // TODO: handle symbolic links
     let pathstr = unicorn.read_string(path);
     let res = if let Ok(fd) = unicorn
@@ -37,30 +72,30 @@ pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, statbuf: u32) -> u32 {
         .file_system
         .open(&pathstr, OpenFileFlags::READ | OpenFileFlags::NO_FOLLOW)
     {
-        let res = fstat64_internal(unicorn, fd as u32, statbuf);
+        let res = fstat64_internal(unicorn, fd as u32, stat_buf);
         unicorn.get_data_mut().file_system.close(fd).unwrap();
         res
     } else {
         -1i32 as u32
     };
     log::trace!(
-        "{:#x}: [SYSCALL] lstat64(path = {}, statbuf = {:#x}) => {:#x}",
+        "{:#x}: [SYSCALL] lstat64(path = {}, stat_buf = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         pathstr,
-        statbuf,
+        stat_buf,
         res
     );
     res
 }
 
-pub fn fstat64(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u32 {
-    let res = fstat64_internal(unicorn, fd, statbuf);
+pub fn fstat64(unicorn: &mut Unicorn<Context>, fd: u32, stat_buf: u32) -> u32 {
+    let res = fstat64_internal(unicorn, fd, stat_buf);
 
     log::trace!(
-        "{:#x}: [SYSCALL] fstat64(fd = {:#x}, statbuf = {:#x}) => {:#x}",
+        "{:#x}: [SYSCALL] fstat64(fd = {:#x}, stat_buf = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         fd,
-        statbuf,
+        stat_buf,
         res
     );
     res
@@ -142,7 +177,7 @@ pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
     res
 }
 
-fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u32 {
+fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, stat_buf: u32) -> u32 {
     if let Some(file_info) = unicorn.get_data_mut().file_system.get_file_info(fd as i32) {
         let mut stat_data = Vec::new();
 
@@ -227,7 +262,7 @@ fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u3
         // st_ino
         stat_data.extend_from_slice(&pack_u64(file_info.inode));
 
-        unicorn.mem_write(statbuf as u64, &stat_data).unwrap();
+        unicorn.mem_write(stat_buf as u64, &stat_data).unwrap();
 
         0u32
     } else {
