@@ -1,3 +1,4 @@
+use crate::emulator::context::Context;
 use crate::file_system::file_info::{FileDetails, FileType};
 use crate::file_system::file_system::FileSystem;
 use crate::file_system::{CloseFileError, FileSystemType, OpenFileError, OpenFileFlags};
@@ -5,6 +6,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use unicorn_engine::Unicorn;
 
 struct OpenedFileData {
     pub file: File,
@@ -152,6 +154,10 @@ impl FileSystem for OsFileSystem {
         } else {
             Err(())
         }
+    }
+
+    fn ioctl(&mut self, unicorn: &mut Unicorn<Context>, fd: i32, request: u32, addr: u32) -> i32 {
+        -1i32
     }
 }
 

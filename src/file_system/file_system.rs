@@ -1,6 +1,8 @@
+use crate::emulator::context::Context;
 use crate::file_system::file_info::FileDetails;
 use bitflags::bitflags;
 use std::io::SeekFrom;
+use unicorn_engine::Unicorn;
 
 bitflags! {
     pub struct OpenFileFlags: u32 {
@@ -67,4 +69,6 @@ pub trait FileSystem {
     fn read(&mut self, fd: i32, content: &mut [u8]) -> Result<u64, ()>;
 
     fn write(&mut self, fd: i32, content: &[u8]) -> Result<u64, ()>;
+
+    fn ioctl(&mut self, unicorn: &mut Unicorn<Context>, fd: i32, request: u32, addr: u32) -> i32;
 }

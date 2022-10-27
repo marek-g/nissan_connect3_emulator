@@ -1,9 +1,11 @@
+use crate::emulator::context::Context;
 use crate::file_system::file_info::FileInfo;
 use crate::file_system::{CloseFileError, FileSystem, OpenFileError, OpenFileFlags};
 use path_absolutize::Absolutize;
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::Path;
+use unicorn_engine::Unicorn;
 
 pub struct MountPoint {
     pub mount_point: String,
@@ -33,7 +35,7 @@ impl MountFileSystem {
         mount_points.sort_by(|a, b| b.mount_point.cmp(&a.mount_point));
 
         Self {
-            current_working_dir: "/bin".to_string(),
+            current_working_dir: "/".to_string(),
 
             mount_points,
             inodes: HashMap::new(),
@@ -269,6 +271,20 @@ impl MountFileSystem {
             }
         } else {
             Err(())
+        }
+    }
+
+    pub fn ioctl(
+        &mut self,
+        unicorn: &mut Unicorn<Context>,
+        fd: i32,
+        request: u32,
+        addr: u32,
+    ) -> i32 {
+        if let Some(mount_point) = self.get_mount_point_mut(fd) {
+            mount_point.file_system.ioctl(unicorn, fd, request, addr)
+        } else {
+            -1i32
         }
     }
 }

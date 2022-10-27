@@ -58,21 +58,24 @@ pub fn get_path_relative_to_dir(
             // AT_FDCWD - pathname is interpreted relative to the current working directory
             // of the calling process (like open())
             unicorn
-                .get_data_mut()
+                .get_data()
                 .file_system
+                .borrow()
                 .current_working_dir
                 .clone()
         } else {
             if let Some(dirinfo) = unicorn
-                .get_data_mut()
+                .get_data()
                 .file_system
+                .borrow_mut()
                 .get_file_info(dirfd as i32)
             {
                 dirinfo.file_path.clone()
             } else {
                 unicorn
-                    .get_data_mut()
+                    .get_data()
                     .file_system
+                    .borrow()
                     .current_working_dir
                     .clone()
             }
@@ -94,8 +97,9 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
         2 => {
             // F_SETFD
             if let Ok(_) = unicorn
-                .get_data_mut()
+                .get_data()
                 .file_system
+                .borrow_mut()
                 .set_file_status_flags(fd as i32, arg1)
             {
                 0u32
@@ -105,7 +109,12 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
         }
         3 => {
             // F_GETFD
-            if let Some(fileinfo) = unicorn.get_data_mut().file_system.get_file_info(fd as i32) {
+            if let Some(fileinfo) = unicorn
+                .get_data()
+                .file_system
+                .borrow_mut()
+                .get_file_info(fd as i32)
+            {
                 fileinfo.file_status_flags
             } else {
                 -1i32 as u32
@@ -130,8 +139,9 @@ fn open_internal(unicorn: &mut Unicorn<Context>, path_name: &str, flags: u32, _m
     let open_file_flags = convert_open_file_flags(flags);
 
     if let Ok(fd) = unicorn
-        .get_data_mut()
+        .get_data()
         .file_system
+        .borrow_mut()
         .open(&path_name, open_file_flags)
     {
         fd as u32

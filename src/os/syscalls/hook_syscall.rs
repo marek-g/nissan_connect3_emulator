@@ -1,6 +1,7 @@
 use crate::emulator::context::Context;
+use crate::os::syscalls::ioctl::ioctl;
 use crate::os::syscalls::{
-    fcntl, futex, linux, mman, resource, signal, socket, stat, time, uio, unistd, utsname,
+    fcntl, futex, ioctl, linux, mman, resource, signal, socket, stat, time, uio, unistd, utsname,
 };
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -34,6 +35,12 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
         6 => unistd::close(unicorn, unicorn.get_u32_arg(0)),
         33 => unistd::access(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         45 => unistd::brk(unicorn, unicorn.get_u32_arg(0)),
+        54 => ioctl::ioctl(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
         78 => time::gettimeofday(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         90 => mman::mmap(
             unicorn,

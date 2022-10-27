@@ -4,6 +4,8 @@ use crate::emulator::memory_map::GET_TLS_ADDR;
 use crate::emulator::mmu::{Mmu, MmuExtension};
 use crate::emulator::utils::load_binary;
 use crate::file_system::MountFileSystem;
+use std::cell::RefCell;
+use std::rc::Rc;
 use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Permission};
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -19,7 +21,7 @@ impl<'a> Emulator<'a> {
                 Mode::LITTLE_ENDIAN,
                 Context {
                     mmu: Mmu::new(),
-                    file_system,
+                    file_system: Rc::new(RefCell::new(file_system)),
                 },
             )?,
         })

@@ -2,6 +2,7 @@ pub mod hook_syscall;
 
 mod fcntl;
 mod futex;
+mod ioctl;
 mod linux;
 mod mman;
 mod resource;

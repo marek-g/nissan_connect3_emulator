@@ -9,13 +9,11 @@ use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn stat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
     let pathstr = unicorn.read_string(path);
-    let res = if let Ok(fd) = unicorn
-        .get_data_mut()
-        .file_system
-        .open(&pathstr, OpenFileFlags::READ)
-    {
+    let file_system = unicorn.get_data().file_system.clone();
+    let open_res = file_system.borrow_mut().open(&pathstr, OpenFileFlags::READ);
+    let res = if let Ok(fd) = open_res {
         let res = fstat64_internal(unicorn, fd as u32, stat_buf);
-        unicorn.get_data_mut().file_system.close(fd).unwrap();
+        file_system.borrow_mut().close(fd).unwrap();
         res
     } else {
         -1i32 as u32
@@ -39,14 +37,14 @@ pub fn fstatat64(
 ) -> u32 {
     let path_name = unicorn.read_string(path);
     let path_name_new = get_path_relative_to_dir(unicorn, dir_fd, &path_name);
+    let file_system = unicorn.get_data().file_system.clone();
 
-    let res = if let Ok(fd) = unicorn
-        .get_data_mut()
-        .file_system
-        .open(&path_name_new, OpenFileFlags::READ)
-    {
+    let open_res = file_system
+        .borrow_mut()
+        .open(&path_name_new, OpenFileFlags::READ);
+    let res = if let Ok(fd) = open_res {
         let res = fstat64_internal(unicorn, fd as u32, stat_buf);
-        unicorn.get_data_mut().file_system.close(fd).unwrap();
+        file_system.borrow_mut().close(fd).unwrap();
         res
     } else {
         -1i32 as u32
@@ -67,13 +65,14 @@ pub fn fstatat64(
 pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
     // TODO: handle symbolic links
     let pathstr = unicorn.read_string(path);
-    let res = if let Ok(fd) = unicorn
-        .get_data_mut()
-        .file_system
-        .open(&pathstr, OpenFileFlags::READ | OpenFileFlags::NO_FOLLOW)
-    {
+    let file_system = unicorn.get_data().file_system.clone();
+
+    let open_res = file_system
+        .borrow_mut()
+        .open(&pathstr, OpenFileFlags::READ | OpenFileFlags::NO_FOLLOW);
+    let res = if let Ok(fd) = open_res {
         let res = fstat64_internal(unicorn, fd as u32, stat_buf);
-        unicorn.get_data_mut().file_system.close(fd).unwrap();
+        file_system.borrow_mut().close(fd).unwrap();
         res
     } else {
         -1i32 as u32
@@ -107,8 +106,9 @@ pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
     let mut vec = Vec::new();
 
     let res = if let Some((mount_point, _path)) = unicorn
-        .get_data_mut()
+        .get_data()
         .file_system
+        .borrow_mut()
         .get_mount_point_from_filepath_mut(&file_path)
     {
         // f_type - type of filesystem
@@ -178,7 +178,9 @@ pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
 }
 
 fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, stat_buf: u32) -> u32 {
-    if let Some(file_info) = unicorn.get_data_mut().file_system.get_file_info(fd as i32) {
+    let file_system = unicorn.get_data().file_system.clone();
+
+    let res = if let Some(file_info) = file_system.borrow_mut().get_file_info(fd as i32) {
         let mut stat_data = Vec::new();
 
         // st_dev
@@ -267,5 +269,7 @@ fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, stat_buf: u32) -> u
         0u32
     } else {
         -1i32 as u32
-    }
+    };
+
+    res
 }

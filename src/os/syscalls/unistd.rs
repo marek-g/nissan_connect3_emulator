@@ -38,7 +38,11 @@ pub fn brk(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
 
 pub fn access(unicorn: &mut Unicorn<Context>, path_name: u32, mode: u32) -> u32 {
     let path_name = unicorn.read_string(path_name);
-    let exists = unicorn.get_data_mut().file_system.exists(&path_name);
+    let exists = unicorn
+        .get_data()
+        .file_system
+        .borrow_mut()
+        .exists(&path_name);
     let res = if exists { 0 } else { -1i32 as u32 };
 
     log::trace!(
@@ -53,7 +57,7 @@ pub fn access(unicorn: &mut Unicorn<Context>, path_name: u32, mode: u32) -> u32 
 }
 
 pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
-    let res = if let Ok(_) = unicorn.get_data_mut().file_system.close(fd as i32) {
+    let res = if let Ok(_) = unicorn.get_data().file_system.borrow_mut().close(fd as i32) {
         0u32
     } else {
         -1i32 as u32
@@ -71,9 +75,9 @@ pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
 
 pub fn read(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u32 {
     let mut buf2 = vec![0u8; length as usize];
-    let file_system = &mut unicorn.get_data_mut().file_system;
-    let res = if file_system.is_open(fd as i32) {
-        match file_system.read(fd as i32, &mut buf2) {
+    let file_system = &mut unicorn.get_data_mut().file_system.clone();
+    let res = if file_system.borrow().is_open(fd as i32) {
+        match file_system.borrow_mut().read(fd as i32, &mut buf2) {
             Ok(len) => {
                 unicorn
                     .mem_write(buf as u64, &buf2[0..len as usize])
@@ -101,9 +105,10 @@ pub fn read(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u
 pub fn write(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u32 {
     let mut buf2 = vec![0u8; length as usize];
     unicorn.mem_read(buf as u64, &mut buf2).unwrap();
-    let file_system = &mut unicorn.get_data_mut().file_system;
-    let res = if file_system.is_open(fd as i32) {
-        match file_system.write(fd as i32, &buf2) {
+    let file_system = &mut unicorn.get_data().file_system.clone();
+    let is_open = file_system.borrow().is_open(fd as i32);
+    let res = if is_open {
+        match file_system.borrow_mut().write(fd as i32, &buf2) {
             Ok(len) => {
                 unicorn
                     .mem_write(buf as u64, &buf2[0..len as usize])
@@ -129,12 +134,12 @@ pub fn write(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> 
 }
 
 pub fn getdents64(unicorn: &mut Unicorn<Context>, fd: u32, dirp: u32, count: u32) -> u32 {
-    let res = if let Some(dir_info) = unicorn.get_data_mut().file_system.get_file_info(fd as i32) {
-        if let Ok(mut dir_entries) = unicorn
-            .get_data_mut()
-            .file_system
-            .read_dir(&dir_info.file_path)
-        {
+    let file_system = unicorn.get_data().file_system.clone();
+
+    let dir_info = file_system.borrow_mut().get_file_info(fd as i32);
+    let res = if let Some(dir_info) = dir_info {
+        let read_dir = file_system.borrow_mut().read_dir(&dir_info.file_path);
+        if let Ok(mut dir_entries) = read_dir {
             let mut res = Vec::new();
 
             dir_entries.push(".".to_string());
@@ -144,9 +149,8 @@ pub fn getdents64(unicorn: &mut Unicorn<Context>, fd: u32, dirp: u32, count: u32
                 let full_path = Path::new(&dir_info.file_path).join(&dir_entry);
                 let full_path = full_path.to_str().unwrap();
 
-                if let Some(file_info) = unicorn
-                    .get_data_mut()
-                    .file_system
+                if let Some(file_info) = file_system
+                    .borrow_mut()
                     .get_file_info_from_filepath(full_path)
                 {
                     let rec_len = 20u16 + dir_entry.as_bytes().len() as u16;

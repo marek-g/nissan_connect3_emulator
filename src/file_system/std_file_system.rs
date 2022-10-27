@@ -1,9 +1,11 @@
+use crate::emulator::context::Context;
 use crate::file_system::file_info::FileDetails;
 use crate::file_system::{
     CloseFileError, FileSystem, FileSystemType, OpenFileError, OpenFileFlags,
 };
 use std::io;
 use std::io::{Read, SeekFrom, Write};
+use unicorn_engine::Unicorn;
 
 pub struct StdFileSystem;
 
@@ -97,5 +99,9 @@ impl FileSystem for StdFileSystem {
         } else {
             Err(())
         }
+    }
+
+    fn ioctl(&mut self, unicorn: &mut Unicorn<Context>, fd: i32, request: u32, addr: u32) -> i32 {
+        -1i32
     }
 }

@@ -3,7 +3,8 @@ use crate::emulator::utils::unpack_u32;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn writev(unicorn: &mut Unicorn<Context>, fd: u32, iov: u32, iovcnt: u32) -> u32 {
-    let res = if unicorn.get_data_mut().file_system.is_open(fd as i32) {
+    let is_open = unicorn.get_data().file_system.borrow().is_open(fd as i32);
+    let res = if is_open {
         let mut written_bytes = 0;
         let mut iov_buf = vec![0u8; (iovcnt * 8) as usize];
         unicorn.mem_read(iov as u64, &mut iov_buf).unwrap();
@@ -14,8 +15,9 @@ pub fn writev(unicorn: &mut Unicorn<Context>, fd: u32, iov: u32, iovcnt: u32) ->
             unicorn.mem_read(addr as u64, &mut buf).unwrap();
 
             match unicorn
-                .get_data_mut()
+                .get_data()
                 .file_system
+                .borrow_mut()
                 .write_all(fd as i32, &buf)
             {
                 Ok(_) => {
