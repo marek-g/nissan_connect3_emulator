@@ -94,6 +94,19 @@ pub fn get_path_relative_to_dir(
 
 pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> u32 {
     let res = match cmd {
+        1 => {
+            // F_GETFD
+            if let Some(fileinfo) = unicorn
+                .get_data()
+                .file_system
+                .borrow_mut()
+                .get_file_info(fd as i32)
+            {
+                fileinfo.file_status_flags
+            } else {
+                -1i32 as u32
+            }
+        }
         2 => {
             // F_SETFD
             if let Ok(_) = unicorn
@@ -108,17 +121,25 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
             }
         }
         3 => {
-            // F_GETFD
+            // F_GETFL
             if let Some(fileinfo) = unicorn
                 .get_data()
                 .file_system
                 .borrow_mut()
                 .get_file_info(fd as i32)
             {
-                fileinfo.file_status_flags
+                if fileinfo.file_details.is_readonly {
+                    0u32
+                } else {
+                    2u32 // O_RDWR
+                }
             } else {
                 -1i32 as u32
             }
+        }
+        4 => {
+            // F_SETFL
+            0u32
         }
         _ => panic!("unsupported command"),
     };
