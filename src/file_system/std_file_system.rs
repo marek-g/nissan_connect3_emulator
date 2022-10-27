@@ -1,4 +1,5 @@
 use crate::emulator::context::Context;
+use crate::emulator::utils::pack_u16;
 use crate::file_system::file_info::FileDetails;
 use crate::file_system::{
     CloseFileError, FileSystem, FileSystemType, OpenFileError, OpenFileFlags,
@@ -102,6 +103,34 @@ impl FileSystem for StdFileSystem {
     }
 
     fn ioctl(&mut self, unicorn: &mut Unicorn<Context>, fd: i32, request: u32, addr: u32) -> i32 {
-        -1i32
+        match request {
+            0x5401 => {
+                // TCGETS
+                if fd == 0 || fd == 1 {
+                    let buf = vec![0u8, 0u8, 0u8, 0u8];
+                    unicorn.mem_write(addr as u64, &buf).unwrap();
+                    0i32
+                } else {
+                    -1i32
+                }
+            }
+
+            0x5413 => {
+                // TIOCGWINSZ
+                if fd == 0 || fd == 1 {
+                    let mut buf = Vec::new();
+                    buf.extend_from_slice(&pack_u16(1000u16)); // rows in characters
+                    buf.extend_from_slice(&pack_u16(360u16)); // columns, in characters
+                    buf.extend_from_slice(&pack_u16(1000u16)); // horizontal size, pixels
+                    buf.extend_from_slice(&pack_u16(1000u16)); // vertical size, pixels
+                    unicorn.mem_write(addr as u64, &buf).unwrap();
+                    0i32
+                } else {
+                    -1i32
+                }
+            }
+
+            _ => -1i32,
+        }
     }
 }
