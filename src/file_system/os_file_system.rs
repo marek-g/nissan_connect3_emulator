@@ -1,4 +1,4 @@
-use crate::file_system::file_info::FileDetails;
+use crate::file_system::file_info::{FileDetails, FileType};
 use crate::file_system::file_system::FileSystem;
 use crate::file_system::{CloseFileError, FileSystemType, OpenFileError, OpenFileFlags};
 use std::collections::HashMap;
@@ -30,6 +30,28 @@ impl FileSystem for OsFileSystem {
     fn exists(&mut self, file_path: &str) -> bool {
         let path = self.path_transform_to_real(file_path);
         path.exists()
+    }
+
+    fn read_dir(&mut self, dir_path: &str) -> Result<Vec<String>, ()> {
+        let full_path_name = self.path_transform_to_real(&dir_path);
+
+        if full_path_name.is_dir() {
+            if let Ok(read_dir) = full_path_name.read_dir() {
+                let mut res = Vec::new();
+                for entry in read_dir {
+                    if let Ok(entry) = entry {
+                        res.push(entry.file_name().to_str().unwrap().to_string())
+                    } else {
+                        return Err(());
+                    }
+                }
+                Ok(res)
+            } else {
+                Err(())
+            }
+        } else {
+            Err(())
+        }
     }
 
     fn open(
@@ -69,9 +91,13 @@ impl FileSystem for OsFileSystem {
         if let Some(file) = self.opened_files.get_mut(&fd).map(|el| &mut el.file) {
             let metadata = file.metadata().unwrap();
             Some(FileDetails {
-                is_file: metadata.is_file(),
-                is_symlink: metadata.is_symlink(),
-                is_dir: metadata.is_dir(),
+                file_type: if metadata.is_dir() {
+                    FileType::Directory
+                } else if metadata.is_symlink() {
+                    FileType::Link
+                } else {
+                    FileType::File
+                },
                 is_readonly: metadata.permissions().readonly(),
                 length: metadata.len(),
             })

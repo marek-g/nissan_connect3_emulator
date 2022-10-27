@@ -26,6 +26,10 @@ impl FileSystem for StdFileSystem {
         false
     }
 
+    fn read_dir(&mut self, _dir_path: &str) -> Result<Vec<String>, ()> {
+        Err(())
+    }
+
     fn open(
         &mut self,
         _file_path: &str,

@@ -55,22 +55,30 @@ impl MountFileSystem {
 
     pub fn get_mount_point_from_filepath_mut(
         &mut self,
-        filepath: &str,
+        file_path: &str,
     ) -> Option<(&mut MountPoint, String)> {
-        let filepath = self.path_convert_to_absolute(filepath);
+        let file_path = self.path_convert_to_absolute(file_path);
         self.mount_points
             .iter_mut()
             .filter(|mp| mp.file_system.support_file_paths())
-            .find(|mp| filepath.starts_with(&mp.mount_point))
+            .find(|mp| file_path.starts_with(&mp.mount_point))
             .map(|mp| {
-                let filepath = filepath[mp.mount_point.len() - 1..].to_string();
-                (mp, filepath)
+                let file_path = file_path[mp.mount_point.len() - 1..].to_string();
+                (mp, file_path)
             })
     }
 
-    pub fn exists(&mut self, filepath: &str) -> bool {
-        if let Some((mount_point, filepath)) = self.get_mount_point_from_filepath_mut(filepath) {
-            mount_point.file_system.exists(&filepath)
+    pub fn read_dir(&mut self, dir_path: &str) -> Result<Vec<String>, ()> {
+        if let Some((mount_point, file_path)) = self.get_mount_point_from_filepath_mut(dir_path) {
+            mount_point.file_system.read_dir(&file_path)
+        } else {
+            Err(())
+        }
+    }
+
+    pub fn exists(&mut self, file_path: &str) -> bool {
+        if let Some((mount_point, file_path)) = self.get_mount_point_from_filepath_mut(file_path) {
+            mount_point.file_system.exists(&file_path)
         } else {
             false
         }
@@ -125,26 +133,37 @@ impl MountFileSystem {
     }
 
     pub fn get_file_info(&mut self, fd: i32) -> Option<FileInfo> {
-        let mut filepath = String::new();
+        let mut file_path = String::new();
         let mut file_status_flags = 0;
 
         if let Some(file_data) = self.file_data.get(&fd) {
-            filepath = file_data.file_path.clone();
+            file_path = file_data.file_path.clone();
             file_status_flags = file_data.file_status_flags;
         }
 
         if let Some(mount_point) = self.get_mount_point_mut(fd) {
             if let Some(file_details) = mount_point.file_system.get_file_details(fd) {
-                let inode = self.get_inode_for_filepath(filepath.clone());
+                let inode = self.get_inode_for_filepath(file_path.clone());
                 Some(FileInfo {
                     file_details,
-                    filepath,
+                    file_path,
                     inode,
                     file_status_flags,
                 })
             } else {
                 None
             }
+        } else {
+            None
+        }
+    }
+
+    pub fn get_file_info_from_filepath(&mut self, file_path: &str) -> Option<FileInfo> {
+        let file_path = self.path_convert_to_absolute(file_path);
+        if let Ok(fd) = self.open(&file_path, OpenFileFlags::READ) {
+            let res = self.get_file_info(fd);
+            self.close(fd).unwrap();
+            res
         } else {
             None
         }
@@ -263,9 +282,9 @@ impl MountFileSystem {
         fd
     }
 
-    fn get_inode_for_filepath(&mut self, filepath: String) -> u64 {
+    fn get_inode_for_filepath(&mut self, file_path: String) -> u64 {
         let next_inode = self.inodes.len() as u64 + 1;
-        let entry = self.inodes.entry(filepath).or_insert(next_inode);
+        let entry = self.inodes.entry(file_path).or_insert(next_inode);
         *entry
     }
 

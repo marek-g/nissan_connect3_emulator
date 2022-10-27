@@ -1,6 +1,8 @@
 use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
-use crate::emulator::utils::mem_align_up;
+use crate::emulator::utils::{mem_align_up, pack_u16, pack_u64};
+use crate::file_system::{FileType, OpenFileFlags};
+use std::path::Path;
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -120,6 +122,80 @@ pub fn write(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> 
         fd,
         buf,
         length,
+        res
+    );
+
+    res
+}
+
+pub fn getdents64(unicorn: &mut Unicorn<Context>, fd: u32, dirp: u32, count: u32) -> u32 {
+    let res = if let Some(dir_info) = unicorn.get_data_mut().file_system.get_file_info(fd as i32) {
+        if let Ok(mut dir_entries) = unicorn
+            .get_data_mut()
+            .file_system
+            .read_dir(&dir_info.file_path)
+        {
+            let mut res = Vec::new();
+
+            dir_entries.push(".".to_string());
+            dir_entries.push("..".to_string());
+
+            for dir_entry in dir_entries {
+                let full_path = Path::new(&dir_info.file_path).join(&dir_entry);
+                let full_path = full_path.to_str().unwrap();
+
+                if let Some(file_info) = unicorn
+                    .get_data_mut()
+                    .file_system
+                    .get_file_info_from_filepath(full_path)
+                {
+                    let rec_len = 20u16 + dir_entry.as_bytes().len() as u16;
+
+                    // d_ino - inode number
+                    res.extend_from_slice(&pack_u64(file_info.inode));
+
+                    // d_off - offset to next structure, not implemented (not sure how exactly)
+                    res.extend_from_slice(&pack_u64(0u64));
+
+                    // d_reclen - size of this dirent
+                    res.extend_from_slice(&pack_u16(rec_len));
+
+                    // d_type - file type
+                    res.push(match file_info.file_details.file_type {
+                        FileType::File => 8u8,
+                        FileType::Link => 10u8,
+                        FileType::Directory => 4u8,
+                        FileType::Socket => 12u8,
+                        FileType::BlockDevice => 6u8,
+                        FileType::CharacterDevice => 2u8,
+                        FileType::NamedPipe => 1u8,
+                    });
+
+                    // d_name
+                    res.extend_from_slice(dir_entry.as_bytes());
+                    res.push(0u8);
+                }
+            }
+
+            if res.len() > count as usize {
+                22u32 // EINVAL
+            } else {
+                unicorn.mem_write(dirp as u64, &res).unwrap();
+                res.len() as u32
+            }
+        } else {
+            -1i32 as u32
+        }
+    } else {
+        -1i32 as u32
+    };
+
+    log::trace!(
+        "{:#x}: [SYSCALL] getdents64(fd: {:#x}, dirp: {:#x}, count: {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        fd,
+        dirp,
+        count,
         res
     );
 

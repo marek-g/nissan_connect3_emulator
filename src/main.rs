@@ -52,9 +52,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
         &envs,
     )?;*/
     //emulator.run_elf("/bin/date.coreutils", &vec![], &envs)?;
-    //emulator.run_elf("/bin/pwd.coreutils", &vec![], &envs)?;
+    emulator.run_elf("/bin/pwd.coreutils", &vec![], &envs)?;
     //emulator.run_elf("/bin/ls.coreutils", &vec![], &envs)?;
-    emulator.run_elf("/opt/bosch/processes/procmapengine.out", &vec![], &envs)?;
+    //emulator.run_elf("/opt/bosch/processes/procmapengine.out", &vec![], &envs)?;
 
     Ok(())
 }

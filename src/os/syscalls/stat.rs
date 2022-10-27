@@ -2,7 +2,7 @@ use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
 use crate::emulator::users::{GID, UID};
 use crate::emulator::utils::{pack_i32, pack_u32, pack_u64};
-use crate::file_system::{FileSystemType, OpenFileFlags};
+use crate::file_system::{FileSystemType, FileType, OpenFileFlags};
 use std::time::SystemTime;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -157,14 +157,14 @@ fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, statbuf: u32) -> u3
 
         // st_mode
         let mut st_mode = 0u32;
-        if file_info.file_details.is_file {
-            st_mode |= 0o0100000u32;
-        } else if file_info.file_details.is_symlink {
-            st_mode |= 0o0120000u32;
-        } else if file_info.file_details.is_dir {
-            st_mode |= 0o0040000u32;
-        } else {
-            panic!("st_mode not implemented");
+        match file_info.file_details.file_type {
+            FileType::File => st_mode |= 0o0100000u32,
+            FileType::Link => st_mode |= 0o0120000u32,
+            FileType::Directory => st_mode |= 0o0040000u32,
+            FileType::Socket => st_mode |= 0o0140000u32,
+            FileType::BlockDevice => st_mode |= 0o0060000u32,
+            FileType::CharacterDevice => st_mode |= 0o0020000u32,
+            FileType::NamedPipe => st_mode |= 0o0010000u32,
         }
 
         if file_info.file_details.is_readonly {

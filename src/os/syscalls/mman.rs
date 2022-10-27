@@ -117,7 +117,7 @@ fn mmapx(
     let mut filepath = String::new();
     let file_system = &mut unicorn.get_data_mut().file_system;
     if let Some(fileinfo) = file_system.get_file_info(fd as i32) {
-        filepath = fileinfo.filepath.clone();
+        filepath = fileinfo.file_path.clone();
 
         let file_pos = file_system.stream_position(fd as i32).unwrap();
         file_system

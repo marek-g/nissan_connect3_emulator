@@ -45,6 +45,8 @@ pub trait FileSystem {
 
     fn exists(&mut self, file_path: &str) -> bool;
 
+    fn read_dir(&mut self, dir_path: &str) -> Result<Vec<String>, ()>;
+
     /// Open file from specified path and assign it with the provided `fd` file descriptor id.
     fn open(&mut self, file_path: &str, flags: OpenFileFlags, fd: i32)
         -> Result<(), OpenFileError>;

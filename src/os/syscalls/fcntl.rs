@@ -46,7 +46,7 @@ pub fn openat(
                 .file_system
                 .get_file_info(dirfd as i32)
             {
-                dirinfo.filepath.clone()
+                dirinfo.file_path.clone()
             } else {
                 unicorn
                     .get_data_mut()

@@ -92,6 +92,12 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
         195 => stat::stat64(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         196 => stat::lstat64(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         197 => stat::fstat64(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        217 => unistd::getdents64(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
         219 => mman::mincore(
             unicorn,
             unicorn.get_u32_arg(0),
