@@ -35,7 +35,7 @@ impl MountFileSystem {
         mount_points.sort_by(|a, b| b.mount_point.cmp(&a.mount_point));
 
         Self {
-            current_working_dir: "/usr/bin".to_string(),
+            current_working_dir: "/".to_string(),
 
             mount_points,
             inodes: HashMap::new(),

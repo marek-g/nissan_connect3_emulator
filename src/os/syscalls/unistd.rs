@@ -1,8 +1,10 @@
 use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
 use crate::emulator::utils::{mem_align_up, pack_u16, pack_u64};
-use crate::file_system::FileType;
+use crate::file_system::{FileType, MountFileSystem};
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -57,6 +59,12 @@ pub fn access(unicorn: &mut Unicorn<Context>, path_name: u32, mode: u32) -> u32 
 }
 
 pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
+    unicorn
+        .get_data_mut()
+        .sys_calls_state
+        .get_dents_list
+        .remove(&fd);
+
     let res = if let Ok(_) = unicorn.get_data().file_system.borrow_mut().close(fd as i32) {
         0u32
     } else {
@@ -136,25 +144,85 @@ pub fn write(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> 
 pub fn getdents64(unicorn: &mut Unicorn<Context>, fd: u32, dirp: u32, count: u32) -> u32 {
     let file_system = unicorn.get_data().file_system.clone();
 
-    let dir_info = file_system.borrow_mut().get_file_info(fd as i32);
-    let res = if let Some(dir_info) = dir_info {
-        let read_dir = file_system.borrow_mut().read_dir(&dir_info.file_path);
-        if let Ok(mut dir_entries) = read_dir {
-            let mut res = Vec::new();
+    // get dir entries to iterate through
+    let dir_entries = if let Some(prev_list) = unicorn
+        .get_data_mut()
+        .sys_calls_state
+        .get_dents_list
+        .remove(&fd)
+    {
+        // we have previously stored list - let's continue iteration over it
+        Some(prev_list)
+    } else {
+        // we are called anew, let's ask filesystem for file list
+        let dir_info = file_system.borrow_mut().get_file_info(fd as i32);
+        if let Some(dir_info) = dir_info {
+            let read_dir = file_system.borrow_mut().read_dir(&dir_info.file_path);
+            if let Ok(mut dir_entries) = read_dir {
+                dir_entries.push(".".to_string());
+                dir_entries.push("..".to_string());
+                Some(dir_entries)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
 
-            dir_entries.push(".".to_string());
-            dir_entries.push("..".to_string());
+    let res = get_dents_internal(unicorn, fd, dirp, count, file_system, dir_entries);
 
-            for dir_entry in dir_entries {
+    log::trace!(
+        "{:#x}: [SYSCALL] getdents64(fd: {:#x}, dirp: {:#x}, count: {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        fd,
+        dirp,
+        count,
+        res
+    );
+
+    res
+}
+
+fn get_dents_internal(
+    unicorn: &mut Unicorn<Context>,
+    fd: u32,
+    dirp: u32,
+    count: u32,
+    file_system: Rc<RefCell<MountFileSystem>>,
+    dir_entries: Option<Vec<String>>,
+) -> u32 {
+    // check if the previous call returned all the results
+    // (this situation is marked as an empty vector
+    // and in that case return 0
+    if let Some(dir_entries) = &dir_entries {
+        if dir_entries.len() == 0 {
+            return 0u32;
+        }
+    }
+
+    // iterate through entries
+    if let Some(mut dir_entries) = dir_entries {
+        let mut res = Vec::new();
+
+        let dir_info = file_system.borrow_mut().get_file_info(fd as i32);
+        if let Some(dir_info) = dir_info {
+            let mut not_enough_space = false;
+            let mut no_copied_entries = 0;
+            for dir_entry in &dir_entries {
                 let full_path = Path::new(&dir_info.file_path).join(&dir_entry);
                 let full_path = full_path.to_str().unwrap();
+
+                let rec_len = 20u16 + dir_entry.as_bytes().len() as u16;
+                if res.len() + rec_len as usize > count as usize {
+                    not_enough_space = true;
+                    break;
+                }
 
                 if let Some(file_info) = file_system
                     .borrow_mut()
                     .get_file_info_from_filepath(full_path)
                 {
-                    let rec_len = 20u16 + dir_entry.as_bytes().len() as u16;
-
                     // d_ino - inode number
                     res.extend_from_slice(&pack_u64(file_info.inode));
 
@@ -179,31 +247,29 @@ pub fn getdents64(unicorn: &mut Unicorn<Context>, fd: u32, dirp: u32, count: u32
                     res.extend_from_slice(dir_entry.as_bytes());
                     res.push(0u8);
                 }
+
+                no_copied_entries += 1;
             }
 
-            if res.len() > count as usize {
+            return if not_enough_space && res.len() == 0 {
                 22u32 // EINVAL
             } else {
                 unicorn.mem_write(dirp as u64, &res).unwrap();
+
+                let mut rest_entries = Vec::new();
+                rest_entries.extend_from_slice(&dir_entries[no_copied_entries..]);
+                unicorn
+                    .get_data_mut()
+                    .sys_calls_state
+                    .get_dents_list
+                    .insert(fd, rest_entries);
+
                 res.len() as u32
-            }
-        } else {
-            -1i32 as u32
+            };
         }
-    } else {
-        -1i32 as u32
     };
 
-    log::trace!(
-        "{:#x}: [SYSCALL] getdents64(fd: {:#x}, dirp: {:#x}, count: {:#x}) => {:#x}",
-        unicorn.reg_read(RegisterARM::PC).unwrap(),
-        fd,
-        dirp,
-        count,
-        res
-    );
-
-    res
+    -1i32 as u32
 }
 
 pub fn set_tid_address(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {

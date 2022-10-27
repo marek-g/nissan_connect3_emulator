@@ -1,4 +1,4 @@
-use crate::emulator::context::Context;
+use crate::emulator::context::{Context, SysCallsState};
 use crate::emulator::elf_loader::load_elf;
 use crate::emulator::memory_map::GET_TLS_ADDR;
 use crate::emulator::mmu::{Mmu, MmuExtension};
@@ -22,6 +22,7 @@ impl<'a> Emulator<'a> {
                 Context {
                     mmu: Mmu::new(),
                     file_system: Rc::new(RefCell::new(file_system)),
+                    sys_calls_state: SysCallsState::new(),
                 },
             )?,
         })
