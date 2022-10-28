@@ -10,10 +10,11 @@ pub fn open(unicorn: &mut Unicorn<Context>, path_name: u32, flags: u32, mode: u3
     let fd = open_internal(unicorn, &path_name, flags, mode);
 
     log::trace!(
-        "{:#x}: [SYSCALL] open(pathname = {}, flags: {:#x}, mode: {:#x}) => {:#x}",
+        "{:#x}: [SYSCALL] open(pathname = {}, flags: {:#x} = {:?}, mode: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         path_name,
         flags,
+        convert_open_file_flags(flags),
         mode,
         fd
     );
@@ -35,11 +36,12 @@ pub fn openat(
     let fd = open_internal(unicorn, &path_name_new, flags, mode);
 
     log::trace!(
-        "{:#x}: [SYSCALL] openat(dirfd = {:#x}, pathname = {}, flags: {:#x}, mode: {:#x}) => {:#x}",
+        "{:#x}: [SYSCALL] openat(dirfd = {:#x}, pathname = {}, flags: {:#x} = {:?}, mode: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         dirfd,
         path_name,
         flags,
+        convert_open_file_flags(flags),
         mode,
         fd
     );
@@ -182,27 +184,27 @@ fn convert_open_file_flags(flags: u32) -> OpenFileFlags {
         open_file_flags |= OpenFileFlags::READ | OpenFileFlags::WRITE;
     }
 
-    if flags & 0x100 != 0 {
+    if flags & 0x40 != 0 {
         open_file_flags |= OpenFileFlags::CREATE;
     }
 
-    if flags & 0x200 != 0 {
+    if flags & 0x80 != 0 {
         open_file_flags |= OpenFileFlags::EXCLUSIVE;
     }
 
-    if flags & 0x1000 != 0 {
+    if flags & 0x200 != 0 {
         open_file_flags |= OpenFileFlags::TRUNC;
     }
 
-    if flags & 0x2000 != 0 {
+    if flags & 0x400 != 0 {
         open_file_flags |= OpenFileFlags::APPEND;
     }
 
-    if flags & 0x200000 != 0 {
+    if flags & 0x4000 != 0 {
         open_file_flags |= OpenFileFlags::DIRECTORY;
     }
 
-    if flags & 0x400000 != 0 {
+    if flags & 0x20000 != 0 {
         open_file_flags |= OpenFileFlags::NO_FOLLOW;
     }
 

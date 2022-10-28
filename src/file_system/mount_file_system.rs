@@ -65,7 +65,11 @@ impl MountFileSystem {
             .filter(|mp| mp.file_system.support_file_paths())
             .find(|mp| file_path.starts_with(&mp.mount_point))
             .map(|mp| {
-                let file_path = file_path[mp.mount_point.len() - 1..].to_string();
+                let mut start_index = mp.mount_point.len();
+                if mp.mount_point.ends_with("/") {
+                    start_index -= 1;
+                }
+                let file_path = file_path[start_index..].to_string();
                 (mp, file_path)
             })
     }

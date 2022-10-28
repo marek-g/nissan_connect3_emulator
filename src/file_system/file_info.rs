@@ -8,6 +8,7 @@ pub struct FileInfo {
 }
 
 /// File type
+#[derive(Debug, PartialEq)]
 pub enum FileType {
     File,
     Link,

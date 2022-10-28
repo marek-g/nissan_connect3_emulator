@@ -1,5 +1,5 @@
 use crate::emulator::emulator::Emulator;
-use crate::file_system::{MountFileSystem, MountPoint, OsFileSystem, StdFileSystem};
+use crate::file_system::{MountFileSystem, MountPoint, OsFileSystem, StdFileSystem, TmpFileSystem};
 use std::path::PathBuf;
 
 mod emulator;
@@ -33,6 +33,24 @@ fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
             ))),
             is_read_only: true,
         },
+        // volatile temp-fs
+        MountPoint {
+            mount_point: "/var/volatile".to_string(),
+            file_system: Box::new(TmpFileSystem::new()),
+            is_read_only: false,
+        },
+        // lib temp-fs
+        MountPoint {
+            mount_point: "/var/lib".to_string(),
+            file_system: Box::new(TmpFileSystem::new()),
+            is_read_only: false,
+        },
+        // shm temp-fs
+        MountPoint {
+            mount_point: "/dev/shm".to_string(),
+            file_system: Box::new(TmpFileSystem::new()),
+            is_read_only: false,
+        },
     ]);
 
     // environment variables
@@ -53,8 +71,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     )?;*/
     //emulator.run_elf("/bin/date.coreutils", &vec![], &envs)?;
     //emulator.run_elf("/bin/pwd.coreutils", &vec![], &envs)?;
-    emulator.run_elf("/bin/ls.coreutils", &vec![], &envs)?;
-    //emulator.run_elf("/opt/bosch/processes/procmapengine.out", &vec![], &envs)?;
+    //emulator.run_elf("/bin/ls.coreutils", &vec![], &envs)?;
+    emulator.run_elf("/opt/bosch/processes/procmapengine.out", &vec![], &envs)?;
 
     Ok(())
 }

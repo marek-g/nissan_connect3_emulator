@@ -8,6 +8,9 @@ use std::io;
 use std::io::{Read, SeekFrom, Write};
 use unicorn_engine::Unicorn;
 
+///
+/// File system that provides stdin, stdout and stderr.
+///
 pub struct StdFileSystem;
 
 impl StdFileSystem {

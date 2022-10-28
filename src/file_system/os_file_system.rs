@@ -13,7 +13,7 @@ struct OpenedFileData {
 }
 
 ///
-/// File system provided by host operating system.
+/// File system that gives access to files hosted on your system.
 ///
 pub struct OsFileSystem {
     host_path: PathBuf,
