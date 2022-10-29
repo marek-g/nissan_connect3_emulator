@@ -13,6 +13,20 @@ pub struct MountPoint {
     pub is_read_only: bool,
 }
 
+impl MountPoint {
+    pub fn translate_path(&self, global_path: &str) -> Result<String, ()> {
+        if global_path.starts_with(&self.mount_point) {
+            let mut start_index = self.mount_point.len();
+            if self.mount_point.ends_with("/") {
+                start_index -= 1;
+            }
+            Ok(global_path[start_index..].to_string())
+        } else {
+            Err(())
+        }
+    }
+}
+
 pub struct MountFsFileData {
     pub file_path: String,
     pub file_status_flags: u32,
@@ -65,11 +79,7 @@ impl MountFileSystem {
             .filter(|mp| mp.file_system.support_file_paths())
             .find(|mp| file_path.starts_with(&mp.mount_point))
             .map(|mp| {
-                let mut start_index = mp.mount_point.len();
-                if mp.mount_point.ends_with("/") {
-                    start_index -= 1;
-                }
-                let file_path = file_path[start_index..].to_string();
+                let file_path = mp.translate_path(&file_path).unwrap();
                 (mp, file_path)
             })
     }
@@ -136,6 +146,27 @@ impl MountFileSystem {
         self.file_data.remove(&fd);
 
         res
+    }
+
+    pub fn link(&mut self, old_path: &str, new_path: &str) -> Result<(), OpenFileError> {
+        if let Some((mount_point, old_file_path)) = self.get_mount_point_from_filepath_mut(old_path)
+        {
+            if let Ok(new_file_path) = mount_point.translate_path(new_path) {
+                mount_point.file_system.link(&old_file_path, &new_file_path)
+            } else {
+                Err(OpenFileError::FileSystemNotMounted)
+            }
+        } else {
+            Err(OpenFileError::FileSystemNotMounted)
+        }
+    }
+
+    pub fn unlink(&mut self, file_path: &str) -> Result<(), OpenFileError> {
+        if let Some((mount_point, file_path)) = self.get_mount_point_from_filepath_mut(file_path) {
+            mount_point.file_system.unlink(&file_path)
+        } else {
+            Err(OpenFileError::FileSystemNotMounted)
+        }
     }
 
     pub fn get_file_info(&mut self, fd: i32) -> Option<FileInfo> {

@@ -89,6 +89,14 @@ impl FileSystem for OsFileSystem {
         }
     }
 
+    fn link(&mut self, _old_path: &str, _new_path: &str) -> Result<(), OpenFileError> {
+        Err(OpenFileError::NoPermission)
+    }
+
+    fn unlink(&mut self, _file_path: &str) -> Result<(), OpenFileError> {
+        Err(OpenFileError::NoPermission)
+    }
+
     fn get_file_details(&mut self, fd: i32) -> Option<FileDetails> {
         if let Some(file) = self.opened_files.get_mut(&fd).map(|el| &mut el.file) {
             let metadata = file.metadata().unwrap();

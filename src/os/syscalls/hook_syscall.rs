@@ -32,6 +32,8 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
             unicorn.get_u32_arg(2),
         ),
         6 => unistd::close(unicorn, unicorn.get_u32_arg(0)),
+        9 => unistd::link(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        10 => unistd::unlink(unicorn, unicorn.get_u32_arg(0)),
         33 => unistd::access(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         45 => unistd::brk(unicorn, unicorn.get_u32_arg(0)),
         54 => ioctl::ioctl(

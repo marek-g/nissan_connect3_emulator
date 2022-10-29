@@ -4,6 +4,7 @@ use crate::emulator::users::{GID, UID};
 use crate::emulator::utils::{pack_i32, pack_u32, pack_u64};
 use crate::file_system::{FileSystemType, FileType, OpenFileError, OpenFileFlags};
 use crate::os::syscalls::fcntl::get_path_relative_to_dir;
+use crate::os::syscalls::SysCallError;
 use std::time::SystemTime;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -77,12 +78,7 @@ pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 
             file_system.borrow_mut().close(fd).unwrap();
             res
         }
-        Err(err) => match err {
-            OpenFileError::FileSystemNotMounted => -2i32 as u32, // -ENOENT
-            OpenFileError::NoSuchFileOrDirectory => -2i32 as u32, // -ENOENT
-            OpenFileError::FileExists => -17i32 as u32,          // -EEXIST
-            OpenFileError::NoPermission => -1i32 as u32,         // -EPERM
-        },
+        Err(err) => err.to_syscall_error(),
     };
 
     log::trace!(

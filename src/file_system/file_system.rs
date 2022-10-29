@@ -19,7 +19,7 @@ bitflags! {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum OpenFileError {
     FileSystemNotMounted,
     NoSuchFileOrDirectory,
@@ -27,12 +27,12 @@ pub enum OpenFileError {
     NoPermission,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CloseFileError {
     FileNotOpened,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FileSystemType {
     Normal,
     Dev,
@@ -56,6 +56,10 @@ pub trait FileSystem {
 
     /// Close the file.
     fn close(&mut self, fd: i32) -> Result<(), CloseFileError>;
+
+    fn link(&mut self, old_path: &str, new_path: &str) -> Result<(), OpenFileError>;
+
+    fn unlink(&mut self, file_path: &str) -> Result<(), OpenFileError>;
 
     fn get_file_details(&mut self, fd: i32) -> Option<FileDetails>;
 

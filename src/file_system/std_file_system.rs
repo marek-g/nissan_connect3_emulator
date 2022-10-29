@@ -57,6 +57,14 @@ impl FileSystem for StdFileSystem {
         }
     }
 
+    fn link(&mut self, _old_path: &str, _new_path: &str) -> Result<(), OpenFileError> {
+        Err(OpenFileError::NoPermission)
+    }
+
+    fn unlink(&mut self, _file_path: &str) -> Result<(), OpenFileError> {
+        Err(OpenFileError::NoPermission)
+    }
+
     fn get_file_details(&mut self, _fd: i32) -> Option<FileDetails> {
         None
     }

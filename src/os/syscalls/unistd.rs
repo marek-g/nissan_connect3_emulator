@@ -1,7 +1,8 @@
 use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
 use crate::emulator::utils::{mem_align_up, pack_u16, pack_u64};
-use crate::file_system::{FileType, MountFileSystem};
+use crate::file_system::{FileType, MountFileSystem, OpenFileError};
+use crate::os::syscalls::SysCallError;
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
@@ -310,4 +311,47 @@ pub fn exit_group(unicorn: &mut Unicorn<Context>, status: u32) -> u32 {
     );
 
     0u32
+}
+
+pub fn link(unicorn: &mut Unicorn<Context>, old_path: u32, new_path: u32) -> u32 {
+    let old_path = unicorn.read_string(old_path);
+    let new_path = unicorn.read_string(new_path);
+
+    let res = match unicorn
+        .get_data()
+        .file_system
+        .borrow_mut()
+        .link(&old_path, &new_path)
+    {
+        Ok(_) => 0u32,
+        Err(err) => err.to_syscall_error(),
+    };
+
+    log::trace!(
+        "{:#x}: [SYSCALL] link(old_path: {}, new_path: {}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        old_path,
+        new_path,
+        res
+    );
+
+    res
+}
+
+pub fn unlink(unicorn: &mut Unicorn<Context>, path: u32) -> u32 {
+    let path = unicorn.read_string(path);
+
+    let res = match unicorn.get_data().file_system.borrow_mut().unlink(&path) {
+        Ok(_) => 0u32,
+        Err(err) => err.to_syscall_error(),
+    };
+
+    log::trace!(
+        "{:#x}: [SYSCALL] unlink(path: {}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        path,
+        res
+    );
+
+    res
 }
