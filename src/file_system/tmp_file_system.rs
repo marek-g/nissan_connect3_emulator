@@ -268,6 +268,24 @@ impl FileSystem for TmpFileSystem {
         return Err(());
     }
 
+    fn truncate(&mut self, fd: i32, length: u32) -> Result<(), ()> {
+        if let Some(opened_file) = self.opened_files.get_mut(&fd) {
+            if !opened_file.flags.contains(OpenFileFlags::WRITE) {
+                return Err(());
+            }
+
+            opened_file
+                .file_data
+                .borrow_mut()
+                .data
+                .resize(length as usize, 0u8);
+
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
     fn ioctl(
         &mut self,
         _unicorn: &mut Unicorn<Context>,

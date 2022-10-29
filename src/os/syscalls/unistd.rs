@@ -355,3 +355,25 @@ pub fn unlink(unicorn: &mut Unicorn<Context>, path: u32) -> u32 {
 
     res
 }
+
+pub fn ftruncate(unicorn: &mut Unicorn<Context>, fd: u32, length: u32) -> u32 {
+    let res = match unicorn
+        .get_data()
+        .file_system
+        .borrow_mut()
+        .ftruncate(fd as i32, length)
+    {
+        Ok(_) => 0u32,
+        Err(err) => -1i32 as u32,
+    };
+
+    log::trace!(
+        "{:#x}: [SYSCALL] ftruncate(fd: {:#x}, length: {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        fd,
+        length,
+        res
+    );
+
+    res
+}

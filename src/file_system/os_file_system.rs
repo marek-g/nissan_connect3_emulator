@@ -164,6 +164,10 @@ impl FileSystem for OsFileSystem {
         }
     }
 
+    fn truncate(&mut self, fd: i32, length: u32) -> Result<(), ()> {
+        Err(())
+    }
+
     fn ioctl(
         &mut self,
         _unicorn: &mut Unicorn<Context>,

@@ -309,6 +309,14 @@ impl MountFileSystem {
         }
     }
 
+    pub fn ftruncate(&mut self, fd: i32, length: u32) -> Result<(), ()> {
+        if let Some(mount_point) = self.get_mount_point_mut(fd) {
+            mount_point.file_system.truncate(fd, length)
+        } else {
+            Err(())
+        }
+    }
+
     pub fn ioctl(
         &mut self,
         unicorn: &mut Unicorn<Context>,

@@ -113,6 +113,10 @@ impl FileSystem for StdFileSystem {
         }
     }
 
+    fn truncate(&mut self, fd: i32, length: u32) -> Result<(), ()> {
+        Err(())
+    }
+
     fn ioctl(&mut self, unicorn: &mut Unicorn<Context>, fd: i32, request: u32, addr: u32) -> i32 {
         match request {
             0x5401 => {
