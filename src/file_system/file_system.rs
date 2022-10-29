@@ -23,6 +23,7 @@ bitflags! {
 pub enum OpenFileError {
     FileSystemNotMounted,
     NoSuchFileOrDirectory,
+    FileExists,
     NoPermission,
 }
 

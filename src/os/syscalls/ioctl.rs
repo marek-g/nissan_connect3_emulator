@@ -1,7 +1,4 @@
 use crate::emulator::context::Context;
-use crate::emulator::mmu::MmuExtension;
-use crate::file_system::OpenFileFlags;
-use std::path::PathBuf;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn ioctl(mut unicorn: &mut Unicorn<Context>, fd: u32, request: u32, addr: u32) -> u32 {

@@ -202,7 +202,7 @@ fn get_dents_internal(
     }
 
     // iterate through entries
-    if let Some(mut dir_entries) = dir_entries {
+    if let Some(dir_entries) = dir_entries {
         let mut res = Vec::new();
 
         let dir_info = file_system.borrow_mut().get_file_info(fd as i32);

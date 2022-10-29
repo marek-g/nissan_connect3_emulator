@@ -23,6 +23,8 @@ struct TmpFsFileData {
 
 struct TmpFsOpenedFileData {
     pub path: String,
+    pub flags: OpenFileFlags,
+    pub pos: usize,
 }
 
 impl TmpFileSystem {
@@ -91,21 +93,46 @@ impl FileSystem for TmpFileSystem {
         flags: OpenFileFlags,
         fd: i32,
     ) -> Result<(), OpenFileError> {
-        if !flags.contains(OpenFileFlags::CREATE) {
+        if flags.contains(OpenFileFlags::CREATE) {
+            if self.files.contains_key(file_path) {
+                if flags.contains(OpenFileFlags::EXCLUSIVE) {
+                    return Err(OpenFileError::FileExists);
+                }
+            } else {
+                self.files.insert(
+                    file_path.to_string(),
+                    TmpFsFileData {
+                        file_type: FileType::File,
+                        data: vec![],
+                    },
+                );
+            }
+        } else {
             // file or directory must exists
             if !self.files.contains_key(file_path) {
                 return Err(OpenFileError::NoSuchFileOrDirectory);
             }
-
-            self.opened_files.insert(
-                fd,
-                TmpFsOpenedFileData {
-                    path: file_path.to_string(),
-                },
-            );
-        } else {
-            panic!("not implemented!");
         }
+
+        if flags.contains(OpenFileFlags::TRUNC) && flags.contains(OpenFileFlags::WRITE) {
+            self.files.get_mut(file_path).unwrap().data.clear();
+        }
+
+        let length = self.files.get_mut(file_path).unwrap().data.len();
+        let pos = if flags.contains(OpenFileFlags::APPEND) {
+            length
+        } else {
+            0
+        };
+
+        self.opened_files.insert(
+            fd,
+            TmpFsOpenedFileData {
+                path: file_path.to_string(),
+                flags,
+                pos,
+            },
+        );
 
         return Ok(());
     }
@@ -118,7 +145,16 @@ impl FileSystem for TmpFileSystem {
     }
 
     fn get_file_details(&mut self, fd: i32) -> Option<FileDetails> {
-        todo!()
+        if let Some(opened_file) = self.opened_files.get_mut(&fd) {
+            if let Some(file_data) = self.files.get(&opened_file.path) {
+                return Some(FileDetails {
+                    file_type: file_data.file_type.clone(),
+                    is_readonly: false,
+                    length: file_data.data.len() as u64,
+                });
+            }
+        }
+        return None;
     }
 
     fn is_open(&self, fd: i32) -> bool {
@@ -126,26 +162,98 @@ impl FileSystem for TmpFileSystem {
     }
 
     fn get_length(&mut self, fd: i32) -> u64 {
-        todo!()
+        if let Some(opened_file) = self.opened_files.get(&fd) {
+            if let Some(file_data) = self.files.get(&opened_file.path) {
+                return file_data.data.len() as u64;
+            }
+        }
+        return 0;
     }
 
     fn stream_position(&mut self, fd: i32) -> Result<u64, ()> {
-        todo!()
+        if let Some(opened_file) = self.opened_files.get(&fd) {
+            Ok(opened_file.pos as u64)
+        } else {
+            Err(())
+        }
     }
 
     fn seek(&mut self, fd: i32, pos: SeekFrom) -> Result<u64, ()> {
-        todo!()
+        if let Some(opened_file) = self.opened_files.get_mut(&fd) {
+            if let Some(file_data) = self.files.get(&opened_file.path) {
+                match pos {
+                    SeekFrom::Start(pos) => {
+                        if pos <= file_data.data.len() as u64 {
+                            opened_file.pos = pos as usize;
+                            return Ok(opened_file.pos as u64);
+                        }
+                    }
+                    SeekFrom::End(offset) => {
+                        if offset <= 0 && file_data.data.len() as i64 + offset >= 0 {
+                            opened_file.pos = (file_data.data.len() as i64 + offset) as usize;
+                            return Ok(opened_file.pos as u64);
+                        }
+                    }
+                    SeekFrom::Current(offset) => {
+                        if opened_file.pos as i64 + offset >= 0
+                            && opened_file.pos as i64 + offset <= file_data.data.len() as i64
+                        {
+                            opened_file.pos = (opened_file.pos as i64 + offset) as usize;
+                            return Ok(opened_file.pos as u64);
+                        }
+                    }
+                }
+            }
+        }
+        return Err(());
     }
 
     fn read(&mut self, fd: i32, content: &mut [u8]) -> Result<u64, ()> {
-        todo!()
+        if let Some(opened_file) = self.opened_files.get_mut(&fd) {
+            if !opened_file.flags.contains(OpenFileFlags::READ) {
+                return Err(());
+            }
+
+            if let Some(file_data) = self.files.get(&opened_file.path) {
+                let bytes_to_read = (file_data.data.len() - opened_file.pos).min(content.len());
+                content[0..bytes_to_read].copy_from_slice(
+                    &file_data.data[opened_file.pos..opened_file.pos + bytes_to_read],
+                );
+                opened_file.pos += bytes_to_read;
+                return Ok(bytes_to_read as u64);
+            }
+        }
+        return Err(());
     }
 
     fn write(&mut self, fd: i32, content: &[u8]) -> Result<u64, ()> {
-        todo!()
+        if let Some(opened_file) = self.opened_files.get_mut(&fd) {
+            if !opened_file.flags.contains(OpenFileFlags::WRITE) {
+                return Err(());
+            }
+
+            if let Some(file_data) = self.files.get_mut(&opened_file.path) {
+                let bytes_to_override = (file_data.data.len() - opened_file.pos).min(content.len());
+                file_data.data[opened_file.pos..opened_file.pos + bytes_to_override]
+                    .copy_from_slice(&content[0..bytes_to_override]);
+                let bytes_to_append = content.len() - bytes_to_override;
+                file_data.data.extend_from_slice(
+                    &content[bytes_to_override..bytes_to_override + bytes_to_append],
+                );
+                opened_file.pos += content.len();
+                return Ok(content.len() as u64);
+            }
+        }
+        return Err(());
     }
 
-    fn ioctl(&mut self, unicorn: &mut Unicorn<Context>, fd: i32, request: u32, addr: u32) -> i32 {
+    fn ioctl(
+        &mut self,
+        _unicorn: &mut Unicorn<Context>,
+        _fd: i32,
+        _request: u32,
+        _addr: u32,
+    ) -> i32 {
         todo!()
     }
 }

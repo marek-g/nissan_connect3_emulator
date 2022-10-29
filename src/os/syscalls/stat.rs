@@ -80,6 +80,7 @@ pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 
         Err(err) => match err {
             OpenFileError::FileSystemNotMounted => -2i32 as u32, // -ENOENT
             OpenFileError::NoSuchFileOrDirectory => -2i32 as u32, // -ENOENT
+            OpenFileError::FileExists => -17i32 as u32,          // -EEXIST
             OpenFileError::NoPermission => -1i32 as u32,         // -EPERM
         },
     };

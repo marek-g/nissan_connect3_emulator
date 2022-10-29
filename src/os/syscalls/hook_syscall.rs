@@ -1,5 +1,4 @@
 use crate::emulator::context::Context;
-use crate::os::syscalls::ioctl::ioctl;
 use crate::os::syscalls::{
     fcntl, futex, ioctl, linux, mman, resource, signal, socket, stat, time, uio, unistd, utsname,
 };

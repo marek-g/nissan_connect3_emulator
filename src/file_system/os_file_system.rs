@@ -156,7 +156,13 @@ impl FileSystem for OsFileSystem {
         }
     }
 
-    fn ioctl(&mut self, unicorn: &mut Unicorn<Context>, fd: i32, request: u32, addr: u32) -> i32 {
+    fn ioctl(
+        &mut self,
+        _unicorn: &mut Unicorn<Context>,
+        _fd: i32,
+        _request: u32,
+        _addr: u32,
+    ) -> i32 {
         -1i32
     }
 }
