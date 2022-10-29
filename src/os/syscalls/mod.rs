@@ -8,6 +8,7 @@ mod ioctl;
 mod linux;
 mod mman;
 mod resource;
+mod sched;
 mod signal;
 mod socket;
 mod stat;
