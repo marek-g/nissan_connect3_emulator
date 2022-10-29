@@ -42,3 +42,47 @@ pub fn sched_get_priority_max(unicorn: &mut Unicorn<Context>, policy: u32) -> u3
 
     res
 }
+
+pub fn sched_setscheduler(
+    unicorn: &mut Unicorn<Context>,
+    pid: u32,
+    policy: u32,
+    param_addr: u32,
+) -> u32 {
+    let res = 0u32;
+
+    log::trace!(
+        "{:#x}: [SYSCALL] sched_setscheduler(pid = {:#x}, policy = {:#x}, param_addr = {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        pid,
+        policy,
+        param_addr,
+        res
+    );
+
+    res
+}
+
+pub fn clone(
+    unicorn: &mut Unicorn<Context>,
+    flags: u32,
+    child_stack: u32,
+    parent_tid_ptr: u32,
+    child_tid_ptr: u32,
+    new_tls: u32,
+) -> u32 {
+    let res = 2u32;
+
+    log::trace!(
+        "{:#x}: [SYSCALL] clone(flags = {:#x}, child_stack: {:#x}, parent_tid_ptr: {:#x}, child_tid_ptr: {:#x}, new_tls: {:#x}) => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        flags,
+        child_stack,
+        parent_tid_ptr,
+        child_tid_ptr,
+        new_tls,
+        res
+    );
+
+    res
+}

@@ -164,7 +164,7 @@ impl FileSystem for OsFileSystem {
         }
     }
 
-    fn truncate(&mut self, fd: i32, length: u32) -> Result<(), ()> {
+    fn truncate(&mut self, _fd: i32, _length: u32) -> Result<(), ()> {
         Err(())
     }
 

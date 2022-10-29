@@ -1,7 +1,7 @@
 use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
 use crate::emulator::utils::{mem_align_up, pack_u16, pack_u64};
-use crate::file_system::{FileType, MountFileSystem, OpenFileError};
+use crate::file_system::{FileType, MountFileSystem};
 use crate::os::syscalls::SysCallError;
 use std::cell::RefCell;
 use std::path::Path;
@@ -364,7 +364,7 @@ pub fn ftruncate(unicorn: &mut Unicorn<Context>, fd: u32, length: u32) -> u32 {
         .ftruncate(fd as i32, length)
     {
         Ok(_) => 0u32,
-        Err(err) => -1i32 as u32,
+        Err(_) => -1i32 as u32,
     };
 
     log::trace!(
