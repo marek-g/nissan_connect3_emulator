@@ -2,7 +2,7 @@ use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
 use crate::emulator::users::{GID, UID};
 use crate::emulator::utils::{pack_i32, pack_u32, pack_u64};
-use crate::file_system::{FileSystemType, FileType, OpenFileFlags};
+use crate::file_system::{FileSystemType, FileType, OpenFileError, OpenFileFlags};
 use crate::os::syscalls::fcntl::get_path_relative_to_dir;
 use std::time::SystemTime;
 use unicorn_engine::{RegisterARM, Unicorn};
@@ -70,13 +70,20 @@ pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 
     let open_res = file_system
         .borrow_mut()
         .open(&pathstr, OpenFileFlags::READ | OpenFileFlags::NO_FOLLOW);
-    let res = if let Ok(fd) = open_res {
-        let res = fstat64_internal(unicorn, fd as u32, stat_buf);
-        file_system.borrow_mut().close(fd).unwrap();
-        res
-    } else {
-        -1i32 as u32
+
+    let res = match open_res {
+        Ok(fd) => {
+            let res = fstat64_internal(unicorn, fd as u32, stat_buf);
+            file_system.borrow_mut().close(fd).unwrap();
+            res
+        }
+        Err(err) => match err {
+            OpenFileError::FileSystemNotMounted => -2i32 as u32, // -ENOENT
+            OpenFileError::NoSuchFileOrDirectory => -2i32 as u32, // -ENOENT
+            OpenFileError::NoPermission => -1i32 as u32,         // -EPERM
+        },
     };
+
     log::trace!(
         "{:#x}: [SYSCALL] lstat64(path = {}, stat_buf = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
