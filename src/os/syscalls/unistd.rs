@@ -300,6 +300,19 @@ pub fn get_tid(unicorn: &mut Unicorn<Context>) -> u32 {
     res
 }
 
+pub fn get_pid(unicorn: &mut Unicorn<Context>) -> u32 {
+    // TODO: implement
+    let res = 2;
+
+    log::trace!(
+        "{:#x}: [SYSCALL] get_pid() => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        res
+    );
+
+    res
+}
+
 pub fn exit_group(unicorn: &mut Unicorn<Context>, status: u32) -> u32 {
     unicorn.emu_stop().unwrap();
 

@@ -182,21 +182,6 @@ impl<'a> Emulator<'a> {
         log::info!("========== Program end ==========");
     }
 
-    /*fn disasm(&mut self, address: u32, len: u32) {
-        let cs = Capstone::new()
-            .arm()
-            .mode(ArchMode::Arm)
-            .endian(Endian::Little)
-            .detail(true)
-            .build()
-            .unwrap();
-
-        let mut vec = vec![0u8; len as usize];
-        self.unicorn.mem_read(address as u64, &mut vec).unwrap();
-        let disasm = cs.disasm_all(&vec, address as u64).unwrap();
-        println!("{}", disasm);
-    }*/
-
     pub fn callback_mem_error(
         unicorn: &mut Unicorn<Context>,
         memtype: MemType,

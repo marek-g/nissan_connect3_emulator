@@ -1,4 +1,8 @@
 use crate::emulator::context::Context;
+use crate::emulator::print::{disasm, mem_dump, print_stack};
+use crate::emulator::utils::{pack_u32, unpack_u32};
+use crate::os::syscalls::linux;
+use libc::newlocale;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn sched_get_priority_min(unicorn: &mut Unicorn<Context>, policy: u32) -> u32 {
@@ -68,19 +72,49 @@ pub fn clone(
     flags: u32,
     child_stack: u32,
     parent_tid_ptr: u32,
+    child_tls: u32,
     child_tid_ptr: u32,
-    new_tls: u32,
+    regs: u32,
 ) -> u32 {
-    let res = 2u32;
+    let parent_tid = 1u32;
+    let child_tid = 2u32;
+
+    print_stack(unicorn);
+    mem_dump(unicorn, regs, 128);
+    mem_dump(unicorn, child_stack, 128);
+    disasm(
+        unicorn,
+        (unicorn.reg_read(RegisterARM::PC).unwrap() - 100) as u32,
+        200,
+    );
+    let mut new_addr = vec![0u8; 4];
+    unicorn.mem_read(child_stack as u64, &mut new_addr).unwrap();
+    disasm(unicorn, unpack_u32(&new_addr), 200);
+
+    unicorn
+        .mem_write(parent_tid_ptr as u64, &pack_u32(parent_tid))
+        .unwrap();
+    unicorn
+        .mem_write(child_tid_ptr as u64, &pack_u32(child_tid))
+        .unwrap();
+
+    linux::set_tls(unicorn, child_tls);
+    unicorn
+        .reg_write(RegisterARM::SP, child_stack as u64)
+        .unwrap();
+    let res = 0i32 as u32;
+
+    //let res = 2i32 as u32;
 
     log::trace!(
-        "{:#x}: [SYSCALL] clone(flags = {:#x}, child_stack: {:#x}, parent_tid_ptr: {:#x}, child_tid_ptr: {:#x}, new_tls: {:#x}) => {:#x}",
+        "{:#x}: [SYSCALL] clone(flags = {:#x}, child_stack: {:#x}, parent_tid_ptr: {:#x}, child_tls: {:#x}, child_tid_ptr: {:#x}, regs: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         flags,
         child_stack,
         parent_tid_ptr,
+        child_tls,
         child_tid_ptr,
-        new_tls,
+        regs,
         res
     );
 
