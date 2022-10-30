@@ -157,9 +157,24 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
     }
 
     fn mmu_unmap(&mut self, address: u32, size: u32) {
-        _ = self.get_data_mut().mmu.map_infos.remove_entry(&address);
+        let (_, entry) = self
+            .get_data_mut()
+            .mmu
+            .map_infos
+            .remove_entry(&address)
+            .unwrap();
         self.mem_unmap(address as u64, size as libc::size_t)
             .unwrap();
+
+        log::debug!(
+            "mmu_unmap: {:#x} - {:#x} (size: {:#x}), {:?} {} {}",
+            address,
+            address + size,
+            size,
+            entry.memory_perms,
+            entry.description,
+            entry.filepath
+        );
     }
 
     fn is_mapped(&mut self, address: u32, size: u32) -> bool {

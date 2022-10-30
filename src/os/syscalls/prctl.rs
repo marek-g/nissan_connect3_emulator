@@ -1,6 +1,5 @@
 use crate::emulator::context::Context;
 use crate::emulator::mmu::MmuExtension;
-use crate::emulator::print::mem_dump;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn prctl(

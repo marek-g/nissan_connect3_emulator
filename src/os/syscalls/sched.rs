@@ -2,7 +2,6 @@ use crate::emulator::context::Context;
 use crate::emulator::print::{disasm, mem_dump, print_stack};
 use crate::emulator::utils::{pack_u32, unpack_u32};
 use crate::os::syscalls::linux;
-use libc::newlocale;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn sched_get_priority_min(unicorn: &mut Unicorn<Context>, policy: u32) -> u32 {
