@@ -11,10 +11,13 @@ use unicorn_engine::{RegisterARM, Unicorn};
 pub fn stat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
     let pathstr = unicorn.read_string(path);
     let file_system = unicorn.get_data().file_system.clone();
-    let open_res = file_system.borrow_mut().open(&pathstr, OpenFileFlags::READ);
+    let open_res = file_system
+        .lock()
+        .unwrap()
+        .open(&pathstr, OpenFileFlags::READ);
     let res = if let Ok(fd) = open_res {
         let res = fstat64_internal(unicorn, fd as u32, stat_buf);
-        file_system.borrow_mut().close(fd).unwrap();
+        file_system.lock().unwrap().close(fd).unwrap();
         res
     } else {
         -1i32 as u32
@@ -41,11 +44,12 @@ pub fn fstatat64(
     let file_system = unicorn.get_data().file_system.clone();
 
     let open_res = file_system
-        .borrow_mut()
+        .lock()
+        .unwrap()
         .open(&path_name_new, OpenFileFlags::READ);
     let res = if let Ok(fd) = open_res {
         let res = fstat64_internal(unicorn, fd as u32, stat_buf);
-        file_system.borrow_mut().close(fd).unwrap();
+        file_system.lock().unwrap().close(fd).unwrap();
         res
     } else {
         -1i32 as u32
@@ -69,13 +73,14 @@ pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 
     let file_system = unicorn.get_data().file_system.clone();
 
     let open_res = file_system
-        .borrow_mut()
+        .lock()
+        .unwrap()
         .open(&pathstr, OpenFileFlags::READ | OpenFileFlags::NO_FOLLOW);
 
     let res = match open_res {
         Ok(fd) => {
             let res = fstat64_internal(unicorn, fd as u32, stat_buf);
-            file_system.borrow_mut().close(fd).unwrap();
+            file_system.lock().unwrap().close(fd).unwrap();
             res
         }
         Err(err) => err.to_syscall_error(),
@@ -112,7 +117,8 @@ pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
     let res = if let Some((mount_point, _path)) = unicorn
         .get_data()
         .file_system
-        .borrow_mut()
+        .lock()
+        .unwrap()
         .get_mount_point_from_filepath_mut(&file_path)
     {
         // f_type - type of filesystem
@@ -184,7 +190,7 @@ pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
 fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, stat_buf: u32) -> u32 {
     let file_system = unicorn.get_data().file_system.clone();
 
-    let res = if let Some(file_info) = file_system.borrow_mut().get_file_info(fd as i32) {
+    let res = if let Some(file_info) = file_system.lock().unwrap().get_file_info(fd as i32) {
         let mut stat_data = Vec::new();
 
         // st_dev

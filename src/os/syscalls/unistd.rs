@@ -3,17 +3,16 @@ use crate::emulator::mmu::MmuExtension;
 use crate::emulator::utils::{mem_align_up, pack_u16, pack_u64};
 use crate::file_system::{FileType, MountFileSystem};
 use crate::os::syscalls::SysCallError;
-use std::cell::RefCell;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn brk(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
     let res = if addr == 0 {
-        unicorn.get_data().mmu.brk_mem_end
+        unicorn.get_data().mmu.lock().unwrap().brk_mem_end
     } else {
-        let brk_mem_end = unicorn.get_data().mmu.brk_mem_end;
+        let brk_mem_end = unicorn.get_data().mmu.lock().unwrap().brk_mem_end;
         let new_brk_mem_end = mem_align_up(addr, None);
         if new_brk_mem_end > brk_mem_end {
             unicorn.mmu_map(
@@ -26,7 +25,7 @@ pub fn brk(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
         } else if new_brk_mem_end < brk_mem_end {
             unicorn.mmu_unmap(new_brk_mem_end, brk_mem_end - new_brk_mem_end);
         }
-        unicorn.get_data_mut().mmu.brk_mem_end = new_brk_mem_end;
+        unicorn.get_data_mut().mmu.lock().unwrap().brk_mem_end = new_brk_mem_end;
         new_brk_mem_end
     };
 
@@ -44,7 +43,8 @@ pub fn access(unicorn: &mut Unicorn<Context>, path_name: u32, mode: u32) -> u32 
     let exists = unicorn
         .get_data()
         .file_system
-        .borrow_mut()
+        .lock()
+        .unwrap()
         .exists(&path_name);
     let res = if exists { 0 } else { -1i32 as u32 };
 
@@ -63,10 +63,18 @@ pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
     unicorn
         .get_data_mut()
         .sys_calls_state
+        .lock()
+        .unwrap()
         .get_dents_list
         .remove(&fd);
 
-    let res = if let Ok(_) = unicorn.get_data().file_system.borrow_mut().close(fd as i32) {
+    let res = if let Ok(_) = unicorn
+        .get_data()
+        .file_system
+        .lock()
+        .unwrap()
+        .close(fd as i32)
+    {
         0u32
     } else {
         -1i32 as u32
@@ -85,8 +93,8 @@ pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
 pub fn read(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u32 {
     let mut buf2 = vec![0u8; length as usize];
     let file_system = &mut unicorn.get_data_mut().file_system.clone();
-    let res = if file_system.borrow().is_open(fd as i32) {
-        match file_system.borrow_mut().read(fd as i32, &mut buf2) {
+    let res = if file_system.lock().unwrap().is_open(fd as i32) {
+        match file_system.lock().unwrap().read(fd as i32, &mut buf2) {
             Ok(len) => {
                 unicorn
                     .mem_write(buf as u64, &buf2[0..len as usize])
@@ -115,9 +123,9 @@ pub fn write(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> 
     let mut buf2 = vec![0u8; length as usize];
     unicorn.mem_read(buf as u64, &mut buf2).unwrap();
     let file_system = &mut unicorn.get_data().file_system.clone();
-    let is_open = file_system.borrow().is_open(fd as i32);
+    let is_open = file_system.lock().unwrap().is_open(fd as i32);
     let res = if is_open {
-        match file_system.borrow_mut().write(fd as i32, &buf2) {
+        match file_system.lock().unwrap().write(fd as i32, &buf2) {
             Ok(len) => {
                 unicorn
                     .mem_write(buf as u64, &buf2[0..len as usize])
@@ -149,6 +157,8 @@ pub fn getdents64(unicorn: &mut Unicorn<Context>, fd: u32, dirp: u32, count: u32
     let dir_entries = if let Some(prev_list) = unicorn
         .get_data_mut()
         .sys_calls_state
+        .lock()
+        .unwrap()
         .get_dents_list
         .remove(&fd)
     {
@@ -156,9 +166,9 @@ pub fn getdents64(unicorn: &mut Unicorn<Context>, fd: u32, dirp: u32, count: u32
         Some(prev_list)
     } else {
         // we are called anew, let's ask filesystem for file list
-        let dir_info = file_system.borrow_mut().get_file_info(fd as i32);
+        let dir_info = file_system.lock().unwrap().get_file_info(fd as i32);
         if let Some(dir_info) = dir_info {
-            let read_dir = file_system.borrow_mut().read_dir(&dir_info.file_path);
+            let read_dir = file_system.lock().unwrap().read_dir(&dir_info.file_path);
             if let Ok(mut dir_entries) = read_dir {
                 dir_entries.push(".".to_string());
                 dir_entries.push("..".to_string());
@@ -190,7 +200,7 @@ fn get_dents_internal(
     fd: u32,
     dirp: u32,
     count: u32,
-    file_system: Rc<RefCell<MountFileSystem>>,
+    file_system: Arc<Mutex<MountFileSystem>>,
     dir_entries: Option<Vec<String>>,
 ) -> u32 {
     // check if the previous call returned all the results
@@ -206,7 +216,7 @@ fn get_dents_internal(
     if let Some(dir_entries) = dir_entries {
         let mut res = Vec::new();
 
-        let dir_info = file_system.borrow_mut().get_file_info(fd as i32);
+        let dir_info = file_system.lock().unwrap().get_file_info(fd as i32);
         if let Some(dir_info) = dir_info {
             let mut not_enough_space = false;
             let mut no_copied_entries = 0;
@@ -221,7 +231,8 @@ fn get_dents_internal(
                 }
 
                 if let Some(file_info) = file_system
-                    .borrow_mut()
+                    .lock()
+                    .unwrap()
                     .get_file_info_from_filepath(full_path)
                 {
                     // d_ino - inode number
@@ -262,6 +273,8 @@ fn get_dents_internal(
                 unicorn
                     .get_data_mut()
                     .sys_calls_state
+                    .lock()
+                    .unwrap()
                     .get_dents_list
                     .insert(fd, rest_entries);
 
@@ -333,7 +346,8 @@ pub fn link(unicorn: &mut Unicorn<Context>, old_path: u32, new_path: u32) -> u32
     let res = match unicorn
         .get_data()
         .file_system
-        .borrow_mut()
+        .lock()
+        .unwrap()
         .link(&old_path, &new_path)
     {
         Ok(_) => 0u32,
@@ -354,7 +368,7 @@ pub fn link(unicorn: &mut Unicorn<Context>, old_path: u32, new_path: u32) -> u32
 pub fn unlink(unicorn: &mut Unicorn<Context>, path: u32) -> u32 {
     let path = unicorn.read_string(path);
 
-    let res = match unicorn.get_data().file_system.borrow_mut().unlink(&path) {
+    let res = match unicorn.get_data().file_system.lock().unwrap().unlink(&path) {
         Ok(_) => 0u32,
         Err(err) => err.to_syscall_error(),
     };
@@ -373,7 +387,8 @@ pub fn ftruncate(unicorn: &mut Unicorn<Context>, fd: u32, length: u32) -> u32 {
     let res = match unicorn
         .get_data()
         .file_system
-        .borrow_mut()
+        .lock()
+        .unwrap()
         .ftruncate(fd as i32, length)
     {
         Ok(_) => 0u32,

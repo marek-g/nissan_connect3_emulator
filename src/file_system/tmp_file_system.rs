@@ -2,10 +2,9 @@ use crate::emulator::context::Context;
 use crate::file_system::{
     CloseFileError, FileDetails, FileSystem, FileSystemType, FileType, OpenFileError, OpenFileFlags,
 };
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use unicorn_engine::Unicorn;
 
 ///
@@ -14,7 +13,7 @@ use unicorn_engine::Unicorn;
 pub struct TmpFileSystem {
     // all paths (to directories and files) should not end on "/"
     // except single one - root ("/")
-    files: HashMap<String, Rc<RefCell<TmpFsFileData>>>,
+    files: HashMap<String, Arc<Mutex<TmpFsFileData>>>,
     opened_files: HashMap<i32, TmpFsOpenedFileData>,
 }
 
@@ -24,7 +23,7 @@ struct TmpFsFileData {
 }
 
 struct TmpFsOpenedFileData {
-    pub file_data: Rc<RefCell<TmpFsFileData>>,
+    pub file_data: Arc<Mutex<TmpFsFileData>>,
     pub flags: OpenFileFlags,
     pub pos: usize,
 }
@@ -34,7 +33,7 @@ impl TmpFileSystem {
         let mut files = HashMap::new();
         files.insert(
             "/".to_string(),
-            Rc::new(RefCell::new(TmpFsFileData {
+            Arc::new(Mutex::new(TmpFsFileData {
                 file_type: FileType::Directory,
                 data: vec![],
             })),
@@ -66,7 +65,7 @@ impl FileSystem for TmpFileSystem {
         }
 
         if let Some(folder) = self.files.get(&dir_path) {
-            if folder.borrow().file_type != FileType::Directory {
+            if folder.lock().unwrap().file_type != FileType::Directory {
                 // this is not a directory
                 return Err(());
             }
@@ -103,7 +102,7 @@ impl FileSystem for TmpFileSystem {
             } else {
                 self.files.insert(
                     file_path.to_string(),
-                    Rc::new(RefCell::new(TmpFsFileData {
+                    Arc::new(Mutex::new(TmpFsFileData {
                         file_type: FileType::File,
                         data: vec![],
                     })),
@@ -120,13 +119,14 @@ impl FileSystem for TmpFileSystem {
             self.files
                 .get_mut(file_path)
                 .unwrap()
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .data
                 .clear();
         }
 
         let file_data = self.files.get_mut(file_path).unwrap();
-        let length = file_data.borrow().data.len();
+        let length = file_data.lock().unwrap().data.len();
         let pos = if flags.contains(OpenFileFlags::APPEND) {
             length
         } else {
@@ -170,10 +170,11 @@ impl FileSystem for TmpFileSystem {
 
     fn get_file_details(&mut self, fd: i32) -> Option<FileDetails> {
         if let Some(opened_file) = self.opened_files.get_mut(&fd) {
+            let file_data = opened_file.file_data.lock().unwrap();
             return Some(FileDetails {
-                file_type: opened_file.file_data.borrow().file_type.clone(),
+                file_type: file_data.file_type.clone(),
                 is_readonly: false,
-                length: opened_file.file_data.borrow().data.len() as u64,
+                length: file_data.data.len() as u64,
             });
         }
         return None;
@@ -185,7 +186,7 @@ impl FileSystem for TmpFileSystem {
 
     fn get_length(&mut self, fd: i32) -> u64 {
         if let Some(opened_file) = self.opened_files.get(&fd) {
-            return opened_file.file_data.borrow().data.len() as u64;
+            return opened_file.file_data.lock().unwrap().data.len() as u64;
         }
         return 0;
     }
@@ -202,23 +203,24 @@ impl FileSystem for TmpFileSystem {
         if let Some(opened_file) = self.opened_files.get_mut(&fd) {
             match pos {
                 SeekFrom::Start(pos) => {
-                    if pos <= opened_file.file_data.borrow().data.len() as u64 {
+                    if pos <= opened_file.file_data.lock().unwrap().data.len() as u64 {
                         opened_file.pos = pos as usize;
                         return Ok(opened_file.pos as u64);
                     }
                 }
                 SeekFrom::End(offset) => {
-                    if offset <= 0 && opened_file.file_data.borrow().data.len() as i64 + offset >= 0
+                    if offset <= 0
+                        && opened_file.file_data.lock().unwrap().data.len() as i64 + offset >= 0
                     {
-                        opened_file.pos =
-                            (opened_file.file_data.borrow().data.len() as i64 + offset) as usize;
+                        opened_file.pos = (opened_file.file_data.lock().unwrap().data.len() as i64
+                            + offset) as usize;
                         return Ok(opened_file.pos as u64);
                     }
                 }
                 SeekFrom::Current(offset) => {
                     if opened_file.pos as i64 + offset >= 0
                         && opened_file.pos as i64 + offset
-                            <= opened_file.file_data.borrow().data.len() as i64
+                            <= opened_file.file_data.lock().unwrap().data.len() as i64
                     {
                         opened_file.pos = (opened_file.pos as i64 + offset) as usize;
                         return Ok(opened_file.pos as u64);
@@ -235,10 +237,11 @@ impl FileSystem for TmpFileSystem {
                 return Err(());
             }
 
-            let bytes_to_read =
-                (opened_file.file_data.borrow().data.len() - opened_file.pos).min(content.len());
+            let bytes_to_read = (opened_file.file_data.lock().unwrap().data.len()
+                - opened_file.pos)
+                .min(content.len());
             content[0..bytes_to_read].copy_from_slice(
-                &opened_file.file_data.borrow().data
+                &opened_file.file_data.lock().unwrap().data
                     [opened_file.pos..opened_file.pos + bytes_to_read],
             );
             opened_file.pos += bytes_to_read;
@@ -253,15 +256,21 @@ impl FileSystem for TmpFileSystem {
                 return Err(());
             }
 
-            let bytes_to_override =
-                (opened_file.file_data.borrow().data.len() - opened_file.pos).min(content.len());
-            opened_file.file_data.borrow_mut().data
+            let bytes_to_override = (opened_file.file_data.lock().unwrap().data.len()
+                - opened_file.pos)
+                .min(content.len());
+            opened_file.file_data.lock().unwrap().data
                 [opened_file.pos..opened_file.pos + bytes_to_override]
                 .copy_from_slice(&content[0..bytes_to_override]);
             let bytes_to_append = content.len() - bytes_to_override;
-            opened_file.file_data.borrow_mut().data.extend_from_slice(
-                &content[bytes_to_override..bytes_to_override + bytes_to_append],
-            );
+            opened_file
+                .file_data
+                .lock()
+                .unwrap()
+                .data
+                .extend_from_slice(
+                    &content[bytes_to_override..bytes_to_override + bytes_to_append],
+                );
             opened_file.pos += content.len();
             return Ok(content.len() as u64);
         }
@@ -276,7 +285,8 @@ impl FileSystem for TmpFileSystem {
 
             opened_file
                 .file_data
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .data
                 .resize(length as usize, 0u8);
 

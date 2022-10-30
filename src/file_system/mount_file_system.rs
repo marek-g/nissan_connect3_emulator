@@ -9,7 +9,7 @@ use unicorn_engine::Unicorn;
 
 pub struct MountPoint {
     pub mount_point: String,
-    pub file_system: Box<dyn FileSystem>,
+    pub file_system: Box<dyn FileSystem + Send + Sync>,
     pub is_read_only: bool,
 }
 

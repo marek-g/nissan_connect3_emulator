@@ -6,7 +6,7 @@ mod emulator;
 mod file_system;
 mod os;
 
-fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     pretty_env_logger::init();
 
     // mounted file systems
@@ -64,15 +64,19 @@ fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
 
     let mut emulator = Emulator::new(file_system).unwrap();
 
-    /*emulator.run_elf(
-        "/bin/echo.coreutils",
-        &vec!["Hello".to_string(), "World!".to_string()],
-        &envs,
+    /*emulator.run_process(
+        "/bin/echo.coreutils".to_string(),
+        vec!["Hello".to_string(), "World!".to_string()],
+        envs,
     )?;*/
-    //emulator.run_elf("/bin/date.coreutils", &vec![], &envs)?;
-    //emulator.run_elf("/bin/pwd.coreutils", &vec![], &envs)?;
-    //emulator.run_elf("/bin/ls.coreutils", &vec![], &envs)?;
-    emulator.run_elf("/opt/bosch/processes/procmapengine.out", &vec![], &envs)?;
+    //emulator.run_process("/bin/date.coreutils".to_string(), vec![], envs)?;
+    //emulator.run_process("/bin/pwd.coreutils".to_string(), vec![], envs)?;
+    //emulator.run_process("/bin/ls.coreutils".to_string(), vec![], envs)?;
+    emulator.run_process(
+        "/opt/bosch/processes/procmapengine.out".to_string(),
+        vec![],
+        envs,
+    )?;
 
     Ok(())
 }

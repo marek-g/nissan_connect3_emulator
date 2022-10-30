@@ -62,14 +62,16 @@ pub fn get_path_relative_to_dir(
             unicorn
                 .get_data()
                 .file_system
-                .borrow()
+                .lock()
+                .unwrap()
                 .current_working_dir
                 .clone()
         } else {
             if let Some(dirinfo) = unicorn
                 .get_data()
                 .file_system
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .get_file_info(dirfd as i32)
             {
                 dirinfo.file_path.clone()
@@ -77,7 +79,8 @@ pub fn get_path_relative_to_dir(
                 unicorn
                     .get_data()
                     .file_system
-                    .borrow()
+                    .lock()
+                    .unwrap()
                     .current_working_dir
                     .clone()
             }
@@ -101,7 +104,8 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
             if let Some(fileinfo) = unicorn
                 .get_data()
                 .file_system
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .get_file_info(fd as i32)
             {
                 fileinfo.file_status_flags
@@ -114,7 +118,8 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
             if let Ok(_) = unicorn
                 .get_data()
                 .file_system
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .set_file_status_flags(fd as i32, arg1)
             {
                 0u32
@@ -127,7 +132,8 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
             if let Some(fileinfo) = unicorn
                 .get_data()
                 .file_system
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .get_file_info(fd as i32)
             {
                 if fileinfo.file_details.is_readonly {
@@ -164,7 +170,8 @@ fn open_internal(unicorn: &mut Unicorn<Context>, path_name: &str, flags: u32, _m
     if let Ok(fd) = unicorn
         .get_data()
         .file_system
-        .borrow_mut()
+        .lock()
+        .unwrap()
         .open(&path_name, open_file_flags)
     {
         fd as u32

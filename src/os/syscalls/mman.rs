@@ -114,9 +114,9 @@ fn mmapx(
     let mut buf = Vec::new();
     let mut filepath = String::new();
     let file_system = &mut unicorn.get_data().file_system.clone();
-    let file_info_res = file_system.borrow_mut().get_file_info(fd as i32);
+    let file_info_res = file_system.lock().unwrap().get_file_info(fd as i32);
     if let Some(fileinfo) = file_info_res {
-        let mut file_system = file_system.borrow_mut();
+        let mut file_system = file_system.lock().unwrap();
 
         filepath = fileinfo.file_path.clone();
 
