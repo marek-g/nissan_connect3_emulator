@@ -7,6 +7,7 @@ mod futex;
 mod ioctl;
 mod linux;
 mod mman;
+mod prctl;
 mod resource;
 mod sched;
 mod signal;

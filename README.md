@@ -23,7 +23,10 @@ ELF format description:
 - https://www.caichinger.com/elf.html
 - https://docs.oracle.com/cd/E26502_01/html/E26507/glcfv.html#scrolltoc
 - https://refspecs.linuxfoundation.org/elf/elf.pdf
+- About ELF Auxiliary Vectors: http://articles.manugarg.com/aboutelfauxiliaryvectors.html
 
-About ELF Auxiliary Vectors: http://articles.manugarg.com/aboutelfauxiliaryvectors.html
+Threading in Unicorn:
+
+- https://github.com/unicorn-engine/unicorn/issues/142
 
 Special thanks to: https://github.com/raburton/lcn-patcher & https://github.com/sapphire-bt/lcn2kai-decompress.

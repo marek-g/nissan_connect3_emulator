@@ -1,7 +1,7 @@
 use crate::emulator::context::Context;
 use crate::os::syscalls::{
-    fcntl, futex, ioctl, linux, mman, resource, sched, signal, socket, stat, time, uio, unistd,
-    utsname,
+    fcntl, futex, ioctl, linux, mman, prctl, resource, sched, signal, socket, stat, time, uio,
+    unistd, utsname,
 };
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -93,6 +93,14 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
         ),
         159 => sched::sched_get_priority_max(unicorn, unicorn.get_u32_arg(0)),
         160 => sched::sched_get_priority_min(unicorn, unicorn.get_u32_arg(0)),
+        172 => prctl::prctl(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+            unicorn.get_u32_arg(3),
+            unicorn.get_u32_arg(4),
+        ),
         174 => signal::rt_sigaction(
             unicorn,
             unicorn.get_u32_arg(0),

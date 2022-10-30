@@ -1,4 +1,5 @@
 use crate::emulator::context::Context;
+use crate::emulator::print::mem_dump;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn set_robust_list(unicorn: &mut Unicorn<Context>, head: u32, len: u32) -> u32 {
@@ -25,6 +26,15 @@ pub fn futex(
     uaddr2: u32,
     val3: u32,
 ) -> u32 {
+    if futex_op & 0x1 == 0 {
+        // FUTEX_WAIT
+        let val = vec![0u8; 4];
+        unicorn.mem_write(uaddr as u64, &val).unwrap();
+    } else {
+        // FUTEX_WAKE
+    }
+    mem_dump(unicorn, uaddr, 4);
+
     // TODO: implement
     let res = 0;
 
