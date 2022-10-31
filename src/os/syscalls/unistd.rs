@@ -327,7 +327,10 @@ pub fn get_pid(unicorn: &mut Unicorn<Context>) -> u32 {
 }
 
 pub fn exit_group(unicorn: &mut Unicorn<Context>, status: u32) -> u32 {
-    unicorn.emu_stop().unwrap();
+    let threads = unicorn.get_data_mut().threads.clone();
+    for thread in threads.lock().unwrap().iter_mut() {
+        thread.exit().unwrap();
+    }
 
     log::trace!(
         "{:#x}: [SYSCALL] exit_group(status: {:#x}) => {:#x}",

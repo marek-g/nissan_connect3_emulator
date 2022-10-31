@@ -55,13 +55,7 @@ pub fn munmap(unicorn: &mut Unicorn<Context>, addr: u32, length: u32) -> u32 {
 pub fn mprotect(unicorn: &mut Unicorn<Context>, addr: u32, len: u32, prot: u32) -> u32 {
     let res = 0u32; //mmapx(unicorn, addr, length, prot, flags, fd, pgoffset * 0x1000);
 
-    unicorn
-        .mem_protect(
-            addr as u64,
-            mem_align_up(len, None) as libc::size_t,
-            prot_to_permission(prot),
-        )
-        .unwrap();
+    unicorn.mmu_mem_protect(addr, mem_align_up(len, None), prot_to_permission(prot));
 
     log::trace!(
         "{:#x} [SYSCALL] mprotect(addr = {:#x}, len = {:#x}, prot = {:#x}) => {:#x}",

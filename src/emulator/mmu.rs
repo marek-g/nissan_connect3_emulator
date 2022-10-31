@@ -33,6 +33,7 @@ pub trait MmuExtension {
     );
     fn add_mapinfo(&mut self, map_info: MapInfo);
     fn mmu_unmap(&mut self, address: u32, size: u32);
+    fn mmu_mem_protect(&mut self, address: u32, size: u32, perms: Permission);
     fn is_mapped(&mut self, address: u32, size: u32) -> bool;
     fn update_map_info_filepath(&mut self, address: u32, size: u32, filename: &str);
     fn display_mapped(&self) -> String;
@@ -95,33 +96,34 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
         filepath: &str,
     ) {
         if self.is_mapped(address, size as u32) {
-            self.mem_protect(
-                address as u64,
-                mem_align_up(size, None) as libc::size_t,
-                perms,
-            )
-            .unwrap();
-
+            self.mmu_mem_protect(address, mem_align_up(size, None), perms);
             self.update_map_info_filepath(address, size, filepath);
-
             return;
+        }
+
+        // pause all threads
+        let threads = self.get_data_mut().threads.clone();
+        for thread in threads.lock().unwrap().iter_mut() {
+            thread.pause().unwrap();
         }
 
         // allocate memory
         let mut data = vec![0u8; size as usize];
 
-        // unsafe is ok as long as:
-        // 1. data will not be moved (Vec resized etc.)
-        // 2. memory will be unmapped before deallocating data
-        unsafe {
-            let _ = self
-                .mem_map_ptr(
-                    address as u64,
-                    size as usize,
-                    perms,
-                    data.as_mut_ptr() as *mut c_void,
-                )
-                .unwrap();
+        for thread in threads.lock().unwrap().iter_mut() {
+            // unsafe is ok as long as:
+            // 1. data will not be moved (Vec resized etc.)
+            // 2. memory will be unmapped before deallocating data
+            unsafe {
+                let _ = thread
+                    .mem_map_ptr(
+                        address as u64,
+                        size as usize,
+                        perms,
+                        data.as_mut_ptr() as *mut c_void,
+                    )
+                    .unwrap();
+            }
         }
 
         let desc = match description.len() {
@@ -149,6 +151,11 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
             desc,
             filepath
         );
+
+        // resume all threads
+        for thread in threads.lock().unwrap().iter_mut() {
+            thread.resume();
+        }
     }
 
     fn add_mapinfo(&mut self, map_info: MapInfo) {
@@ -169,8 +176,21 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
             .map_infos
             .remove_entry(&address)
             .unwrap();
-        self.mem_unmap(address as u64, size as libc::size_t)
-            .unwrap();
+
+        // pause all threads
+        let threads = self.get_data_mut().threads.clone();
+        for thread in threads.lock().unwrap().iter_mut() {
+            thread.pause().unwrap();
+        }
+
+        for thread in threads.lock().unwrap().iter_mut() {
+            thread.mem_unmap(address as u64, size as usize).unwrap();
+        }
+
+        // resume all threads
+        for thread in threads.lock().unwrap().iter_mut() {
+            thread.resume();
+        }
 
         log::debug!(
             "mmu_unmap: {:#x} - {:#x} (size: {:#x}), {:?} {} {}",
@@ -181,6 +201,25 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
             entry.description,
             entry.filepath
         );
+    }
+
+    fn mmu_mem_protect(&mut self, address: u32, size: u32, perms: Permission) {
+        // pause all threads
+        let threads = self.get_data_mut().threads.clone();
+        for thread in threads.lock().unwrap().iter_mut() {
+            thread.pause().unwrap();
+        }
+
+        for thread in threads.lock().unwrap().iter_mut() {
+            thread
+                .mem_protect(address as u64, size as usize, perms)
+                .unwrap();
+        }
+
+        // resume all threads
+        for thread in threads.lock().unwrap().iter_mut() {
+            thread.resume();
+        }
     }
 
     fn is_mapped(&mut self, address: u32, size: u32) -> bool {
