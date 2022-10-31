@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::pin::Pin;
 
 use crate::emulator::context::Context;
 use crate::emulator::utils::mem_align_up;

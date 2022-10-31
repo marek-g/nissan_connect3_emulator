@@ -3,8 +3,10 @@ use crate::emulator::mmu::Mmu;
 use crate::emulator::thread::Thread;
 use crate::file_system::MountFileSystem;
 use crate::os::SysCallsState;
+use libc::sleep;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub struct Process {
     mmu: Arc<Mutex<Mmu>>,
@@ -37,8 +39,13 @@ impl Process {
             sys_calls_state: self.sys_calls_state.clone(),
         };
 
-        let (emu_main_thread, main_thread_handle) =
+        let (mut emu_main_thread, main_thread_handle) =
             Thread::start_elf_file(context, elf_filepath, program_args, program_envs);
+
+        std::thread::sleep(Duration::from_millis(100));
+        emu_main_thread.pause().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        emu_main_thread.resume();
 
         self.threads.lock().unwrap().push(emu_main_thread);
 

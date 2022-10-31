@@ -3,15 +3,38 @@ use crate::emulator::elf_loader::load_elf;
 use crate::emulator::memory_map::GET_TLS_ADDR;
 use crate::emulator::mmu::MmuExtension;
 use crate::emulator::utils::load_binary;
+use core::ffi::c_void;
 use std::error::Error;
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use unicorn_engine::unicorn_const::{Arch, HookType, MemType, Mode, Permission};
+use std::{ptr, thread};
+use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Permission};
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub struct Thread {}
+/// Allow possibility to call uc_emu_stop() for any thread.
+/// This is safe with unicorn, but it's not exposed with Rust's API (as of v2.0.0).
+pub struct UcHandle {
+    pub handle: *mut c_void,
+}
+unsafe impl Send for UcHandle {}
+extern "C" {
+    pub fn uc_emu_stop(engine: *mut c_void) -> uc_error;
+}
+
+pub struct Thread {
+    unicorn_handle: Arc<Mutex<UcHandle>>,
+
+    // used to not start emulation at all when pause is requested very early
+    is_paused: Arc<AtomicBool>,
+
+    // used to resume emulation
+    resume_tx: Sender<()>,
+}
 
 impl Thread {
+    /// Starts new thread with a new unicorn instance.
     pub fn start_elf_file(
         context: Context,
         elf_filepath: String,
@@ -21,10 +44,67 @@ impl Thread {
         Self,
         JoinHandle<Result<(), Box<dyn Error + Send + Sync + 'static>>>,
     ) {
-        let handle = thread::spawn(move || {
-            emu_thread_func(context, elf_filepath.clone(), program_args, program_envs)
+        let unicorn_handle = Arc::new(Mutex::new(UcHandle {
+            handle: ptr::null_mut() as *mut c_void,
+        }));
+
+        let is_paused = Arc::new(AtomicBool::new(false));
+
+        let (init_tx, init_rx) = channel();
+        let (resume_tx, resume_rx) = channel();
+
+        let handle = thread::spawn({
+            let unicorn_handle = unicorn_handle.clone();
+            let is_paused = is_paused.clone();
+            move || {
+                emu_thread_func(
+                    context,
+                    elf_filepath.clone(),
+                    program_args,
+                    program_envs,
+                    unicorn_handle,
+                    is_paused,
+                    init_tx,
+                    resume_rx,
+                )
+            }
         });
-        (Self {}, handle)
+
+        // wait for unicorn to be initialized (when unicorn_handle is set)
+        init_rx.recv().unwrap();
+
+        (
+            Self {
+                unicorn_handle,
+                is_paused,
+                resume_tx,
+            },
+            handle,
+        )
+    }
+
+    pub fn pause(&mut self) -> Result<(), uc_error> {
+        self.is_paused.store(true, Ordering::Relaxed);
+
+        let unicorn_handle = self.unicorn_handle.lock().unwrap().handle;
+        if !unicorn_handle.is_null() {
+            // it is ok to call unsafe as long as unicorn_handle is valid - uc_emu_stop() is thread safe
+            let err = unsafe { uc_emu_stop(unicorn_handle) };
+            if err == uc_error::OK {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        } else {
+            Err(uc_error::HANDLE)
+        }
+    }
+
+    pub fn resume(&mut self) {
+        if self.is_paused.load(Ordering::Relaxed) {
+            self.is_paused.store(false, Ordering::Relaxed);
+            self.resume_tx.send(()).unwrap();
+        }
     }
 }
 
@@ -33,9 +113,18 @@ fn emu_thread_func(
     elf_filepath: String,
     program_args: Vec<String>,
     program_envs: Vec<(String, String)>,
+    unicorn_handle: Arc<Mutex<UcHandle>>,
+    is_paused: Arc<AtomicBool>,
+    init_tx: Sender<()>,
+    resume_rx: Receiver<()>,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let mut unicorn = Unicorn::new_with_data(Arch::ARM, Mode::LITTLE_ENDIAN, context)
         .map_err(|err| format!("Unicorn error: {:?}", err))?;
+
+    unicorn_handle.lock().unwrap().handle = unicorn.get_handle();
+
+    init_tx.send(()).unwrap();
+    drop(init_tx);
 
     let buf = load_binary(&mut unicorn, &elf_filepath);
 
@@ -68,11 +157,45 @@ fn emu_thread_func(
         .reg_write(RegisterARM::SP as i32, stack_ptr as u64)
         .unwrap();
 
-    run_linker(&mut unicorn, interp_entry_point, elf_entry);
+    log::info!(
+        "========== Start program (interp_entry_point: {:#x}, elf_entry_point: {:#x}) ==========",
+        interp_entry_point,
+        elf_entry
+    );
 
-    log::info!("{}", unicorn.display_mapped());
+    let mut start_address = interp_entry_point;
 
-    run_program(&mut unicorn, elf_entry);
+    loop {
+        if !is_paused.load(Ordering::Relaxed) {
+            log::trace!("{:#x}: thread start or resume", start_address);
+            match unicorn.emu_start(start_address as u64, 0, 0, 0) {
+                Ok(()) => {
+                    if is_paused.load(Ordering::Relaxed) {
+                        // we have stopped because the pause was requested
+
+                        start_address = unicorn.reg_read(RegisterARM::PC).unwrap() as u32;
+                        log::trace!("{:#x}: thread paused", start_address);
+
+                        // wait for the signal to resume
+                        resume_rx.recv().unwrap();
+                    } else {
+                        // thread has ended
+                        break;
+                    }
+                }
+                Err(error) => {
+                    log::error!(
+                        "{:#x}: Execution error: {:?}",
+                        unicorn.reg_read(RegisterARM::PC).unwrap(),
+                        error
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    log::info!("========== Program done ==========");
 
     Ok(())
 }
@@ -153,33 +276,6 @@ fn enable_vfp(unicorn: &mut Unicorn<Context>) {
         .reg_write(RegisterARM::C1_C0_2, c1_c0_2 | (0b11 << 20) | (0b11 << 22))
         .unwrap();
     unicorn.reg_write(RegisterARM::FPEXC, 1 << 30).unwrap();
-}
-
-fn run_linker(unicorn: &mut Unicorn<Context>, interp_entry_point: u32, elf_entry: u32) {
-    log::info!("========== Start linker ==========");
-    //self.disasm(interp_entry_point, 100);
-    let result = unicorn.emu_start(interp_entry_point as u64, elf_entry as u64, 0, 0);
-
-    log::debug!("PC: {:#x}", unicorn.reg_read(RegisterARM::PC).unwrap());
-
-    if let Err(error) = result {
-        log::error!("Execution error: {:?}", error);
-    }
-
-    log::info!("========== Linker done ==========");
-}
-
-fn run_program(unicorn: &mut Unicorn<Context>, elf_entry: u32) {
-    log::info!("========== Start program ==========");
-    let result = unicorn.emu_start(elf_entry as u64, 0, 0, 0);
-
-    log::debug!("PC: {:#x}", unicorn.reg_read(RegisterARM::PC).unwrap());
-
-    if let Err(error) = result {
-        log::error!("Execution error: {:?}", error);
-    }
-
-    log::info!("========== Program end ==========");
 }
 
 pub fn callback_mem_error(
