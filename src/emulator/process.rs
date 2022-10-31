@@ -10,7 +10,7 @@ pub struct Process {
     mmu: Arc<Mutex<Mmu>>,
     file_system: Arc<Mutex<MountFileSystem>>,
     sys_calls_state: Arc<Mutex<SysCallsState>>,
-    //threads: Vec<Arc<Mutex<Thread<'a>>>>,
+    threads: Arc<Mutex<Vec<Thread>>>,
 }
 
 impl Process {
@@ -21,7 +21,7 @@ impl Process {
             mmu,
             file_system,
             sys_calls_state,
-            //threads: Vec::new(),
+            threads: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -36,9 +36,14 @@ impl Process {
             file_system: self.file_system.clone(),
             sys_calls_state: self.sys_calls_state.clone(),
         };
-        let emu_main_thread =
+
+        let (emu_main_thread, main_thread_handle) =
             Thread::start_elf_file(context, elf_filepath, program_args, program_envs);
 
-        emu_main_thread.handle.join().unwrap()
+        self.threads.lock().unwrap().push(emu_main_thread);
+
+        main_thread_handle.join().unwrap()?;
+
+        Ok(())
     }
 }

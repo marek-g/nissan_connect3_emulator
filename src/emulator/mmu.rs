@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::ffi::c_void;
+use std::pin::Pin;
 
 use crate::emulator::context::Context;
 use crate::emulator::utils::mem_align_up;
@@ -48,18 +50,9 @@ pub struct MapInfo {
     pub memory_perms: Permission,
     pub description: String,
     pub filepath: String,
-}
 
-impl Clone for MapInfo {
-    fn clone(&self) -> Self {
-        MapInfo {
-            memory_start: self.memory_start,
-            memory_end: self.memory_end,
-            memory_perms: self.memory_perms,
-            description: self.description.clone(),
-            filepath: self.filepath.clone(),
-        }
-    }
+    // important! do not move the data after allocated
+    data: Vec<u8>,
 }
 
 impl std::fmt::Display for MapInfo {
@@ -115,13 +108,22 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
             return;
         }
 
-        let _ = self
-            .mem_map(address as u64, size as libc::size_t, perms)
-            .unwrap();
+        // allocate memory
+        let mut data = vec![0u8; size as usize];
 
-        // clear allocated memory
-        let buf = vec![0; size as usize];
-        self.mem_write(address as u64, &buf).unwrap();
+        // unsafe is ok as long as:
+        // 1. data will not be moved (Vec resized etc.)
+        // 2. memory will be unmapped before deallocating data
+        unsafe {
+            let _ = self
+                .mem_map_ptr(
+                    address as u64,
+                    size as usize,
+                    perms,
+                    data.as_mut_ptr() as *mut c_void,
+                )
+                .unwrap();
+        }
 
         let desc = match description.len() {
             0 => String::from("[mapped]"),
@@ -134,6 +136,7 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
             memory_perms: perms,
             description: desc.clone(),
             filepath: filepath.to_owned(),
+            data,
         };
 
         self.add_mapinfo(map_info);

@@ -9,9 +9,7 @@ use std::thread::JoinHandle;
 use unicorn_engine::unicorn_const::{Arch, HookType, MemType, Mode, Permission};
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub struct Thread {
-    pub handle: JoinHandle<Result<(), Box<dyn Error + Send + Sync + 'static>>>,
-}
+pub struct Thread {}
 
 impl Thread {
     pub fn start_elf_file(
@@ -19,12 +17,14 @@ impl Thread {
         elf_filepath: String,
         program_args: Vec<String>,
         program_envs: Vec<(String, String)>,
-    ) -> Self {
-        Self {
-            handle: thread::spawn(move || {
-                emu_thread_func(context, elf_filepath.clone(), program_args, program_envs)
-            }),
-        }
+    ) -> (
+        Self,
+        JoinHandle<Result<(), Box<dyn Error + Send + Sync + 'static>>>,
+    ) {
+        let handle = thread::spawn(move || {
+            emu_thread_func(context, elf_filepath.clone(), program_args, program_envs)
+        });
+        (Self {}, handle)
     }
 }
 
