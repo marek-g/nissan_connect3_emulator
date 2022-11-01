@@ -102,6 +102,22 @@ impl Thread {
         )
     }
 
+    /*pub fn clone(
+        unicorn: &Unicorn<Context>,
+        child_thread_id: u32,
+        child_tls: u32,
+        child_stack: u32,
+    ) -> (
+        Self,
+        JoinHandle<Result<(), Box<dyn Error + Send + Sync + 'static>>>,
+    ) {
+        linux::set_tls(unicorn, child_tls);
+        unicorn
+            .reg_write(RegisterARM::SP, child_stack as u64)
+            .unwrap();
+        let res = 0i32 as u32;
+    }*/
+
     pub fn pause(&mut self) -> Result<(), uc_error> {
         self.is_paused.store(true, Ordering::Relaxed);
 

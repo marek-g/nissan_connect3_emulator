@@ -1,7 +1,9 @@
 use crate::emulator::context::Context;
 use crate::emulator::print::{disasm, mem_dump, print_stack};
+use crate::emulator::thread::Thread;
 use crate::emulator::utils::{pack_u32, unpack_u32};
 use crate::os::syscalls::linux;
+use std::sync::atomic::Ordering;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn sched_get_priority_min(unicorn: &mut Unicorn<Context>, policy: u32) -> u32 {
@@ -75,10 +77,14 @@ pub fn clone(
     child_tid_ptr: u32,
     regs: u32,
 ) -> u32 {
-    let parent_tid = 1u32;
-    let child_tid = 2u32;
+    let parent_tid = unicorn.get_data().thread_id;
+    let child_tid = unicorn
+        .get_data_mut()
+        .next_thread_id
+        .fetch_add(1, Ordering::Relaxed)
+        + 1;
 
-    print_stack(unicorn);
+    /*print_stack(unicorn);
     mem_dump(unicorn, regs, 128);
     mem_dump(unicorn, child_stack, 128);
     disasm(
@@ -88,7 +94,7 @@ pub fn clone(
     );
     let mut new_addr = vec![0u8; 4];
     unicorn.mem_read(child_stack as u64, &mut new_addr).unwrap();
-    disasm(unicorn, unpack_u32(&new_addr), 200);
+    disasm(unicorn, unpack_u32(&new_addr), 200);*/
 
     unicorn
         .mem_write(parent_tid_ptr as u64, &pack_u32(parent_tid))
@@ -97,13 +103,10 @@ pub fn clone(
         .mem_write(child_tid_ptr as u64, &pack_u32(child_tid))
         .unwrap();
 
-    linux::set_tls(unicorn, child_tls);
-    unicorn
-        .reg_write(RegisterARM::SP, child_stack as u64)
-        .unwrap();
-    let res = 0i32 as u32;
+    //let (new_thread, join_handle) = Thread::clone(unicorn, child_tid, child_tls, child_stack);
+    //unicorn.get_data_mut().threads
 
-    //let res = 2i32 as u32;
+    let res = child_tid as u32;
 
     log::trace!(
         "{:#x}: [SYSCALL] clone(flags = {:#x}, child_stack: {:#x}, parent_tid_ptr: {:#x}, child_tls: {:#x}, child_tid_ptr: {:#x}, regs: {:#x}) => {:#x}",

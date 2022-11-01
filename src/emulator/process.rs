@@ -4,6 +4,7 @@ use crate::emulator::thread::Thread;
 use crate::file_system::MountFileSystem;
 use crate::os::SysCallsState;
 use std::error::Error;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ pub struct Process {
     file_system: Arc<Mutex<MountFileSystem>>,
     sys_calls_state: Arc<Mutex<SysCallsState>>,
     threads: Arc<Mutex<Vec<Thread>>>,
+    next_thread_id: Arc<AtomicU32>,
 }
 
 impl Process {
@@ -23,6 +25,7 @@ impl Process {
             file_system,
             sys_calls_state,
             threads: Arc::new(Mutex::new(Vec::new())),
+            next_thread_id: Arc::new(AtomicU32::new(1)),
         }
     }
 
@@ -32,11 +35,14 @@ impl Process {
         program_args: Vec<String>,
         program_envs: Vec<(String, String)>,
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        let thread_id = self.next_thread_id.fetch_add(1, Ordering::Relaxed);
         let context = Context {
             mmu: self.mmu.clone(),
             file_system: self.file_system.clone(),
             sys_calls_state: self.sys_calls_state.clone(),
             threads: self.threads.clone(),
+            next_thread_id: self.next_thread_id.clone(),
+            thread_id,
         };
 
         let (mut emu_main_thread, main_thread_handle) =
