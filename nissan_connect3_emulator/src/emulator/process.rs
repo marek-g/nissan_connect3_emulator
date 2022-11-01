@@ -6,7 +6,6 @@ use crate::os::SysCallsState;
 use std::error::Error;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 pub struct Process {
     mmu: Arc<Mutex<Mmu>>,
@@ -45,7 +44,7 @@ impl Process {
             thread_id,
         };
 
-        let (mut emu_main_thread, main_thread_handle) =
+        let (emu_main_thread, main_thread_handle) =
             Thread::start_elf_file(context, elf_filepath, program_args, program_envs);
 
         self.threads.lock().unwrap().push(emu_main_thread);

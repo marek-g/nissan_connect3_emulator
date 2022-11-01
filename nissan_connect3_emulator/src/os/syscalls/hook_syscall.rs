@@ -215,7 +215,7 @@ trait Args {
     fn set_u32_result(&mut self, res: u32);
 }
 
-impl<'a> Args for Unicorn<'a, Context> {
+impl Args for Unicorn<Context> {
     fn get_syscall_number(&self) -> u32 {
         self.reg_read_i32(RegisterARM::R7).unwrap() as u32
     }

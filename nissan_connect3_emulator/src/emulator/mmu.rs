@@ -86,7 +86,7 @@ impl std::fmt::Display for MapInfo {
     }
 }
 
-impl<'a> MmuExtension for Unicorn<'a, Context> {
+impl MmuExtension for Unicorn<Context> {
     fn mmu_map(
         &mut self,
         address: u32,
@@ -102,7 +102,7 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
         }
 
         // pause all threads
-        let threads = self.get_data_mut().threads.clone();
+        let threads = self.get_data().threads.clone();
         for thread in threads.lock().unwrap().iter_mut() {
             thread.pause().unwrap();
         }
@@ -159,7 +159,7 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
     }
 
     fn add_mapinfo(&mut self, map_info: MapInfo) {
-        self.get_data_mut()
+        self.get_data()
             .mmu
             .lock()
             .unwrap()
@@ -169,7 +169,7 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
 
     fn mmu_unmap(&mut self, address: u32, size: u32) {
         let (_, entry) = self
-            .get_data_mut()
+            .get_data()
             .mmu
             .lock()
             .unwrap()
@@ -178,7 +178,7 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
             .unwrap();
 
         // pause all threads
-        let threads = self.get_data_mut().threads.clone();
+        let threads = self.get_data().threads.clone();
         for thread in threads.lock().unwrap().iter_mut() {
             thread.pause().unwrap();
         }
@@ -205,7 +205,7 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
 
     fn mmu_mem_protect(&mut self, address: u32, size: u32, perms: Permission) {
         // pause all threads
-        let threads = self.get_data_mut().threads.clone();
+        let threads = self.get_data().threads.clone();
         for thread in threads.lock().unwrap().iter_mut() {
             thread.pause().unwrap();
         }
@@ -230,7 +230,8 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
     }
 
     fn update_map_info_filepath(&mut self, address: u32, size: u32, filepath: &str) {
-        let map_infos = &mut self.get_data_mut().mmu.lock().unwrap().map_infos;
+        let data = self.get_data();
+        let map_infos = &mut data.mmu.lock().unwrap().map_infos;
         for (_key, value) in map_infos {
             if value.memory_start <= address && value.memory_end >= address + size {
                 value.filepath = filepath.to_string();
@@ -240,7 +241,8 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
 
     fn display_mapped(&self) -> String {
         let mut v: Vec<_> = Vec::new();
-        let mmu = self.get_data().mmu.lock().unwrap();
+        let data = self.get_data();
+        let mmu = data.mmu.lock().unwrap();
         for (addr, map_info) in mmu.map_infos.iter() {
             v.push((addr, map_info));
         }
@@ -259,7 +261,7 @@ impl<'a> MmuExtension for Unicorn<'a, Context> {
         let size = mem_align_up(size, None);
         self.mmu_map(heap_addr, size, perms, "[heap]", filepath);
 
-        self.get_data_mut().mmu.lock().unwrap().heap_mem_end = heap_addr + size;
+        self.get_data().mmu.lock().unwrap().heap_mem_end = heap_addr + size;
 
         heap_addr
     }

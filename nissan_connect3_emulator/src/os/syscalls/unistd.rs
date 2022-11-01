@@ -25,7 +25,7 @@ pub fn brk(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
         } else if new_brk_mem_end < brk_mem_end {
             unicorn.mmu_unmap(new_brk_mem_end, brk_mem_end - new_brk_mem_end);
         }
-        unicorn.get_data_mut().mmu.lock().unwrap().brk_mem_end = new_brk_mem_end;
+        unicorn.get_data().mmu.lock().unwrap().brk_mem_end = new_brk_mem_end;
         new_brk_mem_end
     };
 
@@ -61,7 +61,7 @@ pub fn access(unicorn: &mut Unicorn<Context>, path_name: u32, mode: u32) -> u32 
 
 pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
     unicorn
-        .get_data_mut()
+        .get_data()
         .sys_calls_state
         .lock()
         .unwrap()
@@ -92,7 +92,7 @@ pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
 
 pub fn read(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u32 {
     let mut buf2 = vec![0u8; length as usize];
-    let file_system = &mut unicorn.get_data_mut().file_system.clone();
+    let file_system = &mut unicorn.get_data().file_system.clone();
     let res = if file_system.lock().unwrap().is_open(fd as i32) {
         match file_system.lock().unwrap().read(fd as i32, &mut buf2) {
             Ok(len) => {
@@ -155,7 +155,7 @@ pub fn getdents64(unicorn: &mut Unicorn<Context>, fd: u32, dirp: u32, count: u32
 
     // get dir entries to iterate through
     let dir_entries = if let Some(prev_list) = unicorn
-        .get_data_mut()
+        .get_data()
         .sys_calls_state
         .lock()
         .unwrap()
@@ -271,7 +271,7 @@ fn get_dents_internal(
                 let mut rest_entries = Vec::new();
                 rest_entries.extend_from_slice(&dir_entries[no_copied_entries..]);
                 unicorn
-                    .get_data_mut()
+                    .get_data()
                     .sys_calls_state
                     .lock()
                     .unwrap()
@@ -327,7 +327,7 @@ pub fn get_pid(unicorn: &mut Unicorn<Context>) -> u32 {
 }
 
 pub fn exit_group(unicorn: &mut Unicorn<Context>, status: u32) -> u32 {
-    let threads = unicorn.get_data_mut().threads.clone();
+    let threads = unicorn.get_data().threads.clone();
     for thread in threads.lock().unwrap().iter_mut() {
         thread.exit().unwrap();
     }

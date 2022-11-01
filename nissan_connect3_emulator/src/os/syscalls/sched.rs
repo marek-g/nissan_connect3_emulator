@@ -1,8 +1,5 @@
 use crate::emulator::context::Context;
-use crate::emulator::print::{disasm, mem_dump, print_stack};
-use crate::emulator::thread::Thread;
-use crate::emulator::utils::{pack_u32, unpack_u32};
-use crate::os::syscalls::linux;
+use crate::emulator::utils::pack_u32;
 use std::sync::atomic::Ordering;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -79,7 +76,7 @@ pub fn clone(
 ) -> u32 {
     let parent_tid = unicorn.get_data().thread_id;
     let child_tid = unicorn
-        .get_data_mut()
+        .get_data()
         .next_thread_id
         .fetch_add(1, Ordering::Relaxed)
         + 1;

@@ -7,38 +7,14 @@ use core::ffi::c_void;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::thread;
 use std::thread::JoinHandle;
-use std::{ptr, thread};
 use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Permission};
 use unicorn_engine::{RegisterARM, Unicorn};
 
-/// Allow possibility to call uc_emu_stop() and other methods from any thread.
-/// This is safe with unicorn, but it's not exposed with Rust's API (as of v2.0.0).
-pub struct UcHandle {
-    pub handle: *mut c_void,
-}
-unsafe impl Send for UcHandle {}
-extern "C" {
-    pub fn uc_emu_stop(engine: *mut c_void) -> uc_error;
-    pub fn uc_mem_map_ptr(
-        engine: *mut c_void,
-        address: u64,
-        size: libc::size_t,
-        perms: u32,
-        ptr: *mut c_void,
-    ) -> uc_error;
-    pub fn uc_mem_unmap(engine: *mut c_void, address: u64, size: libc::size_t) -> uc_error;
-    pub fn uc_mem_protect(
-        engine: *mut c_void,
-        address: u64,
-        size: libc::size_t,
-        perms: u32,
-    ) -> uc_error;
-}
-
 pub struct Thread {
-    unicorn_handle: Arc<Mutex<UcHandle>>,
+    pub unicorn: Unicorn<Context>,
 
     // used to not start emulation at all when pause is requested very early
     is_paused: Arc<AtomicBool>,
@@ -59,9 +35,9 @@ impl Thread {
         Self,
         JoinHandle<Result<(), Box<dyn Error + Send + Sync + 'static>>>,
     ) {
-        let unicorn_handle = Arc::new(Mutex::new(UcHandle {
-            handle: ptr::null_mut() as *mut c_void,
-        }));
+        let unicorn = Unicorn::new_with_data(Arch::ARM, Mode::LITTLE_ENDIAN, context)
+            .map_err(|err| format!("Unicorn error: {:?}", err))
+            .unwrap();
 
         let is_paused = Arc::new(AtomicBool::new(false));
         let is_exit = Arc::new(AtomicBool::new(false));
@@ -70,16 +46,15 @@ impl Thread {
         let (resume_tx, resume_rx) = channel();
 
         let handle = thread::spawn({
-            let unicorn_handle = unicorn_handle.clone();
+            let unicorn = unicorn.clone();
             let is_paused = is_paused.clone();
             let is_exit = is_exit.clone();
             move || {
                 emu_thread_func(
-                    context,
+                    unicorn,
                     elf_filepath.clone(),
                     program_args,
                     program_envs,
-                    unicorn_handle,
                     is_paused,
                     is_exit,
                     init_tx,
@@ -93,7 +68,7 @@ impl Thread {
 
         (
             Self {
-                unicorn_handle,
+                unicorn,
                 is_paused,
                 is_exit,
                 resume_tx,
@@ -121,18 +96,7 @@ impl Thread {
     pub fn pause(&mut self) -> Result<(), uc_error> {
         self.is_paused.store(true, Ordering::Relaxed);
 
-        let unicorn_handle = self.unicorn_handle.lock().unwrap().handle;
-        if !unicorn_handle.is_null() {
-            // it is ok to call unsafe as long as unicorn_handle is valid - uc_emu_stop() is thread safe
-            let err = unsafe { uc_emu_stop(unicorn_handle) };
-            if err == uc_error::OK {
-                Ok(())
-            } else {
-                Err(err)
-            }
-        } else {
-            Err(uc_error::HANDLE)
-        }
+        self.unicorn.emu_stop()
     }
 
     pub fn resume(&mut self) {
@@ -145,14 +109,7 @@ impl Thread {
     pub fn exit(&mut self) -> Result<(), uc_error> {
         self.is_exit.store(true, Ordering::Relaxed);
 
-        let unicorn_handle = self.unicorn_handle.lock().unwrap().handle;
-        // it is ok to call unsafe as long as unicorn_handle is valid - uc_emu_stop() is thread safe
-        let err = unsafe { uc_emu_stop(unicorn_handle) };
-        if err == uc_error::OK {
-            Ok(())
-        } else {
-            Err(err)
-        }
+        self.unicorn.emu_stop()
     }
 
     pub unsafe fn mem_map_ptr(
@@ -162,23 +119,11 @@ impl Thread {
         perms: Permission,
         ptr: *mut c_void,
     ) -> Result<(), uc_error> {
-        let unicorn_handle = self.unicorn_handle.lock().unwrap().handle;
-        let err = uc_mem_map_ptr(unicorn_handle, address, size, perms.bits(), ptr);
-        if err == uc_error::OK {
-            Ok(())
-        } else {
-            Err(err)
-        }
+        self.unicorn.mem_map_ptr(address, size, perms, ptr)
     }
 
     pub fn mem_unmap(&mut self, address: u64, size: usize) -> Result<(), uc_error> {
-        let unicorn_handle = self.unicorn_handle.lock().unwrap().handle;
-        let err = unsafe { uc_mem_unmap(unicorn_handle, address, size) };
-        if err == uc_error::OK {
-            Ok(())
-        } else {
-            Err(err)
-        }
+        self.unicorn.mem_unmap(address, size)
     }
 
     pub fn mem_protect(
@@ -187,32 +132,20 @@ impl Thread {
         size: libc::size_t,
         perms: Permission,
     ) -> Result<(), uc_error> {
-        let unicorn_handle = self.unicorn_handle.lock().unwrap().handle;
-        let err = unsafe { uc_mem_protect(unicorn_handle, address, size, perms.bits()) };
-        if err == uc_error::OK {
-            Ok(())
-        } else {
-            Err(err)
-        }
+        self.unicorn.mem_protect(address, size, perms)
     }
 }
 
 fn emu_thread_func(
-    context: Context,
+    mut unicorn: Unicorn<Context>,
     elf_filepath: String,
     program_args: Vec<String>,
     program_envs: Vec<(String, String)>,
-    unicorn_handle: Arc<Mutex<UcHandle>>,
     is_paused: Arc<AtomicBool>,
     is_exit: Arc<AtomicBool>,
     init_tx: Sender<()>,
     resume_rx: Receiver<()>,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    let mut unicorn = Unicorn::new_with_data(Arch::ARM, Mode::LITTLE_ENDIAN, context)
-        .map_err(|err| format!("Unicorn error: {:?}", err))?;
-
-    unicorn_handle.lock().unwrap().handle = unicorn.get_handle();
-
     init_tx.send(()).unwrap();
     drop(init_tx);
 

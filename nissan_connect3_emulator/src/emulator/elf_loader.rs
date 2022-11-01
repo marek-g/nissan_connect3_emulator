@@ -41,9 +41,9 @@ enum AUX {
     AtExecFn = 31,
 }
 
-struct ArmElfLoader<'a, 'b> {
+struct ArmElfLoader<'a> {
     // input
-    unicorn: &'a mut Unicorn<'b, Context>,
+    unicorn: &'a mut Unicorn<Context>,
     filepath: &'a str,
     load_address: u32,
 
@@ -52,7 +52,7 @@ struct ArmElfLoader<'a, 'b> {
     mem_end: u32,
 }
 
-impl<'a, 'b> ElfLoader for ArmElfLoader<'a, 'b> {
+impl<'a> ElfLoader for ArmElfLoader<'a> {
     fn allocate(&mut self, load_headers: LoadableHeaders) -> Result<(), ElfLoaderErr> {
         for header in load_headers {
             let mem_start = mem_align_down(self.load_address + header.virtual_addr() as u32, None);
@@ -174,8 +174,8 @@ pub fn load_elf(
     log::debug!("mem_start: {:#x}", mem_start);
     log::debug!("mem_end: {:#x}", mem_end);
 
-    unicorn.get_data_mut().mmu.lock().unwrap().brk_mem_end = mem_end;
-    unicorn.get_data_mut().mmu.lock().unwrap().heap_mem_end = HEAP_START_ADDRESS;
+    unicorn.get_data().mmu.lock().unwrap().brk_mem_end = mem_end;
+    unicorn.get_data().mmu.lock().unwrap().heap_mem_end = HEAP_START_ADDRESS;
 
     // load interpreter
     let interp_address = 0u32;

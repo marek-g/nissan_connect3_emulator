@@ -5,6 +5,7 @@ use crate::os::SysCallsState;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone)]
 pub struct Context {
     pub mmu: Arc<Mutex<Mmu>>,
     pub file_system: Arc<Mutex<MountFileSystem>>,

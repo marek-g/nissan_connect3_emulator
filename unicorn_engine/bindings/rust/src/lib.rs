@@ -26,7 +26,7 @@
 //! ```
 //!
 
-#![no_std]
+//#![no_std]
 
 #[macro_use]
 extern crate alloc;
@@ -50,10 +50,12 @@ pub use crate::{
     unicorn_const::*, x86::*,
 };
 
-use alloc::{boxed::Box, rc::Rc, vec::Vec};
-use core::{cell::UnsafeCell, ptr};
+use alloc::sync::Arc;
+use alloc::{boxed::Box, vec::Vec};
+use core::ptr;
 use ffi::uc_handle;
 use libc::c_void;
+use std::sync::Mutex;
 use unicorn_const::{uc_error, Arch, HookType, MemRegion, MemType, Mode, Permission, Query};
 
 #[derive(Debug)]
@@ -79,13 +81,13 @@ impl Drop for Context {
     }
 }
 
-pub struct MmioCallbackScope<'a> {
+pub struct MmioCallbackScope {
     pub regions: Vec<(u64, usize)>,
-    pub read_callback: Option<Box<dyn ffi::IsUcHook<'a> + 'a>>,
-    pub write_callback: Option<Box<dyn ffi::IsUcHook<'a> + 'a>>,
+    pub read_callback: Option<Box<dyn ffi::IsUcHook>>,
+    pub write_callback: Option<Box<dyn ffi::IsUcHook>>,
 }
 
-impl<'a> MmioCallbackScope<'a> {
+impl MmioCallbackScope {
     fn has_regions(&self) -> bool {
         !self.regions.is_empty()
     }
@@ -129,19 +131,21 @@ impl<'a> MmioCallbackScope<'a> {
     }
 }
 
-pub struct UnicornInner<'a, D> {
+pub struct UnicornInner<D> {
     pub handle: uc_handle,
     pub ffi: bool,
     pub arch: Arch,
     /// to keep ownership over the hook for this uc instance's lifetime
-    pub hooks: Vec<(ffi::uc_hook, Box<dyn ffi::IsUcHook<'a> + 'a>)>,
+    pub hooks: Vec<(ffi::uc_hook, Box<dyn ffi::IsUcHook>)>,
     /// To keep ownership over the mmio callbacks for this uc instance's lifetime
-    pub mmio_callbacks: Vec<MmioCallbackScope<'a>>,
+    pub mmio_callbacks: Vec<MmioCallbackScope>,
     pub data: D,
 }
 
+unsafe impl<D> Send for UnicornInner<D> {}
+
 /// Drop UC
-impl<'a, D> Drop for UnicornInner<'a, D> {
+impl<D> Drop for UnicornInner<D> {
     fn drop(&mut self) {
         if !self.ffi && !self.handle.is_null() {
             unsafe { ffi::uc_close(self.handle) };
@@ -151,22 +155,23 @@ impl<'a, D> Drop for UnicornInner<'a, D> {
 }
 
 /// A Unicorn emulator instance.
-pub struct Unicorn<'a, D: 'a> {
-    inner: Rc<UnsafeCell<UnicornInner<'a, D>>>,
+#[derive(Clone)]
+pub struct Unicorn<D> {
+    inner: Arc<Mutex<UnicornInner<D>>>,
 }
 
-impl<'a> Unicorn<'a, ()> {
+impl Unicorn<()> {
     /// Create a new instance of the unicorn engine for the specified architecture
     /// and hardware mode.
-    pub fn new(arch: Arch, mode: Mode) -> Result<Unicorn<'a, ()>, uc_error> {
+    pub fn new(arch: Arch, mode: Mode) -> Result<Unicorn<()>, uc_error> {
         Self::new_with_data(arch, mode, ())
     }
 }
 
-impl<'a> TryFrom<uc_handle> for Unicorn<'a, ()> {
+impl TryFrom<uc_handle> for Unicorn<()> {
     type Error = uc_error;
 
-    fn try_from(handle: uc_handle) -> Result<Unicorn<'a, ()>, uc_error> {
+    fn try_from(handle: uc_handle) -> Result<Unicorn<()>, uc_error> {
         if handle.is_null() {
             return Err(uc_error::HANDLE);
         }
@@ -176,7 +181,7 @@ impl<'a> TryFrom<uc_handle> for Unicorn<'a, ()> {
             return Err(err);
         }
         Ok(Unicorn {
-            inner: Rc::new(UnsafeCell::from(UnicornInner {
+            inner: Arc::new(Mutex::new(UnicornInner {
                 handle,
                 ffi: true,
                 arch: arch.try_into()?,
@@ -188,18 +193,15 @@ impl<'a> TryFrom<uc_handle> for Unicorn<'a, ()> {
     }
 }
 
-impl<'a, D> Unicorn<'a, D>
-where
-    D: 'a,
-{
+impl<D> Unicorn<D> {
     /// Create a new instance of the unicorn engine for the specified architecture
     /// and hardware mode.
-    pub fn new_with_data(arch: Arch, mode: Mode, data: D) -> Result<Unicorn<'a, D>, uc_error> {
+    pub fn new_with_data(arch: Arch, mode: Mode, data: D) -> Result<Unicorn<D>, uc_error> {
         let mut handle = core::ptr::null_mut();
         let err = unsafe { ffi::uc_open(arch, mode, &mut handle) };
         if err == uc_error::OK {
             Ok(Unicorn {
-                inner: Rc::new(UnsafeCell::from(UnicornInner {
+                inner: Arc::new(Mutex::new(UnicornInner {
                     handle,
                     ffi: false,
                     arch,
@@ -214,46 +216,38 @@ where
     }
 }
 
-impl<'a, D> core::fmt::Debug for Unicorn<'a, D> {
+impl<D> core::fmt::Debug for Unicorn<D>
+where
+    D: Clone + 'static,
+{
     fn fmt(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
         write!(formatter, "Unicorn {{ uc: {:p} }}", self.get_handle())
     }
 }
 
-impl<'a, D> Unicorn<'a, D> {
-    fn inner(&self) -> &UnicornInner<'a, D> {
-        unsafe { self.inner.get().as_ref().unwrap() }
-    }
-
-    fn inner_mut(&mut self) -> &mut UnicornInner<'a, D> {
-        unsafe { self.inner.get().as_mut().unwrap() }
-    }
-
+impl<D> Unicorn<D>
+where
+    D: Clone + 'static,
+{
     /// Return whatever data was passed during initialization.
     ///
     /// For an example, have a look at `utils::init_emu_with_heap` where
     /// a struct is passed which is used for a custom allocator.
     #[must_use]
-    pub fn get_data(&self) -> &D {
-        &self.inner().data
-    }
-
-    /// Return a mutable reference to whatever data was passed during initialization.
-    #[must_use]
-    pub fn get_data_mut(&mut self) -> &mut D {
-        &mut self.inner_mut().data
+    pub fn get_data(&self) -> D {
+        self.inner.lock().unwrap().data.clone()
     }
 
     /// Return the architecture of the current emulator.
     #[must_use]
     pub fn get_arch(&self) -> Arch {
-        self.inner().arch
+        self.inner.lock().unwrap().arch
     }
 
     /// Return the handle of the current emulator.
     #[must_use]
     pub fn get_handle(&self) -> uc_handle {
-        self.inner().handle
+        self.inner.lock().unwrap().handle
     }
 
     /// Returns a vector with the memory regions that are mapped in the emulator.
@@ -355,7 +349,7 @@ impl<'a, D> Unicorn<'a, D> {
     ///
     /// `address` must be aligned to 4kb or this will return `Error::ARG`.
     /// `size` must be a multiple of 4kb or this will return `Error::ARG`.
-    pub fn mmio_map<R: 'a, W: 'a>(
+    pub fn mmio_map<R, W>(
         &mut self,
         address: u64,
         size: libc::size_t,
@@ -363,8 +357,8 @@ impl<'a, D> Unicorn<'a, D> {
         write_callback: Option<W>,
     ) -> Result<(), uc_error>
     where
-        R: FnMut(&mut Unicorn<D>, u64, usize) -> u64,
-        W: FnMut(&mut Unicorn<D>, u64, usize, u64),
+        R: FnMut(&mut Unicorn<D>, u64, usize) -> u64 + 'static,
+        W: FnMut(&mut Unicorn<D>, u64, usize, u64) + 'static,
     {
         let mut read_data = read_callback.map(|c| {
             Box::new(ffi::UcHook {
@@ -404,11 +398,15 @@ impl<'a, D> Unicorn<'a, D> {
         if err == uc_error::OK {
             let rd = read_data.map(|c| c as Box<dyn ffi::IsUcHook>);
             let wd = write_data.map(|c| c as Box<dyn ffi::IsUcHook>);
-            self.inner_mut().mmio_callbacks.push(MmioCallbackScope {
-                regions: vec![(address, size)],
-                read_callback: rd,
-                write_callback: wd,
-            });
+            self.inner
+                .lock()
+                .unwrap()
+                .mmio_callbacks
+                .push(MmioCallbackScope {
+                    regions: vec![(address, size)],
+                    read_callback: rd,
+                    write_callback: wd,
+                });
 
             Ok(())
         } else {
@@ -420,14 +418,14 @@ impl<'a, D> Unicorn<'a, D> {
     ///
     /// `address` must be aligned to 4kb or this will return `Error::ARG`.
     /// `size` must be a multiple of 4kb or this will return `Error::ARG`.
-    pub fn mmio_map_ro<F: 'a>(
+    pub fn mmio_map_ro<F>(
         &mut self,
         address: u64,
         size: libc::size_t,
         callback: F,
     ) -> Result<(), uc_error>
     where
-        F: FnMut(&mut Unicorn<D>, u64, usize) -> u64,
+        F: FnMut(&mut Unicorn<D>, u64, usize) -> u64 + 'static,
     {
         self.mmio_map(
             address,
@@ -441,14 +439,14 @@ impl<'a, D> Unicorn<'a, D> {
     ///
     /// `address` must be aligned to 4kb or this will return `Error::ARG`.
     /// `size` must be a multiple of 4kb or this will return `Error::ARG`.
-    pub fn mmio_map_wo<F: 'a>(
+    pub fn mmio_map_wo<F>(
         &mut self,
         address: u64,
         size: libc::size_t,
         callback: F,
     ) -> Result<(), uc_error>
     where
-        F: FnMut(&mut Unicorn<D>, u64, usize, u64),
+        F: FnMut(&mut Unicorn<D>, u64, usize, u64) + 'static,
     {
         self.mmio_map(
             address,
@@ -475,12 +473,11 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     fn mmio_unmap(&mut self, address: u64, size: libc::size_t) {
-        for scope in self.inner_mut().mmio_callbacks.iter_mut() {
+        let mut inner = self.inner.lock().unwrap();
+        for scope in inner.mmio_callbacks.iter_mut() {
             scope.unmap(address, size);
         }
-        self.inner_mut()
-            .mmio_callbacks
-            .retain(|scope| scope.has_regions());
+        inner.mmio_callbacks.retain(|scope| scope.has_regions());
     }
 
     /// Set the memory permissions for an existing memory region.
@@ -586,7 +583,8 @@ impl<'a, D> Unicorn<'a, D> {
             return Err(uc_error::ARCH);
         }
 
-        let err: uc_error = unsafe { ffi::uc_reg_read(self.get_handle(), curr_reg_id, value.as_mut_ptr() as _) };
+        let err: uc_error =
+            unsafe { ffi::uc_reg_read(self.get_handle(), curr_reg_id, value.as_mut_ptr() as _) };
 
         if err == uc_error::OK {
             boxed = value.into_boxed_slice();
@@ -610,14 +608,14 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     /// Add a code hook.
-    pub fn add_code_hook<F: 'a>(
+    pub fn add_code_hook<F>(
         &mut self,
         begin: u64,
         end: u64,
         callback: F,
     ) -> Result<ffi::uc_hook, uc_error>
     where
-        F: FnMut(&mut crate::Unicorn<D>, u64, u32) + 'a,
+        F: FnMut(&mut crate::Unicorn<D>, u64, u32) + 'static,
     {
         let mut hook_ptr = core::ptr::null_mut();
         let mut user_data = Box::new(ffi::UcHook {
@@ -639,7 +637,7 @@ impl<'a, D> Unicorn<'a, D> {
             )
         };
         if err == uc_error::OK {
-            self.inner_mut().hooks.push((hook_ptr, user_data));
+            self.inner.lock().unwrap().hooks.push((hook_ptr, user_data));
             Ok(hook_ptr)
         } else {
             Err(err)
@@ -647,9 +645,9 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     /// Add a block hook.
-    pub fn add_block_hook<F: 'a>(&mut self, callback: F) -> Result<ffi::uc_hook, uc_error>
+    pub fn add_block_hook<F>(&mut self, callback: F) -> Result<ffi::uc_hook, uc_error>
     where
-        F: FnMut(&mut Unicorn<D>, u64, u32),
+        F: FnMut(&mut Unicorn<D>, u64, u32) + 'static,
     {
         let mut hook_ptr = core::ptr::null_mut();
         let mut user_data = Box::new(ffi::UcHook {
@@ -671,7 +669,7 @@ impl<'a, D> Unicorn<'a, D> {
             )
         };
         if err == uc_error::OK {
-            self.inner_mut().hooks.push((hook_ptr, user_data));
+            self.inner.lock().unwrap().hooks.push((hook_ptr, user_data));
 
             Ok(hook_ptr)
         } else {
@@ -680,7 +678,7 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     /// Add a memory hook.
-    pub fn add_mem_hook<F: 'a>(
+    pub fn add_mem_hook<F>(
         &mut self,
         hook_type: HookType,
         begin: u64,
@@ -688,7 +686,7 @@ impl<'a, D> Unicorn<'a, D> {
         callback: F,
     ) -> Result<ffi::uc_hook, uc_error>
     where
-        F: FnMut(&mut Unicorn<D>, MemType, u64, usize, i64) -> bool,
+        F: FnMut(&mut Unicorn<D>, MemType, u64, usize, i64) -> bool + 'static,
     {
         if !(HookType::MEM_ALL | HookType::MEM_READ_AFTER).contains(hook_type) {
             return Err(uc_error::ARG);
@@ -714,7 +712,7 @@ impl<'a, D> Unicorn<'a, D> {
             )
         };
         if err == uc_error::OK {
-            self.inner_mut().hooks.push((hook_ptr, user_data));
+            self.inner.lock().unwrap().hooks.push((hook_ptr, user_data));
 
             Ok(hook_ptr)
         } else {
@@ -723,9 +721,9 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     /// Add an interrupt hook.
-    pub fn add_intr_hook<F: 'a>(&mut self, callback: F) -> Result<ffi::uc_hook, uc_error>
+    pub fn add_intr_hook<F>(&mut self, callback: F) -> Result<ffi::uc_hook, uc_error>
     where
-        F: FnMut(&mut Unicorn<D>, u32),
+        F: FnMut(&mut Unicorn<D>, u32) + 'static,
     {
         let mut hook_ptr = core::ptr::null_mut();
         let mut user_data = Box::new(ffi::UcHook {
@@ -747,7 +745,7 @@ impl<'a, D> Unicorn<'a, D> {
             )
         };
         if err == uc_error::OK {
-            self.inner_mut().hooks.push((hook_ptr, user_data));
+            self.inner.lock().unwrap().hooks.push((hook_ptr, user_data));
 
             Ok(hook_ptr)
         } else {
@@ -756,9 +754,9 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     /// Add hook for invalid instructions
-    pub fn add_insn_invalid_hook<F: 'a>(&mut self, callback: F) -> Result<ffi::uc_hook, uc_error>
+    pub fn add_insn_invalid_hook<F>(&mut self, callback: F) -> Result<ffi::uc_hook, uc_error>
     where
-        F: FnMut(&mut Unicorn<D>) -> bool,
+        F: FnMut(&mut Unicorn<D>) -> bool + 'static,
     {
         let mut hook_ptr = core::ptr::null_mut();
         let mut user_data = Box::new(ffi::UcHook {
@@ -780,7 +778,7 @@ impl<'a, D> Unicorn<'a, D> {
             )
         };
         if err == uc_error::OK {
-            self.inner_mut().hooks.push((hook_ptr, user_data));
+            self.inner.lock().unwrap().hooks.push((hook_ptr, user_data));
 
             Ok(hook_ptr)
         } else {
@@ -789,9 +787,9 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     /// Add hook for x86 IN instruction.
-    pub fn add_insn_in_hook<F: 'a>(&mut self, callback: F) -> Result<ffi::uc_hook, uc_error>
+    pub fn add_insn_in_hook<F>(&mut self, callback: F) -> Result<ffi::uc_hook, uc_error>
     where
-        F: FnMut(&mut Unicorn<D>, u32, usize) -> u32,
+        F: FnMut(&mut Unicorn<D>, u32, usize) -> u32 + 'static,
     {
         let mut hook_ptr = core::ptr::null_mut();
         let mut user_data = Box::new(ffi::UcHook {
@@ -814,7 +812,7 @@ impl<'a, D> Unicorn<'a, D> {
             )
         };
         if err == uc_error::OK {
-            self.inner_mut().hooks.push((hook_ptr, user_data));
+            self.inner.lock().unwrap().hooks.push((hook_ptr, user_data));
 
             Ok(hook_ptr)
         } else {
@@ -823,9 +821,9 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     /// Add hook for x86 OUT instruction.
-    pub fn add_insn_out_hook<F: 'a>(&mut self, callback: F) -> Result<ffi::uc_hook, uc_error>
+    pub fn add_insn_out_hook<F>(&mut self, callback: F) -> Result<ffi::uc_hook, uc_error>
     where
-        F: FnMut(&mut Unicorn<D>, u32, usize, u32),
+        F: FnMut(&mut Unicorn<D>, u32, usize, u32) + 'static,
     {
         let mut hook_ptr = core::ptr::null_mut();
         let mut user_data = Box::new(ffi::UcHook {
@@ -848,7 +846,7 @@ impl<'a, D> Unicorn<'a, D> {
             )
         };
         if err == uc_error::OK {
-            self.inner_mut().hooks.push((hook_ptr, user_data));
+            self.inner.lock().unwrap().hooks.push((hook_ptr, user_data));
 
             Ok(hook_ptr)
         } else {
@@ -865,7 +863,7 @@ impl<'a, D> Unicorn<'a, D> {
         callback: F,
     ) -> Result<ffi::uc_hook, uc_error>
     where
-        F: FnMut(&mut Unicorn<D>) + 'a,
+        F: FnMut(&mut Unicorn<D>) + 'static,
     {
         let mut hook_ptr = core::ptr::null_mut();
         let mut user_data = Box::new(ffi::UcHook {
@@ -888,7 +886,7 @@ impl<'a, D> Unicorn<'a, D> {
             )
         };
         if err == uc_error::OK {
-            self.inner_mut().hooks.push((hook_ptr, user_data));
+            self.inner.lock().unwrap().hooks.push((hook_ptr, user_data));
 
             Ok(hook_ptr)
         } else {
@@ -901,7 +899,7 @@ impl<'a, D> Unicorn<'a, D> {
     /// `hook` is the value returned by `add_*_hook` functions.
     pub fn remove_hook(&mut self, hook: ffi::uc_hook) -> Result<(), uc_error> {
         // drop the hook
-        let inner = self.inner_mut();
+        let mut inner = self.inner.lock().unwrap();
         inner
             .hooks
             .retain(|(hook_ptr, _hook_impl)| hook_ptr != &hook);
