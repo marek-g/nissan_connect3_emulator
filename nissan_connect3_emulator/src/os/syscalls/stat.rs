@@ -10,7 +10,7 @@ use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn stat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
     let pathstr = unicorn.read_string(path);
-    let file_system = unicorn.get_data().file_system.clone();
+    let file_system = unicorn.get_data().inner.file_system.clone();
     let open_res = file_system
         .lock()
         .unwrap()
@@ -41,7 +41,7 @@ pub fn fstatat64(
 ) -> u32 {
     let path_name = unicorn.read_string(path);
     let path_name_new = get_path_relative_to_dir(unicorn, dir_fd, &path_name);
-    let file_system = unicorn.get_data().file_system.clone();
+    let file_system = unicorn.get_data().inner.file_system.clone();
 
     let open_res = file_system
         .lock()
@@ -70,7 +70,7 @@ pub fn fstatat64(
 pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
     // TODO: handle symbolic links
     let pathstr = unicorn.read_string(path);
-    let file_system = unicorn.get_data().file_system.clone();
+    let file_system = unicorn.get_data().inner.file_system.clone();
 
     let open_res = file_system
         .lock()
@@ -116,6 +116,7 @@ pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
 
     let res = if let Some((mount_point, _path)) = unicorn
         .get_data()
+        .inner
         .file_system
         .lock()
         .unwrap()
@@ -188,7 +189,7 @@ pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
 }
 
 fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, stat_buf: u32) -> u32 {
-    let file_system = unicorn.get_data().file_system.clone();
+    let file_system = unicorn.get_data().inner.file_system.clone();
 
     let res = if let Some(file_info) = file_system.lock().unwrap().get_file_info(fd as i32) {
         let mut stat_data = Vec::new();

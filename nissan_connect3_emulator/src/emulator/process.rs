@@ -1,4 +1,4 @@
-use crate::emulator::context::Context;
+use crate::emulator::context::{Context, ContextInner};
 use crate::emulator::mmu::Mmu;
 use crate::emulator::thread::Thread;
 use crate::file_system::MountFileSystem;
@@ -36,12 +36,14 @@ impl Process {
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         let thread_id = self.next_thread_id.fetch_add(1, Ordering::Relaxed);
         let context = Context {
-            mmu: self.mmu.clone(),
-            file_system: self.file_system.clone(),
-            sys_calls_state: self.sys_calls_state.clone(),
-            threads: self.threads.clone(),
-            next_thread_id: self.next_thread_id.clone(),
-            thread_id,
+            inner: Arc::new(ContextInner {
+                mmu: self.mmu.clone(),
+                file_system: self.file_system.clone(),
+                sys_calls_state: self.sys_calls_state.clone(),
+                threads: Arc::downgrade(&self.threads),
+                next_thread_id: self.next_thread_id.clone(),
+                thread_id,
+            }),
         };
 
         let (emu_main_thread, main_thread_handle) =

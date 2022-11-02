@@ -61,6 +61,7 @@ pub fn get_path_relative_to_dir(
             // of the calling process (like open())
             unicorn
                 .get_data()
+                .inner
                 .file_system
                 .lock()
                 .unwrap()
@@ -69,6 +70,7 @@ pub fn get_path_relative_to_dir(
         } else {
             if let Some(dirinfo) = unicorn
                 .get_data()
+                .inner
                 .file_system
                 .lock()
                 .unwrap()
@@ -78,6 +80,7 @@ pub fn get_path_relative_to_dir(
             } else {
                 unicorn
                     .get_data()
+                    .inner
                     .file_system
                     .lock()
                     .unwrap()
@@ -103,6 +106,7 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
             // F_GETFD
             if let Some(fileinfo) = unicorn
                 .get_data()
+                .inner
                 .file_system
                 .lock()
                 .unwrap()
@@ -117,6 +121,7 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
             // F_SETFD
             if let Ok(_) = unicorn
                 .get_data()
+                .inner
                 .file_system
                 .lock()
                 .unwrap()
@@ -131,6 +136,7 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
             // F_GETFL
             if let Some(fileinfo) = unicorn
                 .get_data()
+                .inner
                 .file_system
                 .lock()
                 .unwrap()
@@ -169,6 +175,7 @@ fn open_internal(unicorn: &mut Unicorn<Context>, path_name: &str, flags: u32, _m
 
     if let Ok(fd) = unicorn
         .get_data()
+        .inner
         .file_system
         .lock()
         .unwrap()

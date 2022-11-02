@@ -5,6 +5,7 @@ use unicorn_engine::{RegisterARM, Unicorn};
 pub fn writev(unicorn: &mut Unicorn<Context>, fd: u32, iov: u32, iovcnt: u32) -> u32 {
     let is_open = unicorn
         .get_data()
+        .inner
         .file_system
         .lock()
         .unwrap()
@@ -21,6 +22,7 @@ pub fn writev(unicorn: &mut Unicorn<Context>, fd: u32, iov: u32, iovcnt: u32) ->
 
             match unicorn
                 .get_data()
+                .inner
                 .file_system
                 .lock()
                 .unwrap()

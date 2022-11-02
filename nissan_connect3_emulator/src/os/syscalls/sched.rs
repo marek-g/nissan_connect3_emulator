@@ -74,9 +74,10 @@ pub fn clone(
     child_tid_ptr: u32,
     regs: u32,
 ) -> u32 {
-    let parent_tid = unicorn.get_data().thread_id;
+    let parent_tid = unicorn.get_data().inner.thread_id;
     let child_tid = unicorn
         .get_data()
+        .inner
         .next_thread_id
         .fetch_add(1, Ordering::Relaxed)
         + 1;

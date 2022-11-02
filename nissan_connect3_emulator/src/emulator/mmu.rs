@@ -102,27 +102,30 @@ impl MmuExtension for Unicorn<Context> {
         }
 
         // pause all threads
-        let threads = self.get_data().threads.clone();
-        for thread in threads.lock().unwrap().iter_mut() {
-            thread.pause().unwrap();
+        if let Some(threads) = self.get_data().inner.threads.upgrade() {
+            for thread in threads.lock().unwrap().iter_mut() {
+                thread.pause().unwrap();
+            }
         }
 
         // allocate memory
         let mut data = vec![0u8; size as usize];
 
-        for thread in threads.lock().unwrap().iter_mut() {
-            // unsafe is ok as long as:
-            // 1. data will not be moved (Vec resized etc.)
-            // 2. memory will be unmapped before deallocating data
-            unsafe {
-                let _ = thread
-                    .mem_map_ptr(
-                        address as u64,
-                        size as usize,
-                        perms,
-                        data.as_mut_ptr() as *mut c_void,
-                    )
-                    .unwrap();
+        if let Some(threads) = self.get_data().inner.threads.upgrade() {
+            for thread in threads.lock().unwrap().iter_mut() {
+                // unsafe is ok as long as:
+                // 1. data will not be moved (Vec resized etc.)
+                // 2. memory will be unmapped before deallocating data
+                unsafe {
+                    let _ = thread
+                        .mem_map_ptr(
+                            address as u64,
+                            size as usize,
+                            perms,
+                            data.as_mut_ptr() as *mut c_void,
+                        )
+                        .unwrap();
+                }
             }
         }
 
@@ -153,13 +156,16 @@ impl MmuExtension for Unicorn<Context> {
         );
 
         // resume all threads
-        for thread in threads.lock().unwrap().iter_mut() {
-            thread.resume();
+        if let Some(threads) = self.get_data().inner.threads.upgrade() {
+            for thread in threads.lock().unwrap().iter_mut() {
+                thread.resume();
+            }
         }
     }
 
     fn add_mapinfo(&mut self, map_info: MapInfo) {
         self.get_data()
+            .inner
             .mmu
             .lock()
             .unwrap()
@@ -170,6 +176,7 @@ impl MmuExtension for Unicorn<Context> {
     fn mmu_unmap(&mut self, address: u32, size: u32) {
         let (_, entry) = self
             .get_data()
+            .inner
             .mmu
             .lock()
             .unwrap()
@@ -177,19 +184,20 @@ impl MmuExtension for Unicorn<Context> {
             .remove_entry(&address)
             .unwrap();
 
-        // pause all threads
-        let threads = self.get_data().threads.clone();
-        for thread in threads.lock().unwrap().iter_mut() {
-            thread.pause().unwrap();
-        }
+        if let Some(threads) = self.get_data().inner.threads.upgrade() {
+            // pause all threads
+            for thread in threads.lock().unwrap().iter_mut() {
+                thread.pause().unwrap();
+            }
 
-        for thread in threads.lock().unwrap().iter_mut() {
-            thread.mem_unmap(address as u64, size as usize).unwrap();
-        }
+            for thread in threads.lock().unwrap().iter_mut() {
+                thread.mem_unmap(address as u64, size as usize).unwrap();
+            }
 
-        // resume all threads
-        for thread in threads.lock().unwrap().iter_mut() {
-            thread.resume();
+            // resume all threads
+            for thread in threads.lock().unwrap().iter_mut() {
+                thread.resume();
+            }
         }
 
         log::debug!(
@@ -204,21 +212,22 @@ impl MmuExtension for Unicorn<Context> {
     }
 
     fn mmu_mem_protect(&mut self, address: u32, size: u32, perms: Permission) {
-        // pause all threads
-        let threads = self.get_data().threads.clone();
-        for thread in threads.lock().unwrap().iter_mut() {
-            thread.pause().unwrap();
-        }
+        if let Some(threads) = self.get_data().inner.threads.upgrade() {
+            // pause all threads
+            for thread in threads.lock().unwrap().iter_mut() {
+                thread.pause().unwrap();
+            }
 
-        for thread in threads.lock().unwrap().iter_mut() {
-            thread
-                .mem_protect(address as u64, size as usize, perms)
-                .unwrap();
-        }
+            for thread in threads.lock().unwrap().iter_mut() {
+                thread
+                    .mem_protect(address as u64, size as usize, perms)
+                    .unwrap();
+            }
 
-        // resume all threads
-        for thread in threads.lock().unwrap().iter_mut() {
-            thread.resume();
+            // resume all threads
+            for thread in threads.lock().unwrap().iter_mut() {
+                thread.resume();
+            }
         }
     }
 
@@ -231,7 +240,7 @@ impl MmuExtension for Unicorn<Context> {
 
     fn update_map_info_filepath(&mut self, address: u32, size: u32, filepath: &str) {
         let data = self.get_data();
-        let map_infos = &mut data.mmu.lock().unwrap().map_infos;
+        let map_infos = &mut data.inner.mmu.lock().unwrap().map_infos;
         for (_key, value) in map_infos {
             if value.memory_start <= address && value.memory_end >= address + size {
                 value.filepath = filepath.to_string();
@@ -242,7 +251,7 @@ impl MmuExtension for Unicorn<Context> {
     fn display_mapped(&self) -> String {
         let mut v: Vec<_> = Vec::new();
         let data = self.get_data();
-        let mmu = data.mmu.lock().unwrap();
+        let mmu = data.inner.mmu.lock().unwrap();
         for (addr, map_info) in mmu.map_infos.iter() {
             v.push((addr, map_info));
         }
@@ -256,12 +265,12 @@ impl MmuExtension for Unicorn<Context> {
     }
 
     fn heap_alloc(&mut self, size: u32, perms: Permission, filepath: &str) -> u32 {
-        let heap_addr = self.get_data().mmu.lock().unwrap().heap_mem_end;
+        let heap_addr = self.get_data().inner.mmu.lock().unwrap().heap_mem_end;
 
         let size = mem_align_up(size, None);
         self.mmu_map(heap_addr, size, perms, "[heap]", filepath);
 
-        self.get_data().mmu.lock().unwrap().heap_mem_end = heap_addr + size;
+        self.get_data().inner.mmu.lock().unwrap().heap_mem_end = heap_addr + size;
 
         heap_addr
     }

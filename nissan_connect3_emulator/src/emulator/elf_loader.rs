@@ -88,30 +88,7 @@ impl<'a> ElfLoader for ArmElfLoader<'a> {
     }
 
     fn relocate(&mut self, _entry: RelocationEntry) -> Result<(), ElfLoaderErr> {
-        //use elfloader::arch::arm::RelocationTypes::*;
-        //use RelocationType::Arm;
-
-        //let addr: *mut u32 = (self.load_address + entry.offset as u32) as *mut u32;
-
-        //println!("relocation: {:?}", entry.rtype);
-
-        // TODO:
-
-        /*match entry.rtype {
-            x86_64(R_AMD64_RELATIVE) => {
-                // This type requires addend to be present
-                let addend = entry
-                    .addend
-                    .ok_or(ElfLoaderErr::UnsupportedRelocationEntry)?;
-
-                // This is a relative relocation, add the offset (where we put our
-                // binary in the vspace) to the addend and we're done.
-                //info!("R_RELATIVE *{:p} = {:#x}", addr, self.vbase + addend);
-                Ok(())
-            }
-            _ => Ok(()), // not implemented
-        }*/
-
+        // relocation code is not needed as we are running real interpreter
         Ok(())
     }
 
@@ -174,8 +151,8 @@ pub fn load_elf(
     log::debug!("mem_start: {:#x}", mem_start);
     log::debug!("mem_end: {:#x}", mem_end);
 
-    unicorn.get_data().mmu.lock().unwrap().brk_mem_end = mem_end;
-    unicorn.get_data().mmu.lock().unwrap().heap_mem_end = HEAP_START_ADDRESS;
+    unicorn.get_data().inner.mmu.lock().unwrap().brk_mem_end = mem_end;
+    unicorn.get_data().inner.mmu.lock().unwrap().heap_mem_end = HEAP_START_ADDRESS;
 
     // load interpreter
     let interp_address = 0u32;

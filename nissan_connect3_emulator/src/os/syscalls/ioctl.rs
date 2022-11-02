@@ -2,7 +2,7 @@ use crate::emulator::context::Context;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn ioctl(mut unicorn: &mut Unicorn<Context>, fd: u32, request: u32, addr: u32) -> u32 {
-    let file_system = unicorn.get_data().file_system.clone();
+    let file_system = unicorn.get_data().inner.file_system.clone();
     let res = file_system
         .lock()
         .unwrap()

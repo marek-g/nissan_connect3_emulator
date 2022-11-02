@@ -107,7 +107,7 @@ fn mmapx(
     // load file
     let mut buf = Vec::new();
     let mut filepath = String::new();
-    let file_system = &mut unicorn.get_data().file_system.clone();
+    let file_system = &mut unicorn.get_data().inner.file_system.clone();
     let file_info_res = file_system.lock().unwrap().get_file_info(fd as i32);
     if let Some(fileinfo) = file_info_res {
         let mut file_system = file_system.lock().unwrap();

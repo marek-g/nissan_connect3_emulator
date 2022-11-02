@@ -6,7 +6,7 @@ use unicorn_engine::Unicorn;
 use xmas_elf::program;
 
 pub fn load_binary(unicorn: &mut Unicorn<Context>, filepath: &str) -> Vec<u8> {
-    let data = unicorn.get_data();
+    let data = unicorn.get_data().inner;
     let file_system = &mut data.file_system.lock().unwrap();
     if let Ok(fd) = file_system.open(filepath, OpenFileFlags::READ) {
         let size = file_system.get_length(fd);

@@ -10,9 +10,9 @@ use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn brk(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
     let res = if addr == 0 {
-        unicorn.get_data().mmu.lock().unwrap().brk_mem_end
+        unicorn.get_data().inner.mmu.lock().unwrap().brk_mem_end
     } else {
-        let brk_mem_end = unicorn.get_data().mmu.lock().unwrap().brk_mem_end;
+        let brk_mem_end = unicorn.get_data().inner.mmu.lock().unwrap().brk_mem_end;
         let new_brk_mem_end = mem_align_up(addr, None);
         if new_brk_mem_end > brk_mem_end {
             unicorn.mmu_map(
@@ -25,7 +25,7 @@ pub fn brk(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
         } else if new_brk_mem_end < brk_mem_end {
             unicorn.mmu_unmap(new_brk_mem_end, brk_mem_end - new_brk_mem_end);
         }
-        unicorn.get_data().mmu.lock().unwrap().brk_mem_end = new_brk_mem_end;
+        unicorn.get_data().inner.mmu.lock().unwrap().brk_mem_end = new_brk_mem_end;
         new_brk_mem_end
     };
 
@@ -42,6 +42,7 @@ pub fn access(unicorn: &mut Unicorn<Context>, path_name: u32, mode: u32) -> u32 
     let path_name = unicorn.read_string(path_name);
     let exists = unicorn
         .get_data()
+        .inner
         .file_system
         .lock()
         .unwrap()
@@ -62,6 +63,7 @@ pub fn access(unicorn: &mut Unicorn<Context>, path_name: u32, mode: u32) -> u32 
 pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
     unicorn
         .get_data()
+        .inner
         .sys_calls_state
         .lock()
         .unwrap()
@@ -70,6 +72,7 @@ pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
 
     let res = if let Ok(_) = unicorn
         .get_data()
+        .inner
         .file_system
         .lock()
         .unwrap()
@@ -92,7 +95,7 @@ pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
 
 pub fn read(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u32 {
     let mut buf2 = vec![0u8; length as usize];
-    let file_system = &mut unicorn.get_data().file_system.clone();
+    let file_system = &mut unicorn.get_data().inner.file_system.clone();
     let res = if file_system.lock().unwrap().is_open(fd as i32) {
         match file_system.lock().unwrap().read(fd as i32, &mut buf2) {
             Ok(len) => {
@@ -122,7 +125,7 @@ pub fn read(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u
 pub fn write(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u32 {
     let mut buf2 = vec![0u8; length as usize];
     unicorn.mem_read(buf as u64, &mut buf2).unwrap();
-    let file_system = &mut unicorn.get_data().file_system.clone();
+    let file_system = &mut unicorn.get_data().inner.file_system.clone();
     let is_open = file_system.lock().unwrap().is_open(fd as i32);
     let res = if is_open {
         match file_system.lock().unwrap().write(fd as i32, &buf2) {
@@ -151,11 +154,12 @@ pub fn write(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> 
 }
 
 pub fn getdents64(unicorn: &mut Unicorn<Context>, fd: u32, dirp: u32, count: u32) -> u32 {
-    let file_system = unicorn.get_data().file_system.clone();
+    let file_system = unicorn.get_data().inner.file_system.clone();
 
     // get dir entries to iterate through
     let dir_entries = if let Some(prev_list) = unicorn
         .get_data()
+        .inner
         .sys_calls_state
         .lock()
         .unwrap()
@@ -272,6 +276,7 @@ fn get_dents_internal(
                 rest_entries.extend_from_slice(&dir_entries[no_copied_entries..]);
                 unicorn
                     .get_data()
+                    .inner
                     .sys_calls_state
                     .lock()
                     .unwrap()
@@ -327,9 +332,10 @@ pub fn get_pid(unicorn: &mut Unicorn<Context>) -> u32 {
 }
 
 pub fn exit_group(unicorn: &mut Unicorn<Context>, status: u32) -> u32 {
-    let threads = unicorn.get_data().threads.clone();
-    for thread in threads.lock().unwrap().iter_mut() {
-        thread.exit().unwrap();
+    if let Some(threads) = unicorn.get_data().inner.threads.upgrade() {
+        for thread in threads.lock().unwrap().iter_mut() {
+            thread.exit().unwrap();
+        }
     }
 
     log::trace!(
@@ -348,6 +354,7 @@ pub fn link(unicorn: &mut Unicorn<Context>, old_path: u32, new_path: u32) -> u32
 
     let res = match unicorn
         .get_data()
+        .inner
         .file_system
         .lock()
         .unwrap()
@@ -371,7 +378,14 @@ pub fn link(unicorn: &mut Unicorn<Context>, old_path: u32, new_path: u32) -> u32
 pub fn unlink(unicorn: &mut Unicorn<Context>, path: u32) -> u32 {
     let path = unicorn.read_string(path);
 
-    let res = match unicorn.get_data().file_system.lock().unwrap().unlink(&path) {
+    let res = match unicorn
+        .get_data()
+        .inner
+        .file_system
+        .lock()
+        .unwrap()
+        .unlink(&path)
+    {
         Ok(_) => 0u32,
         Err(err) => err.to_syscall_error(),
     };
@@ -389,6 +403,7 @@ pub fn unlink(unicorn: &mut Unicorn<Context>, path: u32) -> u32 {
 pub fn ftruncate(unicorn: &mut Unicorn<Context>, fd: u32, length: u32) -> u32 {
     let res = match unicorn
         .get_data()
+        .inner
         .file_system
         .lock()
         .unwrap()
