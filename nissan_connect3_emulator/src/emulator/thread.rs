@@ -31,42 +31,69 @@ impl Thread {
         elf_filepath: String,
         program_args: Vec<String>,
         program_envs: Vec<(String, String)>,
-    ) -> (
-        Self,
-        JoinHandle<Result<(), Box<dyn Error + Send + Sync + 'static>>>,
-    ) {
-        let unicorn = Unicorn::new_with_data(Arch::ARM, Mode::LITTLE_ENDIAN, context)
+    ) -> Result<
+        (
+            Self,
+            JoinHandle<Result<(), Box<dyn Error + Send + Sync + 'static>>>,
+        ),
+        Box<dyn Error + Send + Sync + 'static>,
+    > {
+        let mut unicorn = Unicorn::new_with_data(Arch::ARM, Mode::LITTLE_ENDIAN, context)
             .map_err(|err| format!("Unicorn error: {:?}", err))
+            .unwrap();
+
+        unicorn.add_intr_hook(crate::os::hook_syscall).unwrap();
+        unicorn
+            .add_mem_hook(HookType::MEM_FETCH_UNMAPPED, 1, 0, callback_mem_error)
+            .unwrap();
+        unicorn
+            .add_mem_hook(HookType::MEM_READ_UNMAPPED, 1, 0, callback_mem_rw)
+            .unwrap();
+        unicorn
+            .add_mem_hook(HookType::MEM_WRITE_UNMAPPED, 1, 0, callback_mem_rw)
+            .unwrap();
+        unicorn
+            .add_mem_hook(HookType::MEM_WRITE_PROT, 1, 0, callback_mem_rw)
             .unwrap();
 
         let is_paused = Arc::new(AtomicBool::new(false));
         let is_exit = Arc::new(AtomicBool::new(false));
 
-        let (init_tx, init_rx) = channel();
         let (resume_tx, resume_rx) = channel();
 
         let handle = thread::spawn({
-            let unicorn = unicorn.clone();
+            let mut unicorn = unicorn.clone();
             let is_paused = is_paused.clone();
             let is_exit = is_exit.clone();
             move || {
-                emu_thread_func(
-                    unicorn,
-                    elf_filepath.clone(),
-                    program_args,
-                    program_envs,
-                    is_paused,
-                    is_exit,
-                    init_tx,
-                    resume_rx,
-                )
+                let buf = load_binary(&mut unicorn, &elf_filepath);
+
+                let (interp_entry_point, elf_entry, stack_ptr) = load_elf(
+                    &mut unicorn,
+                    &elf_filepath,
+                    &buf,
+                    &program_args,
+                    &program_envs,
+                )?;
+
+                unicorn
+                    .reg_write(RegisterARM::SP as i32, stack_ptr as u64)
+                    .unwrap();
+
+                set_kernel_traps(&mut unicorn);
+                enable_vfp(&mut unicorn);
+
+                log::info!(
+                    "========== Start program (interp_entry_point: {:#x}, elf_entry_point: {:#x}) ==========",
+                    interp_entry_point,
+                    elf_entry
+                );
+
+                emu_thread_loop(unicorn, interp_entry_point, is_paused, is_exit, resume_rx)
             }
         });
 
-        // wait for unicorn to be initialized (when unicorn_handle is set)
-        init_rx.recv().unwrap();
-
-        (
+        Ok((
             Self {
                 unicorn,
                 is_paused,
@@ -74,7 +101,7 @@ impl Thread {
                 resume_tx,
             },
             handle,
-        )
+        ))
     }
 
     /*pub fn clone(
@@ -136,58 +163,14 @@ impl Thread {
     }
 }
 
-fn emu_thread_func(
+fn emu_thread_loop(
     mut unicorn: Unicorn<Context>,
-    elf_filepath: String,
-    program_args: Vec<String>,
-    program_envs: Vec<(String, String)>,
+    start_address: u32,
     is_paused: Arc<AtomicBool>,
     is_exit: Arc<AtomicBool>,
-    init_tx: Sender<()>,
     resume_rx: Receiver<()>,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    init_tx.send(()).unwrap();
-    drop(init_tx);
-
-    let buf = load_binary(&mut unicorn, &elf_filepath);
-
-    let (interp_entry_point, elf_entry, stack_ptr) = load_elf(
-        &mut unicorn,
-        &elf_filepath,
-        &buf,
-        &program_args,
-        &program_envs,
-    )?;
-
-    set_kernel_traps(&mut unicorn);
-    enable_vfp(&mut unicorn);
-
-    unicorn.add_intr_hook(crate::os::hook_syscall).unwrap();
-    unicorn
-        .add_mem_hook(HookType::MEM_FETCH_UNMAPPED, 1, 0, callback_mem_error)
-        .unwrap();
-    unicorn
-        .add_mem_hook(HookType::MEM_READ_UNMAPPED, 1, 0, callback_mem_rw)
-        .unwrap();
-    unicorn
-        .add_mem_hook(HookType::MEM_WRITE_UNMAPPED, 1, 0, callback_mem_rw)
-        .unwrap();
-    unicorn
-        .add_mem_hook(HookType::MEM_WRITE_PROT, 1, 0, callback_mem_rw)
-        .unwrap();
-
-    unicorn
-        .reg_write(RegisterARM::SP as i32, stack_ptr as u64)
-        .unwrap();
-
-    log::info!(
-        "========== Start program (interp_entry_point: {:#x}, elf_entry_point: {:#x}) ==========",
-        interp_entry_point,
-        elf_entry
-    );
-
-    let mut start_address = interp_entry_point;
-
+    let mut start_address = start_address;
     loop {
         if !is_paused.load(Ordering::Relaxed) {
             log::trace!("{:#x}: thread start or resume", start_address);

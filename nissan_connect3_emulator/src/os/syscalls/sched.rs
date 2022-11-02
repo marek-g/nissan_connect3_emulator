@@ -1,4 +1,5 @@
 use crate::emulator::context::Context;
+use crate::emulator::thread::Thread;
 use crate::emulator::utils::pack_u32;
 use std::sync::atomic::Ordering;
 use unicorn_engine::{RegisterARM, Unicorn};

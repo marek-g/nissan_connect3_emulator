@@ -47,7 +47,7 @@ impl Process {
         };
 
         let (emu_main_thread, main_thread_handle) =
-            Thread::start_elf_file(context, elf_filepath, program_args, program_envs);
+            Thread::start_elf_file(context, elf_filepath, program_args, program_envs)?;
 
         self.threads.lock().unwrap().push(emu_main_thread);
 
