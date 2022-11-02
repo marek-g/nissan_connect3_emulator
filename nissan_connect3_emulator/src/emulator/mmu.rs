@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::error::Error;
 use std::ffi::c_void;
 
 use crate::emulator::context::Context;
@@ -34,7 +35,11 @@ pub trait MmuExtension {
     fn add_mapinfo(&mut self, map_info: MapInfo);
     fn mmu_unmap(&mut self, address: u32, size: u32);
     fn mmu_mem_protect(&mut self, address: u32, size: u32, perms: Permission);
-    fn is_mapped(&mut self, address: u32, size: u32) -> bool;
+    fn mmu_clone_map(
+        &self,
+        dest_unicorn: &mut Unicorn<Context>,
+    ) -> Result<(), Box<dyn Error + Send + Sync + 'static>>;
+    fn is_mapped(&self, address: u32, size: u32) -> bool;
     fn update_map_info_filepath(&mut self, address: u32, size: u32, filename: &str);
     fn display_mapped(&self) -> String;
 
@@ -231,7 +236,28 @@ impl MmuExtension for Unicorn<Context> {
         }
     }
 
-    fn is_mapped(&mut self, address: u32, size: u32) -> bool {
+    fn mmu_clone_map(
+        &self,
+        dest_unicorn: &mut Unicorn<Context>,
+    ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        let data = self.get_data();
+        let mmu = data.inner.mmu.lock().unwrap();
+        for (_, map_info) in &mmu.map_infos {
+            unsafe {
+                dest_unicorn
+                    .mem_map_ptr(
+                        map_info.memory_start as u64,
+                        (map_info.memory_end - map_info.memory_start) as usize,
+                        map_info.memory_perms,
+                        map_info.data.as_ptr() as *mut c_void,
+                    )
+                    .map_err(|err| format!("Unicorn mem_map_ptr error: {:?}", err))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_mapped(&self, address: u32, size: u32) -> bool {
         let regions = self.mem_regions().unwrap();
         regions
             .iter()

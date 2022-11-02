@@ -23,8 +23,9 @@ pub fn stat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
         -1i32 as u32
     };
     log::trace!(
-        "{:#x}: [SYSCALL] stat64(path = {}, stat_buf = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] stat64(path = {}, stat_buf = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         pathstr,
         stat_buf,
         res
@@ -56,8 +57,9 @@ pub fn fstatat64(
     };
 
     log::trace!(
-        "{:#x}: [SYSCALL] fstatat64(dir_fd: {:#x}, path = {}, stat_buf = {:#x}, flags = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] fstatat64(dir_fd: {:#x}, path = {}, stat_buf = {:#x}, flags = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         dir_fd,
         path_name,
         stat_buf,
@@ -87,8 +89,9 @@ pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 
     };
 
     log::trace!(
-        "{:#x}: [SYSCALL] lstat64(path = {}, stat_buf = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] lstat64(path = {}, stat_buf = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         pathstr,
         stat_buf,
         res
@@ -100,8 +103,9 @@ pub fn fstat64(unicorn: &mut Unicorn<Context>, fd: u32, stat_buf: u32) -> u32 {
     let res = fstat64_internal(unicorn, fd, stat_buf);
 
     log::trace!(
-        "{:#x}: [SYSCALL] fstat64(fd = {:#x}, stat_buf = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] fstat64(fd = {:#x}, stat_buf = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         fd,
         stat_buf,
         res
@@ -179,8 +183,9 @@ pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
     }
 
     log::trace!(
-        "{:#x}: [SYSCALL] statfs(path = {}, buf = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] statfs(path = {}, buf = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         file_path,
         buf,
         res

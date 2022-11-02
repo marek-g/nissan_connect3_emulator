@@ -196,8 +196,9 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
         983045 => linux::set_tls(unicorn, unicorn.get_u32_arg(0)),
         _ => {
             panic!(
-                "{:#x}: not implemented syscall #{} (int {}), args: {:#x}, {:#x}, {:#x}, ...",
+                "{:#x}: [{}] not implemented syscall #{} (int {}), args: {:#x}, {:#x}, {:#x}, ...",
                 unicorn.reg_read(RegisterARM::PC).unwrap(),
+                unicorn.get_data().inner.thread_id,
                 unicorn.get_syscall_number(),
                 int_no,
                 unicorn.get_u32_arg(0),

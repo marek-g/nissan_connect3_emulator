@@ -15,8 +15,9 @@ pub fn mmap(
     off_t: u32,
 ) -> u32 {
     let res = mmapx(unicorn, addr, length, prot, flags, fd, off_t);
-    log::trace!("{:#x} [SYSCALL] mmap(addr = {:#x}, length = {:#x}, prot = {:#x}, flags = {:#x}, fd = {:#x}, off_t: {:#x}) => {:#x}",
+    log::trace!("{:#x} [{}] [SYSCALL] mmap(addr = {:#x}, length = {:#x}, prot = {:#x}, flags = {:#x}, fd = {:#x}, off_t: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         addr, length, prot, flags, fd, off_t, res);
     res
 }
@@ -31,8 +32,9 @@ pub fn mmap2(
     pgoffset: u32,
 ) -> u32 {
     let res = mmapx(unicorn, addr, length, prot, flags, fd, pgoffset * 0x1000);
-    log::trace!("{:#x} [SYSCALL] mmap2(addr = {:#x}, length = {:#x}, prot = {:#x}, flags = {:#x}, fd = {:#x}, pgoffset: {:#x}) => {:#x}",
+    log::trace!("{:#x} [{}] [SYSCALL] mmap2(addr = {:#x}, length = {:#x}, prot = {:#x}, flags = {:#x}, fd = {:#x}, pgoffset: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         addr, length, prot, flags, fd, pgoffset, res);
     res
 }
@@ -43,8 +45,9 @@ pub fn munmap(unicorn: &mut Unicorn<Context>, addr: u32, length: u32) -> u32 {
     unicorn.mmu_unmap(addr, mem_align_up(length, None));
 
     log::trace!(
-        "{:#x} [SYSCALL] munmap(addr = {:#x}, len = {:#x}) => {:#x}",
+        "{:#x} [{}] [SYSCALL] munmap(addr = {:#x}, len = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         addr,
         length,
         res
@@ -58,8 +61,9 @@ pub fn mprotect(unicorn: &mut Unicorn<Context>, addr: u32, len: u32, prot: u32) 
     unicorn.mmu_mem_protect(addr, mem_align_up(len, None), prot_to_permission(prot));
 
     log::trace!(
-        "{:#x} [SYSCALL] mprotect(addr = {:#x}, len = {:#x}, prot = {:#x}) => {:#x}",
+        "{:#x} [{}] [SYSCALL] mprotect(addr = {:#x}, len = {:#x}, prot = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         addr,
         len,
         prot,
@@ -72,8 +76,9 @@ pub fn mincore(unicorn: &mut Unicorn<Context>, addr: u32, length: u32, vec: u32)
     let bytes = vec![1u8; ((length + 0x1000 - 1) / 0x1000) as usize];
     unicorn.mem_write(vec as u64, &bytes).unwrap();
     log::trace!(
-        "{:#x} [SYSCALL] mincore(addr = {:#x}, length = {:#x}, vec = {:#x}) => {:#x}",
+        "{:#x} [{}] [SYSCALL] mincore(addr = {:#x}, length = {:#x}, vec = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         addr,
         length,
         vec,

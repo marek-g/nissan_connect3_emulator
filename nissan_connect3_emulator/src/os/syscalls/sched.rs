@@ -1,7 +1,10 @@
 use crate::emulator::context::Context;
+use crate::emulator::print::{disasm, mem_dump, print_stack};
 use crate::emulator::thread::Thread;
-use crate::emulator::utils::pack_u32;
+use crate::emulator::utils::{pack_u32, unpack_u32};
+use crate::os::syscalls::linux;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn sched_get_priority_min(unicorn: &mut Unicorn<Context>, policy: u32) -> u32 {
@@ -16,8 +19,9 @@ pub fn sched_get_priority_min(unicorn: &mut Unicorn<Context>, policy: u32) -> u3
     };
 
     log::trace!(
-        "{:#x}: [SYSCALL] sched_get_priority_min(policy = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] sched_get_priority_min(policy = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         policy,
         res
     );
@@ -37,8 +41,9 @@ pub fn sched_get_priority_max(unicorn: &mut Unicorn<Context>, policy: u32) -> u3
     };
 
     log::trace!(
-        "{:#x}: [SYSCALL] sched_get_priority_min(policy = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] sched_get_priority_min(policy = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         policy,
         res
     );
@@ -55,8 +60,9 @@ pub fn sched_setscheduler(
     let res = 0u32;
 
     log::trace!(
-        "{:#x}: [SYSCALL] sched_setscheduler(pid = {:#x}, policy = {:#x}, param_addr = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] sched_setscheduler(pid = {:#x}, policy = {:#x}, param_addr = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         pid,
         policy,
         param_addr,
@@ -80,8 +86,7 @@ pub fn clone(
         .get_data()
         .inner
         .next_thread_id
-        .fetch_add(1, Ordering::Relaxed)
-        + 1;
+        .fetch_add(1, Ordering::Relaxed);
 
     /*print_stack(unicorn);
     mem_dump(unicorn, regs, 128);
@@ -102,14 +107,16 @@ pub fn clone(
         .mem_write(child_tid_ptr as u64, &pack_u32(child_tid))
         .unwrap();
 
-    //let (new_thread, join_handle) = Thread::clone(unicorn, child_tid, child_tls, child_stack);
-    //unicorn.get_data_mut().threads
+    let (new_thread, _) = Thread::clone(unicorn, child_tid, child_tls, child_stack).unwrap();
+    if let Some(threads) = unicorn.get_data().inner.threads.upgrade() {
+        threads.lock().unwrap().push(new_thread);
+    }
 
     let res = child_tid as u32;
-
     log::trace!(
-        "{:#x}: [SYSCALL] clone(flags = {:#x}, child_stack: {:#x}, parent_tid_ptr: {:#x}, child_tls: {:#x}, child_tid_ptr: {:#x}, regs: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] clone(flags = {:#x}, child_stack: {:#x}, parent_tid_ptr: {:#x}, child_tls: {:#x}, child_tid_ptr: {:#x}, regs: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         flags,
         child_stack,
         parent_tid_ptr,
@@ -118,6 +125,8 @@ pub fn clone(
         regs,
         res
     );
+
+    std::thread::sleep(Duration::from_secs(3));
 
     res
 }

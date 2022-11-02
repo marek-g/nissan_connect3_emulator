@@ -20,8 +20,9 @@ pub fn clock_gettime(unicorn: &mut Unicorn<Context>, clock_id: u32, time_spec: u
         .unwrap();
 
     log::trace!(
-        "{:#x}: [SYSCALL] clock_gettime(clock_id = {:#x}, time_spec: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] clock_gettime(clock_id = {:#x}, time_spec: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         clock_id,
         time_spec,
         0
@@ -54,8 +55,9 @@ pub fn gettimeofday(unicorn: &mut Unicorn<Context>, time_val: u32, time_zone: u3
     }
 
     log::trace!(
-        "{:#x}: [SYSCALL] gettimeofday(time_val = {:#x}, time_zone: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] gettimeofday(time_val = {:#x}, time_zone: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         time_val,
         time_zone,
         0
