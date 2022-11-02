@@ -1,8 +1,8 @@
-use crate::emulator::context::Context;
+use crate::emulator::context::{Context, ContextInner};
 use crate::emulator::elf_loader::load_elf;
 use crate::emulator::memory_map::GET_TLS_ADDR;
 use crate::emulator::mmu::MmuExtension;
-use crate::emulator::utils::load_binary;
+use crate::emulator::utils::{load_binary, pack_u32};
 use core::ffi::c_void;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -104,33 +104,130 @@ impl Thread {
         ))
     }
 
-    /*pub fn clone(
-        unicorn: &Unicorn<Context>,
+    pub fn clone(
+        source_unicorn: &Unicorn<Context>,
         child_thread_id: u32,
         child_tls: u32,
         child_stack: u32,
-    ) -> (
-        Self,
-        JoinHandle<Result<(), Box<dyn Error + Send + Sync + 'static>>>,
-    ) {
-        linux::set_tls(unicorn, child_tls);
+    ) -> Result<
+        (
+            Self,
+            JoinHandle<Result<(), Box<dyn Error + Send + Sync + 'static>>>,
+        ),
+        Box<dyn Error + Send + Sync + 'static>,
+    > {
+        let source_context = source_unicorn.get_data();
+        let context = Context {
+            inner: Arc::new(ContextInner {
+                mmu: source_context.inner.mmu.clone(),
+                file_system: source_context.inner.file_system.clone(),
+                sys_calls_state: source_context.inner.sys_calls_state.clone(),
+                threads: source_context.inner.threads.clone(),
+                next_thread_id: source_context.inner.next_thread_id.clone(),
+                thread_id: child_thread_id,
+            }),
+        };
+
+        let mut unicorn = Unicorn::new_with_data(Arch::ARM, Mode::LITTLE_ENDIAN, context)
+            .map_err(|err| format!("Unicorn error: {:?}", err))
+            .unwrap();
+
+        // copy registers
+        let registers_context = source_unicorn
+            .context_init()
+            .map_err(|err| format!("Unicorn context init error: {:?}", err))?;
+        unicorn
+            .context_restore(&registers_context)
+            .map_err(|err| format!("Unicorn context restore error: {:?}", err))?;
+        /*unicorn
+        .reg_write(
+            RegisterARM::PC,
+            source_unicorn.reg_read(RegisterARM::PC).unwrap(),
+        )
+        .unwrap();*/
+
+        unicorn.add_intr_hook(crate::os::hook_syscall).unwrap();
+        unicorn
+            .add_mem_hook(HookType::MEM_FETCH_UNMAPPED, 1, 0, callback_mem_error)
+            .unwrap();
+        unicorn
+            .add_mem_hook(HookType::MEM_READ_UNMAPPED, 1, 0, callback_mem_rw)
+            .unwrap();
+        unicorn
+            .add_mem_hook(HookType::MEM_WRITE_UNMAPPED, 1, 0, callback_mem_rw)
+            .unwrap();
+        unicorn
+            .add_mem_hook(HookType::MEM_WRITE_PROT, 1, 0, callback_mem_rw)
+            .unwrap();
+
+        // copy memory map
+        source_unicorn.mmu_clone_map(&mut unicorn)?;
+
+        // TODO: set kernel traps and tls for new thread
+        //set_kernel_traps(&mut unicorn);
+        //linux::set_tls(unicorn, child_tls);
+
+        // set tls
+        unicorn
+            .reg_write(RegisterARM::C13_C0_3, child_tls as u64)
+            .unwrap();
+        unicorn
+            .mem_write(GET_TLS_ADDR as u64 + 16, &pack_u32(child_tls))
+            .unwrap();
+
+        enable_vfp(&mut unicorn);
+
+        // the address to continue is stored on new stack
         unicorn
             .reg_write(RegisterARM::SP, child_stack as u64)
             .unwrap();
-        let res = 0i32 as u32;
-    }*/
+
+        // set child_thread_id in R0 (result from syscall)
+        unicorn
+            .reg_write(RegisterARM::R0 as i32, child_thread_id as u64)
+            .unwrap();
+
+        let is_paused = Arc::new(AtomicBool::new(false));
+        let is_exit = Arc::new(AtomicBool::new(false));
+
+        let (resume_tx, resume_rx) = channel();
+
+        let handle = thread::spawn({
+            let unicorn = unicorn.clone();
+            let is_paused = is_paused.clone();
+            let is_exit = is_exit.clone();
+            move || {
+                let pc = unicorn.reg_read(RegisterARM::PC).unwrap() as u32;
+
+                log::info!("========== Clone thread at address: {:#x} ==========", pc);
+
+                emu_thread_loop(unicorn, pc, is_paused, is_exit, resume_rx)
+            }
+        });
+
+        Ok((
+            Self {
+                unicorn,
+                is_paused,
+                is_exit,
+                resume_tx,
+            },
+            handle,
+        ))
+    }
 
     pub fn pause(&mut self) -> Result<(), uc_error> {
-        self.is_paused.store(true, Ordering::Relaxed);
+        /*self.is_paused.store(true, Ordering::Relaxed);
 
-        self.unicorn.emu_stop()
+        self.unicorn.emu_stop()*/
+        Ok(())
     }
 
     pub fn resume(&mut self) {
-        if self.is_paused.load(Ordering::Relaxed) {
+        /*if self.is_paused.load(Ordering::Relaxed) {
             self.is_paused.store(false, Ordering::Relaxed);
             self.resume_tx.send(()).unwrap();
-        }
+        }*/
     }
 
     pub fn exit(&mut self) -> Result<(), uc_error> {
@@ -165,15 +262,18 @@ impl Thread {
 
 fn emu_thread_loop(
     mut unicorn: Unicorn<Context>,
-    start_address: u32,
+    mut start_address: u32,
     is_paused: Arc<AtomicBool>,
     is_exit: Arc<AtomicBool>,
     resume_rx: Receiver<()>,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    let mut start_address = start_address;
     loop {
         if !is_paused.load(Ordering::Relaxed) {
-            log::trace!("{:#x}: thread start or resume", start_address);
+            log::trace!(
+                "{:#x}: [{}] thread start or resume",
+                start_address,
+                unicorn.get_data().inner.thread_id
+            );
             match unicorn.emu_start(start_address as u64, 0, 0, 0) {
                 Ok(()) => {
                     if is_exit.load(Ordering::Relaxed) {
@@ -183,7 +283,11 @@ fn emu_thread_loop(
                         // we have stopped because the pause was requested
 
                         start_address = unicorn.reg_read(RegisterARM::PC).unwrap() as u32;
-                        log::trace!("{:#x}: thread paused", start_address);
+                        log::trace!(
+                            "{:#x}: [{}] thread paused",
+                            start_address,
+                            unicorn.get_data().inner.thread_id,
+                        );
 
                         // wait for the signal to resume
                         resume_rx.recv().unwrap();
@@ -191,8 +295,9 @@ fn emu_thread_loop(
                 }
                 Err(error) => {
                     log::error!(
-                        "{:#x}: Execution error: {:?}",
+                        "{:#x}: [{}] Execution error: {:?}",
                         unicorn.reg_read(RegisterARM::PC).unwrap(),
+                        unicorn.get_data().inner.thread_id,
                         error
                     );
                     break;
@@ -292,8 +397,9 @@ pub fn callback_mem_error(
     value: i64,
 ) -> bool {
     log::error!(
-        "{:#x}: callback_mem_error {:?} - address {:#x}, size: {:#x}, value: {:#x}",
+        "{:#x}: [{}] callback_mem_error {:?} - address {:#x}, size: {:#x}, value: {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         memtype,
         address,
         size,
@@ -311,8 +417,9 @@ pub fn callback_mem_rw(
     value: i64,
 ) -> bool {
     log::error!(
-        "{:#x}: callback_mem_rw {:?} - address {:#x}, size: {:#x}, value: {:#x}",
+        "{:#x}: [{}] callback_mem_rw {:?} - address {:#x}, size: {:#x}, value: {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         memtype,
         address,
         size,

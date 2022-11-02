@@ -8,8 +8,9 @@ pub fn set_priority(unicorn: &mut Unicorn<Context>, which: u32, who: u32, prio: 
     let res = 0;
 
     log::trace!(
-        "{:#x}: [SYSCALL] set_priority(which = {:#x}, who: {:#x}, prio: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] set_priority(which = {:#x}, who: {:#x}, prio: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         which,
         who,
         prio,
@@ -35,8 +36,9 @@ pub fn ugetrlimit(unicorn: &mut Unicorn<Context>, resource: u32, r_limit: u32) -
     };
 
     log::trace!(
-        "{:#x}: [SYSCALL] ugetrlimit(resource = {:#x}, r_limit: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] ugetrlimit(resource = {:#x}, r_limit: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         resource,
         r_limit,
         res

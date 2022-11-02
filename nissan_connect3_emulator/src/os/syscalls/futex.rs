@@ -7,8 +7,9 @@ pub fn set_robust_list(unicorn: &mut Unicorn<Context>, head: u32, len: u32) -> u
     let res = 0;
 
     log::trace!(
-        "{:#x}: [SYSCALL] set_robust_list(head = {:#x}, len: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] set_robust_list(head = {:#x}, len: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         head,
         len,
         res
@@ -39,8 +40,9 @@ pub fn futex(
     let res = 0;
 
     log::trace!(
-        "{:#x}: [SYSCALL] futex(uaddr = {:#x}, futex_op: {:#x}, val: {:#x}, timeout: {:#x}, uaddr2: {:#x}, val3: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] futex(uaddr = {:#x}, futex_op: {:#x}, val: {:#x}, timeout: {:#x}, uaddr2: {:#x}, val3: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         uaddr,
         futex_op,
         val,

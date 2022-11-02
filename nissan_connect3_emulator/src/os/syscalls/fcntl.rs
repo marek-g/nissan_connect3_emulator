@@ -10,8 +10,9 @@ pub fn open(unicorn: &mut Unicorn<Context>, path_name: u32, flags: u32, mode: u3
     let fd = open_internal(unicorn, &path_name, flags, mode);
 
     log::trace!(
-        "{:#x}: [SYSCALL] open(pathname = {}, flags: {:#x} = {:?}, mode: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] open(pathname = {}, flags: {:#x} = {:?}, mode: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         path_name,
         flags,
         convert_open_file_flags(flags),
@@ -36,8 +37,9 @@ pub fn openat(
     let fd = open_internal(unicorn, &path_name_new, flags, mode);
 
     log::trace!(
-        "{:#x}: [SYSCALL] openat(dirfd = {:#x}, pathname = {}, flags: {:#x} = {:?}, mode: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] openat(dirfd = {:#x}, pathname = {}, flags: {:#x} = {:?}, mode: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         dirfd,
         path_name,
         flags,
@@ -159,8 +161,9 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
     };
 
     log::trace!(
-        "{:#x}: [SYSCALL] fcntl64(fd = {:#x}, cmd = {:#x}, arg1: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] fcntl64(fd = {:#x}, cmd = {:#x}, arg1: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         fd,
         cmd,
         arg1,

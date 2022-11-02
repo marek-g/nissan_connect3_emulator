@@ -30,8 +30,9 @@ pub fn brk(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
     };
 
     log::trace!(
-        "{:#x}: [SYSCALL] brk(addr = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] brk(addr = {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         addr,
         res
     );
@@ -50,8 +51,9 @@ pub fn access(unicorn: &mut Unicorn<Context>, path_name: u32, mode: u32) -> u32 
     let res = if exists { 0 } else { -1i32 as u32 };
 
     log::trace!(
-        "{:#x}: [SYSCALL] access(pathname = {}, mode = {:#x}) => {:#x} [{}]",
+        "{:#x}: [{}] [SYSCALL] access(pathname = {}, mode = {:#x}) => {:#x} [{}]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         path_name,
         mode,
         res,
@@ -84,8 +86,9 @@ pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
     };
 
     log::trace!(
-        "{:#x}: [SYSCALL] close(fd: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] close(fd: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         fd,
         res
     );
@@ -111,8 +114,9 @@ pub fn read(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u
     };
 
     log::trace!(
-        "{:#x}: [SYSCALL] read(fd: {:#x}, buf: {:#x}, length: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] read(fd: {:#x}, buf: {:#x}, length: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         fd,
         buf,
         length,
@@ -142,8 +146,9 @@ pub fn write(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> 
     };
 
     log::trace!(
-        "{:#x}: [SYSCALL] write(fd: {:#x}, buf: {:#x}, length: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] write(fd: {:#x}, buf: {:#x}, length: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         fd,
         buf,
         length,
@@ -188,8 +193,9 @@ pub fn getdents64(unicorn: &mut Unicorn<Context>, fd: u32, dirp: u32, count: u32
     let res = get_dents_internal(unicorn, fd, dirp, count, file_system, dir_entries);
 
     log::trace!(
-        "{:#x}: [SYSCALL] getdents64(fd: {:#x}, dirp: {:#x}, count: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] getdents64(fd: {:#x}, dirp: {:#x}, count: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         fd,
         dirp,
         count,
@@ -296,8 +302,9 @@ pub fn set_tid_address(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
     let res = 1;
 
     log::trace!(
-        "{:#x}: [SYSCALL] set_tid_address(addr: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] set_tid_address(addr: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         addr,
         res
     );
@@ -310,8 +317,9 @@ pub fn get_tid(unicorn: &mut Unicorn<Context>) -> u32 {
     let res = 1;
 
     log::trace!(
-        "{:#x}: [SYSCALL] get_tid() => {:#x}",
+        "{:#x}: [{}] [SYSCALL] get_tid() => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         res
     );
 
@@ -323,8 +331,9 @@ pub fn get_pid(unicorn: &mut Unicorn<Context>) -> u32 {
     let res = 2;
 
     log::trace!(
-        "{:#x}: [SYSCALL] get_pid() => {:#x}",
+        "{:#x}: [{}] [SYSCALL] get_pid() => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         res
     );
 
@@ -339,8 +348,9 @@ pub fn exit_group(unicorn: &mut Unicorn<Context>, status: u32) -> u32 {
     }
 
     log::trace!(
-        "{:#x}: [SYSCALL] exit_group(status: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] exit_group(status: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         status,
         0u32
     );
@@ -365,8 +375,9 @@ pub fn link(unicorn: &mut Unicorn<Context>, old_path: u32, new_path: u32) -> u32
     };
 
     log::trace!(
-        "{:#x}: [SYSCALL] link(old_path: {}, new_path: {}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] link(old_path: {}, new_path: {}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         old_path,
         new_path,
         res
@@ -391,8 +402,9 @@ pub fn unlink(unicorn: &mut Unicorn<Context>, path: u32) -> u32 {
     };
 
     log::trace!(
-        "{:#x}: [SYSCALL] unlink(path: {}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] unlink(path: {}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         path,
         res
     );
@@ -414,8 +426,9 @@ pub fn ftruncate(unicorn: &mut Unicorn<Context>, fd: u32, length: u32) -> u32 {
     };
 
     log::trace!(
-        "{:#x}: [SYSCALL] ftruncate(fd: {:#x}, length: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] ftruncate(fd: {:#x}, length: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         fd,
         length,
         res
