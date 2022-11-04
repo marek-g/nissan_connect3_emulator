@@ -64,7 +64,6 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
             unicorn.get_u32_arg(2),
             unicorn.get_u32_arg(3),
             unicorn.get_u32_arg(4),
-            unicorn.get_u32_arg(5),
         ),
         122 => utsname::uname(unicorn, unicorn.get_u32_arg(0)),
         125 => mman::mprotect(

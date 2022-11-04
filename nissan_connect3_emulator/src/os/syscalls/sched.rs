@@ -79,7 +79,6 @@ pub fn clone(
     parent_tid_ptr: u32,
     child_tls: u32,
     child_tid_ptr: u32,
-    regs: u32,
 ) -> u32 {
     let parent_tid = unicorn.get_data().inner.thread_id;
     let child_tid = unicorn
@@ -114,7 +113,7 @@ pub fn clone(
 
     let res = child_tid as u32;
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] clone(flags = {:#x}, child_stack: {:#x}, parent_tid_ptr: {:#x}, child_tls: {:#x}, child_tid_ptr: {:#x}, regs: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] clone(flags = {:#x}, child_stack: {:#x}, parent_tid_ptr: {:#x}, child_tls: {:#x}, child_tid_ptr: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         flags,
@@ -122,11 +121,10 @@ pub fn clone(
         parent_tid_ptr,
         child_tls,
         child_tid_ptr,
-        regs,
         res
     );
 
-    std::thread::sleep(Duration::from_secs(3));
+    //std::thread::sleep(Duration::from_secs(3));
 
     res
 }
