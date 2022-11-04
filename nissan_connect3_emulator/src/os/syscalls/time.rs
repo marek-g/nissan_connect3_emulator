@@ -4,6 +4,14 @@ use std::time::SystemTime;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn clock_gettime(unicorn: &mut Unicorn<Context>, clock_id: u32, time_spec: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] clock_gettime(clock_id = {:#x}, time_spec: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        clock_id,
+        time_spec,
+    );
+
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
@@ -20,11 +28,9 @@ pub fn clock_gettime(unicorn: &mut Unicorn<Context>, clock_id: u32, time_spec: u
         .unwrap();
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] clock_gettime(clock_id = {:#x}, time_spec: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] => {:#x} (clock_gettime)",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
-        clock_id,
-        time_spec,
         0
     );
 
@@ -32,6 +38,14 @@ pub fn clock_gettime(unicorn: &mut Unicorn<Context>, clock_id: u32, time_spec: u
 }
 
 pub fn gettimeofday(unicorn: &mut Unicorn<Context>, time_val: u32, time_zone: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] gettimeofday(time_val = {:#x}, time_zone: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        time_val,
+        time_zone,
+    );
+
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap();
@@ -55,11 +69,9 @@ pub fn gettimeofday(unicorn: &mut Unicorn<Context>, time_val: u32, time_zone: u3
     }
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] gettimeofday(time_val = {:#x}, time_zone: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] => {:#x} (gettimeofday)",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
-        time_val,
-        time_zone,
         0
     );
 

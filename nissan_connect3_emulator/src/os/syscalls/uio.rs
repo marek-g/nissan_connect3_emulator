@@ -3,6 +3,15 @@ use crate::emulator::utils::unpack_u32;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn writev(unicorn: &mut Unicorn<Context>, fd: u32, iov: u32, iovcnt: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] writev(fd: {:#x}, iov: {:#x}, iovcnt: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        fd,
+        iov,
+        iovcnt,
+    );
+
     let is_open = unicorn
         .get_data()
         .inner
@@ -40,12 +49,9 @@ pub fn writev(unicorn: &mut Unicorn<Context>, fd: u32, iov: u32, iovcnt: u32) ->
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] writev(fd: {:#x}, iov: {:#x}, iovcnt: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] => {:#x} (writev)",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
-        fd,
-        iov,
-        iovcnt,
         res
     );
 

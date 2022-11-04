@@ -293,7 +293,7 @@ fn emu_thread_loop(
 // https://elixir.bootlin.com/linux/latest/source/arch/arm/kernel/entry-armv.S#L899
 fn set_kernel_traps(unicorn: &mut Unicorn<Context>) {
     let unicorn_context = unicorn.get_data();
-    let mut mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
+    let mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
 
     mmu.map(
         unicorn,

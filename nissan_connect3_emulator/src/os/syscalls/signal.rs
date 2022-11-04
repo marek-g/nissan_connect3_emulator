@@ -7,16 +7,22 @@ pub fn rt_sigaction(
     action: u32,
     old_action: u32,
 ) -> u32 {
-    // TODO: implement
-    let res = 0;
-
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] rt_sigaction(signum = {:#x}, action: {:#x}, old_action: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] rt_sigaction(signum = {:#x}, action: {:#x}, old_action: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         signum,
         action,
         old_action,
+    );
+
+    // TODO: implement
+    let res = 0;
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] => {:#x} (rt_sigaction)",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         res
     );
 
@@ -30,17 +36,23 @@ pub fn rt_sigprocmask(
     old_set: u32,
     sig_set_size: u32,
 ) -> u32 {
-    // TODO: implement
-    let res = 0;
-
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] rt_sigprocmask(how: {:#x}, set: {:#x}, old_set: {:#x}, sig_set_size: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] rt_sigprocmask(how: {:#x}, set: {:#x}, old_set: {:#x}, sig_set_size: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         how,
         set,
         old_set,
         sig_set_size,
+    );
+
+    // TODO: implement
+    let res = 0;
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] => {:#x} (rt_sigprocmask)",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         res
     );
 
@@ -48,15 +60,21 @@ pub fn rt_sigprocmask(
 }
 
 pub fn sigaltstack(unicorn: &mut Unicorn<Context>, ss: u32, old_ss: u32) -> u32 {
-    // TODO: implement
-    let res = 0;
-
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] sigaltstack(ss: {:#x}, old_ss: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] sigaltstack(ss: {:#x}, old_ss: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         ss,
         old_ss,
+    );
+
+    // TODO: implement
+    let res = 0;
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] {:#x} (sigaltstack)",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         res
     );
 

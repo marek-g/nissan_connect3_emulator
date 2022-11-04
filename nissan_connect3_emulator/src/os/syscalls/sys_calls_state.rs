@@ -5,7 +5,7 @@ pub struct SysCallsState {
     // state for getdents syscall - list of files in folder to process
     pub get_dents_list: HashMap<u32, Vec<String>>,
 
-    // maps futex uaddr to list of waiters for that address
+    // maps futex `uaddr` to list of waiters for that address
     pub futex_waiters: HashMap<u32, Vec<Sender<()>>>,
 }
 

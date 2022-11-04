@@ -65,7 +65,7 @@ impl<'a> ElfLoader for ArmElfLoader<'a> {
             self.mem_end = self.mem_end.max(mem_end);
 
             let unicorn_context = self.unicorn.get_data();
-            let mut mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
+            let mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
             mmu.map(
                 self.unicorn,
                 mem_start,
@@ -214,7 +214,7 @@ fn setup_stack(
     interp_address: u32,
 ) -> u32 {
     let unicorn_context = unicorn.get_data();
-    let mut mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
+    let mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
     mmu.map(
         unicorn,
         STACK_BASE,

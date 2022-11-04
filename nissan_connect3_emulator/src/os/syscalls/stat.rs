@@ -8,7 +8,18 @@ use std::time::SystemTime;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn stat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] stat64(path = {}, stat_buf = {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        path,
+        stat_buf,
+    );
+
     let pathstr = read_string(unicorn, path);
+
+    log::trace!("path = {}", pathstr);
+
     let file_system = unicorn.get_data().inner.file_system.clone();
     let open_res = file_system
         .lock()
@@ -21,12 +32,11 @@ pub fn stat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
     } else {
         -1i32 as u32
     };
+
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] stat64(path = {}, stat_buf = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] => {:#x} (stat64)",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
-        pathstr,
-        stat_buf,
         res
     );
     res
@@ -39,7 +49,20 @@ pub fn fstatat64(
     stat_buf: u32,
     flags: u32,
 ) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] fstatat64(dir_fd: {:#x}, path = {}, stat_buf = {:#x}, flags = {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        dir_fd,
+        path,
+        stat_buf,
+        flags,
+    );
+
     let path_name = read_string(unicorn, path);
+
+    log::trace!("path = {}", path_name);
+
     let path_name_new = get_path_relative_to_dir(unicorn, dir_fd, &path_name);
     let file_system = unicorn.get_data().inner.file_system.clone();
 
@@ -56,21 +79,28 @@ pub fn fstatat64(
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] fstatat64(dir_fd: {:#x}, path = {}, stat_buf = {:#x}, flags = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] => {:#x} (fstatat64)",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
-        dir_fd,
-        path_name,
-        stat_buf,
-        flags,
         res
     );
     res
 }
 
 pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] lstat64(path = {}, stat_buf = {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        path,
+        stat_buf,
+    );
+
     // TODO: handle symbolic links
     let pathstr = read_string(unicorn, path);
+
+    log::trace!("path = {}", pathstr);
+
     let file_system = unicorn.get_data().inner.file_system.clone();
 
     let open_res = file_system
@@ -88,32 +118,46 @@ pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] lstat64(path = {}, stat_buf = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] => {:#x} (lstat64)",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
-        pathstr,
-        stat_buf,
         res
     );
     res
 }
 
 pub fn fstat64(unicorn: &mut Unicorn<Context>, fd: u32, stat_buf: u32) -> u32 {
-    let res = fstat64_internal(unicorn, fd, stat_buf);
-
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] fstat64(fd = {:#x}, stat_buf = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] fstat64(fd = {:#x}, stat_buf = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         fd,
         stat_buf,
+    );
+
+    let res = fstat64_internal(unicorn, fd, stat_buf);
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] => {:#x} (fstat64)",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         res
     );
     res
 }
 
 pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] statfs(path = {}, buf = {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        path,
+        buf,
+    );
+
     let file_path = read_string(unicorn, path);
+
+    log::trace!("path = {}", file_path);
 
     let mut vec = Vec::new();
 
@@ -182,11 +226,9 @@ pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
     }
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] statfs(path = {}, buf = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] => {:#x} (statfs)",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
-        file_path,
-        buf,
         res
     );
     res

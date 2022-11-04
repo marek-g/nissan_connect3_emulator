@@ -5,18 +5,24 @@ use std::path::PathBuf;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn open(unicorn: &mut Unicorn<Context>, path_name: u32, flags: u32, mode: u32) -> u32 {
-    let path_name = read_string(unicorn, path_name);
-
-    let fd = open_internal(unicorn, &path_name, flags, mode);
-
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] open(pathname = {}, flags: {:#x} = {:?}, mode: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] open(pathname = {}, flags: {:#x} = {:?}, mode: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         path_name,
         flags,
         convert_open_file_flags(flags),
         mode,
+    );
+
+    let path_name = read_string(unicorn, path_name);
+
+    let fd = open_internal(unicorn, &path_name, flags, mode);
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] => {:#x} (open)",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         fd
     );
 
@@ -30,14 +36,8 @@ pub fn openat(
     flags: u32,
     mode: u32,
 ) -> u32 {
-    let path_name = read_string(unicorn, path_name);
-    let path_name_new = get_path_relative_to_dir(unicorn, dirfd, &path_name);
-
-    // TODO: handle symbolic links
-    let fd = open_internal(unicorn, &path_name_new, flags, mode);
-
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] openat(dirfd = {:#x}, pathname = {}, flags: {:#x} = {:?}, mode: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] openat(dirfd = {:#x}, pathname = {}, flags: {:#x} = {:?}, mode: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         dirfd,
@@ -45,6 +45,18 @@ pub fn openat(
         flags,
         convert_open_file_flags(flags),
         mode,
+    );
+
+    let path_name = read_string(unicorn, path_name);
+    let path_name_new = get_path_relative_to_dir(unicorn, dirfd, &path_name);
+
+    // TODO: handle symbolic links
+    let fd = open_internal(unicorn, &path_name_new, flags, mode);
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] => {:#x} (openat)",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         fd
     );
 
@@ -103,6 +115,15 @@ pub fn get_path_relative_to_dir(
 }
 
 pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] fcntl64(fd = {:#x}, cmd = {:#x}, arg1: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        fd,
+        cmd,
+        arg1,
+    );
+
     let res = match cmd {
         1 => {
             // F_GETFD
@@ -161,12 +182,9 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] fcntl64(fd = {:#x}, cmd = {:#x}, arg1: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] => {:#x} (fcntl64)",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
-        fd,
-        cmd,
-        arg1,
         res
     );
 

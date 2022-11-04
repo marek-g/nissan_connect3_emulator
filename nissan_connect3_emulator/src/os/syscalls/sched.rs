@@ -1,13 +1,17 @@
 use crate::emulator::context::Context;
-use crate::emulator::print::{disasm, mem_dump, print_stack};
 use crate::emulator::thread::Thread;
-use crate::emulator::utils::{pack_u32, unpack_u32};
-use crate::os::syscalls::linux;
+use crate::emulator::utils::pack_u32;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn sched_get_priority_min(unicorn: &mut Unicorn<Context>, policy: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] sched_get_priority_min(policy = {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        policy,
+    );
+
     let res = match policy {
         0 => 0u32, // SCHED_NORMAL,
         1 => 1u32, // SCHED_FIFO,
@@ -19,10 +23,9 @@ pub fn sched_get_priority_min(unicorn: &mut Unicorn<Context>, policy: u32) -> u3
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] sched_get_priority_min(policy = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] => {:#x} (sched_get_priority_min)",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
-        policy,
         res
     );
 
@@ -30,6 +33,13 @@ pub fn sched_get_priority_min(unicorn: &mut Unicorn<Context>, policy: u32) -> u3
 }
 
 pub fn sched_get_priority_max(unicorn: &mut Unicorn<Context>, policy: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] sched_get_priority_min(policy = {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        policy,
+    );
+
     let res = match policy {
         0 => 0u32,  // SCHED_NORMAL,
         1 => 99u32, // SCHED_FIFO,
@@ -41,10 +51,9 @@ pub fn sched_get_priority_max(unicorn: &mut Unicorn<Context>, policy: u32) -> u3
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] sched_get_priority_min(policy = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] => {:#x} (sched_get_priority_min)",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
-        policy,
         res
     );
 
@@ -57,15 +66,21 @@ pub fn sched_setscheduler(
     policy: u32,
     param_addr: u32,
 ) -> u32 {
-    let res = 0u32;
-
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] sched_setscheduler(pid = {:#x}, policy = {:#x}, param_addr = {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] sched_setscheduler(pid = {:#x}, policy = {:#x}, param_addr = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         pid,
         policy,
         param_addr,
+    );
+
+    let res = 0u32;
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] => {:#x} (sched_setscheduler)",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         res
     );
 
@@ -80,6 +95,17 @@ pub fn clone(
     child_tls: u32,
     child_tid_ptr: u32,
 ) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] clone(flags = {:#x}, child_stack: {:#x}, parent_tid_ptr: {:#x}, child_tls: {:#x}, child_tid_ptr: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        flags,
+        child_stack,
+        parent_tid_ptr,
+        child_tls,
+        child_tid_ptr,
+    );
+
     let parent_tid = unicorn.get_data().inner.thread_id;
     let child_tid = unicorn
         .get_data()
@@ -113,14 +139,9 @@ pub fn clone(
 
     let res = child_tid as u32;
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] clone(flags = {:#x}, child_stack: {:#x}, parent_tid_ptr: {:#x}, child_tls: {:#x}, child_tid_ptr: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] => {:#x} (clone)",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
-        flags,
-        child_stack,
-        parent_tid_ptr,
-        child_tls,
-        child_tid_ptr,
         res
     );
 

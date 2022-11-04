@@ -13,11 +13,20 @@ pub fn mmap(
     fd: u32,
     off_t: u32,
 ) -> u32 {
-    let res = mmapx(unicorn, addr, length, prot, flags, fd, off_t);
-    log::trace!("{:#x} [{}] [SYSCALL] mmap(addr = {:#x}, length = {:#x}, prot = {:#x}, flags = {:#x}, fd = {:#x}, off_t: {:#x}) => {:#x}",
+    log::trace!("{:#x} [{}] [SYSCALL] mmap(addr = {:#x}, length = {:#x}, prot = {:#x}, flags = {:#x}, fd = {:#x}, off_t: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
-        addr, length, prot, flags, fd, off_t, res);
+        addr, length, prot, flags, fd, off_t);
+
+    let res = mmapx(unicorn, addr, length, prot, flags, fd, off_t);
+
+    log::trace!(
+        "{:#x} [{}] [SYSCALL] => {:#x} (mmap)",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        res
+    );
+
     res
 }
 
@@ -30,37 +39,58 @@ pub fn mmap2(
     fd: u32,
     pgoffset: u32,
 ) -> u32 {
-    let res = mmapx(unicorn, addr, length, prot, flags, fd, pgoffset * 0x1000);
-    log::trace!("{:#x} [{}] [SYSCALL] mmap2(addr = {:#x}, length = {:#x}, prot = {:#x}, flags = {:#x}, fd = {:#x}, pgoffset: {:#x}) => {:#x}",
+    log::trace!("{:#x} [{}] [SYSCALL] mmap2(addr = {:#x}, length = {:#x}, prot = {:#x}, flags = {:#x}, fd = {:#x}, pgoffset: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
-        addr, length, prot, flags, fd, pgoffset, res);
+        addr, length, prot, flags, fd, pgoffset);
+
+    let res = mmapx(unicorn, addr, length, prot, flags, fd, pgoffset * 0x1000);
+
+    log::trace!(
+        "{:#x} [{}] [SYSCALL] => {:#x} (mmap2)",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        res
+    );
+
     res
 }
 
 pub fn munmap(unicorn: &mut Unicorn<Context>, addr: u32, length: u32) -> u32 {
-    let res = 0u32;
-
-    let unicorn_context = unicorn.get_data();
-    let mut mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
-    mmu.unmap(unicorn, addr, mem_align_up(length, None));
-
     log::trace!(
-        "{:#x} [{}] [SYSCALL] munmap(addr = {:#x}, len = {:#x}) => {:#x}",
+        "{:#x} [{}] [SYSCALL] munmap(addr = {:#x}, len = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         addr,
         length,
+    );
+
+    let unicorn_context = unicorn.get_data();
+    let mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
+    mmu.unmap(unicorn, addr, mem_align_up(length, None));
+
+    let res = 0u32;
+    log::trace!(
+        "{:#x} [{}] [SYSCALL] => {:#x} (munmap)",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         res
     );
     res
 }
 
 pub fn mprotect(unicorn: &mut Unicorn<Context>, addr: u32, len: u32, prot: u32) -> u32 {
-    let res = 0u32; //mmapx(unicorn, addr, length, prot, flags, fd, pgoffset * 0x1000);
+    log::trace!(
+        "{:#x} [{}] [SYSCALL] mprotect(addr = {:#x}, len = {:#x}, prot = {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        addr,
+        len,
+        prot,
+    );
 
     let unicorn_context = unicorn.get_data();
-    let mut mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
+    let mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
     mmu.mem_protect(
         unicorn,
         addr,
@@ -68,28 +98,33 @@ pub fn mprotect(unicorn: &mut Unicorn<Context>, addr: u32, len: u32, prot: u32) 
         prot_to_permission(prot),
     );
 
+    let res = 0u32;
     log::trace!(
-        "{:#x} [{}] [SYSCALL] mprotect(addr = {:#x}, len = {:#x}, prot = {:#x}) => {:#x}",
+        "{:#x} [{}] [SYSCALL] => {:#x} (mprotect)",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
-        addr,
-        len,
-        prot,
         res
     );
     res
 }
 
 pub fn mincore(unicorn: &mut Unicorn<Context>, addr: u32, length: u32, vec: u32) -> u32 {
-    let bytes = vec![1u8; ((length + 0x1000 - 1) / 0x1000) as usize];
-    unicorn.mem_write(vec as u64, &bytes).unwrap();
     log::trace!(
-        "{:#x} [{}] [SYSCALL] mincore(addr = {:#x}, length = {:#x}, vec = {:#x}) => {:#x}",
+        "{:#x} [{}] [SYSCALL] mincore(addr = {:#x}, length = {:#x}, vec = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         addr,
         length,
         vec,
+    );
+
+    let bytes = vec![1u8; ((length + 0x1000 - 1) / 0x1000) as usize];
+    unicorn.mem_write(vec as u64, &bytes).unwrap();
+
+    log::trace!(
+        "{:#x} [{}] [SYSCALL] => {:#x} (mincore)",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         0
     );
     0
@@ -143,7 +178,7 @@ fn mmapx(
 
     // allocate memory
     let unicorn_context = unicorn.get_data();
-    let mut mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
+    let mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
     let addr = if flags & 0x10 != 0 || addr != 0 {
         // MAP_FIXED - don't interpret addr as a hint
         mmu.map(

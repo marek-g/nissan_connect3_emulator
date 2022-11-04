@@ -1,20 +1,24 @@
 use crate::emulator::context::Context;
-use crate::emulator::print::mem_dump;
 use crate::emulator::utils::unpack_u32;
 use std::sync::mpsc::channel;
-use std::time::Duration;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn set_robust_list(unicorn: &mut Unicorn<Context>, head: u32, len: u32) -> u32 {
-    // TODO: implement
-    let res = 0;
-
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] set_robust_list(head = {:#x}, len: {:#x}) => {:#x}",
+        "{:#x}: [{}] [SYSCALL] set_robust_list(head = {:#x}, len: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         head,
         len,
+    );
+
+    // TODO: implement
+    let res = 0;
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] => {:#x} (set_robust_list)",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
         res
     );
 

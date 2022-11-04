@@ -3,6 +3,13 @@ use std::io::Write;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn uname(unicorn: &mut Unicorn<Context>, buf: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] uname(buf = {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        buf,
+    );
+
     let res = {
         const UTS_LEN: usize = 65;
 
@@ -19,10 +26,9 @@ pub fn uname(unicorn: &mut Unicorn<Context>, buf: u32) -> u32 {
     };
 
     log::trace!(
-        "{:#x}: [{}] uname(buf = {:#x}) => {:#x}",
+        "{:#x}: [{}] => {:#x} (uname)",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
-        buf,
         res,
     );
     res

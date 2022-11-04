@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
