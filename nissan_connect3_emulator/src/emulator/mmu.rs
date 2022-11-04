@@ -153,20 +153,45 @@ impl Mmu {
     }
 
     pub fn display_mapped(&self) -> String {
-        /*let mut v: Vec<_> = Vec::new();
-        let data = self.get_data();
-        let mmu = data.inner.mmu.lock().unwrap();
-        for (addr, map_info) in mmu.map_infos.iter() {
-            v.push((addr, map_info));
+        let mut v: Vec<_> = Vec::new();
+        for map_info in self.regions.iter() {
+            v.push(MmuRegion {
+                memory_start: map_info.memory_start,
+                memory_end: map_info.memory_end,
+                memory_perms: map_info.memory_perms,
+                description: map_info.description.clone(),
+                filepath: map_info.filepath.clone(),
+                data: vec![],
+            });
         }
-        v.sort_by(|x, y| x.0.cmp(&y.0));
+        v.sort_by(|x, y| x.memory_start.cmp(&y.memory_start));
 
-        let mut str = String::from("Memory layout:");
-        for (_addr, map_info) in v {
+        let mut str = format!("{} regions:", v.len());
+        for map_info in v {
             str.push_str(&format!("\n{}", map_info));
         }
-        str*/
-        "".to_string()
+        str
+    }
+
+    pub fn display_mapped_unicorn(unicorn: &Unicorn<Context>) -> String {
+        let mut v: Vec<_> = Vec::new();
+        for mem_region in unicorn.mem_regions().unwrap() {
+            v.push(MmuRegion {
+                memory_start: mem_region.begin as u32,
+                memory_end: mem_region.end as u32,
+                memory_perms: mem_region.perms,
+                description: "".to_string(),
+                filepath: "".to_string(),
+                data: vec![],
+            });
+        }
+        v.sort_by(|x, y| x.memory_start.cmp(&y.memory_start));
+
+        let mut str = format!("{} regions:", v.len());
+        for map_info in v {
+            str.push_str(&format!("\n{}", map_info));
+        }
+        str
     }
 
     pub fn heap_alloc(

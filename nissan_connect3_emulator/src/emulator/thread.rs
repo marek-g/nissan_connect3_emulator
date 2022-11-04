@@ -2,6 +2,7 @@ use crate::emulator::context::{Context, ContextInner};
 use crate::emulator::elf_loader::load_elf;
 use crate::emulator::memory_map::GET_TLS_ADDR;
 use crate::emulator::mmu::mmu_clone_map;
+use crate::emulator::print::{disasm, print_mmu, print_stack};
 use crate::emulator::utils::{load_binary, pack_u32};
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -383,7 +384,9 @@ pub fn callback_mem_error(
         size,
         value
     );
-    //dump_context(uc, address, size);
+
+    dump_context(unicorn);
+
     false
 }
 
@@ -403,6 +406,18 @@ pub fn callback_mem_rw(
         size,
         value
     );
-    //dump_context(uc, address, size);
+
+    dump_context(unicorn);
+
     false
+}
+
+fn dump_context(unicorn: &mut Unicorn<Context>) {
+    print_mmu(unicorn);
+    disasm(
+        unicorn,
+        unicorn.reg_read(RegisterARM::PC).unwrap() as u32 - 100,
+        200,
+    );
+    print_stack(unicorn);
 }

@@ -9,7 +9,7 @@ use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn stat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] stat64(path = {}, stat_buf = {:#x}) [IN]",
+        "{:#x}: [{}] [SYSCALL] stat64(path = {:#x}, stat_buf = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         path,
@@ -50,7 +50,7 @@ pub fn fstatat64(
     flags: u32,
 ) -> u32 {
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] fstatat64(dir_fd: {:#x}, path = {}, stat_buf = {:#x}, flags = {:#x}) [IN]",
+        "{:#x}: [{}] [SYSCALL] fstatat64(dir_fd: {:#x}, path = {:#x}, stat_buf = {:#x}, flags = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         dir_fd,
@@ -89,7 +89,7 @@ pub fn fstatat64(
 
 pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] lstat64(path = {}, stat_buf = {:#x}) [IN]",
+        "{:#x}: [{}] [SYSCALL] lstat64(path = {:#x}, stat_buf = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         path,
@@ -148,7 +148,7 @@ pub fn fstat64(unicorn: &mut Unicorn<Context>, fd: u32, stat_buf: u32) -> u32 {
 
 pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] statfs(path = {}, buf = {:#x}) [IN]",
+        "{:#x}: [{}] [SYSCALL] statfs(path = {:#x}, buf = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         path,

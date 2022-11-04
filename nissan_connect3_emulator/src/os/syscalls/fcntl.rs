@@ -6,7 +6,7 @@ use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn open(unicorn: &mut Unicorn<Context>, path_name: u32, flags: u32, mode: u32) -> u32 {
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] open(path_name = {}, flags: {:#x} = {:?}, mode: {:#x}) [IN]",
+        "{:#x}: [{}] [SYSCALL] open(path_name = {:#x}, flags: {:#x} = {:?}, mode: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         path_name,
@@ -39,7 +39,7 @@ pub fn openat(
     mode: u32,
 ) -> u32 {
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] openat(dirfd = {:#x}, pathname = {}, flags: {:#x} = {:?}, mode: {:#x}) [IN]",
+        "{:#x}: [{}] [SYSCALL] openat(dirfd = {:#x}, pathname = {:#x}, flags: {:#x} = {:?}, mode: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         dirfd,
