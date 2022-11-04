@@ -73,6 +73,20 @@ pub fn push_text_on_stack(unicorn: &mut Unicorn<Context>, address: u32, text: &s
     address
 }
 
+pub fn read_string(unicorn: &Unicorn<Context>, mut addr: u32) -> String {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        unicorn.mem_read(addr as u64, &mut byte).unwrap();
+        if byte[0] == 0 {
+            break;
+        }
+        buf.push(byte[0]);
+        addr += 1;
+    }
+    String::from_utf8(buf).unwrap()
+}
+
 pub fn pack_u16(value: u16) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }

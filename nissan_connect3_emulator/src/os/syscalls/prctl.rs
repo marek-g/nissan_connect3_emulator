@@ -1,5 +1,5 @@
 use crate::emulator::context::Context;
-use crate::emulator::mmu::MmuExtension;
+use crate::emulator::utils::read_string;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn prctl(
@@ -15,7 +15,7 @@ pub fn prctl(
 
     if option == 15 {
         // PR_SET_NAME = set process name
-        let process_name = unicorn.read_string(arg2);
+        let process_name = read_string(unicorn, arg2);
         log::trace!("Process name: {}", process_name);
     }
 

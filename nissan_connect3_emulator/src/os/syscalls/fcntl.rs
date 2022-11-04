@@ -1,11 +1,11 @@
 use crate::emulator::context::Context;
-use crate::emulator::mmu::MmuExtension;
+use crate::emulator::utils::read_string;
 use crate::file_system::OpenFileFlags;
 use std::path::PathBuf;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn open(unicorn: &mut Unicorn<Context>, path_name: u32, flags: u32, mode: u32) -> u32 {
-    let path_name = unicorn.read_string(path_name);
+    let path_name = read_string(unicorn, path_name);
 
     let fd = open_internal(unicorn, &path_name, flags, mode);
 
@@ -30,7 +30,7 @@ pub fn openat(
     flags: u32,
     mode: u32,
 ) -> u32 {
-    let path_name = unicorn.read_string(path_name);
+    let path_name = read_string(unicorn, path_name);
     let path_name_new = get_path_relative_to_dir(unicorn, dirfd, &path_name);
 
     // TODO: handle symbolic links

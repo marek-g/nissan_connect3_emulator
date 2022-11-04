@@ -1,7 +1,6 @@
 use crate::emulator::context::Context;
-use crate::emulator::mmu::MmuExtension;
 use crate::emulator::users::{GID, UID};
-use crate::emulator::utils::{pack_i32, pack_u32, pack_u64};
+use crate::emulator::utils::{pack_i32, pack_u32, pack_u64, read_string};
 use crate::file_system::{FileSystemType, FileType, OpenFileFlags};
 use crate::os::syscalls::fcntl::get_path_relative_to_dir;
 use crate::os::syscalls::SysCallError;
@@ -9,7 +8,7 @@ use std::time::SystemTime;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn stat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
-    let pathstr = unicorn.read_string(path);
+    let pathstr = read_string(unicorn, path);
     let file_system = unicorn.get_data().inner.file_system.clone();
     let open_res = file_system
         .lock()
@@ -40,7 +39,7 @@ pub fn fstatat64(
     stat_buf: u32,
     flags: u32,
 ) -> u32 {
-    let path_name = unicorn.read_string(path);
+    let path_name = read_string(unicorn, path);
     let path_name_new = get_path_relative_to_dir(unicorn, dir_fd, &path_name);
     let file_system = unicorn.get_data().inner.file_system.clone();
 
@@ -71,7 +70,7 @@ pub fn fstatat64(
 
 pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
     // TODO: handle symbolic links
-    let pathstr = unicorn.read_string(path);
+    let pathstr = read_string(unicorn, path);
     let file_system = unicorn.get_data().inner.file_system.clone();
 
     let open_res = file_system
@@ -114,7 +113,7 @@ pub fn fstat64(unicorn: &mut Unicorn<Context>, fd: u32, stat_buf: u32) -> u32 {
 }
 
 pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
-    let file_path = unicorn.read_string(path);
+    let file_path = read_string(unicorn, path);
 
     let mut vec = Vec::new();
 

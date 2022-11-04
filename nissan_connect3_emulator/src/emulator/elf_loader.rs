@@ -1,6 +1,5 @@
 use crate::emulator::context::Context;
 use crate::emulator::memory_map::*;
-use crate::emulator::mmu::MmuExtension;
 use crate::emulator::users::{EGID, EUID, GID, UID};
 use crate::emulator::utils::{
     load_binary, mem_align_down, mem_align_up, pack_u32, push_text_on_stack, to_unicorn_permissions,
@@ -65,8 +64,16 @@ impl<'a> ElfLoader for ArmElfLoader<'a> {
             self.mem_start = self.mem_start.min(mem_start);
             self.mem_end = self.mem_end.max(mem_end);
 
-            self.unicorn
-                .mmu_map(mem_start, mem_end - mem_start, perms, "", self.filepath);
+            let unicorn_context = self.unicorn.get_data();
+            let mut mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
+            mmu.map(
+                self.unicorn,
+                mem_start,
+                mem_end - mem_start,
+                perms,
+                "",
+                self.filepath,
+            );
         }
         Ok(())
     }
@@ -206,7 +213,10 @@ fn setup_stack(
     mem_start: u32,
     interp_address: u32,
 ) -> u32 {
-    unicorn.mmu_map(
+    let unicorn_context = unicorn.get_data();
+    let mut mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
+    mmu.map(
+        unicorn,
         STACK_BASE,
         STACK_SIZE,
         Permission::READ | Permission::WRITE,

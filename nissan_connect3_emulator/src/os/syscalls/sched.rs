@@ -86,10 +86,9 @@ pub fn clone(
         .get_data()
         .inner
         .next_thread_id
-        .fetch_add(1, Ordering::Relaxed)
-        + 1;
+        .fetch_add(1, Ordering::Relaxed);
 
-    print_stack(unicorn);
+    /*print_stack(unicorn);
     mem_dump(unicorn, regs, 128);
     mem_dump(unicorn, child_stack, 128);
     disasm(
@@ -99,7 +98,7 @@ pub fn clone(
     );
     let mut new_addr = vec![0u8; 4];
     unicorn.mem_read(child_stack as u64, &mut new_addr).unwrap();
-    disasm(unicorn, unpack_u32(&new_addr), 200);
+    disasm(unicorn, unpack_u32(&new_addr), 200);*/
 
     unicorn
         .mem_write(parent_tid_ptr as u64, &pack_u32(parent_tid))
@@ -108,19 +107,12 @@ pub fn clone(
         .mem_write(child_tid_ptr as u64, &pack_u32(child_tid))
         .unwrap();
 
-    /*let (new_thread, _) = Thread::clone(unicorn, child_tid, child_tls, child_stack).unwrap();
+    let (new_thread, _) = Thread::clone(unicorn, child_tid, child_tls, child_stack).unwrap();
     if let Some(threads) = unicorn.get_data().inner.threads.upgrade() {
         threads.lock().unwrap().push(new_thread);
-    }*/
+    }
 
-    linux::set_tls(unicorn, child_tls);
-    unicorn
-        .reg_write(RegisterARM::SP, child_stack as u64)
-        .unwrap();
-    let res = 5i32 as u32;
-
-    //    let res = 0 as u32;
-
+    let res = child_tid as u32;
     log::trace!(
         "{:#x}: [{}] [SYSCALL] clone(flags = {:#x}, child_stack: {:#x}, parent_tid_ptr: {:#x}, child_tls: {:#x}, child_tid_ptr: {:#x}, regs: {:#x}) => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),

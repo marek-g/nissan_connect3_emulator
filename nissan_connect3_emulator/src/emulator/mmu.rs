@@ -1,55 +1,16 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::c_void;
+use std::sync::{Arc, Mutex};
 
 use crate::emulator::context::Context;
+use crate::emulator::thread::Thread;
 use crate::emulator::utils::mem_align_up;
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::Unicorn;
 
-pub struct Mmu {
-    map_infos: HashMap<u32, MapInfo>,
-    pub brk_mem_end: u32,
-    pub heap_mem_end: u32,
-}
-
-impl Mmu {
-    pub fn new() -> Self {
-        Self {
-            map_infos: HashMap::new(),
-            brk_mem_end: 0u32,
-            heap_mem_end: 0u32,
-        }
-    }
-}
-
-pub trait MmuExtension {
-    fn mmu_map(
-        &mut self,
-        address: u32,
-        size: u32,
-        perms: Permission,
-        description: &str,
-        filepath: &str,
-    );
-    fn add_mapinfo(&mut self, map_info: MapInfo);
-    fn mmu_unmap(&mut self, address: u32, size: u32);
-    fn mmu_mem_protect(&mut self, address: u32, size: u32, perms: Permission);
-    fn mmu_clone_map(
-        &self,
-        dest_unicorn: &mut Unicorn<Context>,
-    ) -> Result<(), Box<dyn Error + Send + Sync + 'static>>;
-    fn is_mapped(&self, address: u32, size: u32) -> bool;
-    fn update_map_info_filepath(&mut self, address: u32, size: u32, filename: &str);
-    fn display_mapped(&self) -> String;
-
-    fn heap_alloc(&mut self, size: u32, perms: Permission, filepath: &str) -> u32;
-
-    fn read_string(&mut self, addr: u32) -> String;
-}
-
-#[derive(Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct MapInfo {
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
+pub struct MmuRegion {
     pub memory_start: u32,
     pub memory_end: u32,
     pub memory_perms: Permission,
@@ -60,14 +21,14 @@ pub struct MapInfo {
     data: Vec<u8>,
 }
 
-impl std::fmt::Display for MapInfo {
+impl std::fmt::Display for MmuRegion {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
             "{:08x} - {:08x} ({:>6} kB) {}{}{} {:<20} {}",
             self.memory_start,
             self.memory_end,
-            (self.memory_end - self.memory_start) / 1024,
+            (self.memory_end - self.memory_start + 1) / 1024,
             if self.memory_perms & Permission::READ != Permission::NONE {
                 "R"
             } else {
@@ -91,191 +52,109 @@ impl std::fmt::Display for MapInfo {
     }
 }
 
-impl MmuExtension for Unicorn<Context> {
-    fn mmu_map(
+pub struct Mmu {
+    regions: Vec<MmuRegion>,
+    pub brk_mem_end: u32,
+    pub heap_mem_end: u32,
+}
+
+impl Mmu {
+    pub fn new() -> Self {
+        Self {
+            regions: Vec::new(),
+            brk_mem_end: 0u32,
+            heap_mem_end: 0u32,
+        }
+    }
+
+    pub fn map(
         &mut self,
+        unicorn: &mut Unicorn<Context>,
         address: u32,
         size: u32,
         perms: Permission,
         description: &str,
         filepath: &str,
     ) {
-        if self.is_mapped(address, size as u32) {
-            self.mmu_mem_protect(address, mem_align_up(size, None), perms);
-            self.update_map_info_filepath(address, size, filepath);
-            return;
-        }
+        let threads = unicorn.get_data().inner.threads.upgrade().unwrap();
 
-        // pause all threads
-        if let Some(threads) = self.get_data().inner.threads.upgrade() {
-            for thread in threads.lock().unwrap().iter_mut() {
-                thread.pause().unwrap();
-            }
-        }
+        Self::pause_all_threads(&threads);
+
+        self.remove_internal(address, size, &threads);
 
         // allocate memory
-        let mut data = vec![0u8; size as usize];
-
-        if let Some(threads) = self.get_data().inner.threads.upgrade() {
-            for thread in threads.lock().unwrap().iter_mut() {
-                // unsafe is ok as long as:
-                // 1. data will not be moved (Vec resized etc.)
-                // 2. memory will be unmapped before deallocating data
-                unsafe {
-                    let _ = thread
-                        .mem_map_ptr(
-                            address as u64,
-                            size as usize,
-                            perms,
-                            data.as_mut_ptr() as *mut c_void,
-                        )
-                        .unwrap();
-                }
-            }
-        }
+        let data = vec![0u8; size as usize];
 
         let desc = match description.len() {
             0 => String::from("[mapped]"),
             _ => String::from(description),
         };
 
-        let map_info = MapInfo {
-            memory_start: address,
-            memory_end: address.checked_add(size).unwrap(),
-            memory_perms: perms,
-            description: desc.clone(),
-            filepath: filepath.to_owned(),
-            data,
-        };
-
-        self.add_mapinfo(map_info);
+        self.map_internal(&threads, address, size, perms, &desc, filepath, data);
 
         log::debug!(
             "mmu_map: {:#x} - {:#x} (size: {:#x}), {:?} {} {}",
             address,
-            address + size,
+            address + size - 1,
             size,
             perms,
             desc,
             filepath
         );
 
-        // resume all threads
-        if let Some(threads) = self.get_data().inner.threads.upgrade() {
-            for thread in threads.lock().unwrap().iter_mut() {
-                thread.resume();
-            }
-        }
+        Self::resume_all_threads(&threads);
     }
 
-    fn add_mapinfo(&mut self, map_info: MapInfo) {
-        self.get_data()
-            .inner
-            .mmu
-            .lock()
-            .unwrap()
-            .map_infos
-            .insert(map_info.memory_start, map_info);
-    }
+    pub fn unmap(&mut self, unicorn: &mut Unicorn<Context>, address: u32, size: u32) {
+        let threads = unicorn.get_data().inner.threads.upgrade().unwrap();
 
-    fn mmu_unmap(&mut self, address: u32, size: u32) {
-        let (_, entry) = self
-            .get_data()
-            .inner
-            .mmu
-            .lock()
-            .unwrap()
-            .map_infos
-            .remove_entry(&address)
-            .unwrap();
+        Self::pause_all_threads(&threads);
 
-        if let Some(threads) = self.get_data().inner.threads.upgrade() {
-            // pause all threads
-            for thread in threads.lock().unwrap().iter_mut() {
-                thread.pause().unwrap();
-            }
-
-            for thread in threads.lock().unwrap().iter_mut() {
-                thread.mem_unmap(address as u64, size as usize).unwrap();
-            }
-
-            // resume all threads
-            for thread in threads.lock().unwrap().iter_mut() {
-                thread.resume();
-            }
-        }
+        self.remove_internal(address, size, &threads);
 
         log::debug!(
-            "mmu_unmap: {:#x} - {:#x} (size: {:#x}), {:?} {} {}",
+            "mmu_unmap: {:#x} - {:#x} (size: {:#x})",
             address,
             address + size,
             size,
-            entry.memory_perms,
-            entry.description,
-            entry.filepath
         );
+
+        Self::resume_all_threads(&threads);
     }
 
-    fn mmu_mem_protect(&mut self, address: u32, size: u32, perms: Permission) {
-        if let Some(threads) = self.get_data().inner.threads.upgrade() {
-            // pause all threads
-            for thread in threads.lock().unwrap().iter_mut() {
-                thread.pause().unwrap();
-            }
+    pub fn mem_protect(
+        &mut self,
+        unicorn: &mut Unicorn<Context>,
+        address: u32,
+        size: u32,
+        perms: Permission,
+    ) {
+        let threads = unicorn.get_data().inner.threads.upgrade().unwrap();
 
-            for thread in threads.lock().unwrap().iter_mut() {
-                thread
-                    .mem_protect(address as u64, size as usize, perms)
-                    .unwrap();
-            }
+        Self::pause_all_threads(&threads);
 
-            // resume all threads
-            for thread in threads.lock().unwrap().iter_mut() {
-                thread.resume();
+        // split regions at the beginning and end point of the range
+        self.split_internal(address, &threads);
+        self.split_internal(address + size, &threads);
+
+        // change permissions
+        for thread in threads.lock().unwrap().iter_mut() {
+            thread
+                .unicorn
+                .mem_protect(address as u64, size as usize, perms)
+                .unwrap();
+        }
+        for item in &mut self.regions {
+            if item.memory_start >= address && item.memory_end <= address + size - 1 {
+                item.memory_perms = perms;
             }
         }
+
+        Self::resume_all_threads(&threads);
     }
 
-    fn mmu_clone_map(
-        &self,
-        dest_unicorn: &mut Unicorn<Context>,
-    ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-        let data = self.get_data();
-        let mmu = data.inner.mmu.lock().unwrap();
-        for (_, map_info) in &mmu.map_infos {
-            unsafe {
-                dest_unicorn
-                    .mem_map_ptr(
-                        map_info.memory_start as u64,
-                        (map_info.memory_end - map_info.memory_start) as usize,
-                        map_info.memory_perms,
-                        map_info.data.as_ptr() as *mut c_void,
-                    )
-                    .map_err(|err| format!("Unicorn mem_map_ptr error: {:?}", err))?;
-            }
-        }
-        Ok(())
-    }
-
-    fn is_mapped(&self, address: u32, size: u32) -> bool {
-        let regions = self.mem_regions().unwrap();
-        regions
-            .iter()
-            .any(|r| r.begin <= address as u64 && r.end >= address as u64 + size as u64 - 1)
-    }
-
-    fn update_map_info_filepath(&mut self, address: u32, size: u32, filepath: &str) {
-        let data = self.get_data();
-        let map_infos = &mut data.inner.mmu.lock().unwrap().map_infos;
-        for (_key, value) in map_infos {
-            if value.memory_start <= address && value.memory_end >= address + size {
-                value.filepath = filepath.to_string();
-            }
-        }
-    }
-
-    fn display_mapped(&self) -> String {
-        let mut v: Vec<_> = Vec::new();
+    pub fn display_mapped(&self) -> String {
+        /*let mut v: Vec<_> = Vec::new();
         let data = self.get_data();
         let mmu = data.inner.mmu.lock().unwrap();
         for (addr, map_info) in mmu.map_infos.iter() {
@@ -287,31 +166,217 @@ impl MmuExtension for Unicorn<Context> {
         for (_addr, map_info) in v {
             str.push_str(&format!("\n{}", map_info));
         }
-        str
+        str*/
+        "".to_string()
     }
 
-    fn heap_alloc(&mut self, size: u32, perms: Permission, filepath: &str) -> u32 {
-        let heap_addr = self.get_data().inner.mmu.lock().unwrap().heap_mem_end;
+    pub fn heap_alloc(
+        &mut self,
+        unicorn: &mut Unicorn<Context>,
+        size: u32,
+        perms: Permission,
+        filepath: &str,
+    ) -> u32 {
+        let heap_addr = self.heap_mem_end;
 
         let size = mem_align_up(size, None);
-        self.mmu_map(heap_addr, size, perms, "[heap]", filepath);
+        self.map(unicorn, heap_addr, size, perms, "[heap]", filepath);
 
-        self.get_data().inner.mmu.lock().unwrap().heap_mem_end = heap_addr + size;
+        self.heap_mem_end = heap_addr + size;
 
         heap_addr
     }
 
-    fn read_string(&mut self, mut addr: u32) -> String {
-        let mut buf = Vec::new();
-        let mut byte = [0u8; 1];
-        loop {
-            self.mem_read(addr as u64, &mut byte).unwrap();
-            if byte[0] == 0 {
-                break;
+    /// map region to all threads without verifying overlaps
+    fn map_internal(
+        &mut self,
+        threads: &Arc<Mutex<Vec<Thread>>>,
+        address: u32,
+        size: u32,
+        perms: Permission,
+        description: &str,
+        filepath: &str,
+        mut data: Vec<u8>,
+    ) {
+        // map allocated memory to all threads
+        for thread in threads.lock().unwrap().iter_mut() {
+            // unsafe is ok as long as:
+            // 1. data will not be moved (Vec resized etc.)
+            // 2. memory will be unmapped before deallocating data
+            unsafe {
+                let _ = thread
+                    .unicorn
+                    .mem_map_ptr(
+                        address as u64,
+                        size as usize,
+                        perms,
+                        data.as_mut_ptr() as *mut c_void,
+                    )
+                    .unwrap();
             }
-            buf.push(byte[0]);
-            addr += 1;
         }
-        String::from_utf8(buf).unwrap()
+
+        let region = MmuRegion {
+            memory_start: address,
+            memory_end: address.checked_add(size).unwrap().checked_sub(1).unwrap(),
+            memory_perms: perms,
+            description: description.to_string(),
+            filepath: filepath.to_owned(),
+            data,
+        };
+
+        self.regions.push(region);
     }
+
+    /// unmap region from all threads without verifying overlaps
+    fn unmap_internal(&mut self, address: u32, size: u32, threads: &Arc<Mutex<Vec<Thread>>>) {
+        if !self
+            .regions
+            .iter()
+            .any(|item| item.memory_start >= address && item.memory_end <= address + size - 1)
+        {
+            return;
+        }
+
+        for thread in threads.lock().unwrap().iter_mut() {
+            thread
+                .unicorn
+                .mem_unmap(address as u64, size as usize)
+                .unwrap();
+        }
+
+        self.regions
+            .retain(|item| item.memory_end < address || item.memory_start >= address + size);
+    }
+
+    fn remove_internal(&mut self, address: u32, size: u32, threads: &Arc<Mutex<Vec<Thread>>>) {
+        // split regions at the beginning and end point of the range
+        self.split_internal(address, threads);
+        self.split_internal(address + size, threads);
+
+        // remove all existing regions that are fully covered by the range
+        self.unmap_internal(address, size, threads);
+    }
+
+    fn split_internal(&mut self, address: u32, threads: &Arc<Mutex<Vec<Thread>>>) {
+        let to_be_split: Vec<_> = self
+            .regions
+            .iter()
+            .filter(|item| item.memory_start < address && item.memory_end >= address)
+            .map(|item| item.clone())
+            .collect();
+
+        for item in to_be_split {
+            self.unmap_internal(
+                item.memory_start,
+                item.memory_end - item.memory_start + 1,
+                threads,
+            );
+
+            // left item
+            self.map_internal(
+                threads,
+                item.memory_start,
+                address - item.memory_start,
+                item.memory_perms,
+                &item.description,
+                &item.filepath,
+                Vec::from(&item.data[0..(address - item.memory_start) as usize]),
+            );
+
+            // right item
+            self.map_internal(
+                threads,
+                address,
+                item.memory_end - address + 1,
+                item.memory_perms,
+                &item.description,
+                &item.filepath,
+                Vec::from(
+                    &item.data[(address - item.memory_start) as usize
+                        ..(item.memory_end - item.memory_start + 1) as usize],
+                ),
+            );
+        }
+    }
+
+    fn pause_all_threads(threads: &Arc<Mutex<Vec<Thread>>>) {
+        for thread in threads.lock().unwrap().iter_mut() {
+            thread.pause().unwrap();
+        }
+    }
+
+    fn resume_all_threads(threads: &Arc<Mutex<Vec<Thread>>>) {
+        for thread in threads.lock().unwrap().iter_mut() {
+            thread.resume();
+        }
+    }
+}
+
+pub fn mmu_clone_map(
+    src_unicorn: &Unicorn<Context>,
+    dest_unicorn: &mut Unicorn<Context>,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    let data = src_unicorn.get_data();
+    let mmu = &mut data.inner.mmu.lock().unwrap();
+
+    for item in &mut mmu.regions {
+        unsafe {
+            dest_unicorn
+                .mem_map_ptr(
+                    item.memory_start as u64,
+                    (item.memory_end - item.memory_start + 1) as usize,
+                    item.memory_perms,
+                    item.data.as_mut_ptr() as *mut c_void,
+                )
+                .unwrap();
+        }
+    }
+
+    /*let mut map: Vec<_> = mmu.map_infos.values().collect();
+    map.sort_by(|map1, map2| map1.memory_start.cmp(&map2.memory_start));
+
+    let mut map2 = self.mem_regions().unwrap();
+
+    for i in 0..map.len().min(map2.len()) {
+        if map[i].memory_start != map2[i].begin as u32
+            || map[i].memory_end != map2[i].end as u32
+            || map[i].memory_perms != map2[i].perms
+        {
+            println!(
+                "map[{}] {}-{}-{:?} vs {}-{}-{:?}",
+                i,
+                map[i].memory_start,
+                map[i].memory_end,
+                map[i].memory_perms,
+                map2[i].begin,
+                map2[i].end,
+                map2[i].perms
+            );
+        }
+    }
+
+    for (_, map_info) in &mmu.map_infos {
+        let regions = self.mem_regions().unwrap();
+        let address = map_info.memory_start as u64;
+        let size = (map_info.memory_end - map_info.memory_start + 1) as u64;
+        let perms = regions
+            .iter()
+            .filter(|r| r.begin <= address && r.end >= address + size - 1)
+            .next()
+            .unwrap()
+            .perms;
+
+        unsafe {
+            dest_unicorn
+                .mem_map_ptr(
+                    map_info.memory_start as u64,
+                    (map_info.memory_end - map_info.memory_start + 1) as usize,
+                    map_info.memory_perms,
+                    map_info.data.as_ptr() as *mut c_void,
+                )
+                .map_err(|err| format!("Unicorn mem_map_ptr error: {:?}", err))?;
+        }
+    }*/
+    Ok(())
 }

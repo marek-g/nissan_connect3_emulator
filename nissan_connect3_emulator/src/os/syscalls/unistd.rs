@@ -1,6 +1,5 @@
 use crate::emulator::context::Context;
-use crate::emulator::mmu::MmuExtension;
-use crate::emulator::utils::{mem_align_up, pack_u16, pack_u64};
+use crate::emulator::utils::{mem_align_up, pack_u16, pack_u64, read_string};
 use crate::file_system::{FileType, MountFileSystem};
 use crate::os::syscalls::SysCallError;
 use std::path::Path;
@@ -9,13 +8,16 @@ use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn brk(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
+    let unicorn_context = unicorn.get_data();
+    let mut mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
     let res = if addr == 0 {
-        unicorn.get_data().inner.mmu.lock().unwrap().brk_mem_end
+        mmu.brk_mem_end
     } else {
-        let brk_mem_end = unicorn.get_data().inner.mmu.lock().unwrap().brk_mem_end;
+        let brk_mem_end = mmu.brk_mem_end;
         let new_brk_mem_end = mem_align_up(addr, None);
         if new_brk_mem_end > brk_mem_end {
-            unicorn.mmu_map(
+            mmu.map(
+                unicorn,
                 brk_mem_end,
                 new_brk_mem_end - brk_mem_end,
                 Permission::all(),
@@ -23,9 +25,9 @@ pub fn brk(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
                 "",
             );
         } else if new_brk_mem_end < brk_mem_end {
-            unicorn.mmu_unmap(new_brk_mem_end, brk_mem_end - new_brk_mem_end);
+            mmu.unmap(unicorn, new_brk_mem_end, brk_mem_end - new_brk_mem_end);
         }
-        unicorn.get_data().inner.mmu.lock().unwrap().brk_mem_end = new_brk_mem_end;
+        mmu.brk_mem_end = new_brk_mem_end;
         new_brk_mem_end
     };
 
@@ -40,7 +42,7 @@ pub fn brk(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
 }
 
 pub fn access(unicorn: &mut Unicorn<Context>, path_name: u32, mode: u32) -> u32 {
-    let path_name = unicorn.read_string(path_name);
+    let path_name = read_string(unicorn, path_name);
     let exists = unicorn
         .get_data()
         .inner
@@ -359,8 +361,8 @@ pub fn exit_group(unicorn: &mut Unicorn<Context>, status: u32) -> u32 {
 }
 
 pub fn link(unicorn: &mut Unicorn<Context>, old_path: u32, new_path: u32) -> u32 {
-    let old_path = unicorn.read_string(old_path);
-    let new_path = unicorn.read_string(new_path);
+    let old_path = read_string(unicorn, old_path);
+    let new_path = read_string(unicorn, new_path);
 
     let res = match unicorn
         .get_data()
@@ -387,7 +389,7 @@ pub fn link(unicorn: &mut Unicorn<Context>, old_path: u32, new_path: u32) -> u32
 }
 
 pub fn unlink(unicorn: &mut Unicorn<Context>, path: u32) -> u32 {
-    let path = unicorn.read_string(path);
+    let path = read_string(unicorn, path);
 
     let res = match unicorn
         .get_data()
