@@ -413,11 +413,23 @@ pub fn callback_mem_rw(
 }
 
 fn dump_context(unicorn: &mut Unicorn<Context>) {
+    println!(
+        "PC: {:#10x}, LR (return code): {:#10x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.reg_read(RegisterARM::LR).unwrap()
+    );
     print_mmu(unicorn);
     disasm(
         unicorn,
         unicorn.reg_read(RegisterARM::PC).unwrap() as u32 - 100,
         200,
     );
+    disasm(
+        unicorn,
+        unicorn.reg_read(RegisterARM::LR).unwrap() as u32 - 100,
+        200,
+    );
+    disasm(unicorn, 0x484e93ec as u32, 200);
+
     print_stack(unicorn);
 }
