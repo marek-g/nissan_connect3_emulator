@@ -1,5 +1,4 @@
 use crate::emulator::context::Context;
-use crate::emulator::mmu::MmuExtension;
 use crate::emulator::utils::{mem_align_down, mem_align_up};
 use std::io::SeekFrom;
 use unicorn_engine::unicorn_const::Permission;
@@ -42,7 +41,9 @@ pub fn mmap2(
 pub fn munmap(unicorn: &mut Unicorn<Context>, addr: u32, length: u32) -> u32 {
     let res = 0u32;
 
-    unicorn.mmu_unmap(addr, mem_align_up(length, None));
+    let unicorn_context = unicorn.get_data();
+    let mut mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
+    mmu.unmap(unicorn, addr, mem_align_up(length, None));
 
     log::trace!(
         "{:#x} [{}] [SYSCALL] munmap(addr = {:#x}, len = {:#x}) => {:#x}",
@@ -58,7 +59,14 @@ pub fn munmap(unicorn: &mut Unicorn<Context>, addr: u32, length: u32) -> u32 {
 pub fn mprotect(unicorn: &mut Unicorn<Context>, addr: u32, len: u32, prot: u32) -> u32 {
     let res = 0u32; //mmapx(unicorn, addr, length, prot, flags, fd, pgoffset * 0x1000);
 
-    unicorn.mmu_mem_protect(addr, mem_align_up(len, None), prot_to_permission(prot));
+    let unicorn_context = unicorn.get_data();
+    let mut mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
+    mmu.mem_protect(
+        unicorn,
+        addr,
+        mem_align_up(len, None),
+        prot_to_permission(prot),
+    );
 
     log::trace!(
         "{:#x} [{}] [SYSCALL] mprotect(addr = {:#x}, len = {:#x}, prot = {:#x}) => {:#x}",
@@ -134,12 +142,21 @@ fn mmapx(
     }
 
     // allocate memory
+    let unicorn_context = unicorn.get_data();
+    let mut mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
     let addr = if flags & 0x10 != 0 || addr != 0 {
         // MAP_FIXED - don't interpret addr as a hint
-        unicorn.mmu_map(addr, length, perms, "[heap (fixed addr)]", &filepath);
+        mmu.map(
+            unicorn,
+            addr,
+            length,
+            perms,
+            "[heap (fixed addr)]",
+            &filepath,
+        );
         addr
     } else {
-        unicorn.heap_alloc(length, perms, &filepath)
+        mmu.heap_alloc(unicorn, length, perms, &filepath)
     };
 
     // write file

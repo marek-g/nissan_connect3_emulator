@@ -1,9 +1,8 @@
 use crate::emulator::context::{Context, ContextInner};
 use crate::emulator::elf_loader::load_elf;
 use crate::emulator::memory_map::GET_TLS_ADDR;
-use crate::emulator::mmu::MmuExtension;
+use crate::emulator::mmu::mmu_clone_map;
 use crate::emulator::utils::{load_binary, pack_u32};
-use core::ffi::c_void;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -161,7 +160,7 @@ impl Thread {
             .unwrap();
 
         // copy memory map
-        source_unicorn.mmu_clone_map(&mut unicorn)?;
+        mmu_clone_map(&source_unicorn, &mut unicorn)?;
 
         // TODO: set kernel traps and tls for new thread
         //set_kernel_traps(&mut unicorn);
@@ -233,29 +232,6 @@ impl Thread {
 
         self.unicorn.emu_stop()
     }
-
-    pub unsafe fn mem_map_ptr(
-        &mut self,
-        address: u64,
-        size: usize,
-        perms: Permission,
-        ptr: *mut c_void,
-    ) -> Result<(), uc_error> {
-        self.unicorn.mem_map_ptr(address, size, perms, ptr)
-    }
-
-    pub fn mem_unmap(&mut self, address: u64, size: usize) -> Result<(), uc_error> {
-        self.unicorn.mem_unmap(address, size)
-    }
-
-    pub fn mem_protect(
-        &mut self,
-        address: u64,
-        size: libc::size_t,
-        perms: Permission,
-    ) -> Result<(), uc_error> {
-        self.unicorn.mem_protect(address, size, perms)
-    }
 }
 
 fn emu_thread_loop(
@@ -309,14 +285,18 @@ fn emu_thread_loop(
     Ok(())
 }
 
+// If the compiler for the target does not provides some primitives for some
+// reasons (e.g. target limitations), the kernel is responsible to assist
+// with these operations.
+//
+// The following is some `kuser` helpers, which can be found here:
+// https://elixir.bootlin.com/linux/latest/source/arch/arm/kernel/entry-armv.S#L899
 fn set_kernel_traps(unicorn: &mut Unicorn<Context>) {
-    // If the compiler for the target does not provides some primitives for some
-    // reasons (e.g. target limitations), the kernel is responsible to assist
-    // with these operations.
-    //
-    // The following is some `kuser` helpers, which can be found here:
-    // https://elixir.bootlin.com/linux/latest/source/arch/arm/kernel/entry-armv.S#L899
-    unicorn.mmu_map(
+    let unicorn_context = unicorn.get_data();
+    let mut mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
+
+    mmu.map(
+        unicorn,
         0xFFFF0000,
         0x1000,
         Permission::READ | Permission::EXEC,
