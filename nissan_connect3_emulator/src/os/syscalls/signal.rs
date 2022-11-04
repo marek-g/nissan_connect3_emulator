@@ -1,4 +1,5 @@
 use crate::emulator::context::Context;
+use crate::emulator::utils::unpack_u32;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn rt_sigaction(
@@ -68,8 +69,22 @@ pub fn sigaltstack(unicorn: &mut Unicorn<Context>, ss: u32, old_ss: u32) -> u32 
         old_ss,
     );
 
+    if ss != 0 {
+        let mut mem = vec![0u8; 12];
+        unicorn.mem_read(ss as u64, &mut mem).unwrap();
+        let ss_sp = unpack_u32(&mem[0..4]);
+        let ss_flags = unpack_u32(&mem[4..8]);
+        let ss_size = unpack_u32(&mem[8..12]);
+        log::trace!(
+            "ss_sp: {:#x}, ss_flags: {:#x}, ss_size: {:#x}",
+            ss_sp,
+            ss_flags,
+            ss_size
+        );
+    }
+
     // TODO: implement
-    let res = 0;
+    let res = 0i32 as u32;
 
     log::trace!(
         "{:#x}: [{}] [SYSCALL] sigaltstack => {:#x}",
