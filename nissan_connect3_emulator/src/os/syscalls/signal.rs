@@ -20,7 +20,7 @@ pub fn rt_sigaction(
     let res = 0;
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (rt_sigaction)",
+        "{:#x}: [{}] [SYSCALL] rt_sigaction => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -50,7 +50,7 @@ pub fn rt_sigprocmask(
     let res = 0;
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (rt_sigprocmask)",
+        "{:#x}: [{}] [SYSCALL] rt_sigprocmask => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -72,7 +72,7 @@ pub fn sigaltstack(unicorn: &mut Unicorn<Context>, ss: u32, old_ss: u32) -> u32 
     let res = 0;
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] {:#x} (sigaltstack)",
+        "{:#x}: [{}] [SYSCALL] sigaltstack => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res

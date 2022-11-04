@@ -23,7 +23,7 @@ pub fn sched_get_priority_min(unicorn: &mut Unicorn<Context>, policy: u32) -> u3
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (sched_get_priority_min)",
+        "{:#x}: [{}] [SYSCALL] sched_get_priority_min => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -51,7 +51,7 @@ pub fn sched_get_priority_max(unicorn: &mut Unicorn<Context>, policy: u32) -> u3
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (sched_get_priority_min)",
+        "{:#x}: [{}] [SYSCALL] sched_get_priority_min => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -78,7 +78,7 @@ pub fn sched_setscheduler(
     let res = 0u32;
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (sched_setscheduler)",
+        "{:#x}: [{}] [SYSCALL] sched_setscheduler => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -139,7 +139,7 @@ pub fn clone(
 
     let res = child_tid as u32;
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (clone)",
+        "{:#x}: [{}] [SYSCALL] clone => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res

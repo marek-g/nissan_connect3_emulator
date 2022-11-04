@@ -26,7 +26,7 @@ pub fn uname(unicorn: &mut Unicorn<Context>, buf: u32) -> u32 {
     };
 
     log::trace!(
-        "{:#x}: [{}] => {:#x} (uname)",
+        "{:#x}: [{}] uname => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res,

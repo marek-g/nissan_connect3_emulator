@@ -6,7 +6,7 @@ use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn open(unicorn: &mut Unicorn<Context>, path_name: u32, flags: u32, mode: u32) -> u32 {
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] open(pathname = {}, flags: {:#x} = {:?}, mode: {:#x}) [IN]",
+        "{:#x}: [{}] [SYSCALL] open(path_name = {}, flags: {:#x} = {:?}, mode: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         path_name,
@@ -17,10 +17,12 @@ pub fn open(unicorn: &mut Unicorn<Context>, path_name: u32, flags: u32, mode: u3
 
     let path_name = read_string(unicorn, path_name);
 
+    log::trace!("path_name = {}", path_name);
+
     let fd = open_internal(unicorn, &path_name, flags, mode);
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (open)",
+        "{:#x}: [{}] [SYSCALL] open => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         fd
@@ -54,7 +56,7 @@ pub fn openat(
     let fd = open_internal(unicorn, &path_name_new, flags, mode);
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (openat)",
+        "{:#x}: [{}] [SYSCALL] openat => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         fd
@@ -182,7 +184,7 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (fcntl64)",
+        "{:#x}: [{}] [SYSCALL] fcntl64 => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res

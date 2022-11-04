@@ -15,7 +15,7 @@ pub fn socket(unicorn: &mut Unicorn<Context>, domain: u32, socket_type: u32, pro
     let res = 0;
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (socket)",
+        "{:#x}: [{}] [SYSCALL] socket => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -38,7 +38,7 @@ pub fn connect(unicorn: &mut Unicorn<Context>, socket_fd: u32, addr: u32, addr_l
     let res = 0;
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (connect)",
+        "{:#x}: [{}] [SYSCALL] connect => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -68,7 +68,7 @@ pub fn send(unicorn: &mut Unicorn<Context>, socket_fd: u32, buf: u32, len: u32, 
     log::trace!("Message: {}", str);
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (send)",
+        "{:#x}: [{}] [SYSCALL] send => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res

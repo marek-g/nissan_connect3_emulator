@@ -16,7 +16,7 @@ pub fn set_robust_list(unicorn: &mut Unicorn<Context>, head: u32, len: u32) -> u
     let res = 0;
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (set_robust_list)",
+        "{:#x}: [{}] [SYSCALL] set_robust_list => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -124,7 +124,7 @@ pub fn futex(
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (futex)",
+        "{:#x}: [{}] [SYSCALL] futex => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res

@@ -49,7 +49,7 @@ pub fn writev(unicorn: &mut Unicorn<Context>, fd: u32, iov: u32, iovcnt: u32) ->
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (writev)",
+        "{:#x}: [{}] [SYSCALL] writev => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res

@@ -39,7 +39,7 @@ pub fn brk(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (brk)",
+        "{:#x}: [{}] [SYSCALL] brk => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -67,7 +67,7 @@ pub fn access(unicorn: &mut Unicorn<Context>, path_name: u32, mode: u32) -> u32 
     let res = if exists { 0 } else { -1i32 as u32 };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} [{}] (access)",
+        "{:#x}: [{}] [SYSCALL] access => {:#x} [{}]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res,
@@ -107,7 +107,7 @@ pub fn close(unicorn: &mut Unicorn<Context>, fd: u32) -> u32 {
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (close)",
+        "{:#x}: [{}] [SYSCALL] close => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -143,7 +143,7 @@ pub fn read(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> u
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (read)",
+        "{:#x}: [{}] [SYSCALL] read => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -181,7 +181,7 @@ pub fn write(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> 
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (write)",
+        "{:#x}: [{}] [SYSCALL] write => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -234,7 +234,7 @@ pub fn getdents64(unicorn: &mut Unicorn<Context>, fd: u32, dirp: u32, count: u32
     let res = get_dents_internal(unicorn, fd, dirp, count, file_system, dir_entries);
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (getdents64)",
+        "{:#x}: [{}] [SYSCALL] getdents64 => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -347,7 +347,7 @@ pub fn set_tid_address(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
     let res = 1;
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (set_tid_address)",
+        "{:#x}: [{}] [SYSCALL] set_tid_address => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -367,7 +367,7 @@ pub fn get_tid(unicorn: &mut Unicorn<Context>) -> u32 {
     let res = 1;
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} get_tid()",
+        "{:#x}: [{}] [SYSCALL] get_tid => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -387,7 +387,7 @@ pub fn get_pid(unicorn: &mut Unicorn<Context>) -> u32 {
     let res = 2;
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (get_pid)",
+        "{:#x}: [{}] [SYSCALL] get_pid => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -411,7 +411,7 @@ pub fn exit_group(unicorn: &mut Unicorn<Context>, status: u32) -> u32 {
     }
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (exit_group)",
+        "{:#x}: [{}] [SYSCALL] exit_group => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         0u32
@@ -445,7 +445,7 @@ pub fn link(unicorn: &mut Unicorn<Context>, old_path: u32, new_path: u32) -> u32
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (link)",
+        "{:#x}: [{}] [SYSCALL] link => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -477,7 +477,7 @@ pub fn unlink(unicorn: &mut Unicorn<Context>, path: u32) -> u32 {
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (unlink)",
+        "{:#x}: [{}] [SYSCALL] unlink => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
@@ -508,7 +508,7 @@ pub fn ftruncate(unicorn: &mut Unicorn<Context>, fd: u32, length: u32) -> u32 {
     };
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (ftruncate)",
+        "{:#x}: [{}] [SYSCALL] ftruncate => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res

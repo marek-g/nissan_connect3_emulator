@@ -22,7 +22,7 @@ pub fn set_tls(unicorn: &mut Unicorn<Context>, address: u32) -> u32 {
     let res = 0;
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (set_tls)",
+        "{:#x}: [{}] [SYSCALL] set_tls => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res

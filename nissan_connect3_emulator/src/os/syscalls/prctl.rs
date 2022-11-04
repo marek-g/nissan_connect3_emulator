@@ -31,7 +31,7 @@ pub fn prctl(
     }
 
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] => {:#x} (prctl)",
+        "{:#x}: [{}] [SYSCALL] prctl => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res
