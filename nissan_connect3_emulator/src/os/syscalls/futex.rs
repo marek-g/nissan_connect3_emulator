@@ -1,5 +1,6 @@
 use crate::emulator::context::Context;
 use crate::emulator::utils::unpack_u32;
+use log::error;
 use std::sync::mpsc::channel;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -48,7 +49,8 @@ pub fn futex(
 
     if futex_op & 0x80 == 0 {
         // FUTEX_PRIVATE_FLAG - if not set synchronization between processes is needed
-        panic!("futex without FUTEX_PRIVATE_FLAG not implemented");
+        //panic!("futex without FUTEX_PRIVATE_FLAG not implemented");
+        log::error!("futex without FUTEX_PRIVATE_FLAG not implemented");
     }
 
     let res = match futex_op & 0x7F {

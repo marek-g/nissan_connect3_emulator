@@ -4,7 +4,7 @@ use crate::emulator::thread::Thread;
 use crate::file_system::MountFileSystem;
 use crate::os::SysCallsState;
 use std::error::Error;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub struct Process {
@@ -43,6 +43,7 @@ impl Process {
                 threads: Arc::downgrade(&self.threads),
                 next_thread_id: self.next_thread_id.clone(),
                 thread_id,
+                instruction_tracing: Arc::new(AtomicBool::new(false)),
             }),
         };
 
