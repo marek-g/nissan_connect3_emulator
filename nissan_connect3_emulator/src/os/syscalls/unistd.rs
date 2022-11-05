@@ -2,6 +2,7 @@ use crate::emulator::context::Context;
 use crate::emulator::utils::{mem_align_up, pack_u16, pack_u64, read_string};
 use crate::file_system::{FileType, MountFileSystem};
 use crate::os::syscalls::SysCallError;
+use std::io::SeekFrom;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use unicorn_engine::unicorn_const::Permission;
@@ -49,7 +50,7 @@ pub fn brk(unicorn: &mut Unicorn<Context>, addr: u32) -> u32 {
 
 pub fn access(unicorn: &mut Unicorn<Context>, path_name: u32, mode: u32) -> u32 {
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] access(pathname = {}, mode = {:#x}) [IN]",
+        "{:#x}: [{}] [SYSCALL] access(pathname = {:#x}, mode = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         path_name,
@@ -57,6 +58,9 @@ pub fn access(unicorn: &mut Unicorn<Context>, path_name: u32, mode: u32) -> u32 
     );
 
     let path_name = read_string(unicorn, path_name);
+
+    log::trace!("path_name: {}", path_name);
+
     let exists = unicorn
         .get_data()
         .inner
@@ -182,6 +186,55 @@ pub fn write(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> 
 
     log::trace!(
         "{:#x}: [{}] [SYSCALL] write => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        res
+    );
+
+    res
+}
+
+pub fn _llseek(
+    unicorn: &mut Unicorn<Context>,
+    fd: u32,
+    offset_high: u32,
+    offset_low: u32,
+    result: u32,
+    whence: u32,
+) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] _llseek(fd: {:#x}, offset_high: {:#x}, offset_low: {:#x}, result: {:#x}, whence: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        fd,
+        offset_high,
+        offset_low,
+        result,
+        whence,
+    );
+
+    let file_system = &mut unicorn.get_data().inner.file_system.clone();
+    let offset = ((offset_high as u64) << 32) | (offset_low as u64);
+    let res = if let Ok(pos) = match whence {
+        0 => Ok(SeekFrom::Start(offset)),
+        1 => Ok(SeekFrom::Current(offset as i64)),
+        2 => Ok(SeekFrom::End(offset as i64)),
+        _ => Err(()),
+    } {
+        if let Ok(new_pos) = file_system.lock().unwrap().seek(fd as i32, pos) {
+            unicorn
+                .mem_write(result as u64, &pack_u64(new_pos))
+                .unwrap();
+            0 as u32
+        } else {
+            -1i32 as u32
+        }
+    } else {
+        -1i32 as u32
+    };
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] _llseek => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         res

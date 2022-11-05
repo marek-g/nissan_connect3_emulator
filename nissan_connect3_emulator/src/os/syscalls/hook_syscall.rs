@@ -56,6 +56,12 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
         ),
         91 => mman::munmap(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         93 => unistd::ftruncate(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        97 => resource::set_priority(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
         99 => stat::statfs(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         120 => sched::clone(
             unicorn,
@@ -72,11 +78,13 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
             unicorn.get_u32_arg(1),
             unicorn.get_u32_arg(2),
         ),
-        140 => resource::set_priority(
+        140 => unistd::_llseek(
             unicorn,
             unicorn.get_u32_arg(0),
             unicorn.get_u32_arg(1),
             unicorn.get_u32_arg(2),
+            unicorn.get_u32_arg(3),
+            unicorn.get_u32_arg(4),
         ),
         146 => uio::writev(
             unicorn,

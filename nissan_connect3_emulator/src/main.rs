@@ -55,7 +55,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
 
     // environment variables
     let envs = vec![
-        ("PATH".to_string(), "/usr/local/bin".to_string()),
+        ("PATH".to_string(), "/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin".to_string()),
+        ("RUNLEVEL".to_string(), "S".to_string()),
         (
             "LD_LIBRARY_PATH".to_string(),
             "/usr/lib:/lib:/opt/bosch/processes:/opt/bosch/airbiquity:/usr/lib/qtopia/plugins/gfxdrivers".to_string(),
@@ -73,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     //emulator.run_process("/bin/pwd.coreutils".to_string(), vec![], envs)?;
     //emulator.run_process("/bin/ls.coreutils".to_string(), vec![], envs)?;
     emulator.run_process(
-        "/opt/bosch/processes/procmapengine.out".to_string(),
+        "/opt/bosch/processes/procvoice_out.out".to_string(),
         vec![],
         envs,
     )?;
