@@ -146,6 +146,10 @@ fn mmapx(
         fd = 0xFFFFFFFFu32;
     }
 
+    if flags & 0x800u32 != 0 {
+        // MAP_DENYWRITE
+    }
+
     if addr != mem_align_down(addr, None) {
         panic!("wrong address alignment for mmap");
     }
