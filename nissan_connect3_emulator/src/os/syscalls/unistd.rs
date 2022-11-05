@@ -475,7 +475,7 @@ pub fn exit_group(unicorn: &mut Unicorn<Context>, status: u32) -> u32 {
 
 pub fn link(unicorn: &mut Unicorn<Context>, old_path: u32, new_path: u32) -> u32 {
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] link(old_path: {}, new_path: {}) [IN]",
+        "{:#x}: [{}] [SYSCALL] link(old_path: {:#x}, new_path: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         old_path,
@@ -484,6 +484,8 @@ pub fn link(unicorn: &mut Unicorn<Context>, old_path: u32, new_path: u32) -> u32
 
     let old_path = read_string(unicorn, old_path);
     let new_path = read_string(unicorn, new_path);
+
+    log::trace!("old_path: {}, new_path: {}", old_path, new_path);
 
     let res = match unicorn
         .get_data()
