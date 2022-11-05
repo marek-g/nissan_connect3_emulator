@@ -17,12 +17,16 @@ pub fn print_mmu(unicorn: &Unicorn<Context>) {
 
 pub fn print_stack(unicorn: &Unicorn<Context>) {
     let mut sp = unicorn.reg_read(RegisterARM::SP).unwrap();
-    println!("------------------ STACK at {:#010x}:", sp);
-    for i in 0..15 {
+    let mut fp = unicorn.reg_read(RegisterARM::FP).unwrap();
+    println!(
+        "------------------ STACK at {:#010x}, FP: {:#010x}:",
+        sp, fp
+    );
+    for i in 0..20 {
         let mut mem = [0u8; 4];
         unicorn.mem_read(sp, &mut mem).unwrap();
         print!("{:#010x} ", unpack_u32(&mem));
-        sp += i * 4;
+        sp += 4;
     }
     println!();
 }
