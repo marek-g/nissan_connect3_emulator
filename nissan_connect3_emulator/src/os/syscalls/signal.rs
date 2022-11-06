@@ -95,3 +95,32 @@ pub fn sigaltstack(unicorn: &mut Unicorn<Context>, ss: u32, old_ss: u32) -> u32 
 
     res
 }
+pub fn rt_sigtimedwait(
+    unicorn: &mut Unicorn<Context>,
+    set: u32,
+    info: u32,
+    timeout: u32,
+    sig_set_size: u32,
+) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] rt_sigtimedwait(set: {:#x}, info: {:#x}, timeout: {:#x}, sig_set_size: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        set,
+        info,
+        timeout,
+        sig_set_size,
+    );
+
+    // TODO: implement
+    let res = -11i32 as u32; // EAGAIN
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] rt_sigtimedwait => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        res
+    );
+
+    res
+}
