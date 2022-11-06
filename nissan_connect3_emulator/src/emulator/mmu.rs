@@ -254,19 +254,24 @@ impl Mmu {
 
     /// unmap region from all threads without verifying overlaps
     fn unmap_internal(&mut self, address: u32, size: u32, threads: &Arc<Mutex<Vec<Thread>>>) {
-        if !self
+        let regions_to_unmap: Vec<_> = self
             .regions
             .iter()
-            .any(|item| item.memory_start >= address && item.memory_end <= address + size - 1)
-        {
+            .filter(|item| item.memory_start >= address && item.memory_end <= address + size - 1)
+            .map(|item| (item.memory_start, item.memory_end))
+            .collect();
+
+        if regions_to_unmap.len() == 0 {
             return;
         }
 
         for thread in threads.lock().unwrap().iter_mut() {
-            thread
-                .unicorn
-                .mem_unmap(address as u64, size as usize)
-                .unwrap();
+            for region in &regions_to_unmap {
+                thread
+                    .unicorn
+                    .mem_unmap(region.0 as u64, (region.1 - region.0 + 1) as usize)
+                    .unwrap();
+            }
         }
 
         self.regions
