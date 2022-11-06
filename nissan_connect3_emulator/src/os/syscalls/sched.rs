@@ -112,18 +112,6 @@ pub fn clone(
         .next_thread_id
         .fetch_add(1, Ordering::Relaxed);
 
-    /*print_stack(unicorn);
-    mem_dump(unicorn, regs, 128);
-    mem_dump(unicorn, child_stack, 128);
-    disasm(
-        unicorn,
-        (unicorn.reg_read(RegisterARM::PC).unwrap() - 100) as u32,
-        200,
-    );
-    let mut new_addr = vec![0u8; 4];
-    unicorn.mem_read(child_stack as u64, &mut new_addr).unwrap();
-    disasm(unicorn, unpack_u32(&new_addr), 200);*/
-
     if flags & 0x00200000 != 0 {
         // CLONE_CHILD_CLEARTID
         // Erase child thread ID at location child_tidptr in child memory when the child exits,

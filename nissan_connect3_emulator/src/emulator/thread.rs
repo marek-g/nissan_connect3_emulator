@@ -1,6 +1,6 @@
 use crate::emulator::context::{Context, ContextInner};
 use crate::emulator::elf_loader::load_elf;
-use crate::emulator::memory_map::GET_TLS_ADDR;
+use crate::emulator::memory_map::{GET_TLS_ADDR, STACK_BASE, STACK_SIZE};
 use crate::emulator::mmu::mmu_clone_map;
 use crate::emulator::print::{disasm, print_mmu, print_stack};
 use crate::emulator::utils::{load_binary, pack_u32, read_string};
@@ -117,10 +117,10 @@ impl Thread {
     }
 
     pub fn clone(
-        source_unicorn: &Unicorn<Context>,
+        mut source_unicorn: &mut Unicorn<Context>,
         child_thread_id: u32,
         child_tls: u32,
-        child_stack: u32,
+        mut child_stack: u32,
     ) -> Result<
         (
             Self,
@@ -175,9 +175,6 @@ impl Thread {
 
         add_code_hooks(&mut unicorn);
 
-        // copy memory map
-        mmu_clone_map(&source_unicorn, &mut unicorn)?;
-
         set_kernel_traps(&mut unicorn);
 
         // set tls
@@ -190,10 +187,32 @@ impl Thread {
 
         enable_vfp(&mut unicorn);
 
+        // if there is no child_stack, clone the parent's stack
+        if child_stack == 0 {
+            let data = source_unicorn.get_data();
+            let mmu = &mut data.inner.mmu.lock().unwrap();
+            let stack_ptr = mmu.heap_alloc(
+                &mut source_unicorn,
+                STACK_SIZE,
+                Permission::READ | Permission::WRITE,
+                "",
+            );
+            let mut buf = vec![0u8; STACK_SIZE as usize];
+            source_unicorn
+                .mem_read(STACK_BASE as u64, &mut buf)
+                .unwrap();
+            source_unicorn.mem_write(stack_ptr as u64, &buf).unwrap();
+            child_stack =
+                source_unicorn.reg_read(RegisterARM::SP).unwrap() as u32 - STACK_BASE + stack_ptr;
+        }
+
         // the address to continue is stored on new stack
         unicorn
             .reg_write(RegisterARM::SP, child_stack as u64)
             .unwrap();
+
+        // copy memory map
+        mmu_clone_map(&source_unicorn, &mut unicorn)?;
 
         // set 0 in R0 (result from syscall)
         unicorn.reg_write(RegisterARM::R0 as i32, 0).unwrap();
