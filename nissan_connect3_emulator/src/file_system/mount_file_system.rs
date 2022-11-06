@@ -100,6 +100,14 @@ impl MountFileSystem {
         }
     }
 
+    pub fn mkdir(&mut self, file_path: &str, mode: u32) -> Result<(), OpenFileError> {
+        if let Some((mount_point, file_path)) = self.get_mount_point_from_filepath_mut(file_path) {
+            mount_point.file_system.mkdir(&file_path, mode)
+        } else {
+            Err(OpenFileError::FileSystemNotMounted)
+        }
+    }
+
     pub fn open(&mut self, file_path: &str, flags: OpenFileFlags) -> Result<i32, OpenFileError> {
         let fd = self.get_unique_fd();
         if let Some((mount_point, file_path)) = self.get_mount_point_from_filepath_mut(file_path) {

@@ -540,6 +540,42 @@ pub fn unlink(unicorn: &mut Unicorn<Context>, path: u32) -> u32 {
     res
 }
 
+pub fn symlink(unicorn: &mut Unicorn<Context>, old_path: u32, new_path: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] symlink(old_path: {:#x}, new_path: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        old_path,
+        new_path,
+    );
+
+    let old_path = read_string(unicorn, old_path);
+    let new_path = read_string(unicorn, new_path);
+
+    log::trace!("old_path: {}, new_path: {}", old_path, new_path);
+
+    let res = match unicorn
+        .get_data()
+        .inner
+        .file_system
+        .lock()
+        .unwrap()
+        .link(&old_path, &new_path)
+    {
+        Ok(_) => 0u32,
+        Err(err) => err.to_syscall_error(),
+    };
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] symlink => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        res
+    );
+
+    res
+}
+
 pub fn ftruncate(unicorn: &mut Unicorn<Context>, fd: u32, length: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] ftruncate(fd: {:#x}, length: {:#x}) [IN]",

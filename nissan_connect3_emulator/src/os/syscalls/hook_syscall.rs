@@ -39,6 +39,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
         10 => unistd::unlink(unicorn, unicorn.get_u32_arg(0)),
         20 => unistd::get_pid(unicorn),
         33 => unistd::access(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        39 => stat::mkdir(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         45 => unistd::brk(unicorn, unicorn.get_u32_arg(0)),
         54 => ioctl::ioctl(
             unicorn,
@@ -47,6 +48,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
             unicorn.get_u32_arg(2),
         ),
         78 => time::gettimeofday(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        83 => unistd::symlink(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         90 => mman::mmap(
             unicorn,
             unicorn.get_u32_arg(0),

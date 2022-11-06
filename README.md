@@ -29,4 +29,9 @@ Threading in Unicorn:
 
 - https://github.com/unicorn-engine/unicorn/issues/142
 
-Special thanks to: https://github.com/raburton/lcn-patcher & https://github.com/sapphire-bt/lcn2kai-decompress.
+Special thanks to:
+- https://github.com/ea/bosch_headunit_root (Rooting Bosch lcn2kai Headunit)
+- https://github.com/ea/bosch_headunit_root/blob/main/docs/rtos_interaction.md (RTOS interaction)
+- https://github.com/raburton/lcn-patcher
+- https://github.com/sapphire-bt/lcn2kai-decompress
+

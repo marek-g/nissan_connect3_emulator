@@ -34,6 +34,10 @@ impl FileSystem for OsFileSystem {
         path.exists()
     }
 
+    fn mkdir(&mut self, _file_path: &str, _mode: u32) -> Result<(), OpenFileError> {
+        Err(OpenFileError::NoPermission)
+    }
+
     fn read_dir(&mut self, dir_path: &str) -> Result<Vec<String>, ()> {
         let full_path_name = self.path_transform_to_real(&dir_path);
 

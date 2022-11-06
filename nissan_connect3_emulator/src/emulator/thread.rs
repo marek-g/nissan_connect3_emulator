@@ -3,7 +3,7 @@ use crate::emulator::elf_loader::load_elf;
 use crate::emulator::memory_map::GET_TLS_ADDR;
 use crate::emulator::mmu::mmu_clone_map;
 use crate::emulator::print::{disasm, print_mmu, print_stack};
-use crate::emulator::utils::{load_binary, pack_u32};
+use crate::emulator::utils::{load_binary, pack_u32, read_string};
 use capstone::arch::arm::ArchMode;
 use capstone::prelude::{BuildsCapstone, BuildsCapstoneEndian};
 use capstone::{Capstone, Endian};
@@ -460,18 +460,59 @@ fn add_code_hooks(unicorn: &mut Unicorn<Context>) {
 
             let addr = addr as u32;
 
-            /*if let Some(method_name) = method_entries.get(&addr) {
+            if let Some(method_name) = method_entries.get(&addr) {
                 log::trace!("-- {:#x} [{}] OSAL: {}() [IN]", addr, uc.get_data().inner.thread_id,  *method_name);
                 tracing = true;
 
                 let method_name = method_name.to_string();
 
                 if method_name == "vInitTrace" {
-                    // skip vInitTrace that normally crashes (on LLD_vRegTraceCallback inside)
+                    // skip method that normally crashes
                     uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap()).unwrap();
                 }
 
-                if method_name == "OSAL_vAssertFunction" ||
+                if method_name == "DEV_FFD_s32IODeviceInit" {
+                    uc.reg_write(RegisterARM::R0, 1).unwrap();
+                    uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap()).unwrap();
+                }
+
+                if method_name == "LockOsal" ||
+                    method_name == "UnLockOsal" {
+                    uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap()).unwrap();
+                }
+
+                if method_name == "LLD_bIsTraceActive" {
+                    uc.reg_write(RegisterARM::R0, 1u64).unwrap();
+                    uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap()).unwrap();
+                }
+
+                if method_name == "OSAL_vAssertFunction" {
+                    let str1 = read_string(uc, uc.reg_read(RegisterARM::R0).unwrap() as u32);
+                    let str2 = read_string(uc, uc.reg_read(RegisterARM::R0).unwrap() as u32);
+                    if str1 == str2 {
+                        log::trace!("OSAL assert OK: {} = {}", str1, str2);
+                    } else {
+                        log::error!("OSAL assert ERROR: {} != {}", str1, str2);
+                    }
+                    uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap()).unwrap();
+                }
+
+                if method_name == "OSAL_s32MessageQueueOpen" {
+                    let str = read_string(uc, uc.reg_read(RegisterARM::R0).unwrap() as u32);
+                    log::trace!("OSAL_s32MessageQueueOpen: {}", str);
+                }
+
+                if method_name == "vTraceMqInfo" {
+                    uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap()).unwrap();
+                }
+
+                if method_name == "TraceIOString" {
+                    let str = read_string(uc, uc.reg_read(RegisterARM::R0).unwrap() as u32);
+                    log::warn!("TraceIOString: {}", str);
+                    uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap()).unwrap();
+                }
+
+                /*if method_name == "OSAL_vAssertFunction" ||
                     method_name == "vTraceMqInfo" ||
                     method_name == "TraceIOString" ||
                     method_name == "DEV_FFD_s32IODeviceInit" ||
@@ -489,14 +530,10 @@ fn add_code_hooks(unicorn: &mut Unicorn<Context>) {
 
                 if method_name.to_string() == "LLD_vRegTraceCallback" {
                     uc.get_data().inner.instruction_tracing.store(true, Ordering::Relaxed);
-                }
-
-                /*if method_name.to_string() == "exc_lock" {
-                    uc.get_data().inner.instruction_tracing.store(true, Ordering::Relaxed);
                 }*/
             }
 
-            if addr == 0x4851578c {
+            /*if addr == 0x4851578c {
                 log::trace!("-- OSAL_ThreadCreate({:#x}) [IN]", uc.reg_read(RegisterARM::R0).unwrap());
                 tracing = true;
             }

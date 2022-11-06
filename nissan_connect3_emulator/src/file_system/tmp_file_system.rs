@@ -58,6 +58,10 @@ impl FileSystem for TmpFileSystem {
         self.files.contains_key(file_path)
     }
 
+    fn mkdir(&mut self, _file_path: &str, _mode: u32) -> Result<(), OpenFileError> {
+        Err(OpenFileError::NoPermission)
+    }
+
     fn read_dir(&mut self, dir_path: &str) -> Result<Vec<String>, ()> {
         let mut dir_path = dir_path.to_string();
         if dir_path != "/" && dir_path.ends_with("/") {

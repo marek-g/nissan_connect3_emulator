@@ -32,6 +32,10 @@ impl FileSystem for StdFileSystem {
         false
     }
 
+    fn mkdir(&mut self, _file_path: &str, _mode: u32) -> Result<(), OpenFileError> {
+        Err(OpenFileError::NoPermission)
+    }
+
     fn read_dir(&mut self, _dir_path: &str) -> Result<Vec<String>, ()> {
         Err(())
     }

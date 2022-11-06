@@ -234,6 +234,35 @@ pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
     res
 }
 
+pub fn mkdir(unicorn: &mut Unicorn<Context>, path: u32, mode: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] mkdir(path = {:#x}, mode = {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        path,
+        mode,
+    );
+
+    let pathstr = read_string(unicorn, path);
+
+    log::trace!("path = {}", pathstr);
+
+    let file_system = unicorn.get_data().inner.file_system.clone();
+    let res = if let Ok(fd) = file_system.lock().unwrap().mkdir(&pathstr, mode) {
+        0
+    } else {
+        -1i32 as u32
+    };
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] mkdir => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        res
+    );
+    res
+}
+
 fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, stat_buf: u32) -> u32 {
     let file_system = unicorn.get_data().inner.file_system.clone();
 
