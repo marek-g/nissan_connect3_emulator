@@ -128,12 +128,6 @@ impl Thread {
         ),
         Box<dyn Error + Send + Sync + 'static>,
     > {
-        /*source_unicorn
-        .get_data()
-        .inner
-        .instruction_tracing
-        .store(true, Ordering::Relaxed);*/
-
         let source_context = source_unicorn.get_data();
         let context = Context {
             inner: Arc::new(ContextInner {
@@ -184,9 +178,7 @@ impl Thread {
         // copy memory map
         mmu_clone_map(&source_unicorn, &mut unicorn)?;
 
-        // TODO: set kernel traps and tls for new thread
-        //set_kernel_traps(&mut unicorn);
-        //linux::set_tls(unicorn, child_tls);
+        set_kernel_traps(&mut unicorn);
 
         // set tls
         unicorn
@@ -316,16 +308,16 @@ fn emu_thread_loop(
 // https://elixir.bootlin.com/linux/latest/source/arch/arm/kernel/entry-armv.S#L899
 fn set_kernel_traps(unicorn: &mut Unicorn<Context>) {
     let unicorn_context = unicorn.get_data();
-    let mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
 
-    mmu.map(
-        unicorn,
-        0xFFFF0000,
-        0x1000,
-        Permission::READ | Permission::EXEC,
-        "[arm_traps]",
-        "",
-    );
+    // allocate memory directly by unicorn (not mmu object),
+    // so it is different for every thread
+    unicorn
+        .mem_map(
+            0xFFFF0000u64,
+            0x1000usize,
+            Permission::READ | Permission::EXEC,
+        )
+        .unwrap();
 
     // memory_barrier
     log::debug!("Set kernel trap: memory_barrier at 0xFFFF0FA0");
@@ -467,7 +459,8 @@ fn add_code_hooks(unicorn: &mut Unicorn<Context>) {
             let mut tracing = uc.get_data().inner.instruction_tracing.load(Ordering::Relaxed);
 
             let addr = addr as u32;
-            if let Some(method_name) = method_entries.get(&addr) {
+
+            /*if let Some(method_name) = method_entries.get(&addr) {
                 log::trace!("-- {:#x} [{}] OSAL: {}() [IN]", addr, uc.get_data().inner.thread_id,  *method_name);
                 tracing = true;
 
@@ -544,7 +537,7 @@ fn add_code_hooks(unicorn: &mut Unicorn<Context>) {
                 log::trace!("-- [libosal] entry_init1() [OUT]");
                 //uc.get_data().inner.instruction_tracing.store(true, Ordering::Relaxed);
                 tracing = true;
-            }
+            }*/
 
             if tracing {
                 let cs = Capstone::new()

@@ -74,7 +74,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     //emulator.run_process("/bin/pwd.coreutils".to_string(), vec![], envs)?;
     //emulator.run_process("/bin/ls.coreutils".to_string(), vec![], envs)?;
     emulator.run_process(
-        "/opt/bosch/processes/procbaselx_out.out".to_string(),
+        //"/opt/bosch/processes/procbaselx_out.out".to_string(),
+        "/opt/bosch/processes/procvoice_out.out".to_string(),
         vec![],
         envs,
     )?;

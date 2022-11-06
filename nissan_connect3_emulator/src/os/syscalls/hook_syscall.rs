@@ -216,8 +216,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
                 log::trace!("mq_open: {}", path);
                 std::thread::sleep(Duration::from_millis(1000));
             }
-            //panic!(
-            log::error!(
+            panic!(
                 "{:#x}: [{}] not implemented syscall #{} (int {}), args: {:#x}, {:#x}, {:#x}, ...",
                 unicorn.reg_read(RegisterARM::PC).unwrap(),
                 unicorn.get_data().inner.thread_id,
@@ -227,7 +226,6 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
                 unicorn.get_u32_arg(1),
                 unicorn.get_u32_arg(2),
             );
-            0
         }
     };
     unicorn.set_u32_result(res);

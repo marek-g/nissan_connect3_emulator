@@ -416,8 +416,7 @@ pub fn get_tid(unicorn: &mut Unicorn<Context>) -> u32 {
         unicorn.get_data().inner.thread_id,
     );
 
-    // TODO: implement
-    let res = 1;
+    let res = unicorn.get_data().inner.thread_id;
 
     log::trace!(
         "{:#x}: [{}] [SYSCALL] get_tid => {:#x}",
@@ -437,7 +436,7 @@ pub fn get_pid(unicorn: &mut Unicorn<Context>) -> u32 {
     );
 
     // TODO: implement
-    let res = 2;
+    let res = 1;
 
     log::trace!(
         "{:#x}: [{}] [SYSCALL] get_pid => {:#x}",

@@ -106,7 +106,6 @@ pub fn clone(
         child_tid_ptr,
     );
 
-    let parent_tid = unicorn.get_data().inner.thread_id;
     let child_tid = unicorn
         .get_data()
         .inner
@@ -125,12 +124,27 @@ pub fn clone(
     unicorn.mem_read(child_stack as u64, &mut new_addr).unwrap();
     disasm(unicorn, unpack_u32(&new_addr), 200);*/
 
-    unicorn
-        .mem_write(parent_tid_ptr as u64, &pack_u32(parent_tid))
-        .unwrap();
-    unicorn
-        .mem_write(child_tid_ptr as u64, &pack_u32(child_tid))
-        .unwrap();
+    if flags & 0x00200000 != 0 {
+        // CLONE_CHILD_CLEARTID
+        // Erase child thread ID at location child_tidptr in child memory when the child exits,
+        // and do a wakeup on the futex at that address.
+        log::warn!("clone() - CLONE_CHILD_CLEARTID not implemented");
+    }
+
+    if flags & 0x00100000 != 0 {
+        // CLONE_PARENT_SETTID
+        // Store child thread ID at location parent_tid_ptr in parent and child memory
+        unicorn
+            .mem_write(parent_tid_ptr as u64, &pack_u32(child_tid))
+            .unwrap();
+    }
+    if flags & 0x01000000 != 0 {
+        // CLONE_CHILD_SETTID
+        // Store child thread ID at location child_tidptr in child memory
+        unicorn
+            .mem_write(child_tid_ptr as u64, &pack_u32(child_tid))
+            .unwrap();
+    }
 
     let (new_thread, _) = Thread::clone(unicorn, child_tid, child_tls, child_stack).unwrap();
     if let Some(threads) = unicorn.get_data().inner.threads.upgrade() {

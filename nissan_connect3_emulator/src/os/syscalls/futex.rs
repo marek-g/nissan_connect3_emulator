@@ -1,6 +1,5 @@
 use crate::emulator::context::Context;
 use crate::emulator::utils::unpack_u32;
-use log::error;
 use std::sync::mpsc::channel;
 use unicorn_engine::{RegisterARM, Unicorn};
 

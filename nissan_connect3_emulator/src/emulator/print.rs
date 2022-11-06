@@ -1,5 +1,4 @@
 use crate::emulator::context::Context;
-use crate::emulator::mmu::Mmu;
 use crate::emulator::utils::unpack_u32;
 use capstone::arch::arm::ArchMode;
 use capstone::prelude::*;
@@ -17,12 +16,12 @@ pub fn print_mmu(unicorn: &Unicorn<Context>) {
 
 pub fn print_stack(unicorn: &Unicorn<Context>) {
     let mut sp = unicorn.reg_read(RegisterARM::SP).unwrap();
-    let mut fp = unicorn.reg_read(RegisterARM::FP).unwrap();
+    let fp = unicorn.reg_read(RegisterARM::FP).unwrap();
     println!(
         "------------------ STACK at {:#010x}, FP: {:#010x}:",
         sp, fp
     );
-    for i in 0..20 {
+    for _ in 0..20 {
         let mut mem = [0u8; 4];
         unicorn.mem_read(sp, &mut mem).unwrap();
         print!("{:#010x} ", unpack_u32(&mem));
