@@ -248,7 +248,7 @@ pub fn mkdir(unicorn: &mut Unicorn<Context>, path: u32, mode: u32) -> u32 {
     log::trace!("path = {}", pathstr);
 
     let file_system = unicorn.get_data().inner.file_system.clone();
-    let res = if let Ok(fd) = file_system.lock().unwrap().mkdir(&pathstr, mode) {
+    let res = if let Ok(_) = file_system.lock().unwrap().mkdir(&pathstr, mode) {
         0
     } else {
         -1i32 as u32
