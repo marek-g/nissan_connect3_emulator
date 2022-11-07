@@ -194,6 +194,43 @@ pub fn write(unicorn: &mut Unicorn<Context>, fd: u32, buf: u32, length: u32) -> 
     res
 }
 
+pub fn lseek(unicorn: &mut Unicorn<Context>, fd: u32, offset: u32, whence: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] lseek(fd: {:#x}, offset: {:#x}, whence: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        fd,
+        offset,
+        whence,
+    );
+
+    let file_system = &mut unicorn.get_data().inner.file_system.clone();
+    let offset = offset as u64;
+    let res = if let Ok(pos) = match whence {
+        0 => Ok(SeekFrom::Start(offset)),
+        1 => Ok(SeekFrom::Current(offset as i64)),
+        2 => Ok(SeekFrom::End(offset as i64)),
+        _ => Err(()),
+    } {
+        if let Ok(new_pos) = file_system.lock().unwrap().seek(fd as i32, pos) {
+            0 as u32
+        } else {
+            -1i32 as u32
+        }
+    } else {
+        -1i32 as u32
+    };
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] lseek => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        res
+    );
+
+    res
+}
+
 pub fn _llseek(
     unicorn: &mut Unicorn<Context>,
     fd: u32,
