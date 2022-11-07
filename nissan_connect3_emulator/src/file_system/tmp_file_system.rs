@@ -30,18 +30,19 @@ struct TmpFsOpenedFileData {
 
 impl TmpFileSystem {
     pub fn new() -> Self {
-        let mut files = HashMap::new();
-        files.insert(
-            "/".to_string(),
-            Arc::new(Mutex::new(TmpFsFileData {
-                file_type: FileType::Directory,
-                data: vec![],
-            })),
-        );
-        Self {
-            files,
+        let mut tmp_fs = Self {
+            files: HashMap::new(),
             opened_files: HashMap::new(),
-        }
+        };
+        tmp_fs.insert_entry("/", FileType::Directory, vec![]);
+        tmp_fs
+    }
+
+    pub fn insert_entry(&mut self, path: &str, file_type: FileType, data: Vec<u8>) {
+        self.files.insert(
+            path.to_string(),
+            Arc::new(Mutex::new(TmpFsFileData { file_type, data })),
+        );
     }
 }
 
