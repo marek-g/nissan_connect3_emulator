@@ -547,13 +547,15 @@ pub fn link(unicorn: &mut Unicorn<Context>, old_path: u32, new_path: u32) -> u32
 
 pub fn unlink(unicorn: &mut Unicorn<Context>, path: u32) -> u32 {
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] unlink(path: {}) [IN]",
+        "{:#x}: [{}] [SYSCALL] unlink(path: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id,
         path,
     );
 
     let path = read_string(unicorn, path);
+
+    log::trace!("path: {}", path);
 
     let res = match unicorn
         .get_data()

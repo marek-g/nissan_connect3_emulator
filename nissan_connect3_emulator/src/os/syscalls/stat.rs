@@ -263,6 +263,25 @@ pub fn mkdir(unicorn: &mut Unicorn<Context>, path: u32, mode: u32) -> u32 {
     res
 }
 
+pub fn umask(unicorn: &mut Unicorn<Context>, mask: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] umask(mask = {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        mask,
+    );
+
+    let res = 0777;
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] umask => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        res
+    );
+    res
+}
+
 fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, stat_buf: u32) -> u32 {
     let file_system = unicorn.get_data().inner.file_system.clone();
 
