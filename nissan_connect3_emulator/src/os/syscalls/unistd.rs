@@ -213,7 +213,7 @@ pub fn lseek(unicorn: &mut Unicorn<Context>, fd: u32, offset: u32, whence: u32) 
         _ => Err(()),
     } {
         if let Ok(new_pos) = file_system.lock().unwrap().seek(fd as i32, pos) {
-            0 as u32
+            new_pos as u32
         } else {
             -1i32 as u32
         }

@@ -1,3 +1,4 @@
+mod dev_file_system;
 mod file_info;
 mod file_system;
 mod mount_file_system;
@@ -6,6 +7,7 @@ mod proc_file_system;
 mod std_file_system;
 mod tmp_file_system;
 
+pub use dev_file_system::*;
 pub use file_info::*;
 pub use file_system::*;
 pub use mount_file_system::*;

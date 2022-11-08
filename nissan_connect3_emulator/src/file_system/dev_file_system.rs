@@ -8,43 +8,37 @@ use std::io::SeekFrom;
 use unicorn_engine::Unicorn;
 
 ///
-/// Proc file system.
+/// Dev file system.
 ///
-pub struct ProcFileSystem {
+pub struct DevFileSystem {
     tmp_fs: TmpFileSystem,
 }
 
-impl ProcFileSystem {
+impl DevFileSystem {
     pub fn new() -> Self {
         let mut tmp_fs = TmpFileSystem::new();
         tmp_fs.insert_entry(
-            "/cmdline",
+            "/iosc",
             FileType::File,
             //"rw dualosoff=false".to_string().as_bytes().to_vec(),
-            "rw".to_string().as_bytes().to_vec(),
+            "????????????".to_string().as_bytes().to_vec(),
         );
         tmp_fs.insert_entry(
-            "/self/cmdline",
+            "/errmem",
             FileType::File,
-            "my_program".to_string().as_bytes().to_vec(),
+            "???????????????".to_string().as_bytes().to_vec(),
         );
-        tmp_fs.insert_entry(
-            "/1/comm",
-            FileType::File,
-            "systemd".to_string().as_bytes().to_vec(),
-        );
-
         Self { tmp_fs }
     }
 }
 
-impl FileSystem for ProcFileSystem {
+impl FileSystem for DevFileSystem {
     fn support_file_paths(&self) -> bool {
         true
     }
 
     fn file_system_type(&self) -> FileSystemType {
-        FileSystemType::Proc
+        FileSystemType::Dev
     }
 
     fn exists(&mut self, file_path: &str) -> bool {

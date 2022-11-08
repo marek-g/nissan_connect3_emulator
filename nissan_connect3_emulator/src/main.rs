@@ -1,6 +1,7 @@
 use crate::emulator::emulator::Emulator;
 use crate::file_system::{
-    MountFileSystem, MountPoint, OsFileSystem, ProcFileSystem, StdFileSystem, TmpFileSystem,
+    DevFileSystem, MountFileSystem, MountPoint, OsFileSystem, ProcFileSystem, StdFileSystem,
+    TmpFileSystem,
 };
 use std::path::PathBuf;
 
@@ -57,6 +58,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         MountPoint {
             mount_point: "/proc".to_string(),
             file_system: Box::new(ProcFileSystem::new()),
+            is_read_only: false,
+        },
+        // dev-fs
+        MountPoint {
+            mount_point: "/dev".to_string(),
+            file_system: Box::new(DevFileSystem::new()),
             is_read_only: false,
         },
     ]);
