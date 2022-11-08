@@ -57,6 +57,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
         60 => stat::umask(unicorn, unicorn.get_u32_arg(0)),
         78 => time::gettimeofday(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         83 => unistd::symlink(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        88 => unistd::reboot(unicorn, unicorn.get_u32_arg(0)),
         90 => mman::mmap(
             unicorn,
             unicorn.get_u32_arg(0),

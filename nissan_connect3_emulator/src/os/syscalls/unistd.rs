@@ -537,6 +537,30 @@ pub fn exit_group(unicorn: &mut Unicorn<Context>, status: u32) -> u32 {
     0u32
 }
 
+pub fn reboot(unicorn: &mut Unicorn<Context>, status: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] reboot(status: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        status,
+    );
+
+    if let Some(threads) = unicorn.get_data().inner.threads.upgrade() {
+        for thread in threads.lock().unwrap().iter_mut() {
+            thread.exit().unwrap();
+        }
+    }
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] reboot => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        0u32
+    );
+
+    0u32
+}
+
 pub fn link(unicorn: &mut Unicorn<Context>, old_path: u32, new_path: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] link(old_path: {:#x}, new_path: {:#x}) [IN]",
