@@ -485,6 +485,34 @@ pub fn get_pid(unicorn: &mut Unicorn<Context>) -> u32 {
     res
 }
 
+pub fn exit(unicorn: &mut Unicorn<Context>, status: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] exit(status: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        status,
+    );
+
+    let current_thread_id = unicorn.get_data().inner.thread_id;
+
+    if let Some(threads) = unicorn.get_data().inner.threads.upgrade() {
+        for thread in threads.lock().unwrap().iter_mut() {
+            if thread.unicorn.get_data().inner.thread_id == current_thread_id {
+                thread.exit().unwrap();
+            }
+        }
+    }
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] exit => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id,
+        0u32
+    );
+
+    0u32
+}
+
 pub fn exit_group(unicorn: &mut Unicorn<Context>, status: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] exit_group(status: {:#x}) [IN]",

@@ -16,6 +16,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
     // - https://github.com/zeropointdynamics/zelos/blob/master/src/zelos/ext/platforms/linux/syscalls/syscalls.py
     // - https://github.com/qilingframework/qiling/tree/master/qiling/os/posix/syscall
     let res = match unicorn.get_syscall_number() {
+        1 => unistd::exit(unicorn, unicorn.get_u32_arg(0)),
         3 => unistd::read(
             unicorn,
             unicorn.get_u32_arg(0),

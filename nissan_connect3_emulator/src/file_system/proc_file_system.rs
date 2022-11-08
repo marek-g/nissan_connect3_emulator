@@ -24,7 +24,7 @@ impl ProcFileSystem {
         tmp_fs.insert_entry(
             "/cmdline",
             FileType::File,
-            "rw".to_string().as_bytes().to_vec(),
+            "rw dualosoff=false".to_string().as_bytes().to_vec(),
         );
         tmp_fs.insert_entry(
             "/self/cmdline",
