@@ -111,6 +111,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
         ),
         159 => sched::sched_get_priority_max(unicorn, unicorn.get_u32_arg(0)),
         160 => sched::sched_get_priority_min(unicorn, unicorn.get_u32_arg(0)),
+        162 => time::nanosleep(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         172 => prctl::prctl(
             unicorn,
             unicorn.get_u32_arg(0),

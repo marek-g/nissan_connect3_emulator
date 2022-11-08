@@ -271,6 +271,7 @@ pub fn umask(unicorn: &mut Unicorn<Context>, mask: u32) -> u32 {
         mask,
     );
 
+    // TODO:
     let res = 0777;
 
     log::trace!(
