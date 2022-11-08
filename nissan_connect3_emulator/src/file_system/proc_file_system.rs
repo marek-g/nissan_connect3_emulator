@@ -33,6 +33,11 @@ impl ProcFileSystem {
             FileType::File,
             "systemd".to_string().as_bytes().to_vec(),
         );
+        tmp_fs.insert_entry(
+            "/iosc/status",
+            FileType::File,
+            "???????????".to_string().as_bytes().to_vec(),
+        );
 
         Self { tmp_fs }
     }

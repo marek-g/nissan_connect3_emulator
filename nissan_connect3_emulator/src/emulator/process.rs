@@ -3,6 +3,7 @@ use crate::emulator::mmu::Mmu;
 use crate::emulator::thread::Thread;
 use crate::file_system::MountFileSystem;
 use crate::os::SysCallsState;
+use std::collections::HashSet;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,6 +45,7 @@ impl Process {
                 next_thread_id: self.next_thread_id.clone(),
                 thread_id,
                 instruction_tracing: Arc::new(AtomicBool::new(false)),
+                hooked_libraries: Arc::new(Mutex::new(HashSet::new())),
             }),
         };
 

@@ -131,7 +131,7 @@ pub fn mincore(unicorn: &mut Unicorn<Context>, addr: u32, length: u32, vec: u32)
 }
 
 fn mmapx(
-    unicorn: &mut Unicorn<Context>,
+    mut unicorn: &mut Unicorn<Context>,
     addr: u32,
     mut length: u32,
     prot: u32,
@@ -182,10 +182,9 @@ fn mmapx(
 
     // allocate memory
     let unicorn_context = unicorn.get_data();
-    let mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
     let addr = if flags & 0x10 != 0 || addr != 0 {
         // MAP_FIXED - don't interpret addr as a hint
-        mmu.map(
+        unicorn_context.inner.mmu.lock().unwrap().map(
             unicorn,
             addr,
             length,
@@ -195,12 +194,26 @@ fn mmapx(
         );
         addr
     } else {
-        mmu.heap_alloc(unicorn, length, perms, &filepath)
+        unicorn_context
+            .inner
+            .mmu
+            .lock()
+            .unwrap()
+            .heap_alloc(unicorn, length, perms, &filepath)
     };
 
     // write file
     if buf.len() > 0 {
         unicorn.mem_write(addr as u64, &buf).unwrap();
+
+        if perms.contains(Permission::EXEC) {
+            unicorn_context
+                .inner
+                .mmu
+                .lock()
+                .unwrap()
+                .update_library_hooks_for_all_threads(&unicorn);
+        }
     }
 
     addr

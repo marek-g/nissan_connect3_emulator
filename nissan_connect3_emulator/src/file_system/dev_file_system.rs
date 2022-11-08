@@ -116,6 +116,6 @@ impl FileSystem for DevFileSystem {
         _request: u32,
         _addr: u32,
     ) -> i32 {
-        todo!()
+        0i32
     }
 }

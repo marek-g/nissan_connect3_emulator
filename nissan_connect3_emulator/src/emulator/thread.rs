@@ -5,10 +5,11 @@ use crate::emulator::mmu::mmu_clone_map;
 use crate::emulator::print::{disasm, print_mmu, print_stack};
 use crate::emulator::utils::{load_binary, pack_u32};
 use crate::os::libosal_add_code_hooks;
+use std::collections::HashSet;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
 use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Permission};
@@ -56,8 +57,6 @@ impl Thread {
         unicorn
             .add_mem_hook(HookType::MEM_WRITE_PROT, 1, 0, callback_mem_rw)
             .unwrap();
-
-        libosal_add_code_hooks(&mut unicorn);
 
         let is_paused = Arc::new(AtomicBool::new(false));
         let is_exit = Arc::new(AtomicBool::new(false));
@@ -129,6 +128,7 @@ impl Thread {
                 next_thread_id: source_context.inner.next_thread_id.clone(),
                 thread_id: child_thread_id,
                 instruction_tracing: Arc::new(AtomicBool::new(false)),
+                hooked_libraries: Arc::new(Mutex::new(HashSet::new())),
             }),
         };
 
@@ -143,12 +143,6 @@ impl Thread {
         unicorn
             .context_restore(&registers_context)
             .map_err(|err| format!("Unicorn context restore error: {:?}", err))?;
-        /*unicorn
-        .reg_write(
-            RegisterARM::PC,
-            source_unicorn.reg_read(RegisterARM::PC).unwrap(),
-        )
-        .unwrap();*/
 
         unicorn.add_intr_hook(crate::os::hook_syscall).unwrap();
         unicorn
@@ -164,7 +158,14 @@ impl Thread {
             .add_mem_hook(HookType::MEM_WRITE_PROT, 1, 0, callback_mem_rw)
             .unwrap();
 
-        libosal_add_code_hooks(&mut unicorn);
+        {
+            let data = unicorn.get_data();
+            data.inner
+                .mmu
+                .lock()
+                .unwrap()
+                .update_library_hooks(&mut unicorn);
+        }
 
         set_kernel_traps(&mut unicorn);
 

@@ -6,14 +6,15 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<Context>) {
+pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<Context>, base_address: u32) {
     let mut method_entries = HashMap::new();
     insert_libosal_method_entries(&mut method_entries);
 
-    for entry in method_entries {
+    for (mut address, method_name) in method_entries {
+        address = address - 0x484e8000 + base_address;
         unicorn
-            .add_code_hook(entry.0 as u64, entry.0 as u64, move |uc, addr, _| {
-                handle_hook(uc, addr, entry.1)
+            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+                handle_hook(uc, addr, method_name)
             })
             .unwrap();
     }
@@ -119,6 +120,7 @@ fn handle_hook(uc: &mut Unicorn<Context>, addr: u64, method_name: &str) {
     }
 }
 
+// rabin2 -E ./libosal_linux_so.so
 fn insert_libosal_method_entries(method_entries: &mut HashMap<u32, &str>) {
     method_entries.insert(0x484ecf50, "vRegisterOsalIO_Callback");
     method_entries.insert(0x48530a68, "bReadPublicKey");

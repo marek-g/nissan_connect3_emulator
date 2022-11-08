@@ -2,6 +2,7 @@ use crate::emulator::mmu::Mmu;
 use crate::emulator::thread::Thread;
 use crate::file_system::MountFileSystem;
 use crate::os::SysCallsState;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -19,4 +20,6 @@ pub struct ContextInner {
 
     pub thread_id: u32,
     pub instruction_tracing: Arc<AtomicBool>,
+
+    pub hooked_libraries: Arc<Mutex<HashSet<String>>>,
 }

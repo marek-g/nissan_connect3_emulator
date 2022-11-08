@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use crate::emulator::context::Context;
 use crate::emulator::thread::Thread;
 use crate::emulator::utils::mem_align_up;
+use crate::os::add_library_hook;
 use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::Unicorn;
 
@@ -150,6 +151,51 @@ impl Mmu {
         }
 
         Self::resume_all_threads(&threads);
+    }
+
+    pub fn get_regions(&self) -> &Vec<MmuRegion> {
+        &self.regions
+    }
+
+    pub fn get_libraries_and_base_addresses(&self) -> Vec<(String, u32)> {
+        self.regions
+            .iter()
+            .filter(|region| {
+                region.memory_perms.contains(Permission::EXEC) && region.filepath.len() > 0
+            })
+            .map(|region| (region.filepath.clone(), region.memory_start))
+            .collect()
+    }
+
+    /// Updates library hooks for all threads
+    pub fn update_library_hooks_for_all_threads(&self, unicorn: &Unicorn<Context>) {
+        let threads = unicorn.get_data().inner.threads.upgrade().unwrap();
+
+        Self::pause_all_threads(&threads);
+
+        for thread in threads.lock().unwrap().iter_mut() {
+            self.update_library_hooks(&mut thread.unicorn);
+        }
+
+        Self::resume_all_threads(&threads);
+    }
+
+    /// Updates library hooks for a single unicorn instance
+    pub fn update_library_hooks(&self, unicorn: &mut Unicorn<Context>) {
+        let libraries = self.get_libraries_and_base_addresses();
+        let data = unicorn.get_data();
+        for (library, base_address) in libraries {
+            if !data
+                .inner
+                .hooked_libraries
+                .lock()
+                .unwrap()
+                .contains(&library)
+            {
+                add_library_hook(unicorn, &library, base_address);
+                data.inner.hooked_libraries.lock().unwrap().insert(library);
+            }
+        }
     }
 
     pub fn display_mapped(&self) -> String {
