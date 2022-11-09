@@ -11,7 +11,7 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<Context>, base_address: u32)
     insert_libosal_method_entries(&mut method_entries);
 
     for (mut address, method_name) in method_entries {
-        address = address - 0x484e8000 + base_address;
+        //address = address - 0x484d8000 + base_address;
         unicorn
             .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
                 handle_hook(uc, addr, method_name)

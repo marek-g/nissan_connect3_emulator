@@ -1,11 +1,122 @@
+mod trace;
+
 use crate::emulator::context::Context;
+use crate::os::libtrace::trace::*;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use unicorn_engine::Unicorn;
+use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn libtrace_add_code_hooks(unicorn: &mut Unicorn<Context>, base_address: u32) {
     let mut method_entries = HashMap::new();
     insert_libtrace_method_entries(&mut method_entries);
+
+    unicorn
+        .add_code_hook(
+            (base_address + 0x00002f58) as u64,
+            (base_address + 0x00002f58) as u64,
+            |uc, addr, _| {
+                log::trace!(
+                    "{:#x}: [{}] [LIBTRACE HOOK] _init()",
+                    uc.reg_read(RegisterARM::PC).unwrap(),
+                    uc.get_data().inner.thread_id,
+                );
+                let res = trace_init();
+                uc.reg_write(RegisterARM::R0, res as u64).unwrap();
+                uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
+                    .unwrap();
+            },
+        )
+        .unwrap();
+
+    unicorn
+        .add_code_hook(
+            (base_address + 0x00004634) as u64,
+            (base_address + 0x00004634) as u64,
+            |uc, addr, _| {
+                log::trace!(
+                    "{:#x}: [{}] [LIBTRACE HOOK] TR_chan_acess_bRegChan()",
+                    uc.reg_read(RegisterARM::PC).unwrap(),
+                    uc.get_data().inner.thread_id,
+                );
+                let res = trace_tr_chan_access();
+                uc.reg_write(RegisterARM::R0, res as u64).unwrap();
+                uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
+                    .unwrap();
+            },
+        )
+        .unwrap();
+
+    unicorn
+        .add_code_hook(
+            (base_address + 0x000043a0) as u64,
+            (base_address + 0x000043a0) as u64,
+            |uc, addr, _| {
+                log::trace!(
+                    "{:#x}: [{}] [LIBTRACE HOOK] TR_core_uwTraceOut()",
+                    uc.reg_read(RegisterARM::PC).unwrap(),
+                    uc.get_data().inner.thread_id,
+                );
+                let res = trace_tr_core_uw_trace_out();
+                uc.reg_write(RegisterARM::R0, res as u64).unwrap();
+                uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
+                    .unwrap();
+            },
+        )
+        .unwrap();
+
+    unicorn
+        .add_code_hook(
+            (base_address + 0x00007864) as u64,
+            (base_address + 0x00007864) as u64,
+            |uc, addr, _| {
+                log::trace!(
+                    "{:#x}: [{}] [LIBTRACE HOOK] TRACE_sharedmem_create_dualOS()",
+                    uc.reg_read(RegisterARM::PC).unwrap(),
+                    uc.get_data().inner.thread_id,
+                );
+                let res = trace_sharedmem_create_dual_os();
+                uc.reg_write(RegisterARM::R0, res as u64).unwrap();
+                uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
+                    .unwrap();
+            },
+        )
+        .unwrap();
+
+    unicorn
+        .add_code_hook(
+            (base_address + 0x0000513c) as u64,
+            (base_address + 0x0000513c) as u64,
+            |uc, addr, _| {
+                log::trace!(
+                    "{:#x}: [{}] [LIBTRACE HOOK] TRACE_stop()",
+                    uc.reg_read(RegisterARM::PC).unwrap(),
+                    uc.get_data().inner.thread_id,
+                );
+                let res = trace_stop();
+                uc.reg_write(RegisterARM::R0, res as u64).unwrap();
+                uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
+                    .unwrap();
+            },
+        )
+        .unwrap();
+
+    unicorn
+        .add_code_hook(
+            (base_address + 0x000076e4) as u64,
+            (base_address + 0x000076e4) as u64,
+            |uc, addr, _| {
+                log::trace!(
+                    "{:#x}: [{}] [LIBTRACE HOOK] TR_core_bIsClassSelected()",
+                    uc.reg_read(RegisterARM::PC).unwrap(),
+                    uc.get_data().inner.thread_id,
+                );
+                let res = trace_tr_core_is_class_selected();
+                uc.reg_write(RegisterARM::R0, res as u64).unwrap();
+                uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
+                    .unwrap();
+            },
+        )
+        .unwrap();
 
     for (mut address, method_name) in method_entries {
         address = base_address + address;
@@ -19,7 +130,7 @@ pub fn libtrace_add_code_hooks(unicorn: &mut Unicorn<Context>, base_address: u32
 
 fn handle_hook(uc: &mut Unicorn<Context>, addr: u64, method_name: &str) {
     log::trace!(
-        "-- {:#x} [{}] LIBTRACE: {}() [IN]",
+        "{:#x} [{}] [LIBTRACE] {}() [IN]",
         addr,
         uc.get_data().inner.thread_id,
         method_name
@@ -44,7 +155,7 @@ fn insert_libtrace_method_entries(method_entries: &mut HashMap<u32, &str>) {
     method_entries.insert(0x000065e8, "TRACE_iosc_dl_releaseSem");
     method_entries.insert(0x00006620, "TRACE_iosc_dl_destroySem");
     method_entries.insert(0x00004558, "TRACE_create_task");
-    method_entries.insert(0x00007864, "TRACE_sharedmem_create_dualOS");
+    //method_entries.insert(0x00007864, "TRACE_sharedmem_create_dualOS");
     method_entries.insert(0x00007d14, "TRACE_mutex_init_singleOS");
     method_entries.insert(0x00007d88, "TRACE_mutex_lock_singleOS");
     method_entries.insert(0x000068b8, "TRACE_iosc_dl_createSem");
@@ -99,7 +210,7 @@ fn insert_libtrace_method_entries(method_entries: &mut HashMap<u32, &str>) {
     method_entries.insert(0x00009874, "__exidx_end");
     method_entries.insert(0x0000812c, "UTIL_RegisterChannel");
     method_entries.insert(0x00007570, "TRACE_socket_open_sender");
-    method_entries.insert(0x000076e4, "TR_core_bIsClassSelected");
+    //method_entries.insert(0x000076e4, "TR_core_bIsClassSelected");
     method_entries.insert(0x00007cac, "TRACE_q_lock_init_singleOS");
     method_entries.insert(0x00009dec, "g_TRACE_ver");
     method_entries.insert(0x000067dc, "TRACE_iosc_dl_leaveMutex");
@@ -124,7 +235,7 @@ fn insert_libtrace_method_entries(method_entries: &mut HashMap<u32, &str>) {
     method_entries.insert(0x00006378, "TRACE_init_task");
     method_entries.insert(0x00007828, "TRACE_sharedmem_destroy_dualOS");
     method_entries.insert(0x00007be4, "TRACE_wait_flag_dualOS");
-    method_entries.insert(0x000052b0, "TRACE_start");
+    //method_entries.insert(0x000052b0, "TRACE_start");
     method_entries.insert(0x000089a8, "UTIL_trace_isActive");
     method_entries.insert(0x00006964, "TRACE_dl_init");
     method_entries.insert(0x00006930, "TRACE_iosc_dl_exit");
@@ -136,7 +247,7 @@ fn insert_libtrace_method_entries(method_entries: &mut HashMap<u32, &str>) {
     method_entries.insert(0x00006884, "TRACE_iosc_dl_shared_mem_free");
     method_entries.insert(0x00008044, "TRACE_create_flag_singleOS");
     method_entries.insert(0x00008378, "UTIL_cre_hsh");
-    method_entries.insert(0x00004634, "TR_chan_acess_bRegChan");
+    //method_entries.insert(0x00004634, "TR_chan_acess_bRegChan");
     method_entries.insert(0x00008334, "UTIL_clr_hsh");
     method_entries.insert(0x00004484, "TRACE_unreg_notify_evt");
     method_entries.insert(0x00003928, "TRACE_dll_uninit");
@@ -155,12 +266,12 @@ fn insert_libtrace_method_entries(method_entries: &mut HashMap<u32, &str>) {
     method_entries.insert(0x00007a24, "TRACE_sharedmem_create_singleOS");
     method_entries.insert(0x00004720, "TRACE_reg_notify_evt");
     method_entries.insert(0x000037fc, "TR_core_s32SendCmd");
-    method_entries.insert(0x000043a0, "TR_core_uwTraceOut");
+    //method_entries.insert(0x000043a0, "TR_core_uwTraceOut");
     method_entries.insert(0x000084c0, "UTIL_rel_mpf");
     method_entries.insert(0x00009874, "__exidx_start");
     method_entries.insert(0x00007c78, "TRACE_create_flag_dualOS");
     method_entries.insert(0x00006b8c, "TRACE_q_pop");
     method_entries.insert(0x00008144, "UTIL_TraceBinOutput");
-    method_entries.insert(0x00002f58, "_init");
+    //method_entries.insert(0x00002f58, "_init");
     method_entries.insert(0x00007270, "TRACE_socket_init");
 }
