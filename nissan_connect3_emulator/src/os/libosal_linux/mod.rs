@@ -1,6 +1,12 @@
+mod init;
+mod io;
+mod message;
 mod trace;
 
 use crate::emulator::context::Context;
+use crate::os::libosal_linux::init::hook_core_code;
+use crate::os::libosal_linux::io::hook_io_code;
+use crate::os::libosal_linux::message::hook_message_code;
 use crate::os::libosal_linux::trace::hook_trace_code;
 use capstone::arch::arm::ArchMode;
 use capstone::prelude::*;
@@ -10,6 +16,9 @@ use std::sync::atomic::Ordering;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<Context>, base_address: u32) {
+    hook_core_code(unicorn, base_address);
+    hook_io_code(unicorn, base_address);
+    hook_message_code(unicorn, base_address);
     hook_trace_code(unicorn, base_address);
 
     let mut method_entries = HashMap::new();
@@ -34,7 +43,7 @@ fn handle_hook(uc: &mut Unicorn<Context>, addr: u64, method_name: &str) {
     let addr = addr as u32;
 
     log::trace!(
-        "-- {:#x} [{}] OSAL: {}() [IN]",
+        "-- {:#x} [{}] [OSAL] {}() [IN]",
         addr,
         uc.get_data().inner.thread_id,
         method_name
@@ -182,7 +191,7 @@ fn insert_libosal_method_entries(method_entries: &mut HashMap<u32, &str>) {
     method_entries.insert(0x484fb21c, "LFS_u32IOOpen");
     method_entries.insert(0x48522fe8, "u32AcousticOutIOCtrl_SetChannels");
     method_entries.insert(0x48505784, "u32ConvertErrorCore");
-    method_entries.insert(0x4850ba98, "u32OpenMsgQueue");
+    //method_entries.insert(0x4850ba98, "u32OpenMsgQueue");
     method_entries.insert(0x48506da8, "OSAL_s32EventOpen");
     method_entries.insert(0x48570404, "_u8TxBuf");
     method_entries.insert(0x48517bd0, "OSAL_s32SharedMemoryClose");
@@ -371,7 +380,7 @@ fn insert_libosal_method_entries(method_entries: &mut HashMap<u32, &str>) {
     method_entries.insert(0x485385c4, "sd_card_refresh_interface_vTraceInfo");
     method_entries.insert(0x4852fd64, "ERRMEM_s32IOControl");
     method_entries.insert(0x48511dbc, "s32LinuxMapping");
-    method_entries.insert(0x4850e940, "vTraceMqInfo");
+    //method_entries.insert(0x4850e940, "vTraceMqInfo");
     method_entries.insert(0x485117d4, "vPrintMessage");
     method_entries.insert(0x485301bc, "FD_Crypt_vEnterCriticalSection");
     method_entries.insert(0x485311fc, "fd_crypt_get_signaturefile_type");
@@ -826,7 +835,7 @@ fn insert_libosal_method_entries(method_entries: &mut HashMap<u32, &str>) {
     method_entries.insert(0x4852feb8, "FD_Crypt_vLeaveBPCLCriticalSec");
     method_entries.insert(0x484ee7b4, "vOsalDisplayLoadTaskStatus");
     method_entries.insert(0x48512ea8, "OSAL_pu8MessageContentGet");
-    method_entries.insert(0x4851c6f8, "TraceString");
+    //method_entries.insert(0x4851c6f8, "TraceString");
     method_entries.insert(0x4850bc90, "u32CreateMsgQueue");
     method_entries.insert(0x48529f34, "BT_UGZZC_s32IODeviceRemove");
     method_entries.insert(0x4851d928, "vShowCurrentResourceSitutaion");
@@ -920,7 +929,7 @@ fn insert_libosal_method_entries(method_entries: &mut HashMap<u32, &str>) {
     method_entries.insert(0x48509058, "OSAL_s32IoscSharedMemoryUnmap");
     method_entries.insert(0x4856b7bc, "vrFFDConfigData_GM");
     method_entries.insert(0x4854b55c, "arm_backtrace_asm");
-    method_entries.insert(0x4850f028, "OSAL_s32MessageQueueOpen");
+    //method_entries.insert(0x4850f028, "OSAL_s32MessageQueueOpen");
     method_entries.insert(0x48572cc0, "refresh_state");
     method_entries.insert(0x485483e0, "field_element_modular_add");
     method_entries.insert(0x48538ffc, "s32obtainPath");
@@ -1094,7 +1103,7 @@ fn insert_libosal_method_entries(method_entries: &mut HashMap<u32, &str>) {
     method_entries.insert(0x48572cc8, "pu8buffer");
     method_entries.insert(0x48535cac, "libminxml_get_rset");
     method_entries.insert(0x48516334, "vAddProcessEntry");
-    method_entries.insert(0x4850ca5c, "vInitOsalCoreIOSC");
+    //method_entries.insert(0x4850ca5c, "vInitOsalCoreIOSC");
     method_entries.insert(0x48506b38, "OSAL_s32EventClose");
     method_entries.insert(0x48522c5c, "u32AcousticOutIOCtrl_GetTime");
     method_entries.insert(0x4850c838, "vGenerateTermMqHandle");
