@@ -1,4 +1,7 @@
+mod trace;
+
 use crate::emulator::context::Context;
+use crate::os::libosal_linux::trace::hook_trace_code;
 use capstone::arch::arm::ArchMode;
 use capstone::prelude::*;
 use capstone::{Capstone, Endian};
@@ -7,9 +10,10 @@ use std::sync::atomic::Ordering;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<Context>, base_address: u32) {
+    hook_trace_code(unicorn, base_address);
+
     let mut method_entries = HashMap::new();
     insert_libosal_method_entries(&mut method_entries);
-
     for (mut address, method_name) in method_entries {
         //address = address - 0x484d8000 + base_address;
         unicorn
@@ -233,7 +237,7 @@ fn insert_libosal_method_entries(method_entries: &mut HashMap<u32, &str>) {
     method_entries.insert(0x48571a30, "prFdCryptPvtData");
     method_entries.insert(0x48522b88, "vResetErrorThresholds");
     method_entries.insert(0x484ed030, "vReadMemStatus");
-    method_entries.insert(0x485084b0, "vInitTrace");
+    //method_entries.insert(0x485084b0, "vInitTrace");
     method_entries.insert(0x4851c44c, "LLD_vRegTraceCallback");
     method_entries.insert(0x484ed344, "vDumpMemStatusForProcess");
     method_entries.insert(0x4850a84c, "u32SendToMessageQueue");
