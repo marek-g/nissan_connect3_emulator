@@ -13,21 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     pretty_env_logger::init();
 
     // mounted file systems
+    // (currently must be sorted from longest to shortest path)
     let file_system = MountFileSystem::new(vec![
-        // stdin, stdout, stderr
-        MountPoint {
-            mount_point: "".to_string(),
-            file_system: Box::new(StdFileSystem::new()),
-            is_read_only: false,
-        },
-        // firmware
-        MountPoint {
-            mount_point: "/".to_string(),
-            file_system: Box::new(OsFileSystem::new(PathBuf::from(
-                "/mnt/hdd_media/ZInternetu/Firmware/NissanConnect/firmware_d605_unpacked",
-            ))),
-            is_read_only: true,
-        },
         // sd-card with maps
         MountPoint {
             mount_point: "/var/opt/bosch/dynamic".to_string(),
@@ -66,6 +53,20 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
             file_system: Box::new(DevFileSystem::new()),
             is_read_only: false,
         },
+        // firmware
+        MountPoint {
+            mount_point: "/".to_string(),
+            file_system: Box::new(OsFileSystem::new(PathBuf::from(
+                "/mnt/hdd_media/ZInternetu/Firmware/NissanConnect/firmware_d605_unpacked",
+            ))),
+            is_read_only: true,
+        },
+        // stdin, stdout, stderr
+        MountPoint {
+            mount_point: "".to_string(),
+            file_system: Box::new(StdFileSystem::new()),
+            is_read_only: false,
+        },
     ]);
 
     // environment variables
@@ -90,10 +91,10 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     //emulator.run_process("/bin/pwd.coreutils".to_string(), vec![], envs)?;
     //emulator.run_process("/bin/ls.coreutils".to_string(), vec![], envs)?;
     emulator.run_process(
-        "/opt/bosch/processes/procbaselx_out.out".to_string(),
+        //"/opt/bosch/processes/procbaselx_out.out".to_string(),
         //"/opt/bosch/processes/proccgs_out.out".to_string(),
         //"/opt/bosch/processes/prochmi_out.out".to_string(),
-        //"/opt/bosch/processes/procvoice_out.out".to_string(),
+        "/opt/bosch/processes/procvoice_out.out".to_string(),
         //"/var/opt/bosch/dynamic/CRYPTNAV/DNL/BIN/NAV/COMMON/DAPIAPP.OUT".to_string(),
         //"/bin/font_demo".to_string(),
         vec![],
