@@ -1,5 +1,5 @@
 [workspace]
-workspace.resolver = "3"
+resolver = "3"
 
 members = [
     "nissan_connect3_emulator"

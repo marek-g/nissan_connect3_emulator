@@ -1,0 +1,14 @@
+[env]
+CC = "clang-22"
+CXX = "clang++-22"
+
+CFLAGS="-Wno-error=incompatible-pointer-types-discards-qualifiers -Wno-incompatible-pointer-types-discards-qualifiers"
+CXXFLAGS="-Wno-error=incompatible-pointer-types-discards-qualifiers -Wno-incompatible-pointer-types-discards-qualifiers"
+
+CROSS_CC = "clang-22 --target=arm-linux-gnueabihf"
+CROSS_CXX = "clang++-22 --target=arm-linux-gnueabihf"
+
+CROSS_CFLAGS="-Wno-error=incompatible-pointer-types-discards-qualifiers -Wno-incompatible-pointer-types-discards-qualifiers"
+CROSS_CXXFLAGS="-Wno-error=incompatible-pointer-types-discards-qualifiers -Wno-incompatible-pointer-types-discards-qualifiers"
+
+

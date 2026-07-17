@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+libafl = "0.15.4"
+libafl_qemu = { version = "0.15.4", features = ["arm"] }
+log = "0.4"
+env_logger = "0.11"
