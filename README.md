@@ -2,7 +2,7 @@
 
 This project is an attempt to emulate and run firmware from Nissan Qashqai 2017. My aim is to be able to run Navigation application to help me verify navigation data hacks (finally I would like to be able to use OSM maps with Nissan Navigation system).
 
-_**It's in a very early stage and the project is not usable yet**_. And probably never will be because of the amout of work needed. But it is fun to start and learn about executable and operating system interaction.
+_**It's in a very early stage and the project is not usable yet**_. And probably never will be because of the amout of work needed. In the meantime (because lack of time) I've changed my approach and there is alternative project. This time focused on writing map converter without focusing on the emulation part: https://github.com/marek-g/nissan_connect3_map_conv
 
 # Setup
 
