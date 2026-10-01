@@ -270,6 +270,11 @@ impl MountFileSystem {
                     .file_system
                     .read(fd, &mut content[len - bytes_to_read..])
                 {
+                    Ok(0) => {
+                        // a 0-byte result (e.g. the file shrank between get_length and
+                        // the read) would spin this loop forever - treat it as an error
+                        return Err(());
+                    }
                     Ok(bytes) => bytes_to_read -= bytes as usize,
                     Err(e) => return Err(e),
                 }
@@ -306,6 +311,11 @@ impl MountFileSystem {
                         .file_system
                         .write(fd, &content[len - bytes_to_write..])
                     {
+                        Ok(0) => {
+                            // a 0-byte result would spin this loop forever - treat it
+                            // as an error
+                            return Err(());
+                        }
                         Ok(bytes) => bytes_to_write -= bytes as usize,
                         Err(e) => return Err(e),
                     }

@@ -2,12 +2,6 @@
 
 Bugs where the emulated guest behaves wrongly (wrong syscall semantics, data corruption, hangs).
 
-## MountFileSystem: infinite loop on 0-byte IO
-
-- **Location:** `nissan_connect3_emulator/src/file_system/mount_file_system.rs:264-281, 296-318`
-- **Problem:** `while bytes_to_read > 0 { ... bytes_to_read -= bytes as usize }` never handles a 0-byte result. If the host file shrinks between `get_length` and the read (TOCTOU), or a write returns 0, the loop spins forever.
-- **Fix:** `if bytes == 0 { return Err(()) }` (or break on read EOF).
-
 ## mmap: unsigned underflow when offset > file length
 
 - **Location:** `nissan_connect3_emulator/src/os/syscalls/mman.rs:174`
