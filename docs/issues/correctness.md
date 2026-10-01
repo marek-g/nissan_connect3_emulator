@@ -2,12 +2,6 @@
 
 Bugs where the emulated guest behaves wrongly (wrong syscall semantics, data corruption, hangs).
 
-## devfs/procfs: exists("/cmdline") true but open fails
-
-- **Location:** `nissan_connect3_emulator/src/file_system/dev_file_system.rs:45-48, 56-59`, `nissan_connect3_emulator/src/file_system/proc_file_system.rs`
-- **Problem:** Dead `/cmdline` special-cases make `exists("/cmdline")` return true while `open("/cmdline")` fails — a real inconsistency for guests that stat-before-open.
-- **Fix:** either implement the file or remove the special cases so exists/open agree.
-
 ## mq_open unimplemented → OSAL message queue creation fails → reboot loop
 
 - **Location:** `nissan_connect3_emulator/src/os/syscalls/hook_syscall.rs` (fallback arm, ARM #274), libosal `u32CreateMsgQueue`/`OSAL_s32MessageQueueCreate`

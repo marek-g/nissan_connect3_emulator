@@ -53,10 +53,9 @@ impl FileSystem for ProcFileSystem {
     }
 
     fn exists(&mut self, file_path: &str) -> bool {
-        match file_path {
-            "/cmdline" => true,
-            _ => self.tmp_fs.exists(file_path),
-        }
+        // /cmdline is a real entry in tmp_fs (see new()), so no special case -
+        // this keeps exists() and open() agreeing
+        self.tmp_fs.exists(file_path)
     }
 
     fn mkdir(&mut self, _file_path: &str, _mode: u32) -> Result<(), OpenFileError> {

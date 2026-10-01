@@ -42,10 +42,7 @@ impl FileSystem for DevFileSystem {
     }
 
     fn exists(&mut self, file_path: &str) -> bool {
-        match file_path {
-            "/cmdline" => true,
-            _ => self.tmp_fs.exists(file_path),
-        }
+        self.tmp_fs.exists(file_path)
     }
 
     fn mkdir(&mut self, _file_path: &str, _mode: u32) -> Result<(), OpenFileError> {
