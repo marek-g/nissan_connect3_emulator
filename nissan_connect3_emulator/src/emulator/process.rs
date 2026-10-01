@@ -2,7 +2,7 @@ use crate::emulator::context::{Context, ContextInner};
 use crate::emulator::mmu::Mmu;
 use crate::emulator::scheduler::run as run_scheduler;
 use crate::emulator::thread::add_mem_fault_hooks;
-use crate::file_system::MountFileSystem;
+use crate::os::file_system::MountFileSystem;
 use crate::os::hook_syscall;
 use crate::os::SysCallsState;
 use std::error::Error;

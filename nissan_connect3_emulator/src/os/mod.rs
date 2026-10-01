@@ -1,10 +1,9 @@
-mod libosal_linux;
-mod libtrace;
+pub mod file_system;
 mod syscalls;
 
 use crate::emulator::context::Context;
-use crate::os::libtrace::libtrace_add_code_hooks;
-pub use libosal_linux::libosal_add_code_hooks;
+use crate::libs::libtrace::libtrace_add_code_hooks;
+pub use crate::libs::libosal_linux::libosal_add_code_hooks;
 pub use syscalls::hook_syscall::hook_syscall;
 pub use syscalls::sys_calls_state::SysCallsState;
 use unicorn_engine::Unicorn;

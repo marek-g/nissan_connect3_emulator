@@ -1,6 +1,6 @@
 use crate::emulator::mmu::Mmu;
 use crate::emulator::thread::{GuestThread, ThreadAction};
-use crate::file_system::MountFileSystem;
+use crate::os::file_system::MountFileSystem;
 use crate::os::SysCallsState;
 use std::cell::Cell;
 use std::collections::HashSet;

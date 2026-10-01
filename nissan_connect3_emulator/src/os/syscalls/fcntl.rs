@@ -1,6 +1,6 @@
 use crate::emulator::context::Context;
 use crate::emulator::utils::read_string;
-use crate::file_system::OpenFileFlags;
+use crate::os::file_system::OpenFileFlags;
 use std::path::PathBuf;
 use unicorn_engine::{RegisterARM, Unicorn};
 

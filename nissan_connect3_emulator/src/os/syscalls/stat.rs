@@ -1,7 +1,7 @@
 use crate::emulator::context::Context;
 use crate::emulator::users::{GID, UID};
 use crate::emulator::utils::{pack_i32, pack_u32, pack_u64, read_string};
-use crate::file_system::{FileSystemType, FileType, OpenFileFlags};
+use crate::os::file_system::{FileSystemType, FileType, OpenFileFlags};
 use crate::os::syscalls::fcntl::get_path_relative_to_dir;
 use crate::os::syscalls::SysCallError;
 use std::time::SystemTime;

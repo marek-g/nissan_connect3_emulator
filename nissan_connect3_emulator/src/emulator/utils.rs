@@ -1,5 +1,5 @@
 use crate::emulator::context::Context;
-use crate::file_system::OpenFileFlags;
+use crate::os::file_system::OpenFileFlags;
 use byteorder::{ByteOrder, LittleEndian};
 use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::Unicorn;

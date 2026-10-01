@@ -1,7 +1,7 @@
 use crate::emulator::context::Context;
 use crate::emulator::utils::pack_u16;
-use crate::file_system::file_info::FileDetails;
-use crate::file_system::{
+use crate::os::file_system::file_info::FileDetails;
+use crate::os::file_system::{
     CloseFileError, FileSystem, FileSystemType, OpenFileError, OpenFileFlags,
 };
 use std::io;

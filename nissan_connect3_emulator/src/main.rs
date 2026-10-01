@@ -1,12 +1,12 @@
 use crate::emulator::emulator::Emulator;
-use crate::file_system::{
+use crate::os::file_system::{
     DevFileSystem, MountFileSystem, MountPoint, OsFileSystem, ProcFileSystem, StdFileSystem,
     TmpFileSystem,
 };
 use std::path::PathBuf;
 
 mod emulator;
-mod file_system;
+mod libs;
 mod os;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {

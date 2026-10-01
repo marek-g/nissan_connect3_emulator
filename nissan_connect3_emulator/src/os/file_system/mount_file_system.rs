@@ -1,6 +1,6 @@
 use crate::emulator::context::Context;
-use crate::file_system::file_info::FileInfo;
-use crate::file_system::{CloseFileError, FileSystem, OpenFileError, OpenFileFlags};
+use crate::os::file_system::file_info::FileInfo;
+use crate::os::file_system::{CloseFileError, FileSystem, OpenFileError, OpenFileFlags};
 use path_absolutize::Absolutize;
 use std::collections::HashMap;
 use std::io::SeekFrom;

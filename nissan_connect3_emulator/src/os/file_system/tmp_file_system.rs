@@ -1,5 +1,5 @@
 use crate::emulator::context::Context;
-use crate::file_system::{
+use crate::os::file_system::{
     CloseFileError, FileDetails, FileSystem, FileSystemType, FileType, OpenFileError, OpenFileFlags,
 };
 use std::collections::{HashMap, HashSet};

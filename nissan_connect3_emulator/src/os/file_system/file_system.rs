@@ -1,5 +1,5 @@
 use crate::emulator::context::Context;
-use crate::file_system::file_info::FileDetails;
+use crate::os::file_system::file_info::FileDetails;
 use bitflags::bitflags;
 use std::io::SeekFrom;
 use unicorn_engine::Unicorn;

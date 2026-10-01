@@ -1,5 +1,5 @@
 use crate::emulator::process::Process;
-use crate::file_system::MountFileSystem;
+use crate::os::file_system::MountFileSystem;
 use std::error::Error;
 use std::sync::{Arc, Mutex};
 use unicorn_engine::unicorn_const::uc_error;

@@ -1,7 +1,7 @@
 use crate::emulator::context::Context;
-use crate::file_system::file_info::{FileDetails, FileType};
-use crate::file_system::file_system::FileSystem;
-use crate::file_system::{CloseFileError, FileSystemType, OpenFileError, OpenFileFlags};
+use crate::os::file_system::file_info::{FileDetails, FileType};
+use crate::os::file_system::file_system::FileSystem;
+use crate::os::file_system::{CloseFileError, FileSystemType, OpenFileError, OpenFileFlags};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};

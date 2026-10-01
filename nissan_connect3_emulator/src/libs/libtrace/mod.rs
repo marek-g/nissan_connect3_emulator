@@ -1,7 +1,7 @@
 mod trace;
 
 use crate::emulator::context::Context;
-use crate::os::libtrace::trace::*;
+use crate::libs::libtrace::trace::*;
 use std::collections::HashMap;
 
 use unicorn_engine::Unicorn;

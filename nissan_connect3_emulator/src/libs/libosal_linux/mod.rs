@@ -4,10 +4,10 @@ mod message;
 mod trace;
 
 use crate::emulator::context::Context;
-use crate::os::libosal_linux::init::hook_core_code;
-use crate::os::libosal_linux::io::hook_io_code;
-use crate::os::libosal_linux::message::hook_message_code;
-use crate::os::libosal_linux::trace::hook_trace_code;
+use crate::libs::libosal_linux::init::hook_core_code;
+use crate::libs::libosal_linux::io::hook_io_code;
+use crate::libs::libosal_linux::message::hook_message_code;
+use crate::libs::libosal_linux::trace::hook_trace_code;
 use capstone::arch::arm::ArchMode;
 use capstone::prelude::*;
 use capstone::{Capstone, Endian};

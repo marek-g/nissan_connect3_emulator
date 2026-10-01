@@ -1,7 +1,7 @@
 use crate::emulator::context::Context;
 use crate::emulator::thread::ThreadAction;
 use crate::emulator::utils::{mem_align_up, pack_u16, pack_u64, read_string};
-use crate::file_system::{FileType, MountFileSystem};
+use crate::os::file_system::{FileType, MountFileSystem};
 use crate::os::syscalls::SysCallError;
 use std::io::SeekFrom;
 use std::path::Path;
