@@ -4,15 +4,6 @@ This project is an attempt to emulate and run firmware from Nissan Qashqai 2017.
 
 _**It's in a very early stage and the project is not usable yet**_. And probably never will be because of the amout of work needed. In the meantime (because lack of time) I've changed my approach and there is alternative project. This time focused on writing map converter without focusing on the emulation part: https://github.com/marek-g/nissan_connect3_map_conv
 
-# Setup
-
-## Compilation
-
-1. Tested with clang v22. Install clang-22 in your system.
-2. 
-
-# Links
-
 Similar projects:
 - https://github.com/zeropointdynamics/zelos (Python)
 - https://github.com/qilingframework/qiling (Python)
