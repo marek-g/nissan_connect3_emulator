@@ -30,8 +30,11 @@ impl FileSystem for OsFileSystem {
     }
 
     fn exists(&mut self, file_path: &str) -> bool {
-        let path = self.path_transform_to_real(file_path);
-        path.exists()
+        if let Some(path) = self.path_transform_to_real(file_path) {
+            path.exists()
+        } else {
+            false
+        }
     }
 
     fn mkdir(&mut self, _file_path: &str, _mode: u32) -> Result<(), OpenFileError> {
@@ -39,14 +42,21 @@ impl FileSystem for OsFileSystem {
     }
 
     fn read_dir(&mut self, dir_path: &str) -> Result<Vec<String>, ()> {
-        let full_path_name = self.path_transform_to_real(&dir_path);
+        let full_path_name = match self.path_transform_to_real(&dir_path) {
+            Some(path) => path,
+            None => return Err(()),
+        };
 
         if full_path_name.is_dir() {
             if let Ok(read_dir) = full_path_name.read_dir() {
                 let mut res = Vec::new();
                 for entry in read_dir {
                     if let Ok(entry) = entry {
-                        res.push(entry.file_name().to_str().unwrap().to_string())
+                        // skip non-UTF8 host file names instead of panicking
+                        match entry.file_name().to_str() {
+                            Some(name) => res.push(name.to_string()),
+                            None => log::warn!("skipping non-UTF8 file name in {}", dir_path),
+                        }
                     } else {
                         return Err(());
                     }
@@ -66,11 +76,14 @@ impl FileSystem for OsFileSystem {
         flags: OpenFileFlags,
         fd: i32,
     ) -> Result<(), OpenFileError> {
-        let full_path_name = self.path_transform_to_real(&file_path);
+        let full_path_name = match self.path_transform_to_real(&file_path) {
+            Some(path) => path,
+            None => return Err(OpenFileError::NoSuchFileOrDirectory),
+        };
 
         log::debug!(
             "Opening: {}, flags: {:?}",
-            full_path_name.to_str().unwrap(),
+            full_path_name.display(),
             flags
         );
 
@@ -103,7 +116,8 @@ impl FileSystem for OsFileSystem {
 
     fn get_file_details(&mut self, fd: i32) -> Option<FileDetails> {
         if let Some(file) = self.opened_files.get_mut(&fd).map(|el| &mut el.file) {
-            let metadata = file.metadata().unwrap();
+            // the host file may have vanished between open and stat - do not panic
+            let metadata = file.metadata().ok()?;
             Some(FileDetails {
                 file_type: if metadata.is_dir() {
                     FileType::Directory
@@ -121,7 +135,7 @@ impl FileSystem for OsFileSystem {
     }
 
     fn get_file_details_for_path(&mut self, file_path: &str) -> Option<FileDetails> {
-        let full_path_name = self.path_transform_to_real(file_path);
+        let full_path_name = self.path_transform_to_real(file_path)?;
         let metadata = std::fs::metadata(full_path_name).ok()?;
         Some(FileDetails {
             file_type: if metadata.is_dir() {
@@ -142,7 +156,8 @@ impl FileSystem for OsFileSystem {
 
     fn get_length(&mut self, fd: i32) -> u64 {
         if let Some(file) = self.opened_files.get_mut(&fd).map(|el| &mut el.file) {
-            file.metadata().unwrap().len()
+            // the host file may have vanished between open and stat - do not panic
+            file.metadata().map(|metadata| metadata.len()).unwrap_or(0)
         } else {
             0
         }
@@ -202,20 +217,33 @@ impl FileSystem for OsFileSystem {
 impl OsFileSystem {
     pub fn new(host_path: PathBuf) -> Self {
         Self {
-            host_path,
+            host_path: normalize_path(&host_path),
             opened_files: HashMap::new(),
         }
     }
 
-    fn path_transform_to_real(&self, guest_path: &str) -> PathBuf {
-        if guest_path.starts_with("/") {
-            self.host_path.join(&guest_path[1..])
-        } else {
-            panic!(
-                "Only mount file system handle relative paths: {}!",
+    /// Translate a guest path to the corresponding host path. Returns None for
+    /// relative paths (only the mount file system resolves those) and for
+    /// paths that would escape the mounted host root.
+    fn path_transform_to_real(&self, guest_path: &str) -> Option<PathBuf> {
+        if !guest_path.starts_with("/") {
+            log::warn!(
+                "Only mount file system handles relative paths - refusing: {}",
                 guest_path
             );
+            return None;
         }
+
+        let joined = self.host_path.join(&guest_path[1..]);
+        // defensively check that the result stays under host_path (a path with
+        // '..' components would otherwise escape the mounted root)
+        let normalized = normalize_path(&joined);
+        if !normalized.starts_with(&self.host_path) {
+            log::warn!("guest path escapes the host root: {}", guest_path);
+            return None;
+        }
+
+        Some(normalized)
     }
 
     fn get_open_options(&self, flags: OpenFileFlags) -> OpenOptions {
@@ -234,4 +262,19 @@ impl OsFileSystem {
 
         open_options
     }
+}
+
+/// Lexically remove `.` and `..` components (no symlink resolution).
+fn normalize_path(path: &std::path::Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            _ => result.push(component.as_os_str()),
+        }
+    }
+    result
 }

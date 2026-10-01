@@ -2,16 +2,6 @@
 
 Bugs where the emulated guest behaves wrongly (wrong syscall semantics, data corruption, hangs).
 
-## OsFileSystem: no host-path containment check, panics on relative path
-
-- **Location:** `nissan_connect3_emulator/src/file_system/os_file_system.rs:49, 106, 129, 194-203`
-- **Problem:**
-  - `path_transform_to_real` panics if a non-absolute path ever reaches it.
-  - `host_path.join(...)` has no defensive check that the result stays under `host_path` (only "works" because upstream `absolutize()` strips `..` — fragile cross-module invariant).
-  - `metadata().unwrap()` (lines 106/129) panics if the host file vanishes between open and stat.
-  - Line 49 `to_str().unwrap()` panics on non-UTF8 host filenames.
-- **Fix:** normalize then assert `starts_with(host_path)` and return `Err` instead of panicking; make metadata failures return `None`.
-
 ## devfs/procfs: exists("/cmdline") true but open fails
 
 - **Location:** `nissan_connect3_emulator/src/file_system/dev_file_system.rs:45-48, 56-59`, `nissan_connect3_emulator/src/file_system/proc_file_system.rs`
