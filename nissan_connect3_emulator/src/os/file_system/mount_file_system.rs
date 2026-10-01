@@ -56,7 +56,11 @@ impl MountPoint {
 }
 
 pub struct MountFsFileData {
+    /// global (absolute) path of the opened file
     pub file_path: String,
+    /// mount point the file was opened on - part of the inode key so that
+    /// identical relative paths on different mounts do not collide in st_ino
+    pub mount_point: String,
     pub file_status_flags: u32,
 }
 
@@ -67,7 +71,7 @@ pub struct MountFileSystem {
     pub current_working_dir: String,
 
     mount_points: Vec<MountPoint>,
-    inodes: HashMap<String, u64>,
+    inodes: HashMap<(String, String), u64>,
     file_data: HashMap<i32, MountFsFileData>,
 }
 
@@ -104,14 +108,19 @@ impl MountFileSystem {
         &mut self,
         file_path: &str,
     ) -> Option<(&mut MountPoint, String)> {
-        let file_path = self.path_convert_to_absolute(file_path);
+        let absolute_path = self.path_convert_to_absolute(file_path);
+        self.resolve_mount(&absolute_path)
+    }
+
+    /// resolve an already-absolute global path to the (mount point, translated path)
+    fn resolve_mount(&mut self, absolute_path: &str) -> Option<(&mut MountPoint, String)> {
         self.mount_points
             .iter_mut()
             .filter(|mp| mp.file_system.support_file_paths())
-            .find(|mp| mp.matches(&file_path))
+            .find(|mp| mp.matches(absolute_path))
             .map(|mp| {
-                let file_path = mp.translate_path(&file_path).unwrap();
-                (mp, file_path)
+                let translated_path = mp.translate_path(absolute_path).unwrap();
+                (mp, translated_path)
             })
     }
 
@@ -141,7 +150,8 @@ impl MountFileSystem {
 
     pub fn open(&mut self, file_path: &str, flags: OpenFileFlags) -> Result<i32, OpenFileError> {
         let fd = self.get_unique_fd();
-        if let Some((mount_point, file_path)) = self.get_mount_point_from_filepath_mut(file_path) {
+        let absolute_path = self.path_convert_to_absolute(file_path);
+        if let Some((mount_point, translated_path)) = self.resolve_mount(&absolute_path) {
             if mount_point.is_read_only
                 && (flags.contains(OpenFileFlags::WRITE)
                     || flags.contains(OpenFileFlags::CREATE)
@@ -150,19 +160,23 @@ impl MountFileSystem {
             {
                 log::warn!(
                     "Open file for saving ignored for readonly file system! File: ({}), flags: {:?}",
-                    file_path, flags
+                    translated_path, flags
                 );
                 return Err(OpenFileError::NoPermission);
             }
 
             let res = mount_point
                 .file_system
-                .open(&file_path, flags, fd)
+                .open(&translated_path, flags, fd)
                 .map(|_| fd);
 
             if res.is_ok() {
+                // store the global path (not the mount-relative one) so that
+                // dirfd-based operations (openat, getdents) re-resolve entries
+                // against the file's real location
                 let mount_fs_file_data = MountFsFileData {
-                    file_path: file_path.to_string(),
+                    file_path: absolute_path.clone(),
+                    mount_point: mount_point.mount_point.clone(),
                     file_status_flags: 0,
                 };
 
@@ -210,25 +224,29 @@ impl MountFileSystem {
 
     pub fn get_file_info(&mut self, fd: i32) -> Option<FileInfo> {
         let mut file_path = String::new();
+        let mut mount_name = String::new();
         let mut file_status_flags = 0;
 
         if let Some(file_data) = self.file_data.get(&fd) {
             file_path = file_data.file_path.clone();
+            mount_name = file_data.mount_point.clone();
             file_status_flags = file_data.file_status_flags;
         }
 
-        if let Some(mount_point) = self.get_mount_point_mut(fd) {
-            if let Some(file_details) = mount_point.file_system.get_file_details(fd) {
-                let inode = self.get_inode_for_filepath(file_path.clone());
-                Some(FileInfo {
-                    file_details,
-                    file_path,
-                    inode,
-                    file_status_flags,
-                })
-            } else {
-                None
-            }
+        // pull the (owned) file details out and drop the mutable borrow of the
+        // mount point before calling the inode lookup below
+        let file_details = self
+            .get_mount_point_mut(fd)
+            .and_then(|mount_point| mount_point.file_system.get_file_details(fd));
+
+        if let Some(file_details) = file_details {
+            let inode = self.get_inode_for_filepath(&mount_name, &file_path);
+            Some(FileInfo {
+                file_details,
+                file_path,
+                inode,
+                file_status_flags,
+            })
         } else {
             None
         }
@@ -390,9 +408,12 @@ impl MountFileSystem {
         fd
     }
 
-    fn get_inode_for_filepath(&mut self, file_path: String) -> u64 {
+    fn get_inode_for_filepath(&mut self, mount_point: &str, file_path: &str) -> u64 {
         let next_inode = self.inodes.len() as u64 + 1;
-        let entry = self.inodes.entry(file_path).or_insert(next_inode);
+        let entry = self
+            .inodes
+            .entry((mount_point.to_string(), file_path.to_string()))
+            .or_insert(next_inode);
         *entry
     }
 

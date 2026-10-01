@@ -2,15 +2,6 @@
 
 Bugs where the emulated guest behaves wrongly (wrong syscall semantics, data corruption, hangs).
 
-## FileInfo stores mount-relative path → broken openat/getdents, inode collisions
-
-- **Location:** `nissan_connect3_emulator/src/file_system/mount_file_system.rs:133-138, 184-197, 352-356`
-- **Problem:** Because the translated (relative) path is what gets stored:
-  - `fcntl.rs:95` (`openat` with dirfd) and `unistd.rs:362` (getdents) join entries onto it and re-resolve, producing wrong global paths for any non-root mount (e.g. `/var/volatile/...` becomes `/sub/entry` on the root fs).
-  - Inodes are keyed by relative path (`get_inode_for_filepath`, line 191), so identical relative paths on different mounts collide in `st_ino`.
-  - The `inodes` map grows without bound (every fstat inserts an entry, never removed).
-- **Fix:** store the global path in `MountFsFileData`; key inodes by `(mount_point, path)` or use host inos.
-
 ## stat implemented as open + fstat + close(fd).unwrap()
 
 - **Location:** `nissan_connect3_emulator/src/os/syscalls/stat.rs:24-34, 69-79, 106-118`
