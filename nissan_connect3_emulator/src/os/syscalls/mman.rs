@@ -156,28 +156,37 @@ fn mmapx(
 
     length = mem_align_up(length, None);
 
-    // load file
+    // load the file content to be mapped (like the kernel, an offset past the end
+    // of the file maps zero-filled pages instead of failing)
     let mut buf = Vec::new();
     let mut filepath = String::new();
-    let file_system = &mut unicorn.get_data().inner.file_system.clone();
-    let file_info_res = file_system.lock().unwrap().get_file_info(fd as i32);
-    if let Some(fileinfo) = file_info_res {
-        let mut file_system = file_system.lock().unwrap();
+    if fd != 0xFFFFFFFFu32 {
+        let file_system = &mut unicorn.get_data().inner.file_system.clone();
+        let mut fs = file_system.lock().unwrap();
 
-        filepath = fileinfo.file_path.clone();
+        if let Some(fileinfo) = fs.get_file_info(fd as i32) {
+            filepath = fileinfo.file_path.clone();
 
-        let file_pos = file_system.stream_position(fd as i32).unwrap();
-        file_system
-            .seek(fd as i32, SeekFrom::Start(off_t as u64))
-            .unwrap();
+            let file_pos = match fs.stream_position(fd as i32) {
+                Ok(pos) => pos,
+                Err(_) => return -22i32 as u32, // -EINVAL
+            };
 
-        let bytes_to_read = length.min(file_system.get_length(fd as i32) as u32 - off_t);
-        buf.resize(bytes_to_read as usize, 0u8);
-        file_system.read_all(fd as i32, &mut buf).unwrap();
+            let file_len = fs.get_length(fd as i32);
+            if (off_t as u64) < file_len {
+                if fs.seek(fd as i32, SeekFrom::Start(off_t as u64)).is_err() {
+                    return -22i32 as u32; // -EINVAL
+                }
+                let bytes_to_read = (length as u64)
+                    .min(file_len.saturating_sub(off_t as u64)) as u32;
+                buf.resize(bytes_to_read as usize, 0u8);
+                if fs.read_all(fd as i32, &mut buf).is_err() {
+                    return -5i32 as u32; // -EIO
+                }
+            }
 
-        file_system
-            .seek(fd as i32, SeekFrom::Start(file_pos))
-            .unwrap();
+            let _ = fs.seek(fd as i32, SeekFrom::Start(file_pos));
+        }
     }
 
     // allocate memory

@@ -2,13 +2,6 @@
 
 Bugs where the emulated guest behaves wrongly (wrong syscall semantics, data corruption, hangs).
 
-## mmap: unsigned underflow when offset > file length
-
-- **Location:** `nissan_connect3_emulator/src/os/syscalls/mman.rs:174`
-- **Problem:** `length.min(file_system.get_length(fd) as u32 - off_t)` wraps in release mode when the offset is past EOF → `buf.resize(huge)` → OOM abort on a plain `mmap(fd, len, offset)`.
-- **Related:** lines 169-180 take 5 separate mutex locks + unwraps for one mmap.
-- **Fix:** checked subtraction returning `-EINVAL`/`-ENOMEM`; single lock scope.
-
 ## Mount resolution: string-prefix matching without component boundary
 
 - **Location:** `nissan_connect3_emulator/src/file_system/mount_file_system.rs:49, 80, 18-23`
