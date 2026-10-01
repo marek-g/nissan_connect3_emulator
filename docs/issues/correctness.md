@@ -2,15 +2,6 @@
 
 Bugs where the emulated guest behaves wrongly (wrong syscall semantics, data corruption, hangs).
 
-## Mount resolution: string-prefix matching without component boundary
-
-- **Location:** `nissan_connect3_emulator/src/file_system/mount_file_system.rs:49, 80, 18-23`
-- **Problem:**
-  - Matching is raw `str::starts_with`, so mount `/var/lib` also claims `/var/libfoo/...`.
-  - Line 49 sorts lexicographically, not by length; it only happens to work because a true string prefix sorts before its extension.
-  - The "must be sorted longest to shortest" requirement leaks into `main.rs:16` (stale comment — `new()` re-sorts anyway).
-- **Fix:** match on `Path` components (`path.strip_prefix(mount)` with component-boundary check); ordering becomes irrelevant and the sort + caller requirement disappear.
-
 ## FileInfo stores mount-relative path → broken openat/getdents, inode collisions
 
 - **Location:** `nissan_connect3_emulator/src/file_system/mount_file_system.rs:133-138, 184-197, 352-356`

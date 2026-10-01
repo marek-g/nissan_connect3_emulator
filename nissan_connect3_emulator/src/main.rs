@@ -13,7 +13,6 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     pretty_env_logger::init();
 
     // mounted file systems
-    // (currently must be sorted from longest to shortest path)
     let file_system = MountFileSystem::new(vec![
         // sd-card with maps
         MountPoint {

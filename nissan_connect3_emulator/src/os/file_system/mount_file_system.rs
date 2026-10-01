@@ -13,16 +13,44 @@ pub struct MountPoint {
     pub is_read_only: bool,
 }
 
+/// strip a single trailing slash ("/var/lib/" -> "/var/lib"), keeping "/" intact
+fn strip_trailing_slash(path: &str) -> &str {
+    if path.len() > 1 && path.ends_with('/') {
+        &path[..path.len() - 1]
+    } else {
+        path
+    }
+}
+
 impl MountPoint {
+    /// Whether a global path belongs to this mount point (the mount point
+    /// itself or anything below it). Matching is done on full path
+    /// components, so mounting /var/lib does not claim /var/libfoo.
+    pub fn matches(&self, global_path: &str) -> bool {
+        if self.mount_point.is_empty() {
+            // the std (fd 0-2) file system has no paths
+            return false;
+        }
+        if self.mount_point == "/" {
+            return global_path.starts_with("/");
+        }
+        let global_path = strip_trailing_slash(global_path);
+        if global_path == self.mount_point {
+            return true;
+        }
+        let prefix = format!("{}/", self.mount_point);
+        global_path.starts_with(&prefix)
+    }
+
     pub fn translate_path(&self, global_path: &str) -> Result<String, ()> {
-        if global_path.starts_with(&self.mount_point) {
-            let mut start_index = self.mount_point.len();
-            if self.mount_point.ends_with("/") {
-                start_index -= 1;
-            }
-            Ok(global_path[start_index..].to_string())
+        if !self.matches(global_path) {
+            return Err(());
+        }
+        if self.mount_point == "/" {
+            Ok(global_path.to_string())
         } else {
-            Err(())
+            let global_path = strip_trailing_slash(global_path);
+            Ok(global_path[self.mount_point.len()..].to_string())
         }
     }
 }
@@ -45,8 +73,11 @@ pub struct MountFileSystem {
 
 impl MountFileSystem {
     pub fn new(mut mount_points: Vec<MountPoint>) -> Self {
-        // sort mount points from longest to shortest to allow matching paths in order
-        mount_points.sort_by(|a, b| b.mount_point.cmp(&a.mount_point));
+        // sort mount points from longest to shortest so that nested mounts
+        // (e.g. /var/volatile under /) resolve to the most specific one;
+        // with component-boundary matching the order of unrelated mount
+        // points is irrelevant
+        mount_points.sort_by(|a, b| b.mount_point.len().cmp(&a.mount_point.len()));
 
         Self {
             current_working_dir: "/".to_string(),
@@ -77,7 +108,7 @@ impl MountFileSystem {
         self.mount_points
             .iter_mut()
             .filter(|mp| mp.file_system.support_file_paths())
-            .find(|mp| file_path.starts_with(&mp.mount_point))
+            .find(|mp| mp.matches(&file_path))
             .map(|mp| {
                 let file_path = mp.translate_path(&file_path).unwrap();
                 (mp, file_path)
