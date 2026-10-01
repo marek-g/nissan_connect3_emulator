@@ -17,7 +17,7 @@ macro_rules! add_code_hook {
                 log::trace!(
                     "{:#x}: [{}] [{} HOOK] {}() [IN]",
                     uc.reg_read(RegisterARM::PC).unwrap(),
-                    uc.get_data().inner.thread_id,
+                    uc.get_data().inner.thread_id(),
                     $lib,
                     stringify!($func)
                 );
@@ -25,7 +25,7 @@ macro_rules! add_code_hook {
                 log::trace!(
                     "{:#x}: [{}] [{} HOOK] {}() => {}",
                     uc.reg_read(RegisterARM::PC).unwrap(),
-                    uc.get_data().inner.thread_id,
+                    uc.get_data().inner.thread_id(),
                     $lib,
                     stringify!($func),
                     res
@@ -49,7 +49,7 @@ pub fn add_library_hook(unicorn: &mut Unicorn<Context>, library: &str, base_addr
 
     log::info!(
         "[{}] Added library hooks for {} at base address {:#x}.",
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         library,
         base_address
     );

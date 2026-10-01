@@ -1,12 +1,11 @@
 use std::collections::HashMap;
-use std::sync::mpsc::Sender;
 
 pub struct SysCallsState {
     // state for getdents syscall - list of files in folder to process
     pub get_dents_list: HashMap<u32, Vec<String>>,
 
-    // maps futex `uaddr` to list of waiters for that address
-    pub futex_waiters: HashMap<u32, Vec<Sender<()>>>,
+    // maps futex `uaddr` to list of blocked guest thread ids waiting on that address
+    pub futex_waiters: HashMap<u32, Vec<u32>>,
 }
 
 impl SysCallsState {

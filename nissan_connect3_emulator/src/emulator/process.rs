@@ -1,18 +1,21 @@
 use crate::emulator::context::{Context, ContextInner};
 use crate::emulator::mmu::Mmu;
-use crate::emulator::thread::Thread;
+use crate::emulator::scheduler::run as run_scheduler;
+use crate::emulator::thread::add_mem_fault_hooks;
 use crate::file_system::MountFileSystem;
+use crate::os::hook_syscall;
 use crate::os::SysCallsState;
-use std::collections::HashSet;
 use std::error::Error;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use unicorn_engine::unicorn_const::{Arch, Mode};
+use unicorn_engine::Unicorn;
 
 pub struct Process {
     mmu: Arc<Mutex<Mmu>>,
     file_system: Arc<Mutex<MountFileSystem>>,
     sys_calls_state: Arc<Mutex<SysCallsState>>,
-    threads: Arc<Mutex<Vec<Thread>>>,
+    threads: Arc<Mutex<Vec<crate::emulator::thread::GuestThread>>>,
     next_thread_id: Arc<AtomicU32>,
 }
 
@@ -35,27 +38,23 @@ impl Process {
         program_args: Vec<String>,
         program_envs: Vec<(String, String)>,
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-        let thread_id = self.next_thread_id.fetch_add(1, Ordering::Relaxed);
         let context = Context {
-            inner: Arc::new(ContextInner {
-                mmu: self.mmu.clone(),
-                file_system: self.file_system.clone(),
-                sys_calls_state: self.sys_calls_state.clone(),
-                threads: Arc::downgrade(&self.threads),
-                next_thread_id: self.next_thread_id.clone(),
-                thread_id,
-                instruction_tracing: Arc::new(AtomicBool::new(false)),
-                hooked_libraries: Arc::new(Mutex::new(HashSet::new())),
-            }),
+            inner: Arc::new(ContextInner::new(
+                self.mmu.clone(),
+                self.file_system.clone(),
+                self.sys_calls_state.clone(),
+                self.threads.clone(),
+                self.next_thread_id.clone(),
+            )),
         };
 
-        let (emu_main_thread, main_thread_handle) =
-            Thread::start_elf_file(context, elf_filepath, program_args, program_envs)?;
+        // the single VM shared by all guest threads
+        let mut unicorn =
+            Unicorn::new_with_data(Arch::ARM, Mode::LITTLE_ENDIAN, context)
+                .map_err(|e| format!("Unicorn error: {:?}", e))?;
+        unicorn.add_intr_hook(hook_syscall).unwrap();
+        add_mem_fault_hooks(&mut unicorn);
 
-        self.threads.lock().unwrap().push(emu_main_thread);
-
-        main_thread_handle.join().unwrap()?;
-
-        Ok(())
+        run_scheduler(&mut unicorn, &elf_filepath, program_args, program_envs)
     }
 }

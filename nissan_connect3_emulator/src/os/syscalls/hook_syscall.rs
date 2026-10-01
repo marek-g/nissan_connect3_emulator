@@ -1,10 +1,10 @@
 use crate::emulator::context::Context;
+use crate::emulator::thread::{block_current_thread, exit_current_thread, exit_process, ThreadAction};
 use crate::emulator::utils::read_string;
 use crate::os::syscalls::{
     fcntl, futex, ioctl, linux, mman, prctl, resource, sched, signal, socket, stat, time, uio,
     unistd, utsname,
 };
-use std::time::Duration;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
@@ -105,12 +105,14 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
             unicorn.get_u32_arg(1),
             unicorn.get_u32_arg(2),
         ),
+        155 => sched::sched_getparam(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         156 => sched::sched_setscheduler(
             unicorn,
             unicorn.get_u32_arg(0),
             unicorn.get_u32_arg(1),
             unicorn.get_u32_arg(2),
         ),
+        157 => sched::sched_getscheduler(unicorn, unicorn.get_u32_arg(0)),
         159 => sched::sched_get_priority_max(unicorn, unicorn.get_u32_arg(0)),
         160 => sched::sched_get_priority_min(unicorn, unicorn.get_u32_arg(0)),
         162 => time::nanosleep(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
@@ -224,23 +226,32 @@ pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
         983045 => linux::set_tls(unicorn, unicorn.get_u32_arg(0)),
         x => {
             if x == 274 {
+                // mq_open
                 let path = read_string(unicorn, unicorn.get_u32_arg(0));
                 log::trace!("mq_open: {}", path);
-                std::thread::sleep(Duration::from_millis(1000));
             }
-            panic!(
+            log::error!(
                 "{:#x}: [{}] not implemented syscall #{} (int {}), args: {:#x}, {:#x}, {:#x}, ...",
                 unicorn.reg_read(RegisterARM::PC).unwrap(),
-                unicorn.get_data().inner.thread_id,
+                unicorn.get_data().thread_id(),
                 unicorn.get_syscall_number(),
                 int_no,
                 unicorn.get_u32_arg(0),
                 unicorn.get_u32_arg(1),
                 unicorn.get_u32_arg(2),
             );
+            -38i32 as u32 // ENOSYS
         }
     };
     unicorn.set_u32_result(res);
+
+    // a syscall handler may have requested a scheduling action
+    match unicorn.get_data().take_action() {
+        ThreadAction::None => {}
+        ThreadAction::Block(reason) => block_current_thread(unicorn, reason),
+        ThreadAction::ExitThread(code) => exit_current_thread(unicorn, code),
+        ThreadAction::ExitProcess(code) => exit_process(unicorn, code),
+    }
 }
 
 trait Args {

@@ -5,7 +5,7 @@ pub fn socket(unicorn: &mut Unicorn<Context>, domain: u32, socket_type: u32, pro
     log::trace!(
         "{:#x}: [{}] [SYSCALL] socket(domain = {:#x}, socket_type: {:#x}, protocol: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         domain,
         socket_type,
         protocol,
@@ -17,7 +17,7 @@ pub fn socket(unicorn: &mut Unicorn<Context>, domain: u32, socket_type: u32, pro
     log::trace!(
         "{:#x}: [{}] [SYSCALL] socket => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         res
     );
 
@@ -28,7 +28,7 @@ pub fn connect(unicorn: &mut Unicorn<Context>, socket_fd: u32, addr: u32, addr_l
     log::trace!(
         "{:#x}: [{}] [SYSCALL] connect(socket_fd = {:#x}, addr: {:#x}, addr_len: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         socket_fd,
         addr,
         addr_len,
@@ -40,7 +40,7 @@ pub fn connect(unicorn: &mut Unicorn<Context>, socket_fd: u32, addr: u32, addr_l
     log::trace!(
         "{:#x}: [{}] [SYSCALL] connect => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         res
     );
 
@@ -51,7 +51,7 @@ pub fn send(unicorn: &mut Unicorn<Context>, socket_fd: u32, buf: u32, len: u32, 
     log::trace!(
         "{:#x}: [{}] [SYSCALL] send(socket_fd = {:#x}, buf: {:#x}, len: {:#x}, flags: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         socket_fd,
         buf,
         len,
@@ -70,7 +70,7 @@ pub fn send(unicorn: &mut Unicorn<Context>, socket_fd: u32, buf: u32, len: u32, 
     log::trace!(
         "{:#x}: [{}] [SYSCALL] send => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         res
     );
 

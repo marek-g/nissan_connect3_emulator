@@ -32,30 +32,6 @@ Hot-path problems: per-syscall allocations, O(n) lookups, redundant FFI calls, r
 - **Problem:** O(n) scan of all files per call, and the `key.starts_with(&dir_path)` prefix test has no component boundary check (a `/ab/...` entry would be listed under directory `/a`).
 - **Fix:** keep a per-directory index or sort keys; use a path-component boundary check.
 
-## MMU: every mapping stores a full zero-filled Vec<u8> forever
-
-- **Location:** `nissan_connect3_emulator/src/emulator/mmu.rs:86, 295`
-- **Problem:** `MmuRegion.data` duplicates ~100% of guest memory in the host heap on top of Unicorn's own copy, held for the process lifetime (it exists only to back `mem_map_ptr`).
-- **Fix:** back regions with a shared arena, or use Unicorn `mem_map` + copy-on-clone instead of persistent per-region buffers.
-
-## MMU split clones the entire region on every split
-
-- **Location:** `nissan_connect3_emulator/src/emulator/mmu.rs:341`
-- **Problem:** `.map(|item| item.clone())` copies the full `data: Vec<u8>`, then lines 359 and 370-373 allocate two more sub-slices → ~3× peak memory + O(n) copy per `mmap`/`mprotect`/`munmap`.
-- **Fix:** slice from the original buffer before removing it; avoid the full clone.
-
-## Library paths cloned per thread on every hook update
-
-- **Location:** `nissan_connect3_emulator/src/emulator/mmu.rs:160-168` (called at 185, per thread at 177)
-- **Problem:** `get_libraries_and_base_addresses` does `.map(|r| (r.filepath.clone(), ...))`, invoked once per thread from `update_library_hooks_for_all_threads` → O(threads × libraries) string clones in the hook path.
-- **Fix:** return references/`&str` or cache; avoid cloning per thread.
-
-## Fresh Capstone handle on every disasm call
-
-- **Location:** `nissan_connect3_emulator/src/emulator/print.rs:46-59`
-- **Problem:** Capstone initialization is costly and `dump_context` calls it 3× per fault.
-- **Fix:** cache the disassembler (thread-local / `OnceLock`) and reuse it.
-
 ## OSAL trace hook builds Capstone per hit + unwraps register reads
 
 - **Location:** `nissan_connect3_emulator/src/os/libosal_linux/mod.rs:105-133`

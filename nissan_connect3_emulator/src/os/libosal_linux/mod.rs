@@ -45,7 +45,7 @@ fn handle_hook(uc: &mut Unicorn<Context>, addr: u64, method_name: &str) {
     log::trace!(
         "-- {:#x} [{}] [OSAL] {}() [IN]",
         addr,
-        uc.get_data().inner.thread_id,
+        uc.get_data().inner.thread_id(),
         method_name
     );
     tracing = true;

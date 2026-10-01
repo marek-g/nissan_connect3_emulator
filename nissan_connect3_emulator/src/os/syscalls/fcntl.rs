@@ -8,7 +8,7 @@ pub fn open(unicorn: &mut Unicorn<Context>, path_name: u32, flags: u32, mode: u3
     log::trace!(
         "{:#x}: [{}] [SYSCALL] open(path_name = {:#x}, flags: {:#x} = {:?}, mode: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         path_name,
         flags,
         convert_open_file_flags(flags),
@@ -24,7 +24,7 @@ pub fn open(unicorn: &mut Unicorn<Context>, path_name: u32, flags: u32, mode: u3
     log::trace!(
         "{:#x}: [{}] [SYSCALL] open => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         fd
     );
 
@@ -41,7 +41,7 @@ pub fn openat(
     log::trace!(
         "{:#x}: [{}] [SYSCALL] openat(dirfd = {:#x}, pathname = {:#x}, flags: {:#x} = {:?}, mode: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         dirfd,
         path_name,
         flags,
@@ -58,7 +58,7 @@ pub fn openat(
     log::trace!(
         "{:#x}: [{}] [SYSCALL] openat => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         fd
     );
 
@@ -120,7 +120,7 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
     log::trace!(
         "{:#x}: [{}] [SYSCALL] fcntl64(fd = {:#x}, cmd = {:#x}, arg1: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         fd,
         cmd,
         arg1,
@@ -186,7 +186,7 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
     log::trace!(
         "{:#x}: [{}] [SYSCALL] fcntl64 => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         res
     );
 

@@ -5,7 +5,7 @@ pub fn ioctl(mut unicorn: &mut Unicorn<Context>, fd: u32, request: u32, addr: u3
     log::trace!(
         "{:#x}: [{}] [SYSCALL] ioctl(fd = {:#x}, request: {:#x}, addr: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         fd,
         request,
         addr,
@@ -20,7 +20,7 @@ pub fn ioctl(mut unicorn: &mut Unicorn<Context>, fd: u32, request: u32, addr: u3
     log::trace!(
         "{:#x}: [{}] [SYSCALL] ioctl => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         res
     );
 

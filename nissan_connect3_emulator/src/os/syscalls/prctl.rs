@@ -13,7 +13,7 @@ pub fn prctl(
     log::trace!(
         "{:#x}: [{}] [SYSCALL] prctl(option = {:#x}, arg2: {:#x}, arg3: {:#x}, arg4: {:#x}, arg5: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         option,
         arg2,
         arg3,
@@ -33,7 +33,7 @@ pub fn prctl(
     log::trace!(
         "{:#x}: [{}] [SYSCALL] prctl => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         res
     );
 

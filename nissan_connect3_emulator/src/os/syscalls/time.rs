@@ -1,13 +1,14 @@
 use crate::emulator::context::Context;
+use crate::emulator::thread::{block_current_thread, BlockReason};
 use crate::emulator::utils::{pack_u32, pack_u64, unpack_u32};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn clock_gettime(unicorn: &mut Unicorn<Context>, clock_id: u32, time_spec: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] clock_gettime(clock_id = {:#x}, time_spec: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         clock_id,
         time_spec,
     );
@@ -30,7 +31,7 @@ pub fn clock_gettime(unicorn: &mut Unicorn<Context>, clock_id: u32, time_spec: u
     log::trace!(
         "{:#x}: [{}] [SYSCALL] clock_gettime => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         0
     );
 
@@ -41,7 +42,7 @@ pub fn gettimeofday(unicorn: &mut Unicorn<Context>, time_val: u32, time_zone: u3
     log::trace!(
         "{:#x}: [{}] [SYSCALL] gettimeofday(time_val = {:#x}, time_zone: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         time_val,
         time_zone,
     );
@@ -71,7 +72,7 @@ pub fn gettimeofday(unicorn: &mut Unicorn<Context>, time_val: u32, time_zone: u3
     log::trace!(
         "{:#x}: [{}] [SYSCALL] gettimeofday => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         0
     );
 
@@ -82,7 +83,7 @@ pub fn nanosleep(unicorn: &mut Unicorn<Context>, req: u32, rem: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] nanosleep(req = {:#x}, rem: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         req,
         rem,
     );
@@ -93,14 +94,14 @@ pub fn nanosleep(unicorn: &mut Unicorn<Context>, req: u32, rem: u32) -> u32 {
     unicorn.mem_read(req as u64 + 4, &mut buf).unwrap();
     let nanoseconds = unpack_u32(&buf);
 
-    std::thread::sleep(Duration::from_nanos(
-        (seconds as u64) * 1000000000u64 + nanoseconds as u64,
-    ));
+    // block the current guest thread (other threads keep running) until the deadline
+    let duration = Duration::new(seconds as u64, nanoseconds as u32);
+    block_current_thread(unicorn, BlockReason::SleepUntil(Instant::now() + duration));
 
     log::trace!(
         "{:#x}: [{}] [SYSCALL] nanosleep => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         0
     );
 

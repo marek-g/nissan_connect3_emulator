@@ -1,14 +1,16 @@
 use crate::emulator::context::Context;
-use crate::emulator::thread::Thread;
+use crate::emulator::memory_map::{STACK_BASE, STACK_SIZE};
+use crate::emulator::thread::{GuestThread, ThreadStatus};
 use crate::emulator::utils::pack_u32;
 use std::sync::atomic::Ordering;
+use unicorn_engine::unicorn_const::Permission;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn sched_get_priority_min(unicorn: &mut Unicorn<Context>, policy: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] sched_get_priority_min(policy = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         policy,
     );
 
@@ -25,7 +27,7 @@ pub fn sched_get_priority_min(unicorn: &mut Unicorn<Context>, policy: u32) -> u3
     log::trace!(
         "{:#x}: [{}] [SYSCALL] sched_get_priority_min => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         res
     );
 
@@ -36,7 +38,7 @@ pub fn sched_get_priority_max(unicorn: &mut Unicorn<Context>, policy: u32) -> u3
     log::trace!(
         "{:#x}: [{}] [SYSCALL] sched_get_priority_min(policy = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         policy,
     );
 
@@ -53,7 +55,75 @@ pub fn sched_get_priority_max(unicorn: &mut Unicorn<Context>, policy: u32) -> u3
     log::trace!(
         "{:#x}: [{}] [SYSCALL] sched_get_priority_min => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
+        res
+    );
+
+    res
+}
+
+/// sched_getparam(pid, param) - kernel/sched.c: sys_sched_getparam
+/// copies the thread's sched_param (priority 0 for SCHED_NORMAL) to user space
+pub fn sched_getparam(unicorn: &mut Unicorn<Context>, pid: u32, param_addr: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] sched_getparam(pid = {:#x}, param_addr = {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().thread_id(),
+        pid,
+        param_addr,
+    );
+
+    let exists = {
+        let data = unicorn.get_data();
+        let threads = data.threads.lock().unwrap();
+        threads.iter().any(|t| t.id == pid)
+    };
+
+    let res: u32 = if !exists {
+        -3i32 as u32 // ESRCH
+    } else {
+        match unicorn.mem_write(param_addr as u64, &pack_u32(0)) {
+            Ok(()) => 0u32,
+            Err(_) => -14i32 as u32, // EFAULT
+        }
+    };
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] sched_getparam => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().thread_id(),
+        res
+    );
+
+    res
+}
+
+/// sched_getscheduler(pid) - kernel/sched.c: sys_sched_getscheduler
+/// returns the scheduling policy of the thread (SCHED_NORMAL for all guest threads)
+pub fn sched_getscheduler(unicorn: &mut Unicorn<Context>, pid: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] sched_getscheduler(pid = {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().thread_id(),
+        pid,
+    );
+
+    let exists = {
+        let data = unicorn.get_data();
+        let threads = data.threads.lock().unwrap();
+        threads.iter().any(|t| t.id == pid)
+    };
+
+    let res: u32 = if !exists {
+        -3i32 as u32 // ESRCH
+    } else {
+        0u32 // SCHED_NORMAL
+    };
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] sched_getscheduler => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().thread_id(),
         res
     );
 
@@ -69,7 +139,7 @@ pub fn sched_setscheduler(
     log::trace!(
         "{:#x}: [{}] [SYSCALL] sched_setscheduler(pid = {:#x}, policy = {:#x}, param_addr = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         pid,
         policy,
         param_addr,
@@ -80,7 +150,7 @@ pub fn sched_setscheduler(
     log::trace!(
         "{:#x}: [{}] [SYSCALL] sched_setscheduler => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         res
     );
 
@@ -98,7 +168,7 @@ pub fn clone(
     log::trace!(
         "{:#x}: [{}] [SYSCALL] clone(flags = {:#x}, child_stack: {:#x}, parent_tid_ptr: {:#x}, child_tls: {:#x}, child_tid_ptr: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().inner.thread_id(),
         flags,
         child_stack,
         parent_tid_ptr,
@@ -134,20 +204,68 @@ pub fn clone(
             .unwrap();
     }
 
-    let (new_thread, _) = Thread::clone(unicorn, child_tid, child_tls, child_stack).unwrap();
-    if let Some(threads) = unicorn.get_data().inner.threads.upgrade() {
-        threads.lock().unwrap().push(new_thread);
+    // snapshot the current (parent) CPU state - it is the base for the child
+    let parent_context = unicorn.context_init().unwrap();
+
+    // if there is no child_stack, clone the parent's stack
+    let mut child_stack = child_stack;
+    if child_stack == 0 {
+        let new_base = unicorn
+            .get_data()
+            .inner
+            .mmu
+            .lock()
+            .unwrap()
+            .heap_alloc(unicorn, STACK_SIZE, Permission::READ | Permission::WRITE, "");
+        let mut buf = vec![0u8; STACK_SIZE as usize];
+        unicorn.mem_read(STACK_BASE as u64, &mut buf).unwrap();
+        unicorn.mem_write(new_base as u64, &buf).unwrap();
+
+        let parent_sp = unicorn.reg_read(RegisterARM::SP).unwrap() as u32;
+        child_stack = match parent_sp.checked_sub(STACK_BASE) {
+            Some(delta) => new_base + delta,
+            None => new_base,
+        };
+    }
+
+    // temporarily set the child state on the shared vCPU, snapshot it,
+    // then restore the parent state (we are inside the parent's syscall hook)
+    unicorn
+        .reg_write(RegisterARM::SP as i32, child_stack as u64)
+        .unwrap();
+    unicorn
+        .reg_write(RegisterARM::C13_C0_3 as i32, child_tls as u64)
+        .unwrap();
+    // set 0 in R0 (result from syscall)
+    unicorn.reg_write(RegisterARM::R0 as i32, 0u64).unwrap();
+
+    let child_context = unicorn.context_init().unwrap();
+    let pc = unicorn.reg_read(RegisterARM::PC).unwrap() as u32;
+    unicorn.context_restore(&parent_context).unwrap();
+
+    {
+        let data = unicorn.get_data();
+        data.threads.lock().unwrap().push(GuestThread {
+            id: child_tid,
+            is_main: false,
+            status: ThreadStatus::Runnable,
+            cpu_context: Some(child_context),
+            pc,
+        });
     }
 
     let res = child_tid as u32;
+    log::info!(
+        "========== Clone thread [{}] at address: {:#x} ==========",
+        child_tid,
+        pc
+    );
     log::trace!(
         "{:#x}: [{}] [SYSCALL] clone => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
-        unicorn.get_data().inner.thread_id,
+        unicorn.get_data().thread_id(),
         res
     );
-
-    //std::thread::sleep(Duration::from_secs(3));
 
     res
 }

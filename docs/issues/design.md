@@ -20,12 +20,6 @@ Structural problems: inconsistent abstractions, duplication, hardcoded data, bui
 - **Problem:** Near-identical delegation shims over `TmpFileSystem`; the trace-log + lock + unwrap boilerplate is copy-pasted into every syscall function across `os/syscalls/`.
 - **Fix:** extract a common delegating base/helper; centralize the log+lock+unwrap wrapper.
 
-## Duplicated hook registration in Thread
-
-- **Locations:** `nissan_connect3_emulator/src/emulator/thread.rs:47-59` vs `147-159`
-- **Problem:** The 5 hook registrations are duplicated verbatim between `start_elf_file` and `clone`, each with `.unwrap()`.
-- **Fix:** factor into a helper that returns `Result`.
-
 ## Misleading Result / by-value parameters in the public API
 
 - **Locations:** `nissan_connect3_emulator/src/emulator/emulator.rs:12, 20`
