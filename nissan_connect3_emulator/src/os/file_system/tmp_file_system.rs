@@ -185,6 +185,16 @@ impl FileSystem for TmpFileSystem {
         return None;
     }
 
+    fn get_file_details_for_path(&mut self, file_path: &str) -> Option<FileDetails> {
+        let file_data = self.files.get(file_path)?;
+        let data = file_data.lock().unwrap();
+        Some(FileDetails {
+            file_type: data.file_type.clone(),
+            is_readonly: false,
+            length: data.data.len() as u64,
+        })
+    }
+
     fn is_open(&self, fd: i32) -> bool {
         self.opened_files.contains_key(&fd)
     }

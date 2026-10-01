@@ -1,9 +1,8 @@
 use crate::emulator::context::Context;
 use crate::emulator::users::{GID, UID};
 use crate::emulator::utils::{pack_i32, pack_u32, pack_u64, read_string};
-use crate::os::file_system::{FileSystemType, FileType, OpenFileFlags};
+use crate::os::file_system::{FileInfo, FileSystemType, FileType};
 use crate::os::syscalls::fcntl::get_path_relative_to_dir;
-use crate::os::syscalls::SysCallError;
 use std::time::SystemTime;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -21,16 +20,14 @@ pub fn stat64(unicorn: &mut Unicorn<'_, Context>, path: u32, stat_buf: u32) -> u
     log::trace!("path = {}", pathstr);
 
     let file_system = unicorn.get_data().inner.file_system.clone();
-    let open_res = file_system
+    let res = if let Some(file_info) = file_system
         .lock()
         .unwrap()
-        .open(&pathstr, OpenFileFlags::READ);
-    let res = if let Ok(fd) = open_res {
-        let res = fstat64_internal(unicorn, fd as u32, stat_buf);
-        file_system.lock().unwrap().close(fd).unwrap();
-        res
+        .get_file_info_from_filepath(&pathstr)
+    {
+        write_stat64_buffer(unicorn, &file_info, stat_buf)
     } else {
-        -1i32 as u32
+        -2i32 as u32 // -ENOENT
     };
 
     log::trace!(
@@ -66,16 +63,14 @@ pub fn fstatat64(
     let path_name_new = get_path_relative_to_dir(unicorn, dir_fd, &path_name);
     let file_system = unicorn.get_data().inner.file_system.clone();
 
-    let open_res = file_system
+    let res = if let Some(file_info) = file_system
         .lock()
         .unwrap()
-        .open(&path_name_new, OpenFileFlags::READ);
-    let res = if let Ok(fd) = open_res {
-        let res = fstat64_internal(unicorn, fd as u32, stat_buf);
-        file_system.lock().unwrap().close(fd).unwrap();
-        res
+        .get_file_info_from_filepath(&path_name_new)
+    {
+        write_stat64_buffer(unicorn, &file_info, stat_buf)
     } else {
-        -1i32 as u32
+        -2i32 as u32 // -ENOENT
     };
 
     log::trace!(
@@ -96,25 +91,21 @@ pub fn lstat64(unicorn: &mut Unicorn<'_, Context>, path: u32, stat_buf: u32) -> 
         stat_buf,
     );
 
-    // TODO: handle symbolic links
+    // TODO: handle symbolic links (until then lstat behaves like stat)
     let pathstr = read_string(unicorn, path);
 
     log::trace!("path = {}", pathstr);
 
     let file_system = unicorn.get_data().inner.file_system.clone();
 
-    let open_res = file_system
+    let res = if let Some(file_info) = file_system
         .lock()
         .unwrap()
-        .open(&pathstr, OpenFileFlags::READ | OpenFileFlags::NO_FOLLOW);
-
-    let res = match open_res {
-        Ok(fd) => {
-            let res = fstat64_internal(unicorn, fd as u32, stat_buf);
-            file_system.lock().unwrap().close(fd).unwrap();
-            res
-        }
-        Err(err) => err.to_syscall_error(),
+        .get_file_info_from_filepath(&pathstr)
+    {
+        write_stat64_buffer(unicorn, &file_info, stat_buf)
+    } else {
+        -2i32 as u32 // -ENOENT
     };
 
     log::trace!(
@@ -287,95 +278,103 @@ fn fstat64_internal(unicorn: &mut Unicorn<'_, Context>, fd: u32, stat_buf: u32) 
     let file_system = unicorn.get_data().inner.file_system.clone();
 
     let res = if let Some(file_info) = file_system.lock().unwrap().get_file_info(fd as i32) {
-        let mut stat_data = Vec::new();
-
-        // st_dev
-        stat_data.extend_from_slice(&pack_u64(1));
-
-        // padding
-        stat_data.extend_from_slice(&pack_u32(0));
-
-        // st_ino
-        stat_data.extend_from_slice(&pack_u32(1));
-
-        // st_mode
-        let mut st_mode = 0u32;
-        match file_info.file_details.file_type {
-            FileType::File => st_mode |= 0o0100000u32,
-            FileType::Link => st_mode |= 0o0120000u32,
-            FileType::Directory => st_mode |= 0o0040000u32,
-            FileType::Socket => st_mode |= 0o0140000u32,
-            FileType::BlockDevice => st_mode |= 0o0060000u32,
-            FileType::CharacterDevice => st_mode |= 0o0020000u32,
-            FileType::NamedPipe => st_mode |= 0o0010000u32,
-        }
-
-        if file_info.file_details.is_readonly {
-            st_mode |= 0o000555;
-        } else {
-            st_mode |= 0o000777;
-        }
-
-        stat_data.extend_from_slice(&pack_u32(st_mode));
-
-        // st_nlink
-        stat_data.extend_from_slice(&pack_u32(0));
-
-        // st_uid
-        stat_data.extend_from_slice(&pack_u32(UID));
-
-        // st_gid
-        stat_data.extend_from_slice(&pack_u32(GID));
-
-        // st_rdev
-        stat_data.extend_from_slice(&pack_u64(0));
-
-        // padding
-        stat_data.extend_from_slice(&pack_u64(0));
-
-        // st_size
-        stat_data.extend_from_slice(&pack_u64(file_info.file_details.length));
-
-        // st_blksize
-        stat_data.extend_from_slice(&pack_i32(4096));
-
-        // padding
-        stat_data.extend_from_slice(&pack_u32(0));
-
-        // st_blocks
-        stat_data.extend_from_slice(&pack_u64((file_info.file_details.length + 511) / 512));
-
-        // st_atime
-        let time = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        stat_data.extend_from_slice(&pack_u32(time as u32));
-
-        // st_atime_ns
-        stat_data.extend_from_slice(&pack_u32(0));
-
-        // st_mtime
-        stat_data.extend_from_slice(&pack_u32(time as u32));
-
-        // st_mtime_ns
-        stat_data.extend_from_slice(&pack_u32(0));
-
-        // st_ctime
-        stat_data.extend_from_slice(&pack_u32(time as u32));
-
-        // st_ctime_ns
-        stat_data.extend_from_slice(&pack_u32(0));
-
-        // st_ino
-        stat_data.extend_from_slice(&pack_u64(file_info.inode));
-
-        unicorn.mem_write(stat_buf as u64, &stat_data).unwrap();
-
-        0u32
+        write_stat64_buffer(unicorn, &file_info, stat_buf)
     } else {
         -1i32 as u32
     };
-
     res
+}
+
+/// pack a `struct stat64` from file info into the guest buffer
+fn write_stat64_buffer(
+    unicorn: &mut Unicorn<'_, Context>,
+    file_info: &FileInfo,
+    stat_buf: u32,
+) -> u32 {
+    let mut stat_data = Vec::new();
+
+    // st_dev
+    stat_data.extend_from_slice(&pack_u64(1));
+
+    // padding
+    stat_data.extend_from_slice(&pack_u32(0));
+
+    // st_ino
+    stat_data.extend_from_slice(&pack_u32(1));
+
+    // st_mode
+    let mut st_mode = 0u32;
+    match file_info.file_details.file_type {
+        FileType::File => st_mode |= 0o0100000u32,
+        FileType::Link => st_mode |= 0o0120000u32,
+        FileType::Directory => st_mode |= 0o0040000u32,
+        FileType::Socket => st_mode |= 0o0140000u32,
+        FileType::BlockDevice => st_mode |= 0o0060000u32,
+        FileType::CharacterDevice => st_mode |= 0o0020000u32,
+        FileType::NamedPipe => st_mode |= 0o0010000u32,
+    }
+
+    if file_info.file_details.is_readonly {
+        st_mode |= 0o000555;
+    } else {
+        st_mode |= 0o000777;
+    }
+
+    stat_data.extend_from_slice(&pack_u32(st_mode));
+
+    // st_nlink
+    stat_data.extend_from_slice(&pack_u32(0));
+
+    // st_uid
+    stat_data.extend_from_slice(&pack_u32(UID));
+
+    // st_gid
+    stat_data.extend_from_slice(&pack_u32(GID));
+
+    // st_rdev
+    stat_data.extend_from_slice(&pack_u64(0));
+
+    // padding
+    stat_data.extend_from_slice(&pack_u64(0));
+
+    // st_size
+    stat_data.extend_from_slice(&pack_u64(file_info.file_details.length));
+
+    // st_blksize
+    stat_data.extend_from_slice(&pack_i32(4096));
+
+    // padding
+    stat_data.extend_from_slice(&pack_u32(0));
+
+    // st_blocks
+    stat_data.extend_from_slice(&pack_u64((file_info.file_details.length + 511) / 512));
+
+    // st_atime
+    let time = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    stat_data.extend_from_slice(&pack_u32(time as u32));
+
+    // st_atime_ns
+    stat_data.extend_from_slice(&pack_u32(0));
+
+    // st_mtime
+    stat_data.extend_from_slice(&pack_u32(time as u32));
+
+    // st_mtime_ns
+    stat_data.extend_from_slice(&pack_u32(0));
+
+    // st_ctime
+    stat_data.extend_from_slice(&pack_u32(time as u32));
+
+    // st_ctime_ns
+    stat_data.extend_from_slice(&pack_u32(0));
+
+    // st_ino
+    stat_data.extend_from_slice(&pack_u64(file_info.inode));
+
+    unicorn.mem_write(stat_buf as u64, &stat_data).unwrap();
+
+    0u32
 }

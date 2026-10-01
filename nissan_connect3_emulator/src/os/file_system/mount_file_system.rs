@@ -253,11 +253,26 @@ impl MountFileSystem {
     }
 
     pub fn get_file_info_from_filepath(&mut self, file_path: &str) -> Option<FileInfo> {
-        let file_path = self.path_convert_to_absolute(file_path);
-        if let Ok(fd) = self.open(&file_path, OpenFileFlags::READ) {
-            let res = self.get_file_info(fd);
-            self.close(fd).unwrap();
-            res
+        let absolute_path = self.path_convert_to_absolute(file_path);
+
+        // stat by path - no need (or side effect) of opening the file
+        let mount_and_details = self
+            .resolve_mount(&absolute_path)
+            .and_then(|(mount_point, translated_path)| {
+                mount_point
+                    .file_system
+                    .get_file_details_for_path(&translated_path)
+                    .map(|details| (mount_point.mount_point.clone(), details))
+            });
+
+        if let Some((mount_name, file_details)) = mount_and_details {
+            let inode = self.get_inode_for_filepath(&mount_name, &absolute_path);
+            Some(FileInfo {
+                file_details,
+                file_path: absolute_path,
+                inode,
+                file_status_flags: 0,
+            })
         } else {
             None
         }

@@ -92,6 +92,10 @@ impl FileSystem for ProcFileSystem {
         self.tmp_fs.get_file_details(fd)
     }
 
+    fn get_file_details_for_path(&mut self, file_path: &str) -> Option<FileDetails> {
+        self.tmp_fs.get_file_details_for_path(file_path)
+    }
+
     fn is_open(&self, fd: i32) -> bool {
         self.tmp_fs.is_open(fd)
     }

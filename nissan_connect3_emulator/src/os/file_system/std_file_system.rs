@@ -73,6 +73,10 @@ impl FileSystem for StdFileSystem {
         None
     }
 
+    fn get_file_details_for_path(&mut self, _file_path: &str) -> Option<FileDetails> {
+        None
+    }
+
     fn is_open(&self, fd: i32) -> bool {
         if fd >= 0 && fd <= 2 {
             true

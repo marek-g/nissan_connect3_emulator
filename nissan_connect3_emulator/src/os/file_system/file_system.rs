@@ -65,6 +65,9 @@ pub trait FileSystem {
 
     fn get_file_details(&mut self, fd: i32) -> Option<FileDetails>;
 
+    /// Get file details for a path without opening the file (stat/lstat).
+    fn get_file_details_for_path(&mut self, file_path: &str) -> Option<FileDetails>;
+
     fn is_open(&self, fd: i32) -> bool;
 
     fn get_length(&mut self, fd: i32) -> u64;

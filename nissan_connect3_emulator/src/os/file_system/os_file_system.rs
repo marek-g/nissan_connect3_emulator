@@ -120,6 +120,22 @@ impl FileSystem for OsFileSystem {
         }
     }
 
+    fn get_file_details_for_path(&mut self, file_path: &str) -> Option<FileDetails> {
+        let full_path_name = self.path_transform_to_real(file_path);
+        let metadata = std::fs::metadata(full_path_name).ok()?;
+        Some(FileDetails {
+            file_type: if metadata.is_dir() {
+                FileType::Directory
+            } else if metadata.is_symlink() {
+                FileType::Link
+            } else {
+                FileType::File
+            },
+            is_readonly: metadata.permissions().readonly(),
+            length: metadata.len(),
+        })
+    }
+
     fn is_open(&self, fd: i32) -> bool {
         self.opened_files.contains_key(&fd)
     }

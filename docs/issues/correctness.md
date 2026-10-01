@@ -2,12 +2,6 @@
 
 Bugs where the emulated guest behaves wrongly (wrong syscall semantics, data corruption, hangs).
 
-## stat implemented as open + fstat + close(fd).unwrap()
-
-- **Location:** `nissan_connect3_emulator/src/os/syscalls/stat.rs:24-34, 69-79, 106-118`
-- **Problem:** Every path-based stat allocates an fd (side effects on some fs), is TOCTOU-prone, panics if close fails, and pollutes the inode table.
-- **Fix:** add a `stat_path`/lstat-style method to the `FileSystem` trait (no open) and drop the unwrap.
-
 ## OsFileSystem: no host-path containment check, panics on relative path
 
 - **Location:** `nissan_connect3_emulator/src/file_system/os_file_system.rs:49, 106, 129, 194-203`
