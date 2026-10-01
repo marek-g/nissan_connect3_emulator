@@ -2,13 +2,6 @@
 
 Bugs where the emulated guest behaves wrongly (wrong syscall semantics, data corruption, hangs).
 
-## TmpFileSystem: unchecked length arithmetic → underflow/OOM
-
-- **Location:** `nissan_connect3_emulator/src/file_system/tmp_file_system.rs:245-268`
-- **Problem:** `pos` is per-fd while `data` is shared via `Arc<Mutex>`. If another fd truncates the file after a seek, `data.len() - pos` underflows in debug or wraps in release (`bytes_to_read` becomes huge → OOM/slice panic). Real race across emulated threads since the fs mutex is only held per-syscall.
-- **Related:** lines 245/249 take the lock twice for one operation.
-- **Fix:** saturating math / clamp `pos` to `len`, return 0 at EOF; use a single lock guard per operation.
-
 ## MountFileSystem: infinite loop on 0-byte IO
 
 - **Location:** `nissan_connect3_emulator/src/file_system/mount_file_system.rs:264-281, 296-318`

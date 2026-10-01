@@ -242,12 +242,17 @@ impl FileSystem for TmpFileSystem {
                 return Err(());
             }
 
-            let bytes_to_read = (opened_file.file_data.lock().unwrap().data.len()
-                - opened_file.pos)
-                .min(content.len());
+            let file_data = opened_file.file_data.lock().unwrap();
+
+            // the position is per-fd but the data is shared - another fd may have
+            // truncated the file since this one was positioned, so clamp to EOF
+            if opened_file.pos > file_data.data.len() {
+                opened_file.pos = file_data.data.len();
+            }
+
+            let bytes_to_read = (file_data.data.len() - opened_file.pos).min(content.len());
             content[0..bytes_to_read].copy_from_slice(
-                &opened_file.file_data.lock().unwrap().data
-                    [opened_file.pos..opened_file.pos + bytes_to_read],
+                &file_data.data[opened_file.pos..opened_file.pos + bytes_to_read],
             );
             opened_file.pos += bytes_to_read;
             return Ok(bytes_to_read as u64);
@@ -261,21 +266,21 @@ impl FileSystem for TmpFileSystem {
                 return Err(());
             }
 
-            let bytes_to_override = (opened_file.file_data.lock().unwrap().data.len()
-                - opened_file.pos)
-                .min(content.len());
-            opened_file.file_data.lock().unwrap().data
-                [opened_file.pos..opened_file.pos + bytes_to_override]
+            let mut file_data = opened_file.file_data.lock().unwrap();
+
+            // a write past the end of the file extends it, with the gap filled
+            // with zeros (like the kernel does for regular files)
+            if opened_file.pos > file_data.data.len() {
+                file_data.data.resize(opened_file.pos, 0u8);
+            }
+
+            let bytes_to_override = (file_data.data.len() - opened_file.pos).min(content.len());
+            file_data.data[opened_file.pos..opened_file.pos + bytes_to_override]
                 .copy_from_slice(&content[0..bytes_to_override]);
             let bytes_to_append = content.len() - bytes_to_override;
-            opened_file
-                .file_data
-                .lock()
-                .unwrap()
-                .data
-                .extend_from_slice(
-                    &content[bytes_to_override..bytes_to_override + bytes_to_append],
-                );
+            if bytes_to_append > 0 {
+                file_data.data.extend_from_slice(&content[bytes_to_override..]);
+            }
             opened_file.pos += content.len();
             return Ok(content.len() as u64);
         }
