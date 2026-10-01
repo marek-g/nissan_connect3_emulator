@@ -327,7 +327,7 @@ impl MountFileSystem {
 
     pub fn ioctl(
         &mut self,
-        unicorn: &mut Unicorn<Context>,
+        unicorn: &mut Unicorn<'_, Context>,
         fd: i32,
         request: u32,
         addr: u32,

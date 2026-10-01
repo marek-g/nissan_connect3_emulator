@@ -1,7 +1,7 @@
 use crate::emulator::context::Context;
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn socket(unicorn: &mut Unicorn<Context>, domain: u32, socket_type: u32, protocol: u32) -> u32 {
+pub fn socket(unicorn: &mut Unicorn<'_, Context>, domain: u32, socket_type: u32, protocol: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] socket(domain = {:#x}, socket_type: {:#x}, protocol: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -24,7 +24,7 @@ pub fn socket(unicorn: &mut Unicorn<Context>, domain: u32, socket_type: u32, pro
     res
 }
 
-pub fn connect(unicorn: &mut Unicorn<Context>, socket_fd: u32, addr: u32, addr_len: u32) -> u32 {
+pub fn connect(unicorn: &mut Unicorn<'_, Context>, socket_fd: u32, addr: u32, addr_len: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] connect(socket_fd = {:#x}, addr: {:#x}, addr_len: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -47,7 +47,7 @@ pub fn connect(unicorn: &mut Unicorn<Context>, socket_fd: u32, addr: u32, addr_l
     res
 }
 
-pub fn send(unicorn: &mut Unicorn<Context>, socket_fd: u32, buf: u32, len: u32, flags: u32) -> u32 {
+pub fn send(unicorn: &mut Unicorn<'_, Context>, socket_fd: u32, buf: u32, len: u32, flags: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] send(socket_fd = {:#x}, buf: {:#x}, len: {:#x}, flags: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),

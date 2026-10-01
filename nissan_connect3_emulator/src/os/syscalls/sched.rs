@@ -3,10 +3,10 @@ use crate::emulator::memory_map::{STACK_BASE, STACK_SIZE};
 use crate::emulator::thread::{GuestThread, ThreadStatus};
 use crate::emulator::utils::pack_u32;
 use std::sync::atomic::Ordering;
-use unicorn_engine::unicorn_const::Permission;
+use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn sched_get_priority_min(unicorn: &mut Unicorn<Context>, policy: u32) -> u32 {
+pub fn sched_get_priority_min(unicorn: &mut Unicorn<'_, Context>, policy: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] sched_get_priority_min(policy = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -34,7 +34,7 @@ pub fn sched_get_priority_min(unicorn: &mut Unicorn<Context>, policy: u32) -> u3
     res
 }
 
-pub fn sched_get_priority_max(unicorn: &mut Unicorn<Context>, policy: u32) -> u32 {
+pub fn sched_get_priority_max(unicorn: &mut Unicorn<'_, Context>, policy: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] sched_get_priority_min(policy = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -64,7 +64,7 @@ pub fn sched_get_priority_max(unicorn: &mut Unicorn<Context>, policy: u32) -> u3
 
 /// sched_getparam(pid, param) - kernel/sched.c: sys_sched_getparam
 /// copies the thread's sched_param (priority 0 for SCHED_NORMAL) to user space
-pub fn sched_getparam(unicorn: &mut Unicorn<Context>, pid: u32, param_addr: u32) -> u32 {
+pub fn sched_getparam(unicorn: &mut Unicorn<'_, Context>, pid: u32, param_addr: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] sched_getparam(pid = {:#x}, param_addr = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -100,7 +100,7 @@ pub fn sched_getparam(unicorn: &mut Unicorn<Context>, pid: u32, param_addr: u32)
 
 /// sched_getscheduler(pid) - kernel/sched.c: sys_sched_getscheduler
 /// returns the scheduling policy of the thread (SCHED_NORMAL for all guest threads)
-pub fn sched_getscheduler(unicorn: &mut Unicorn<Context>, pid: u32) -> u32 {
+pub fn sched_getscheduler(unicorn: &mut Unicorn<'_, Context>, pid: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] sched_getscheduler(pid = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -131,7 +131,7 @@ pub fn sched_getscheduler(unicorn: &mut Unicorn<Context>, pid: u32) -> u32 {
 }
 
 pub fn sched_setscheduler(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     pid: u32,
     policy: u32,
     param_addr: u32,
@@ -158,7 +158,7 @@ pub fn sched_setscheduler(
 }
 
 pub fn clone(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     flags: u32,
     child_stack: u32,
     parent_tid_ptr: u32,
@@ -210,13 +210,11 @@ pub fn clone(
     // if there is no child_stack, clone the parent's stack
     let mut child_stack = child_stack;
     if child_stack == 0 {
-        let new_base = unicorn
-            .get_data()
-            .inner
-            .mmu
+        let mmu_arc = unicorn.get_data().inner.mmu.clone();
+        let new_base = mmu_arc
             .lock()
             .unwrap()
-            .heap_alloc(unicorn, STACK_SIZE, Permission::READ | Permission::WRITE, "");
+            .heap_alloc(unicorn, STACK_SIZE, Prot::READ | Prot::WRITE, "");
         let mut buf = vec![0u8; STACK_SIZE as usize];
         unicorn.mem_read(STACK_BASE as u64, &mut buf).unwrap();
         unicorn.mem_write(new_base as u64, &buf).unwrap();

@@ -23,7 +23,7 @@ const IDLE_TICK: Duration = Duration::from_millis(500);
 
 /// Runs the single Unicorn VM, cooperatively scheduling all guest threads on it.
 pub fn run(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     elf_filepath: &str,
     program_args: Vec<String>,
     program_envs: Vec<(String, String)>,
@@ -141,7 +141,7 @@ pub fn run(
 }
 
 /// wake blocked threads whose deadline has passed
-fn wake_expired(unicorn: &Unicorn<Context>) {
+fn wake_expired(unicorn: &Unicorn<'_, Context>) {
     let now = Instant::now();
     let data = unicorn.get_data();
 
@@ -179,7 +179,7 @@ fn wake_expired(unicorn: &Unicorn<Context>) {
 }
 
 /// round-robin pick of the next runnable thread
-fn pick_next_runnable(unicorn: &Unicorn<Context>) -> Option<u32> {
+fn pick_next_runnable(unicorn: &Unicorn<'_, Context>) -> Option<u32> {
     let data = unicorn.get_data();
     let picked = {
         let threads = data.threads.lock().unwrap();
@@ -204,20 +204,20 @@ fn pick_next_runnable(unicorn: &Unicorn<Context>) -> Option<u32> {
     Some(id)
 }
 
-fn other_runnable_exists(unicorn: &Unicorn<Context>) -> bool {
+fn other_runnable_exists(unicorn: &Unicorn<'_, Context>) -> bool {
     let data = unicorn.get_data();
     let threads = data.threads.lock().unwrap();
     threads.iter().any(|t| t.status == ThreadStatus::Runnable)
 }
 
-fn all_exited(unicorn: &Unicorn<Context>) -> bool {
+fn all_exited(unicorn: &Unicorn<'_, Context>) -> bool {
     let data = unicorn.get_data();
     let threads = data.threads.lock().unwrap();
     !threads.is_empty() && threads.iter().all(|t| matches!(t.status, ThreadStatus::Exited(_)))
 }
 
 /// sleep the host until the nearest blocked-thread deadline (or a short tick)
-fn sleep_until_next_wakeup(unicorn: &Unicorn<Context>) {
+fn sleep_until_next_wakeup(unicorn: &Unicorn<'_, Context>) {
     let now = Instant::now();
     let data = unicorn.get_data();
     let threads = data.threads.lock().unwrap();

@@ -2,7 +2,7 @@ use crate::emulator::context::Context;
 use std::io::Write;
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn uname(unicorn: &mut Unicorn<Context>, buf: u32) -> u32 {
+pub fn uname(unicorn: &mut Unicorn<'_, Context>, buf: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] uname(buf = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),

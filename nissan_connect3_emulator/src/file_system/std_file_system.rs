@@ -121,7 +121,7 @@ impl FileSystem for StdFileSystem {
         Err(())
     }
 
-    fn ioctl(&mut self, unicorn: &mut Unicorn<Context>, fd: i32, request: u32, addr: u32) -> i32 {
+    fn ioctl(&mut self, unicorn: &mut Unicorn<'_, Context>, fd: i32, request: u32, addr: u32) -> i32 {
         match request {
             0x5401 => {
                 // TCGETS

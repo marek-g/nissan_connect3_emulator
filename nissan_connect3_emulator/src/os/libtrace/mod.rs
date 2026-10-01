@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn libtrace_add_code_hooks(unicorn: &mut Unicorn<Context>, base_address: u32) {
+pub fn libtrace_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     hook_trace_code(unicorn, base_address);
 
     let mut method_entries = HashMap::new();
@@ -21,7 +21,7 @@ pub fn libtrace_add_code_hooks(unicorn: &mut Unicorn<Context>, base_address: u32
     }
 }
 
-fn handle_hook(uc: &mut Unicorn<Context>, addr: u64, method_name: &str) {
+fn handle_hook(uc: &mut Unicorn<'_, Context>, addr: u64, method_name: &str) {
     log::trace!(
         "{:#x} [{}] [LIBTRACE] {}() [IN]",
         addr,

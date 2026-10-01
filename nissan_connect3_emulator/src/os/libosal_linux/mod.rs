@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<Context>, base_address: u32) {
+pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     hook_core_code(unicorn, base_address);
     hook_io_code(unicorn, base_address);
     hook_message_code(unicorn, base_address);
@@ -33,7 +33,7 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<Context>, base_address: u32)
     }
 }
 
-fn handle_hook(uc: &mut Unicorn<Context>, addr: u64, method_name: &str) {
+fn handle_hook(uc: &mut Unicorn<'_, Context>, addr: u64, method_name: &str) {
     let mut tracing = uc
         .get_data()
         .inner

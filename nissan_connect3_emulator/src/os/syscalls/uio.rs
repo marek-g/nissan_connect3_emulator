@@ -2,7 +2,7 @@ use crate::emulator::context::Context;
 use crate::emulator::utils::unpack_u32;
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn writev(unicorn: &mut Unicorn<Context>, fd: u32, iov: u32, iovcnt: u32) -> u32 {
+pub fn writev(unicorn: &mut Unicorn<'_, Context>, fd: u32, iov: u32, iovcnt: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] writev(fd: {:#x}, iov: {:#x}, iovcnt: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),

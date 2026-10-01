@@ -4,7 +4,7 @@ use crate::emulator::utils::unpack_u32;
 use std::time::{Duration, Instant};
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn set_robust_list(unicorn: &mut Unicorn<Context>, head: u32, len: u32) -> u32 {
+pub fn set_robust_list(unicorn: &mut Unicorn<'_, Context>, head: u32, len: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] set_robust_list(head = {:#x}, len: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -27,7 +27,7 @@ pub fn set_robust_list(unicorn: &mut Unicorn<Context>, head: u32, len: u32) -> u
 }
 
 pub fn futex(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     uaddr: u32,
     futex_op: u32,
     val: u32,
@@ -118,7 +118,7 @@ pub fn futex(
 }
 
 /// wake at most `val` blocked waiters of the futex at `uaddr`
-fn wake_waiters(unicorn: &mut Unicorn<Context>, uaddr: u32, val: u32) -> u32 {
+fn wake_waiters(unicorn: &mut Unicorn<'_, Context>, uaddr: u32, val: u32) -> u32 {
     let data = unicorn.get_data();
 
     // pop up to `val` waiters (LIFO)
@@ -153,7 +153,7 @@ fn wake_waiters(unicorn: &mut Unicorn<Context>, uaddr: u32, val: u32) -> u32 {
 }
 
 /// read an optional `struct timespec` timeout from guest memory
-fn read_timeout_deadline(unicorn: &Unicorn<Context>, timeout: u32) -> Option<Instant> {
+fn read_timeout_deadline(unicorn: &Unicorn<'_, Context>, timeout: u32) -> Option<Instant> {
     if timeout == 0 {
         return None;
     }

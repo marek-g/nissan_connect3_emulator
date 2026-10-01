@@ -3,7 +3,7 @@ use crate::emulator::utils::read_string;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn prctl(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     option: u32,
     arg2: u32,
     arg3: u32,

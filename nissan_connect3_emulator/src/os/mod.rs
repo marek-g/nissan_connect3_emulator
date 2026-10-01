@@ -7,7 +7,7 @@ use crate::os::libtrace::libtrace_add_code_hooks;
 pub use libosal_linux::libosal_add_code_hooks;
 pub use syscalls::hook_syscall::hook_syscall;
 pub use syscalls::sys_calls_state::SysCallsState;
-use unicorn_engine::unicorn_const::Permission;
+use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::Unicorn;
 
 macro_rules! add_code_hook {
@@ -40,7 +40,7 @@ macro_rules! add_code_hook {
 
 pub(crate) use add_code_hook;
 
-pub fn add_library_hook(unicorn: &mut Unicorn<Context>, library: &str, base_address: u32) {
+pub fn add_library_hook(unicorn: &mut Unicorn<'_, Context>, library: &str, base_address: u32) {
     match library {
         "/usr/lib/libtrace.so" => libtrace_add_code_hooks(unicorn, base_address),
         "/opt/bosch/processes/libosal_linux_so.so" => libosal_add_code_hooks(unicorn, base_address),

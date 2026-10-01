@@ -4,7 +4,7 @@ use crate::emulator::utils::{pack_u32, pack_u64, unpack_u32};
 use std::time::{Duration, Instant, SystemTime};
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn clock_gettime(unicorn: &mut Unicorn<Context>, clock_id: u32, time_spec: u32) -> u32 {
+pub fn clock_gettime(unicorn: &mut Unicorn<'_, Context>, clock_id: u32, time_spec: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] clock_gettime(clock_id = {:#x}, time_spec: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -38,7 +38,7 @@ pub fn clock_gettime(unicorn: &mut Unicorn<Context>, clock_id: u32, time_spec: u
     0
 }
 
-pub fn gettimeofday(unicorn: &mut Unicorn<Context>, time_val: u32, time_zone: u32) -> u32 {
+pub fn gettimeofday(unicorn: &mut Unicorn<'_, Context>, time_val: u32, time_zone: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] gettimeofday(time_val = {:#x}, time_zone: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -79,7 +79,7 @@ pub fn gettimeofday(unicorn: &mut Unicorn<Context>, time_val: u32, time_zone: u3
     0
 }
 
-pub fn nanosleep(unicorn: &mut Unicorn<Context>, req: u32, rem: u32) -> u32 {
+pub fn nanosleep(unicorn: &mut Unicorn<'_, Context>, req: u32, rem: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] nanosleep(req = {:#x}, rem: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),

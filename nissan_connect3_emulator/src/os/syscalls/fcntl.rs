@@ -4,7 +4,7 @@ use crate::file_system::OpenFileFlags;
 use std::path::PathBuf;
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn open(unicorn: &mut Unicorn<Context>, path_name: u32, flags: u32, mode: u32) -> u32 {
+pub fn open(unicorn: &mut Unicorn<'_, Context>, path_name: u32, flags: u32, mode: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] open(path_name = {:#x}, flags: {:#x} = {:?}, mode: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -32,7 +32,7 @@ pub fn open(unicorn: &mut Unicorn<Context>, path_name: u32, flags: u32, mode: u3
 }
 
 pub fn openat(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     dirfd: u32,
     path_name: u32,
     flags: u32,
@@ -66,7 +66,7 @@ pub fn openat(
 }
 
 pub fn get_path_relative_to_dir(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     dirfd: u32,
     path_name: &str,
 ) -> String {
@@ -116,7 +116,7 @@ pub fn get_path_relative_to_dir(
     path_name
 }
 
-pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> u32 {
+pub fn fcntl64(unicorn: &mut Unicorn<'_, Context>, fd: u32, cmd: u32, arg1: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] fcntl64(fd = {:#x}, cmd = {:#x}, arg1: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -193,7 +193,7 @@ pub fn fcntl64(unicorn: &mut Unicorn<Context>, fd: u32, cmd: u32, arg1: u32) -> 
     res
 }
 
-fn open_internal(unicorn: &mut Unicorn<Context>, path_name: &str, flags: u32, _mode: u32) -> u32 {
+fn open_internal(unicorn: &mut Unicorn<'_, Context>, path_name: &str, flags: u32, _mode: u32) -> u32 {
     let open_file_flags = convert_open_file_flags(flags);
 
     if let Ok(fd) = unicorn

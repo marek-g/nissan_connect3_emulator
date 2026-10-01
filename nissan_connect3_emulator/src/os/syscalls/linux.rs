@@ -1,7 +1,7 @@
 use crate::emulator::context::Context;
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn set_tls(unicorn: &mut Unicorn<Context>, address: u32) -> u32 {
+pub fn set_tls(unicorn: &mut Unicorn<'_, Context>, address: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] set_tls(addr: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),

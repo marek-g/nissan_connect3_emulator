@@ -7,7 +7,7 @@ use crate::os::syscalls::SysCallError;
 use std::time::SystemTime;
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn stat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
+pub fn stat64(unicorn: &mut Unicorn<'_, Context>, path: u32, stat_buf: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] stat64(path = {:#x}, stat_buf = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -43,7 +43,7 @@ pub fn stat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
 }
 
 pub fn fstatat64(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     dir_fd: u32,
     path: u32,
     stat_buf: u32,
@@ -87,7 +87,7 @@ pub fn fstatat64(
     res
 }
 
-pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 {
+pub fn lstat64(unicorn: &mut Unicorn<'_, Context>, path: u32, stat_buf: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] lstat64(path = {:#x}, stat_buf = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -126,7 +126,7 @@ pub fn lstat64(unicorn: &mut Unicorn<Context>, path: u32, stat_buf: u32) -> u32 
     res
 }
 
-pub fn fstat64(unicorn: &mut Unicorn<Context>, fd: u32, stat_buf: u32) -> u32 {
+pub fn fstat64(unicorn: &mut Unicorn<'_, Context>, fd: u32, stat_buf: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] fstat64(fd = {:#x}, stat_buf = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -146,7 +146,7 @@ pub fn fstat64(unicorn: &mut Unicorn<Context>, fd: u32, stat_buf: u32) -> u32 {
     res
 }
 
-pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
+pub fn statfs(unicorn: &mut Unicorn<'_, Context>, path: u32, buf: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] statfs(path = {:#x}, buf = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -234,7 +234,7 @@ pub fn statfs(unicorn: &mut Unicorn<Context>, path: u32, buf: u32) -> u32 {
     res
 }
 
-pub fn mkdir(unicorn: &mut Unicorn<Context>, path: u32, mode: u32) -> u32 {
+pub fn mkdir(unicorn: &mut Unicorn<'_, Context>, path: u32, mode: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] mkdir(path = {:#x}, mode = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -263,7 +263,7 @@ pub fn mkdir(unicorn: &mut Unicorn<Context>, path: u32, mode: u32) -> u32 {
     res
 }
 
-pub fn umask(unicorn: &mut Unicorn<Context>, mask: u32) -> u32 {
+pub fn umask(unicorn: &mut Unicorn<'_, Context>, mask: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] umask(mask = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -283,7 +283,7 @@ pub fn umask(unicorn: &mut Unicorn<Context>, mask: u32) -> u32 {
     res
 }
 
-fn fstat64_internal(unicorn: &mut Unicorn<Context>, fd: u32, stat_buf: u32) -> u32 {
+fn fstat64_internal(unicorn: &mut Unicorn<'_, Context>, fd: u32, stat_buf: u32) -> u32 {
     let file_system = unicorn.get_data().inner.file_system.clone();
 
     let res = if let Some(file_info) = file_system.lock().unwrap().get_file_info(fd as i32) {

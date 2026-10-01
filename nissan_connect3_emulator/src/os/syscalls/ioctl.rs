@@ -1,7 +1,7 @@
 use crate::emulator::context::Context;
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn ioctl(mut unicorn: &mut Unicorn<Context>, fd: u32, request: u32, addr: u32) -> u32 {
+pub fn ioctl(mut unicorn: &mut Unicorn<'_, Context>, fd: u32, request: u32, addr: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] ioctl(fd = {:#x}, request: {:#x}, addr: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),

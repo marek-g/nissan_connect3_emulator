@@ -1,11 +1,11 @@
 use crate::emulator::context::Context;
 use crate::emulator::utils::{mem_align_down, mem_align_up};
 use std::io::SeekFrom;
-use unicorn_engine::unicorn_const::Permission;
+use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn mmap(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     addr: u32,
     length: u32,
     prot: u32,
@@ -31,7 +31,7 @@ pub fn mmap(
 }
 
 pub fn mmap2(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     addr: u32,
     length: u32,
     prot: u32,
@@ -56,7 +56,7 @@ pub fn mmap2(
     res
 }
 
-pub fn munmap(unicorn: &mut Unicorn<Context>, addr: u32, length: u32) -> u32 {
+pub fn munmap(unicorn: &mut Unicorn<'_, Context>, addr: u32, length: u32) -> u32 {
     log::trace!(
         "{:#x} [{}] [SYSCALL] munmap(addr = {:#x}, len = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -65,8 +65,8 @@ pub fn munmap(unicorn: &mut Unicorn<Context>, addr: u32, length: u32) -> u32 {
         length,
     );
 
-    let unicorn_context = unicorn.get_data();
-    let mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
+    let mmu_arc = unicorn.get_data().inner.mmu.clone();
+    let mut mmu = mmu_arc.lock().unwrap();
     mmu.unmap(unicorn, addr, mem_align_up(length, None));
 
     let res = 0u32;
@@ -79,7 +79,7 @@ pub fn munmap(unicorn: &mut Unicorn<Context>, addr: u32, length: u32) -> u32 {
     res
 }
 
-pub fn mprotect(unicorn: &mut Unicorn<Context>, addr: u32, len: u32, prot: u32) -> u32 {
+pub fn mprotect(unicorn: &mut Unicorn<'_, Context>, addr: u32, len: u32, prot: u32) -> u32 {
     log::trace!(
         "{:#x} [{}] [SYSCALL] mprotect(addr = {:#x}, len = {:#x}, prot = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -89,8 +89,8 @@ pub fn mprotect(unicorn: &mut Unicorn<Context>, addr: u32, len: u32, prot: u32) 
         prot,
     );
 
-    let unicorn_context = unicorn.get_data();
-    let mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
+    let mmu_arc = unicorn.get_data().inner.mmu.clone();
+    let mut mmu = mmu_arc.lock().unwrap();
     mmu.mem_protect(
         unicorn,
         addr,
@@ -108,7 +108,7 @@ pub fn mprotect(unicorn: &mut Unicorn<Context>, addr: u32, len: u32, prot: u32) 
     res
 }
 
-pub fn mincore(unicorn: &mut Unicorn<Context>, addr: u32, length: u32, vec: u32) -> u32 {
+pub fn mincore(unicorn: &mut Unicorn<'_, Context>, addr: u32, length: u32, vec: u32) -> u32 {
     log::trace!(
         "{:#x} [{}] [SYSCALL] mincore(addr = {:#x}, length = {:#x}, vec = {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -131,7 +131,7 @@ pub fn mincore(unicorn: &mut Unicorn<Context>, addr: u32, length: u32, vec: u32)
 }
 
 fn mmapx(
-    mut unicorn: &mut Unicorn<Context>,
+    mut unicorn: &mut Unicorn<'_, Context>,
     addr: u32,
     mut length: u32,
     prot: u32,
@@ -181,10 +181,10 @@ fn mmapx(
     }
 
     // allocate memory
-    let unicorn_context = unicorn.get_data();
+    let mmu_arc = unicorn.get_data().inner.mmu.clone();
     let addr = if flags & 0x10 != 0 || addr != 0 {
         // MAP_FIXED - don't interpret addr as a hint
-        unicorn_context.inner.mmu.lock().unwrap().map(
+        mmu_arc.lock().unwrap().map(
             unicorn,
             addr,
             length,
@@ -194,41 +194,31 @@ fn mmapx(
         );
         addr
     } else {
-        unicorn_context
-            .inner
-            .mmu
-            .lock()
-            .unwrap()
-            .heap_alloc(unicorn, length, perms, &filepath)
+        mmu_arc.lock().unwrap().heap_alloc(unicorn, length, perms, &filepath)
     };
 
     // write file
     if buf.len() > 0 {
         unicorn.mem_write(addr as u64, &buf).unwrap();
 
-        if perms.contains(Permission::EXEC) {
-            unicorn_context
-                .inner
-                .mmu
-                .lock()
-                .unwrap()
-                .update_library_hooks(&mut unicorn);
+        if (perms & Prot::EXEC) != Prot::NONE {
+            mmu_arc.lock().unwrap().update_library_hooks(unicorn);
         }
     }
 
     addr
 }
 
-fn prot_to_permission(prot: u32) -> Permission {
-    let mut perms = Permission::NONE;
+fn prot_to_permission(prot: u32) -> Prot {
+    let mut perms = Prot::NONE;
     if prot & 1 != 0 {
-        perms |= Permission::READ;
+        perms |= Prot::READ;
     }
     if prot & 2 != 0 {
-        perms |= Permission::WRITE;
+        perms |= Prot::WRITE;
     }
     if prot & 4 != 0 {
-        perms |= Permission::EXEC;
+        perms |= Prot::EXEC;
     }
 
     perms

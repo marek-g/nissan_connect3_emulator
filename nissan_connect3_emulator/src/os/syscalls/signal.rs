@@ -3,7 +3,7 @@ use crate::emulator::utils::unpack_u32;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn rt_sigaction(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     signum: u32,
     action: u32,
     old_action: u32,
@@ -31,7 +31,7 @@ pub fn rt_sigaction(
 }
 
 pub fn rt_sigprocmask(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     how: u32,
     set: u32,
     old_set: u32,
@@ -60,7 +60,7 @@ pub fn rt_sigprocmask(
     res
 }
 
-pub fn sigaltstack(unicorn: &mut Unicorn<Context>, ss: u32, old_ss: u32) -> u32 {
+pub fn sigaltstack(unicorn: &mut Unicorn<'_, Context>, ss: u32, old_ss: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] sigaltstack(ss: {:#x}, old_ss: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -96,7 +96,7 @@ pub fn sigaltstack(unicorn: &mut Unicorn<Context>, ss: u32, old_ss: u32) -> u32 
     res
 }
 pub fn rt_sigtimedwait(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     set: u32,
     info: u32,
     timeout: u32,

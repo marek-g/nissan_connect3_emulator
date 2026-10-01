@@ -2,7 +2,7 @@ use crate::emulator::context::Context;
 use crate::emulator::memory_map::GET_TLS_ADDR;
 use crate::emulator::print::{disasm, print_mmu, print_stack};
 use std::time::Instant;
-use unicorn_engine::unicorn_const::{MemType, Permission};
+use unicorn_engine::unicorn_const::{MemType, Prot};
 use unicorn_engine::{RegisterARM, Unicorn};
 use unicorn_engine::Context as CpuContext;
 
@@ -46,7 +46,7 @@ pub struct GuestThread {
     pub pc: u32,
 }
 
-pub fn block_current_thread(unicorn: &mut Unicorn<Context>, reason: BlockReason) {
+pub fn block_current_thread(unicorn: &mut Unicorn<'_, Context>, reason: BlockReason) {
     let (tid, threads) = {
         let data = unicorn.get_data();
         (data.thread_id(), data.threads.clone())
@@ -57,7 +57,7 @@ pub fn block_current_thread(unicorn: &mut Unicorn<Context>, reason: BlockReason)
     unicorn.emu_stop().unwrap();
 }
 
-pub fn exit_current_thread(unicorn: &mut Unicorn<Context>, code: i32) {
+pub fn exit_current_thread(unicorn: &mut Unicorn<'_, Context>, code: i32) {
     let (tid, threads) = {
         let data = unicorn.get_data();
         (data.thread_id(), data.threads.clone())
@@ -68,7 +68,7 @@ pub fn exit_current_thread(unicorn: &mut Unicorn<Context>, code: i32) {
     unicorn.emu_stop().unwrap();
 }
 
-pub fn exit_process(unicorn: &mut Unicorn<Context>, code: i32) {
+pub fn exit_process(unicorn: &mut Unicorn<'_, Context>, code: i32) {
     let (tid, threads) = {
         let data = unicorn.get_data();
         data.set_process_exit_code(code);
@@ -86,13 +86,13 @@ pub fn exit_process(unicorn: &mut Unicorn<Context>, code: i32) {
 //
 // The following is some `kuser` helpers, which can be found here:
 // https://elixir.bootlin.com/linux/latest/source/arch/arm/kernel/entry-armv.S#L899
-pub fn set_kernel_traps(unicorn: &mut Unicorn<Context>) {
+pub fn set_kernel_traps(unicorn: &mut Unicorn<'_, Context>) {
     // allocate memory directly by unicorn (not mmu object)
     unicorn
         .mem_map(
             0xFFFF0000u64,
-            0x1000usize,
-            Permission::READ | Permission::EXEC,
+            0x1000u64,
+            Prot::READ | Prot::EXEC,
         )
         .unwrap();
 
@@ -140,7 +140,7 @@ pub fn set_kernel_traps(unicorn: &mut Unicorn<Context>) {
         .unwrap();
 }
 
-pub fn enable_vfp(unicorn: &mut Unicorn<Context>) {
+pub fn enable_vfp(unicorn: &mut Unicorn<'_, Context>) {
     // other version? https://github.com/AeonLucid/AndroidNativeEmu/blob/40b89c8095b2aeb4a918ba9a85332afdb3d1b1/src/androidemu/emulator.py
 
     // https://github.com/qilingframework/qiling/blob/master/qiling/arch/arm.py
@@ -155,7 +155,7 @@ pub fn enable_vfp(unicorn: &mut Unicorn<Context>) {
 /// while the vCPU is mid-translation, so no memory reads (dumping happens in
 /// the scheduler after `emu_start` returns, when the VM is stopped).
 fn on_mem_fault(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     memtype: MemType,
     address: u64,
     size: usize,
@@ -174,7 +174,7 @@ fn on_mem_fault(
     false
 }
 
-pub fn add_mem_fault_hooks(unicorn: &mut Unicorn<Context>) {
+pub fn add_mem_fault_hooks(unicorn: &mut Unicorn<'_, Context>) {
     use unicorn_engine::unicorn_const::HookType;
     unicorn
         .add_mem_hook(HookType::MEM_FETCH_UNMAPPED, 1, 0, on_mem_fault)
@@ -192,7 +192,7 @@ pub fn add_mem_fault_hooks(unicorn: &mut Unicorn<Context>) {
 
 /// Dump the full context of the current thread. Only call when the VM is stopped
 /// (i.e. not from inside a hook callback).
-pub fn dump_context(unicorn: &Unicorn<Context>) {
+pub fn dump_context(unicorn: &Unicorn<'_, Context>) {
     println!(
         "PC: {:#10x}, LR (return code): {:#10x}, SP: {:#10x}, FP: {:#10x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),

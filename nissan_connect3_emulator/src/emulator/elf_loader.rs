@@ -5,7 +5,7 @@ use crate::emulator::utils::{
     load_binary, mem_align_down, mem_align_up, pack_u32, push_text_on_stack, to_unicorn_permissions,
 };
 use elfloader::*;
-use unicorn_engine::unicorn_const::Permission;
+use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::Unicorn;
 use xmas_elf::header;
 use xmas_elf::header::{Data, Machine};
@@ -40,9 +40,9 @@ enum AUX {
     AtExecFn = 31,
 }
 
-struct ArmElfLoader<'a> {
+struct ArmElfLoader<'a, 'b> {
     // input
-    unicorn: &'a mut Unicorn<Context>,
+    unicorn: &'a mut Unicorn<'b, Context>,
     filepath: &'a str,
     load_address: u32,
 
@@ -51,7 +51,7 @@ struct ArmElfLoader<'a> {
     mem_end: u32,
 }
 
-impl<'a> ElfLoader for ArmElfLoader<'a> {
+impl<'a, 'b> ElfLoader for ArmElfLoader<'a, 'b> {
     fn allocate(&mut self, load_headers: LoadableHeaders) -> Result<(), ElfLoaderErr> {
         for header in load_headers {
             let mem_start = mem_align_down(self.load_address + header.virtual_addr() as u32, None);
@@ -64,8 +64,8 @@ impl<'a> ElfLoader for ArmElfLoader<'a> {
             self.mem_start = self.mem_start.min(mem_start);
             self.mem_end = self.mem_end.max(mem_end);
 
-            let unicorn_context = self.unicorn.get_data();
-            let mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
+            let mmu_arc = self.unicorn.get_data().inner.mmu.clone();
+            let mut mmu = mmu_arc.lock().unwrap();
             mmu.map(
                 self.unicorn,
                 mem_start,
@@ -116,7 +116,7 @@ impl<'a> ElfLoader for ArmElfLoader<'a> {
 }
 
 pub fn load_elf(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     elf_filepath: &str,
     buf: &[u8],
     program_args: &Vec<String>,
@@ -204,7 +204,7 @@ pub fn load_elf(
 }
 
 fn setup_stack(
-    unicorn: &mut Unicorn<Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     elf_filepath: &str,
     program_args: &Vec<String>,
     program_envs: &Vec<(String, String)>,
@@ -213,13 +213,13 @@ fn setup_stack(
     mem_start: u32,
     interp_address: u32,
 ) -> u32 {
-    let unicorn_context = unicorn.get_data();
-    let mmu = &mut unicorn_context.inner.mmu.lock().unwrap();
+    let mmu_arc = unicorn.get_data().inner.mmu.clone();
+    let mut mmu = mmu_arc.lock().unwrap();
     mmu.map(
         unicorn,
         STACK_BASE,
         STACK_SIZE,
-        Permission::READ | Permission::WRITE,
+        Prot::READ | Prot::WRITE,
         "[stack]",
         "",
     );

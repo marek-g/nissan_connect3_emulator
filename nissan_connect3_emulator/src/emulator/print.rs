@@ -5,7 +5,7 @@ use capstone::prelude::*;
 use capstone::{Capstone, Endian};
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn print_mmu(unicorn: &Unicorn<Context>) {
+pub fn print_mmu(unicorn: &Unicorn<'_, Context>) {
     let data = unicorn.get_data();
     let mmu = data.inner.mmu.lock().unwrap();
     println!("------------------ MMU (emulator regions):");
@@ -14,7 +14,7 @@ pub fn print_mmu(unicorn: &Unicorn<Context>) {
     //println!("{}", Mmu::display_mapped_unicorn(unicorn));
 }
 
-pub fn print_stack(unicorn: &Unicorn<Context>) {
+pub fn print_stack(unicorn: &Unicorn<'_, Context>) {
     let mut sp = unicorn.reg_read(RegisterARM::SP).unwrap();
     let fp = unicorn.reg_read(RegisterARM::FP).unwrap();
     println!(
@@ -30,7 +30,7 @@ pub fn print_stack(unicorn: &Unicorn<Context>) {
     println!();
 }
 
-pub fn mem_dump(unicorn: &Unicorn<Context>, address: u32, len: u32) {
+pub fn mem_dump(unicorn: &Unicorn<'_, Context>, address: u32, len: u32) {
     println!("------------------ MEM DUMP at {:#010x}:", address);
     let mut mem = vec![0u8; len as usize];
     unicorn.mem_read(address as u64, &mut mem).unwrap();
@@ -43,7 +43,7 @@ pub fn mem_dump(unicorn: &Unicorn<Context>, address: u32, len: u32) {
     println!();
 }
 
-pub fn disasm(unicorn: &Unicorn<Context>, address: u32, len: u32) {
+pub fn disasm(unicorn: &Unicorn<'_, Context>, address: u32, len: u32) {
     let cs = Capstone::new()
         .arm()
         .mode(ArchMode::Arm)

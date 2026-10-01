@@ -7,7 +7,7 @@ use crate::os::syscalls::{
 };
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn hook_syscall(unicorn: &mut Unicorn<Context>, int_no: u32) {
+pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
     // table:
     // - https://marcin.juszkiewicz.com.pl/download/tables/syscalls.html
     // - https://github.com/qilingframework/qiling/blob/master/qiling/os/linux/map_syscall.py
@@ -260,7 +260,7 @@ trait Args {
     fn set_u32_result(&mut self, res: u32);
 }
 
-impl Args for Unicorn<Context> {
+impl<'a> Args for Unicorn<'a, Context> {
     fn get_syscall_number(&self) -> u32 {
         self.reg_read_i32(RegisterARM::R7).unwrap() as u32
     }

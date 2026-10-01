@@ -1,14 +1,14 @@
 use crate::emulator::context::Context;
 use crate::emulator::utils::mem_align_up;
 use crate::os::add_library_hook;
-use unicorn_engine::unicorn_const::Permission;
+use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::Unicorn;
 
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone)]
 pub struct MmuRegion {
     pub memory_start: u32,
     pub memory_end: u32,
-    pub memory_perms: Permission,
+    pub memory_perms: Prot,
     pub description: String,
     pub filepath: String,
 }
@@ -21,17 +21,17 @@ impl std::fmt::Display for MmuRegion {
             self.memory_start,
             self.memory_end,
             (self.memory_end - self.memory_start + 1) / 1024,
-            if self.memory_perms & Permission::READ != Permission::NONE {
+            if self.memory_perms & Prot::READ != Prot::NONE {
                 "R"
             } else {
                 "-"
             },
-            if self.memory_perms & Permission::WRITE != Permission::NONE {
+            if self.memory_perms & Prot::WRITE != Prot::NONE {
                 "W"
             } else {
                 "-"
             },
-            if self.memory_perms & Permission::EXEC != Permission::NONE {
+            if self.memory_perms & Prot::EXEC != Prot::NONE {
                 "X"
             } else {
                 "-"
@@ -64,17 +64,17 @@ impl Mmu {
 
     pub fn map(
         &mut self,
-        unicorn: &mut Unicorn<Context>,
+        unicorn: &mut Unicorn<'_, Context>,
         address: u32,
         size: u32,
-        perms: Permission,
+        perms: Prot,
         description: &str,
         filepath: &str,
     ) {
         self.remove_internal(unicorn, address, size);
 
         // fresh anonymous memory is zero-filled by the emulator (like a real kernel)
-        unicorn.mem_map(address as u64, size as usize, perms).unwrap();
+        unicorn.mem_map(address as u64, size as u64, perms).unwrap();
 
         let desc = match description.len() {
             0 => String::from("[mapped]"),
@@ -100,7 +100,7 @@ impl Mmu {
         );
     }
 
-    pub fn unmap(&mut self, unicorn: &mut Unicorn<Context>, address: u32, size: u32) {
+    pub fn unmap(&mut self, unicorn: &mut Unicorn<'_, Context>, address: u32, size: u32) {
         self.remove_internal(unicorn, address, size);
 
         log::debug!(
@@ -112,16 +112,16 @@ impl Mmu {
 
     pub fn mem_protect(
         &mut self,
-        unicorn: &mut Unicorn<Context>,
+        unicorn: &mut Unicorn<'_, Context>,
         address: u32,
         size: u32,
-        perms: Permission,
+        perms: Prot,
     ) {
         // split regions at the beginning and end point of the range
         self.split_internal(unicorn, address);
         self.split_internal(unicorn, address + size);
 
-        unicorn.mem_protect(address as u64, size as usize, perms).unwrap();
+        unicorn.mem_protect(address as u64, size as u64, perms).unwrap();
 
         for item in &mut self.regions {
             if item.memory_start >= address && item.memory_end <= address + size - 1 {
@@ -138,26 +138,20 @@ impl Mmu {
         self.regions
             .iter()
             .filter(|region| {
-                region.memory_perms.contains(Permission::EXEC) && region.filepath.len() > 0
+                (region.memory_perms & Prot::EXEC) != Prot::NONE && region.filepath.len() > 0
             })
             .map(|region| (region.filepath.clone(), region.memory_start))
             .collect()
     }
 
     /// Adds code hooks for newly mapped libraries to the (single) VM.
-    pub fn update_library_hooks(&self, unicorn: &mut Unicorn<Context>) {
+    pub fn update_library_hooks(&self, unicorn: &mut Unicorn<'_, Context>) {
         let libraries = self.get_libraries_and_base_addresses();
-        let data = unicorn.get_data();
+        let hooked_libraries = unicorn.get_data().inner.hooked_libraries.clone();
         for (library, base_address) in libraries {
-            if !data
-                .inner
-                .hooked_libraries
-                .lock()
-                .unwrap()
-                .contains(&library)
-            {
+            if !hooked_libraries.lock().unwrap().contains(&library) {
                 add_library_hook(unicorn, &library, base_address);
-                data.inner.hooked_libraries.lock().unwrap().insert(library);
+                hooked_libraries.lock().unwrap().insert(library);
             }
         }
     }
@@ -173,13 +167,13 @@ impl Mmu {
         str
     }
 
-    pub fn display_mapped_unicorn(unicorn: &Unicorn<Context>) -> String {
+    pub fn display_mapped_unicorn(unicorn: &Unicorn<'_, Context>) -> String {
         let mut v: Vec<_> = Vec::new();
         for mem_region in unicorn.mem_regions().unwrap() {
             v.push(MmuRegion {
                 memory_start: mem_region.begin as u32,
                 memory_end: mem_region.end as u32,
-                memory_perms: mem_region.perms,
+                memory_perms: Prot(mem_region.perms),
                 description: "".to_string(),
                 filepath: "".to_string(),
             });
@@ -195,9 +189,9 @@ impl Mmu {
 
     pub fn heap_alloc(
         &mut self,
-        unicorn: &mut Unicorn<Context>,
+        unicorn: &mut Unicorn<'_, Context>,
         size: u32,
-        perms: Permission,
+        perms: Prot,
         filepath: &str,
     ) -> u32 {
         let heap_addr = self.heap_mem_end;
@@ -211,7 +205,7 @@ impl Mmu {
     }
 
     /// unmap all regions fully covered by [address, address + size)
-    fn unmap_internal(&mut self, unicorn: &mut Unicorn<Context>, address: u32, size: u32) {
+    fn unmap_internal(&mut self, unicorn: &mut Unicorn<'_, Context>, address: u32, size: u32) {
         let regions_to_unmap: Vec<_> = self
             .regions
             .iter()
@@ -225,7 +219,7 @@ impl Mmu {
 
         for region in &regions_to_unmap {
             unicorn
-                .mem_unmap(region.0 as u64, (region.1 - region.0 + 1) as usize)
+                .mem_unmap(region.0 as u64, (region.1 - region.0 + 1) as u64)
                 .unwrap();
         }
 
@@ -233,7 +227,7 @@ impl Mmu {
             .retain(|item| item.memory_end < address || item.memory_start >= address + size);
     }
 
-    fn remove_internal(&mut self, unicorn: &mut Unicorn<Context>, address: u32, size: u32) {
+    fn remove_internal(&mut self, unicorn: &mut Unicorn<'_, Context>, address: u32, size: u32) {
         // split regions at the beginning and end point of the range
         self.split_internal(unicorn, address);
         self.split_internal(unicorn, address + size);
@@ -244,7 +238,7 @@ impl Mmu {
 
     /// split the region containing `address` into two at that point,
     /// preserving the existing contents
-    fn split_internal(&mut self, unicorn: &mut Unicorn<Context>, address: u32) {
+    fn split_internal(&mut self, unicorn: &mut Unicorn<'_, Context>, address: u32) {
         let to_be_split: Vec<_> = self
             .regions
             .iter()
@@ -268,7 +262,7 @@ impl Mmu {
 
             // left part
             unicorn
-                .mem_map(item.memory_start as u64, left_size as usize, item.memory_perms)
+                .mem_map(item.memory_start as u64, left_size as u64, item.memory_perms)
                 .unwrap();
             unicorn
                 .mem_write(item.memory_start as u64, &data[..split_offset])
@@ -283,7 +277,7 @@ impl Mmu {
 
             // right part
             unicorn
-                .mem_map(address as u64, right_size as usize, item.memory_perms)
+                .mem_map(address as u64, right_size as u64, item.memory_perms)
                 .unwrap();
             unicorn.mem_write(address as u64, &data[split_offset..]).unwrap();
             self.regions.push(MmuRegion {

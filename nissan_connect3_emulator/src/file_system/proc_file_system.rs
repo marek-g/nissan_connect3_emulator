@@ -122,7 +122,7 @@ impl FileSystem for ProcFileSystem {
 
     fn ioctl(
         &mut self,
-        _unicorn: &mut Unicorn<Context>,
+        _unicorn: &mut Unicorn<'_, Context>,
         _fd: i32,
         _request: u32,
         _addr: u32,

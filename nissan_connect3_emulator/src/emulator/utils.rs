@@ -1,12 +1,12 @@
 use crate::emulator::context::Context;
 use crate::file_system::OpenFileFlags;
 use byteorder::{ByteOrder, LittleEndian};
-use unicorn_engine::unicorn_const::Permission;
+use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::Unicorn;
 use xmas_elf::program;
 
-pub fn load_binary(unicorn: &mut Unicorn<Context>, filepath: &str) -> Vec<u8> {
-    let data = unicorn.get_data().inner;
+pub fn load_binary(unicorn: &mut Unicorn<'_, Context>, filepath: &str) -> Vec<u8> {
+    let data = unicorn.get_data().inner.clone();
     let file_system = &mut data.file_system.lock().unwrap();
     if let Ok(fd) = file_system.open(filepath, OpenFileFlags::READ) {
         let size = file_system.get_length(fd);
@@ -41,21 +41,21 @@ pub fn mem_align_up(address: u32, alignment: Option<u32>) -> u32 {
     ((address + align - 1) / align) * align
 }
 
-pub fn to_unicorn_permissions(perms: program::Flags) -> Permission {
-    let mut uc_perms: Permission = Permission::NONE;
+pub fn to_unicorn_permissions(perms: program::Flags) -> Prot {
+    let mut uc_perms: Prot = Prot::NONE;
 
     if perms.is_execute() {
-        uc_perms = uc_perms | Permission::EXEC;
+        uc_perms = uc_perms | Prot::EXEC;
         // assumes read if execute
-        uc_perms = uc_perms | Permission::READ;
+        uc_perms = uc_perms | Prot::READ;
     }
 
     if perms.is_write() {
-        uc_perms = uc_perms | Permission::WRITE;
+        uc_perms = uc_perms | Prot::WRITE;
     }
 
     if perms.is_read() {
-        uc_perms = uc_perms | Permission::READ;
+        uc_perms = uc_perms | Prot::READ;
     }
 
     uc_perms
@@ -63,7 +63,7 @@ pub fn to_unicorn_permissions(perms: program::Flags) -> Permission {
 
 /// Write a string to stack memory (aligned to pointer size).
 /// Return new top of stack.
-pub fn push_text_on_stack(unicorn: &mut Unicorn<Context>, address: u32, text: &str) -> u32 {
+pub fn push_text_on_stack(unicorn: &mut Unicorn<'_, Context>, address: u32, text: &str) -> u32 {
     let data = text.as_bytes();
     let address = mem_align_down(address - data.len() as u32 - 1, Some(4));
     unicorn.mem_write(address as u64, data).unwrap();
@@ -73,7 +73,7 @@ pub fn push_text_on_stack(unicorn: &mut Unicorn<Context>, address: u32, text: &s
     address
 }
 
-pub fn read_string(unicorn: &Unicorn<Context>, mut addr: u32) -> String {
+pub fn read_string(unicorn: &Unicorn<'_, Context>, mut addr: u32) -> String {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     loop {

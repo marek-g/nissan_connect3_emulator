@@ -3,7 +3,7 @@ use crate::emulator::memory_map::STACK_SIZE;
 use crate::emulator::utils::pack_i64;
 use unicorn_engine::{RegisterARM, Unicorn};
 
-pub fn set_priority(unicorn: &mut Unicorn<Context>, which: u32, who: u32, prio: u32) -> u32 {
+pub fn set_priority(unicorn: &mut Unicorn<'_, Context>, which: u32, who: u32, prio: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] set_priority(which = {:#x}, who: {:#x}, prio: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -26,7 +26,7 @@ pub fn set_priority(unicorn: &mut Unicorn<Context>, which: u32, who: u32, prio: 
     res
 }
 
-pub fn ugetrlimit(unicorn: &mut Unicorn<Context>, resource: u32, r_limit: u32) -> u32 {
+pub fn ugetrlimit(unicorn: &mut Unicorn<'_, Context>, resource: u32, r_limit: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] ugetrlimit(resource = {:#x}, r_limit: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
