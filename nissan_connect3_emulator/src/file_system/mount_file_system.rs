@@ -215,7 +215,7 @@ impl MountFileSystem {
     }
 
     pub fn set_file_status_flags(&mut self, fd: i32, status_flags: u32) -> Result<(), ()> {
-        if let Some(mut file_data) = self.file_data.get_mut(&fd) {
+        if let Some(file_data) = self.file_data.get_mut(&fd) {
             file_data.file_status_flags = status_flags;
             Ok(())
         } else {

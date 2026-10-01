@@ -36,7 +36,7 @@ pub fn v_init_osal_core_iosc(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
     0u32
 }
 
-pub fn v_generate_term_mq_handle(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+pub fn v_generate_term_mq_handle(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
     //let name = read_string(unicorn, unicorn.reg_read(RegisterARM::R0).unwrap() as u32);
     //log::trace!("queue_name: {}", name);
     0u32

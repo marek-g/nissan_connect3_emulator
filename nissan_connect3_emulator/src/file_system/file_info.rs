@@ -9,6 +9,7 @@ pub struct FileInfo {
 
 /// File type
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum FileType {
     File,
     Link,

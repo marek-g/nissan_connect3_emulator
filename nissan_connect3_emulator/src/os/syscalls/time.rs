@@ -1,5 +1,5 @@
 use crate::emulator::context::Context;
-use crate::emulator::thread::{block_current_thread, BlockReason};
+use crate::emulator::thread::{BlockReason, ThreadAction};
 use crate::emulator::utils::{pack_u32, pack_u64, unpack_u32};
 use std::time::{Duration, Instant, SystemTime};
 use unicorn_engine::{RegisterARM, Unicorn};
@@ -96,7 +96,9 @@ pub fn nanosleep(unicorn: &mut Unicorn<'_, Context>, req: u32, rem: u32) -> u32 
 
     // block the current guest thread (other threads keep running) until the deadline
     let duration = Duration::new(seconds as u64, nanoseconds as u32);
-    block_current_thread(unicorn, BlockReason::SleepUntil(Instant::now() + duration));
+    unicorn
+        .get_data()
+        .set_action(ThreadAction::Block(BlockReason::SleepUntil(Instant::now() + duration)));
 
     log::trace!(
         "{:#x}: [{}] [SYSCALL] nanosleep => {:#x}",

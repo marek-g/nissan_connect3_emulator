@@ -131,7 +131,7 @@ pub fn mincore(unicorn: &mut Unicorn<'_, Context>, addr: u32, length: u32, vec: 
 }
 
 fn mmapx(
-    mut unicorn: &mut Unicorn<'_, Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     addr: u32,
     mut length: u32,
     prot: u32,

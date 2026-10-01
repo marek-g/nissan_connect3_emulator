@@ -130,10 +130,6 @@ impl Mmu {
         }
     }
 
-    pub fn get_regions(&self) -> &Vec<MmuRegion> {
-        &self.regions
-    }
-
     pub fn get_libraries_and_base_addresses(&self) -> Vec<(String, u32)> {
         self.regions
             .iter()
@@ -158,26 +154,6 @@ impl Mmu {
 
     pub fn display_mapped(&self) -> String {
         let mut v: Vec<_> = self.regions.clone();
-        v.sort_by(|x, y| x.memory_start.cmp(&y.memory_start));
-
-        let mut str = format!("{} regions:", v.len());
-        for map_info in v {
-            str.push_str(&format!("\n{}", map_info));
-        }
-        str
-    }
-
-    pub fn display_mapped_unicorn(unicorn: &Unicorn<'_, Context>) -> String {
-        let mut v: Vec<_> = Vec::new();
-        for mem_region in unicorn.mem_regions().unwrap() {
-            v.push(MmuRegion {
-                memory_start: mem_region.begin as u32,
-                memory_end: mem_region.end as u32,
-                memory_perms: Prot(mem_region.perms),
-                description: "".to_string(),
-                filepath: "".to_string(),
-            });
-        }
         v.sort_by(|x, y| x.memory_start.cmp(&y.memory_start));
 
         let mut str = format!("{} regions:", v.len());

@@ -31,26 +31,26 @@ pub fn hook_trace_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     );
 }
 
-pub fn trace_init(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+pub fn trace_init(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
     0u32
 }
 
-pub fn trace_tr_chan_access(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+pub fn trace_tr_chan_access(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
     0u32
 }
 
-pub fn trace_tr_core_uw_trace_out(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+pub fn trace_tr_core_uw_trace_out(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
     0u32
 }
 
-pub fn trace_sharedmem_create_dual_os(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+pub fn trace_sharedmem_create_dual_os(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
     1u32
 }
 
-pub fn trace_stop(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+pub fn trace_stop(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
     1u32
 }
 
-pub fn trace_tr_core_is_class_selected(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+pub fn trace_tr_core_is_class_selected(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
     1u32
 }

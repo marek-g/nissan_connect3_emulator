@@ -3,8 +3,8 @@ mod trace;
 use crate::emulator::context::Context;
 use crate::os::libtrace::trace::*;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
-use unicorn_engine::{RegisterARM, Unicorn};
+
+use unicorn_engine::Unicorn;
 
 pub fn libtrace_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     hook_trace_code(unicorn, base_address);

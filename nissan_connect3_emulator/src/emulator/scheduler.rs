@@ -1,14 +1,13 @@
 use crate::emulator::context::Context;
 use crate::emulator::elf_loader::load_elf;
 use crate::emulator::thread::{
-    add_mem_fault_hooks, dump_context, enable_vfp, set_kernel_traps, BlockReason, GuestThread,
-    ThreadAction, ThreadStatus,
+    dump_context, enable_vfp, set_kernel_traps, BlockReason, GuestThread, ThreadStatus,
 };
 use crate::emulator::utils::load_binary;
 use std::error::Error;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use unicorn_engine::unicorn_const::{uc_error, Arch, Mode};
+use unicorn_engine::unicorn_const::uc_error;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 fn map_uc_error(error: uc_error) -> Box<dyn Error + Send + Sync + 'static> {
@@ -54,7 +53,6 @@ pub fn run(
         let cpu_context = unicorn.context_init().map_err(map_uc_error)?;
         data.threads.lock().unwrap().push(GuestThread {
             id: main_id,
-            is_main: true,
             status: ThreadStatus::Runnable,
             cpu_context: Some(cpu_context),
             pc: interp_entry_point,

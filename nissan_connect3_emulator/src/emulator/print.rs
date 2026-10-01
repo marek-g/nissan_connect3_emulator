@@ -10,8 +10,6 @@ pub fn print_mmu(unicorn: &Unicorn<'_, Context>) {
     let mmu = data.inner.mmu.lock().unwrap();
     println!("------------------ MMU (emulator regions):");
     println!("{}", mmu.display_mapped());
-    //println!("------------------ MMU (unicorn regions):");
-    //println!("{}", Mmu::display_mapped_unicorn(unicorn));
 }
 
 pub fn print_stack(unicorn: &Unicorn<'_, Context>) {
@@ -26,19 +24,6 @@ pub fn print_stack(unicorn: &Unicorn<'_, Context>) {
         unicorn.mem_read(sp, &mut mem).unwrap();
         print!("{:#010x} ", unpack_u32(&mem));
         sp += 4;
-    }
-    println!();
-}
-
-pub fn mem_dump(unicorn: &Unicorn<'_, Context>, address: u32, len: u32) {
-    println!("------------------ MEM DUMP at {:#010x}:", address);
-    let mut mem = vec![0u8; len as usize];
-    unicorn.mem_read(address as u64, &mut mem).unwrap();
-    for i in 0..len / 4 {
-        print!(
-            "{:#010x} ",
-            unpack_u32(&mem[(4 * i) as usize..(4 * (i + 1)) as usize])
-        );
     }
     println!();
 }

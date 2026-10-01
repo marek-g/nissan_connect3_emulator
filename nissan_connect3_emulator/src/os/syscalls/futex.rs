@@ -1,5 +1,5 @@
 use crate::emulator::context::Context;
-use crate::emulator::thread::{block_current_thread, BlockReason, ThreadStatus};
+use crate::emulator::thread::{BlockReason, ThreadAction, ThreadStatus};
 use crate::emulator::utils::unpack_u32;
 use std::time::{Duration, Instant};
 use unicorn_engine::{RegisterARM, Unicorn};
@@ -82,10 +82,10 @@ pub fn futex(
                         .push(thread_id);
                 }
 
-                block_current_thread(
-                    unicorn,
-                    BlockReason::FutexWait { addr: uaddr, deadline },
-                );
+                unicorn.get_data().set_action(ThreadAction::Block(BlockReason::FutexWait {
+                    addr: uaddr,
+                    deadline,
+                }));
 
                 log::trace!(
                     "{:#x}: [{}] [SYSCALL] futex - woken up",

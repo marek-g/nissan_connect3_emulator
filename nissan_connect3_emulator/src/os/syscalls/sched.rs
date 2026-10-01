@@ -245,7 +245,6 @@ pub fn clone(
         let data = unicorn.get_data();
         data.threads.lock().unwrap().push(GuestThread {
             id: child_tid,
-            is_main: false,
             status: ThreadStatus::Runnable,
             cpu_context: Some(child_context),
             pc,

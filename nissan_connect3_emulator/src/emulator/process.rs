@@ -6,7 +6,7 @@ use crate::file_system::MountFileSystem;
 use crate::os::hook_syscall;
 use crate::os::SysCallsState;
 use std::error::Error;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use unicorn_engine::unicorn_const::{Arch, Mode};
 use unicorn_engine::Unicorn;

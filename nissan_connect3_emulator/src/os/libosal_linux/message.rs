@@ -52,9 +52,4 @@ pub fn u32_open_msg_queue(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     1u32
 }
 
-/// OSAL_s32MessageQueueOpen
-pub fn message_queue_open(unicorn: &mut Unicorn<'_, Context>) -> u32 {
-    let queue_name = read_string(unicorn, unicorn.reg_read(RegisterARM::R0).unwrap() as u32);
-    log::warn!("queue_name: {}", queue_name);
-    0u32
-}
+

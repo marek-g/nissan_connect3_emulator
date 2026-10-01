@@ -37,7 +37,6 @@ pub enum ThreadStatus {
 /// the single Unicorn VM (one address space); only the CPU context is per-thread.
 pub struct GuestThread {
     pub id: u32,
-    pub is_main: bool,
     pub status: ThreadStatus,
 
     /// saved CPU state (None while Running)

@@ -7,13 +7,12 @@ use crate::os::libtrace::libtrace_add_code_hooks;
 pub use libosal_linux::libosal_add_code_hooks;
 pub use syscalls::hook_syscall::hook_syscall;
 pub use syscalls::sys_calls_state::SysCallsState;
-use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::Unicorn;
 
 macro_rules! add_code_hook {
     ($unicorn:ident, $lib:literal, $address:expr, $func:ident) => {
         $unicorn
-            .add_code_hook($address as u64, $address as u64, |uc, addr, _| {
+            .add_code_hook($address as u64, $address as u64, |uc, _addr, _| {
                 log::trace!(
                     "{:#x}: [{}] [{} HOOK] {}() [IN]",
                     uc.reg_read(RegisterARM::PC).unwrap(),

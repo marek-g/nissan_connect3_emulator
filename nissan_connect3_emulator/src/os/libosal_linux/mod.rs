@@ -23,7 +23,7 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
 
     let mut method_entries = HashMap::new();
     insert_libosal_method_entries(&mut method_entries);
-    for (mut address, method_name) in method_entries {
+    for (address, method_name) in method_entries {
         //address = address - 0x484d8000 + base_address;
         unicorn
             .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
@@ -34,7 +34,7 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
 }
 
 fn handle_hook(uc: &mut Unicorn<'_, Context>, addr: u64, method_name: &str) {
-    let mut tracing = uc
+    let tracing = uc
         .get_data()
         .inner
         .instruction_tracing
@@ -48,7 +48,6 @@ fn handle_hook(uc: &mut Unicorn<'_, Context>, addr: u64, method_name: &str) {
         uc.get_data().inner.thread_id(),
         method_name
     );
-    tracing = true;
 
     /*if method_name == "vInitTrace" {
         // skip method that normally crashes
