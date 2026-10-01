@@ -1,0 +1,11 @@
+You are working on emulator of the Bosch lcn2kai car headunit. The goal is to have an usable emulator to run and test navigation system with GUI.
+
+The emulator has access to the firmware: `/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/D605_unpacked/lx001.tar.gz` and SD card content: `/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/NISSAN Connect LCN3 V7 2022_2023`. Do not ever modify the content located there.
+
+Here you have Linux 2.6.34 source code: `/home/marek/Ext/reverse_engineering/NissanMaps/linux-2.6.32.14`. Every time you are fixing or creating a new syscall, first try to understand how the syscall works exactly in Linux 2.6.32.14.
+
+You can keep track of any issues (adding and removing them) with the following files:
+- `docs/issues/correctness.md`
+- `docs/issues/robustness.md`
+- `docs/issues/performance.md`
+- `docs/issues/design.md`
