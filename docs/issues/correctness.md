@@ -2,13 +2,6 @@
 
 Bugs where the emulated guest behaves wrongly (wrong syscall semantics, data corruption, hangs).
 
-## O_WRONLY mapped to read-only — all guest writes fail
-
-- **Location:** `nissan_connect3_emulator/src/os/syscalls/fcntl.rs:216-222`
-- **Problem:** The flag decoding uses `(flags & 0x2) == 1`, which can never be true (`& 0x2` yields only `0` or `2`). A file opened with `O_WRONLY` therefore gets only the `READ` flag and every subsequent `write()` fails; `fopen("w")` (O_WRONLY|O_CREAT) creates empty files only.
-- **Related:** line 240 uses `0x4000` for `O_DIRECTORY`, but the ARM value is `0x10000`.
-- **Fix:** `match flags & 0x3 { 0 => READ, 1 => WRITE, 2 => READ | WRITE, _ => EINVAL }`; use `0x10000` for `O_DIRECTORY`.
-
 ## FUTEX_WAIT always blocks (missing return)
 
 - **Location:** `nissan_connect3_emulator/src/os/syscalls/futex.rs:62-64`

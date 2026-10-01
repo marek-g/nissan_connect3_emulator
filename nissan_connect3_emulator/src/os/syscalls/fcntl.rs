@@ -213,12 +213,11 @@ fn open_internal(unicorn: &mut Unicorn<Context>, path_name: &str, flags: u32, _m
 fn convert_open_file_flags(flags: u32) -> OpenFileFlags {
     let mut open_file_flags = OpenFileFlags::NONE;
 
-    if flags & 0x2 == 0 {
-        open_file_flags |= OpenFileFlags::READ;
-    } else if flags & 0x2 == 1 {
-        open_file_flags |= OpenFileFlags::WRITE;
-    } else if flags & 0x2 == 2 {
-        open_file_flags |= OpenFileFlags::READ | OpenFileFlags::WRITE;
+    // access mode: O_ACCMODE = 0003 (O_RDONLY=0, O_WRONLY=1, O_RDWR=2)
+    match flags & 0x3 {
+        0 => open_file_flags |= OpenFileFlags::READ,
+        1 => open_file_flags |= OpenFileFlags::WRITE,
+        _ => open_file_flags |= OpenFileFlags::READ | OpenFileFlags::WRITE,
     }
 
     if flags & 0x40 != 0 {
@@ -237,11 +236,13 @@ fn convert_open_file_flags(flags: u32) -> OpenFileFlags {
         open_file_flags |= OpenFileFlags::APPEND;
     }
 
+    // O_DIRECTORY = 040000 (arch/arm/include/asm/fcntl.h)
     if flags & 0x4000 != 0 {
         open_file_flags |= OpenFileFlags::DIRECTORY;
     }
 
-    if flags & 0x20000 != 0 {
+    // O_NOFOLLOW = 0100000 (arch/arm/include/asm/fcntl.h)
+    if flags & 0x8000 != 0 {
         open_file_flags |= OpenFileFlags::NO_FOLLOW;
     }
 
