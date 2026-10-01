@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         MountPoint {
             mount_point: "/var/opt/bosch/dynamic".to_string(),
             file_system: Box::new(OsFileSystem::new(PathBuf::from(
-                "/mnt/hdd_media/ZInternetu/Firmware/NissanConnect/Europe_v7_2022/files",
+                "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/NISSAN Connect LCN3 V7 2022_2023",
             ))),
             is_read_only: true,
         },
@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         MountPoint {
             mount_point: "/".to_string(),
             file_system: Box::new(OsFileSystem::new(PathBuf::from(
-                "/mnt/hdd_media/ZInternetu/Firmware/NissanConnect/firmware_d605_unpacked",
+                "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/D605_unpacked/lx001.tar.gz",
             ))),
             is_read_only: true,
         },
