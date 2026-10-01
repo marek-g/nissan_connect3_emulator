@@ -1,6 +1,6 @@
 [workspace]
-workspace.resolver = "3"
 
 members = [
-    "nissan_connect3_emulator"
+    "nissan_connect3_emulator",
+    "unicorn_engine",
 ]
