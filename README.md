@@ -35,3 +35,10 @@ Special thanks to:
 - https://github.com/raburton/lcn-patcher
 - https://github.com/sapphire-bt/lcn2kai-decompress
 
+## Requirements
+
+- `libunicorn` installed in the system
+
+``` shell
+sudo apt install libunicorn-dev
+```
