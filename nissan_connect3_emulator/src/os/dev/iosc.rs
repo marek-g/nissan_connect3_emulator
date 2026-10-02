@@ -398,29 +398,31 @@ fn enter_mutex(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     0 // overwritten by pending_result when the wait completes
 }
 
-/// iosc_leave_mutex(mutex_id): arg struct `{ mutex_id }`. Releases and hands the
-/// lock to one waiting thread.
+/// iosc_leave_mutex(mutex_id): arg struct `{ mutex_id, result_ptr }`. The driver
+/// writes the outcome to `*result_ptr` (0 == released); libiosclib reads it back
+/// (when the ioctl returned >= 0) and feeds it to u32MapErrorCodeIOSC.
 fn leave_mutex(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     let mutex_id = read_u32(unicorn, addr);
+    let result_ptr = read_u32(unicorn, addr + 4);
     let woken_tid = {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
-        match state.iosc.mutexes.get_mut(&mutex_id) {
-            Some(m) => {
-                m.locked = false;
-                match m.waiters.pop() {
-                    Some(tid) => {
-                        m.locked = true; // hand the lock to the woken thread
-                        Some(tid)
-                    }
-                    None => None,
+        if let Some(m) = state.iosc.mutexes.get_mut(&mutex_id) {
+            m.locked = false;
+            match m.waiters.pop() {
+                Some(tid) => {
+                    m.locked = true; // hand the lock to the woken thread
+                    Some(tid)
                 }
+                None => None,
             }
-            None => return EINVAL,
+        } else {
+            None
         }
     };
     if let Some(tid) = woken_tid {
         set_runnable_with_result(unicorn, tid, 0);
     }
+    write_result(unicorn, result_ptr, 0);
     0
 }
 
@@ -447,23 +449,30 @@ fn create_semaphore(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     id
 }
 
-/// iosc_obtain_semaphore(id, _, timeout): arg struct `{ id, _, timeout }`.
-/// Blocks until the count is non-zero, then decrements it.
+/// iosc_obtain_semaphore(id, _, timeout): arg struct
+/// `{ id, _, timeout, result_ptr }`. Blocks until the count is non-zero, then
+/// decrements it. The driver writes the outcome to `*result_ptr` (0 == acquired);
+/// libiosclib returns that value (-4 == EINTR triggers a retry).
 fn obtain_semaphore(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     let sem_id = read_u32(unicorn, addr);
     let deadline = timeout_to_deadline(read_i32(unicorn, addr + 8));
+    let result_ptr = read_u32(unicorn, addr + 12);
 
     // fast path: available now
-    {
+    let acquired = {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
         match state.iosc.semaphores.get_mut(&sem_id) {
             Some(sem) if sem.count > 0 => {
                 sem.count -= 1;
-                return 0;
+                true
             }
             None => return EINVAL,
-            _ => {}
+            _ => false,
         }
+    };
+    if acquired {
+        write_result(unicorn, result_ptr, 0);
+        return 0;
     }
 
     match deadline {
@@ -477,6 +486,7 @@ fn obtain_semaphore(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
             sem.waiters.push(tid);
         }
     }
+    write_result(unicorn, result_ptr, 0);
     unicorn
         .get_data()
         .set_action(ThreadAction::Block(BlockReason::IoscSemaphore {
@@ -486,11 +496,13 @@ fn obtain_semaphore(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     0 // overwritten by pending_result when the wait completes
 }
 
-/// iosc_release_semaphore(id, value): arg struct `{ id, value }`. Increments the
-/// count and wakes one waiting obtainer.
+/// iosc_release_semaphore(id, value): arg struct `{ id, value, result_ptr }`.
+/// Increments the count and wakes one waiting obtainer. The driver writes the
+/// outcome to `*result_ptr` (0 == released).
 fn release_semaphore(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     let sem_id = read_u32(unicorn, addr);
     let value = read_i32(unicorn, addr + 4).max(0) as u32;
+    let result_ptr = read_u32(unicorn, addr + 8);
 
     let woken_tid = {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
@@ -509,6 +521,7 @@ fn release_semaphore(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     if let Some(tid) = woken_tid {
         set_runnable_with_result(unicorn, tid, 0);
     }
+    write_result(unicorn, result_ptr, 0);
     0
 }
 
