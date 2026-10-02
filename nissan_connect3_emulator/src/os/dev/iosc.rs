@@ -103,7 +103,10 @@ impl Default for IoscState {
 pub fn open_iosc(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let fd = {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
-        state.iosc.alloc_fd()
+        let fd = state.iosc.alloc_fd();
+        // register the fd so is_iosc_fd() can route ioctl()/close() to this driver
+        state.iosc.fds.insert(fd);
+        fd
     };
     log::trace!(
         "{:#x}: [{}] [IOSC] open(/dev/iosc) => {:#x}",
@@ -200,6 +203,14 @@ fn timeout_to_deadline(ms: i32) -> Option<Instant> {
         None
     } else {
         Some(Instant::now() + Duration::from_millis(ms as u64))
+    }
+}
+
+/// write an outcome value to the driver out-param pointed to by `result_ptr`
+/// (the libiosclib wrappers read it back and feed it to u32MapErrorCodeIOSC)
+fn write_result(unicorn: &mut Unicorn<'_, Context>, result_ptr: u32, value: u32) {
+    if result_ptr != 0 {
+        unicorn.mem_write(result_ptr as u64, &pack_u32(value)).unwrap();
     }
 }
 
@@ -331,16 +342,19 @@ fn create_mutex(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     handle
 }
 
-/// iosc_enter_mutex(mutex_id, timeout): arg struct `{ mutex_id, timeout }`.
+/// iosc_enter_mutex(mutex_id, timeout): arg struct `{ mutex_id, timeout,
+/// result_ptr }`. The driver writes the outcome to `*result_ptr` (0 == acquired);
+/// libiosclib reads that back and passes it to u32MapErrorCodeIOSC.
 fn enter_mutex(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     let mutex_id = read_u32(unicorn, addr);
     let deadline = timeout_to_deadline(read_i32(unicorn, addr + 4));
+    let result_ptr = read_u32(unicorn, addr + 8);
 
     // fast path: free (or new) - take it
-    {
+    let acquired = {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
         match state.iosc.mutexes.get_mut(&mutex_id) {
-            Some(m) if m.locked => {}
+            Some(m) if m.locked => false,
             _ => {
                 state
                     .iosc
@@ -348,9 +362,13 @@ fn enter_mutex(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
                     .entry(mutex_id)
                     .or_insert_with(IoscMutex::default)
                     .locked = true;
-                return 0;
+                true
             }
         }
+    };
+    if acquired {
+        write_result(unicorn, result_ptr, 0);
+        return 0;
     }
 
     // slow path: held - block (or time out)
