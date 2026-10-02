@@ -1,4 +1,4 @@
-use crate::os::syscalls::iosc::IoscState;
+use crate::os::dev::iosc::IoscState;
 use crate::os::syscalls::mqueue::MqState;
 use crate::os::syscalls::signal::SignalState;
 use std::collections::HashMap;

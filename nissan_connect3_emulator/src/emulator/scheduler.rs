@@ -241,7 +241,7 @@ fn wake_expired(unicorn: &mut Unicorn<'_, Context>) {
         crate::os::syscalls::mqueue::finish_mq_wait(unicorn, tid);
     }
     for tid in expired_iosc_waiters {
-        crate::os::syscalls::iosc::finish_iosc_wait(unicorn, tid);
+        crate::os::dev::iosc::finish_iosc_wait(unicorn, tid);
     }
 }
 

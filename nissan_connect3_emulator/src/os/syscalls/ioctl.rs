@@ -12,8 +12,8 @@ pub fn ioctl(mut unicorn: &mut Unicorn<'_, Context>, fd: u32, request: u32, addr
     );
 
     // /dev/iosc fds are backed by the emulated IOSC driver, not a filesystem
-    if crate::os::syscalls::iosc::is_iosc_fd(&unicorn, fd) {
-        return crate::os::syscalls::iosc::ioctl(&mut unicorn, fd, request, addr);
+    if crate::os::dev::iosc::is_iosc_fd(&unicorn, fd) {
+        return crate::os::dev::iosc::ioctl(&mut unicorn, fd, request, addr);
     }
 
     let file_system = unicorn.get_data().inner.file_system.clone();

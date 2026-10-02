@@ -1,3 +1,4 @@
+pub mod dev;
 pub mod file_system;
 pub(crate) mod syscalls;
 

@@ -5,7 +5,6 @@ pub mod sys_calls_state;
 
 mod fcntl;
 pub(crate) mod futex;
-pub mod iosc;
 pub mod mqueue;
 mod ioctl;
 mod linux;

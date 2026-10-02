@@ -100,8 +100,8 @@ pub fn close(unicorn: &mut Unicorn<'_, Context>, fd: u32) -> u32 {
     }
 
     // /dev/iosc descriptors are backed by the emulated IOSC driver, not the fs
-    if crate::os::syscalls::iosc::is_iosc_fd(unicorn, fd) {
-        return crate::os::syscalls::iosc::close_iosc(unicorn, fd);
+    if crate::os::dev::iosc::is_iosc_fd(unicorn, fd) {
+        return crate::os::dev::iosc::close_iosc(unicorn, fd);
     }
 
     unicorn
