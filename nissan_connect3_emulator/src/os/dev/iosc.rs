@@ -18,6 +18,7 @@ use unicorn_engine::{RegisterARM, Unicorn};
 
 // ioctl command numbers (type 'OS' = 0x534f), recovered from libiosclib_so.so
 const IOSC_SHARED_MALLOC: u32 = 0x534f0000;
+const IOSC_CREATE_MUTEX: u32 = 0x534f000a;
 const IOSC_CREATE_SEMAPHORE: u32 = 0x534f0002;
 const IOSC_OBTAIN_SEMAPHORE: u32 = 0x534f0004;
 const IOSC_RELEASE_SEMAPHORE: u32 = 0x534f0005;
@@ -152,6 +153,7 @@ pub fn ioctl(unicorn: &mut Unicorn<'_, Context>, fd: u32, request: u32, addr: u3
 
     let res = match request {
         IOSC_SHARED_MALLOC => shared_malloc(unicorn, addr),
+        IOSC_CREATE_MUTEX => create_mutex(unicorn),
         IOSC_CREATE_SEMAPHORE => create_semaphore(unicorn, addr),
         IOSC_OBTAIN_SEMAPHORE => obtain_semaphore(unicorn, addr),
         IOSC_RELEASE_SEMAPHORE => release_semaphore(unicorn, addr),
@@ -316,6 +318,18 @@ fn wait_for_event(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
 }
 
 // ---- mutexes --------------------------------------------------------------
+
+/// iosc_create_mutex: no argument struct; the driver assigns and returns a new
+/// mutex handle (positive on success). Mirrors create_event.
+fn create_mutex(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+    let handle = {
+        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let h = state.iosc.alloc_handle();
+        state.iosc.mutexes.insert(h, IoscMutex::default());
+        h
+    };
+    handle
+}
 
 /// iosc_enter_mutex(mutex_id, timeout): arg struct `{ mutex_id, timeout }`.
 fn enter_mutex(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
