@@ -180,8 +180,11 @@ pub fn mq_open(
         attr_addr,
     );
 
-    // kernel: mqueue names start with '/' and contain no other '/'
-    let res = if !name.starts_with('/') || name[1..].contains('/') {
+    // The kernel roots mqueue names at '/' and forbids any other '/'. The
+    // firmware's non-IOSC OSAL path instead names queues with bare identifiers
+    // (e.g. "NOIOSC_CB_HDR_LI_0") - accept both conventions, rejecting only an
+    // empty name or an embedded '/'.
+    let res = if name.is_empty() || name[1..].contains('/') {
         EINVAL
     } else if name.len() > NAME_MAX {
         ENAMETOOLONG

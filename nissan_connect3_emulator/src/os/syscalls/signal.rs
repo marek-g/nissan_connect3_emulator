@@ -1,4 +1,6 @@
 use crate::emulator::context::Context;
+use crate::emulator::thread::{BlockReason, ThreadAction};
+use std::time::{Duration, Instant};
 use unicorn_engine::{RegisterARM, Unicorn};
 
 // ---- ARM rt_sigframe layout (arch/arm/kernel/signal.c + asm/ucontext.h) ----
@@ -472,7 +474,16 @@ pub fn rt_sigtimedwait(
         sig_set_size,
     );
 
+    // No per-thread pending-signal delivery yet, so a wait for a signal finds
+    // none. Rather than return EAGAIN immediately (which makes OSAL's
+    // sigtimedwait-based wait loops busy-spin at full emulation speed and starve
+    // the cooperative scheduler), block briefly so other threads make progress;
+    // the guest then re-polls. This approximates a blocking wait for an idle
+    // thread without risking a deadlock from never being woken.
     let res = -11i32 as u32; // EAGAIN
+    unicorn.get_data().set_action(ThreadAction::Block(BlockReason::SleepUntil(
+        Instant::now() + Duration::from_millis(1),
+    )));
 
     log::trace!(
         "{:#x}: [{}] [SYSCALL] rt_sigtimedwait => {:#x}",
