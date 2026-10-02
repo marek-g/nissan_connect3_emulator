@@ -57,6 +57,7 @@ pub fn run(
             cpu_context: Some(cpu_context),
             pc: interp_entry_point,
             pending_result: None,
+            clear_child_tid: None,
         });
     }
 

@@ -1,6 +1,7 @@
 use crate::emulator::context::Context;
 use crate::emulator::memory_map::{GET_TLS_ADDR, MQ_NOTIFY_EXIT_STUB};
 use crate::emulator::print::{disasm, print_mmu, print_stack};
+use crate::emulator::utils::pack_u32;
 use std::time::Instant;
 use unicorn_engine::unicorn_const::{MemType, Prot};
 use unicorn_engine::{RegisterARM, Unicorn};
@@ -62,6 +63,9 @@ pub struct GuestThread {
     /// syscall result to install into R0 on the next switch-in (set by the code
     /// that completes a blocked operation, e.g. a woken mq receiver)
     pub pending_result: Option<u32>,
+    /// CLONE_CHILD_CLEARTID: guest address of the tid field to zero and futex-wake
+    /// when this thread exits normally (kernel/fork.c release_task)
+    pub clear_child_tid: Option<u32>,
 }
 
 pub fn block_current_thread(unicorn: &mut Unicorn<'_, Context>, reason: BlockReason) {
@@ -76,12 +80,29 @@ pub fn block_current_thread(unicorn: &mut Unicorn<'_, Context>, reason: BlockRea
 }
 
 pub fn exit_current_thread(unicorn: &mut Unicorn<'_, Context>, code: i32) {
-    let (tid, threads) = {
+    let clear_tid = {
         let data = unicorn.get_data();
-        (data.thread_id(), data.threads.clone())
+        let tid = data.thread_id();
+        let threads = data.threads.clone();
+        // mark the thread exited and take its CLONE_CHILD_CLEARTID pointer, if any
+        let result = {
+            let mut guard = threads.lock().unwrap();
+            guard
+                .iter_mut()
+                .find(|t| t.id == tid)
+                .map(|t| {
+                    t.status = ThreadStatus::Exited(code);
+                    t.clear_child_tid
+                })
+                .flatten()
+        };
+        result
     };
-    if let Some(thread) = threads.lock().unwrap().iter_mut().find(|t| t.id == tid) {
-        thread.status = ThreadStatus::Exited(code);
+    if let Some(ptr) = clear_tid {
+        // kernel/fork.c release_task: on a normal sys_exit (not death-by-signal)
+        // zero the tid field and wake one waiter parked on the futex at that address
+        unicorn.mem_write(ptr as u64, &pack_u32(0)).unwrap();
+        crate::os::syscalls::futex::wake_waiters(unicorn, ptr, 1);
     }
     unicorn.emu_stop().unwrap();
 }

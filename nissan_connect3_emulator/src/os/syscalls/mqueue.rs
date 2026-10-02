@@ -405,6 +405,7 @@ fn spawn_notify_thread(unicorn: &mut Unicorn<'_, Context>, function: u32, sigval
             cpu_context: Some(child_context),
             pc: function,
             pending_result: None,
+            clear_child_tid: None,
         });
     }
 

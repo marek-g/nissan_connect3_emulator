@@ -182,12 +182,13 @@ pub fn clone(
         .next_thread_id
         .fetch_add(1, Ordering::Relaxed);
 
-    if flags & 0x00200000 != 0 {
-        // CLONE_CHILD_CLEARTID
-        // Erase child thread ID at location child_tidptr in child memory when the child exits,
-        // and do a wakeup on the futex at that address.
-        log::warn!("clone() - CLONE_CHILD_CLEARTID not implemented");
-    }
+    let clear_child_tid = if flags & 0x00200000 != 0 {
+        // CLONE_CHILD_CLEARTID: zero the tid field at child_tidptr and wake one futex
+        // waiter there when the child exits normally (kernel/fork.c release_task)
+        Some(child_tid_ptr)
+    } else {
+        None
+    };
 
     if flags & 0x00100000 != 0 {
         // CLONE_PARENT_SETTID
@@ -249,6 +250,7 @@ pub fn clone(
             cpu_context: Some(child_context),
             pc,
             pending_result: None,
+            clear_child_tid,
         });
     }
 

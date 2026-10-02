@@ -4,7 +4,7 @@ pub mod hook_syscall;
 pub mod sys_calls_state;
 
 mod fcntl;
-mod futex;
+pub(crate) mod futex;
 pub mod mqueue;
 mod ioctl;
 mod linux;

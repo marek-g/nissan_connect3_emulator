@@ -118,7 +118,7 @@ pub fn futex(
 }
 
 /// wake at most `val` blocked waiters of the futex at `uaddr`
-fn wake_waiters(unicorn: &mut Unicorn<'_, Context>, uaddr: u32, val: u32) -> u32 {
+pub(crate) fn wake_waiters(unicorn: &mut Unicorn<'_, Context>, uaddr: u32, val: u32) -> u32 {
     let data = unicorn.get_data();
 
     // pop up to `val` waiters (LIFO)
