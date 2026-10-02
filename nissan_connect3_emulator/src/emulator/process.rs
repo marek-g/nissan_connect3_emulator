@@ -1,9 +1,10 @@
 use crate::emulator::context::{Context, ContextInner};
 use crate::emulator::mmu::Mmu;
-use crate::emulator::scheduler::run as run_scheduler;
+use crate::emulator::scheduler::setup_process;
 use crate::emulator::thread::add_mem_fault_hooks;
 use crate::os::file_system::MountFileSystem;
 use crate::os::hook_syscall;
+use crate::os::syscalls::namespace::SystemNamespace;
 use crate::os::SysCallsState;
 use std::error::Error;
 use std::sync::atomic::AtomicU32;
@@ -15,46 +16,57 @@ pub struct Process {
     mmu: Arc<Mutex<Mmu>>,
     file_system: Arc<Mutex<MountFileSystem>>,
     sys_calls_state: Arc<Mutex<SysCallsState>>,
+    namespace: Arc<Mutex<SystemNamespace>>,
     threads: Arc<Mutex<Vec<crate::emulator::thread::GuestThread>>>,
     next_thread_id: Arc<AtomicU32>,
 }
 
 impl Process {
-    pub fn new(file_system: Arc<Mutex<MountFileSystem>>) -> Self {
+    pub fn new(
+        file_system: Arc<Mutex<MountFileSystem>>,
+        namespace: Arc<Mutex<SystemNamespace>>,
+        // shared across every process so guest thread ids are globally unique
+        next_thread_id: Arc<AtomicU32>,
+    ) -> Self {
         let mmu = Arc::new(Mutex::new(Mmu::new()));
         let sys_calls_state = Arc::new(Mutex::new(SysCallsState::new()));
         Self {
             mmu,
             file_system,
             sys_calls_state,
+            namespace,
             threads: Arc::new(Mutex::new(Vec::new())),
-            next_thread_id: Arc::new(AtomicU32::new(1)),
+            next_thread_id,
         }
     }
 
-    pub fn run(
-        &mut self,
-        elf_filepath: String,
+    /// Create this process' VM (it owns its Context and, through it, clones of
+    /// the shared mmu/threads/namespace), load the ELF into it and register the
+    /// main thread. The returned Unicorn is self-contained and ready to schedule.
+    pub fn setup(
+        &self,
+        elf_filepath: &str,
         program_args: Vec<String>,
         program_envs: Vec<(String, String)>,
-    ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    ) -> Result<Unicorn<'static, Context>, Box<dyn Error + Send + Sync + 'static>> {
         let context = Context {
             inner: Arc::new(ContextInner::new(
                 self.mmu.clone(),
                 self.file_system.clone(),
                 self.sys_calls_state.clone(),
+                self.namespace.clone(),
                 self.threads.clone(),
                 self.next_thread_id.clone(),
             )),
         };
 
-        // the single VM shared by all guest threads
         let mut unicorn =
             Unicorn::new_with_data(Arch::ARM, Mode::LITTLE_ENDIAN, context)
                 .map_err(|e| format!("Unicorn error: {:?}", e))?;
         unicorn.add_intr_hook(hook_syscall).unwrap();
         add_mem_fault_hooks(&mut unicorn);
 
-        run_scheduler(&mut unicorn, &elf_filepath, program_args, program_envs)
+        setup_process(&mut unicorn, elf_filepath, program_args, program_envs)?;
+        Ok(unicorn)
     }
 }

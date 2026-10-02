@@ -20,8 +20,10 @@ const TIMESLICE_INSTRUCTIONS: usize = 10_000;
 /// host sleep tick when all guest threads are blocked without a deadline
 const IDLE_TICK: Duration = Duration::from_millis(500);
 
-/// Runs the single Unicorn VM, cooperatively scheduling all guest threads on it.
-pub fn run(
+/// Load an ELF into a fresh VM and register its main guest thread. Called once
+/// per process before the cooperative scheduling loop begins. The returned
+/// Unicorn owns its Context (and through it this process' mmu/threads/namespace).
+pub fn setup_process(
     unicorn: &mut Unicorn<'_, Context>,
     elf_filepath: &str,
     program_args: Vec<String>,
@@ -61,109 +63,137 @@ pub fn run(
         });
     }
 
-    loop {
-        wake_expired(unicorn);
+    Ok(())
+}
 
-        if unicorn.get_data().process_exit_code().is_some() {
-            break;
+/// Run one scheduling quantum on a single process' VM: switch in its next
+/// runnable guest thread, execute up to `count` instructions (0 = until the
+/// thread blocks or exits), handle any memory fault, then switch out. Returns
+/// true if a thread was run.
+fn run_quantum(
+    unicorn: &mut Unicorn<'_, Context>,
+    count: usize,
+) -> Result<bool, Box<dyn Error + Send + Sync + 'static>> {
+    let next_id = match pick_next_runnable(unicorn) {
+        Some(id) => id,
+        None => return Ok(false),
+    };
+
+    // ---- switch in: restore the thread's CPU state onto the shared vCPU
+    let (cpu_context, pc, pending_result) = {
+        let data = unicorn.get_data();
+        let mut threads = data.threads.lock().unwrap();
+        let thread = threads.iter_mut().find(|t| t.id == next_id).unwrap();
+        thread.status = ThreadStatus::Running;
+        (
+            thread.cpu_context.take().unwrap(),
+            thread.pc,
+            thread.pending_result.take(),
+        )
+    };
+    unicorn.get_data().set_thread_id(next_id);
+    unicorn.context_restore(&cpu_context).map_err(map_uc_error)?;
+
+    // a completed blocked syscall (e.g. woken mq receive) parks its result
+    // here instead of in the saved context
+    if let Some(result) = pending_result {
+        unicorn
+            .reg_write(RegisterARM::R0 as i32, result as u64)
+            .unwrap();
+    }
+
+    let res = unicorn.emu_start(pc as u64, 0, 0, count);
+
+    // a memory fault captured by the mem hook? With the VM stopped we can now read
+    // registers and write the signal frame. Delivery either jumps to the guest's
+    // SIGSEGV handler (or performs a sigreturn), leaving the thread runnable at the
+    // new PC; otherwise the default action applies (terminate).
+    let (fault_handled, had_fault) = match unicorn.get_data().take_pending_fault() {
+        Some(fault) => {
+            let handled = crate::os::syscalls::signal::handle_mem_fault(
+                unicorn,
+                fault.addr,
+                fault.is_fetch,
+            );
+            (handled, true)
+        }
+        None => (false, false),
+    };
+
+    // ---- switch out: save the CPU state back to the thread record
+    let mut saved_context = unicorn.context_alloc().map_err(map_uc_error)?;
+    unicorn.context_save(&mut saved_context).map_err(map_uc_error)?;
+    let pc = unicorn.reg_read(RegisterARM::PC).unwrap() as u32;
+    {
+        let data = unicorn.get_data();
+        let mut threads = data.threads.lock().unwrap();
+        if let Some(thread) = threads.iter_mut().find(|t| t.id == next_id) {
+            // a syscall handler may have already changed the status
+            // (blocked / exited); otherwise decide based on the run result
+            if thread.status == ThreadStatus::Running {
+                if fault_handled {
+                    // resumed at the signal handler / post-sigreturn PC
+                    thread.status = ThreadStatus::Runnable;
+                } else if had_fault {
+                    // unhandled SIGSEGV -> default action: terminate (128 + SIGSEGV)
+                    thread.status = ThreadStatus::Exited(139);
+                } else if res.is_err() {
+                    thread.status = ThreadStatus::Exited(1);
+                } else {
+                    // timeslice simply expired
+                    thread.status = ThreadStatus::Runnable;
+                }
+            }
+            thread.cpu_context = Some(saved_context);
+            thread.pc = pc;
+        }
+    }
+
+    if res.is_err() && !fault_handled {
+        // the VM is stopped now, so dumping memory is safe
+        log::error!(
+            "{:#x}: [{}] Execution error: {:?}",
+            unicorn.reg_read(RegisterARM::PC).unwrap(),
+            next_id,
+            res.as_ref().err()
+        );
+        dump_context(unicorn);
+    }
+
+    Ok(true)
+}
+
+/// A process is finished when it has requested exit or all its threads exited.
+fn process_is_done(unicorn: &Unicorn<'_, Context>) -> bool {
+    unicorn.get_data().process_exit_code().is_some() || all_exited(unicorn)
+}
+
+/// Cooperatively schedule the guest threads of every process on their own VMs,
+/// round-robin across processes. Runs until every process has exited.
+pub fn run_all(
+    mut unicorns: Vec<Unicorn<'_, Context>>,
+) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    // bound each quantum only when more than one process is active, so a busy
+    // process cannot starve the others; a lone process runs until it blocks.
+    let timeslice = if unicorns.len() > 1 { TIMESLICE_INSTRUCTIONS } else { 0 };
+
+    loop {
+        let mut any_runnable = false;
+        for unicorn in unicorns.iter_mut() {
+            wake_expired(unicorn);
+            if process_is_done(unicorn) {
+                continue;
+            }
+            if run_quantum(unicorn, timeslice)? {
+                any_runnable = true;
+            }
         }
 
-        let next_id = pick_next_runnable(unicorn);
-        let Some(next_id) = next_id else {
-            // no runnable thread - either everything is blocked or exited
-            if all_exited(unicorn) {
+        if !any_runnable {
+            if unicorns.iter().all(process_is_done) {
                 break;
             }
-            sleep_until_next_wakeup(unicorn);
-            continue;
-        };
-
-        // ---- switch in: restore the thread's CPU state onto the shared vCPU
-        let (cpu_context, pc, pending_result) = {
-            let data = unicorn.get_data();
-            let mut threads = data.threads.lock().unwrap();
-            let thread = threads.iter_mut().find(|t| t.id == next_id).unwrap();
-            thread.status = ThreadStatus::Running;
-            (
-                thread.cpu_context.take().unwrap(),
-                thread.pc,
-                thread.pending_result.take(),
-            )
-        };
-        unicorn.get_data().set_thread_id(next_id);
-        unicorn.context_restore(&cpu_context).map_err(map_uc_error)?;
-
-        // a completed blocked syscall (e.g. woken mq receive) parks its result
-        // here instead of in the saved context
-        if let Some(result) = pending_result {
-            unicorn
-                .reg_write(RegisterARM::R0 as i32, result as u64)
-                .unwrap();
-        }
-
-        // timeslice only when there is another runnable thread to switch to
-        let count = if other_runnable_exists(unicorn) {
-            TIMESLICE_INSTRUCTIONS
-        } else {
-            0
-        };
-
-        let res = unicorn.emu_start(pc as u64, 0, 0, count);
-
-        // a memory fault captured by the mem hook? With the VM stopped we can now read
-        // registers and write the signal frame. Delivery either jumps to the guest's
-        // SIGSEGV handler (or performs a sigreturn), leaving the thread runnable at the
-        // new PC; otherwise the default action applies (terminate).
-        let (fault_handled, had_fault) = match unicorn.get_data().take_pending_fault() {
-            Some(fault) => {
-                let handled = crate::os::syscalls::signal::handle_mem_fault(
-                    unicorn,
-                    fault.addr,
-                    fault.is_fetch,
-                );
-                (handled, true)
-            }
-            None => (false, false),
-        };
-
-        // ---- switch out: save the CPU state back to the thread record
-        let mut saved_context = unicorn.context_alloc().map_err(map_uc_error)?;
-        unicorn.context_save(&mut saved_context).map_err(map_uc_error)?;
-        let pc = unicorn.reg_read(RegisterARM::PC).unwrap() as u32;
-        {
-            let data = unicorn.get_data();
-            let mut threads = data.threads.lock().unwrap();
-            if let Some(thread) = threads.iter_mut().find(|t| t.id == next_id) {
-                // a syscall handler may have already changed the status
-                // (blocked / exited); otherwise decide based on the run result
-                if thread.status == ThreadStatus::Running {
-                    if fault_handled {
-                        // resumed at the signal handler / post-sigreturn PC
-                        thread.status = ThreadStatus::Runnable;
-                    } else if had_fault {
-                        // unhandled SIGSEGV -> default action: terminate (128 + SIGSEGV)
-                        thread.status = ThreadStatus::Exited(139);
-                    } else if res.is_err() {
-                        thread.status = ThreadStatus::Exited(1);
-                    } else {
-                        // timeslice simply expired
-                        thread.status = ThreadStatus::Runnable;
-                    }
-                }
-                thread.cpu_context = Some(saved_context);
-                thread.pc = pc;
-            }
-        }
-
-        if res.is_err() && !fault_handled {
-            // the VM is stopped now, so dumping memory is safe
-            log::error!(
-                "{:#x}: [{}] Execution error: {:?}",
-                unicorn.reg_read(RegisterARM::PC).unwrap(),
-                next_id,
-                res.as_ref().err()
-            );
-            dump_context(unicorn);
+            sleep_until_next_wakeup(&unicorns);
         }
     }
 
@@ -271,35 +301,41 @@ fn pick_next_runnable(unicorn: &Unicorn<'_, Context>) -> Option<u32> {
     Some(id)
 }
 
-fn other_runnable_exists(unicorn: &Unicorn<'_, Context>) -> bool {
-    let data = unicorn.get_data();
-    let threads = data.threads.lock().unwrap();
-    threads.iter().any(|t| t.status == ThreadStatus::Runnable)
-}
-
 fn all_exited(unicorn: &Unicorn<'_, Context>) -> bool {
     let data = unicorn.get_data();
     let threads = data.threads.lock().unwrap();
     !threads.is_empty() && threads.iter().all(|t| matches!(t.status, ThreadStatus::Exited(_)))
 }
 
-/// sleep the host until the nearest blocked-thread deadline (or a short tick)
-fn sleep_until_next_wakeup(unicorn: &Unicorn<'_, Context>) {
+/// sleep the host until the nearest blocked-thread deadline across all
+/// processes (or a short tick if none is pending)
+fn sleep_until_next_wakeup(unicorns: &[Unicorn<'_, Context>]) {
     let now = Instant::now();
-    let data = unicorn.get_data();
-    let threads = data.threads.lock().unwrap();
-    let next_deadline = threads.iter().find_map(|t| match &t.status {
-        ThreadStatus::Blocked(BlockReason::FutexWait { deadline, .. }) => *deadline,
-        ThreadStatus::Blocked(BlockReason::SleepUntil(until)) => Some(*until),
-        ThreadStatus::Blocked(BlockReason::MqSend { deadline, .. })
-        | ThreadStatus::Blocked(BlockReason::MqReceive { deadline, .. }) => *deadline,
-        ThreadStatus::Blocked(BlockReason::IoscMutex { deadline, .. })
-        | ThreadStatus::Blocked(BlockReason::IoscEvent { deadline, .. })
-        | ThreadStatus::Blocked(BlockReason::IoscSemaphore { deadline, .. }) => *deadline,
-        _ => None,
-    });
+    let mut next_deadline = None;
+    for unicorn in unicorns {
+        let data = unicorn.get_data();
+        let threads = data.threads.lock().unwrap();
+        let d = threads.iter().find_map(|t| match &t.status {
+            ThreadStatus::Blocked(BlockReason::FutexWait { deadline, .. }) => *deadline,
+            ThreadStatus::Blocked(BlockReason::SleepUntil(until)) => Some(*until),
+            ThreadStatus::Blocked(
+                BlockReason::MqSend { deadline, .. } | BlockReason::MqReceive { deadline, .. },
+            ) => *deadline,
+            ThreadStatus::Blocked(
+                BlockReason::IoscMutex { deadline, .. }
+                | BlockReason::IoscEvent { deadline, .. }
+                | BlockReason::IoscSemaphore { deadline, .. },
+            ) => *deadline,
+            _ => None,
+        });
+        drop(threads);
 
-    drop(threads);
+        next_deadline = match (next_deadline, d) {
+            (Some(a), Some(b)) if b < a => Some(b),
+            (Some(a), _) => Some(a),
+            (None, b) => b,
+        };
+    }
 
     let duration = match next_deadline {
         Some(deadline) if deadline > now => deadline.duration_since(now),

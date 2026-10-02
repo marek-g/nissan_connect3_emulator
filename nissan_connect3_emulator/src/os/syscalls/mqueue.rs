@@ -198,7 +198,7 @@ pub fn mq_open(
         };
 
         let data = unicorn.get_data();
-        let mut state = data.sys_calls_state.lock().unwrap();
+        let mut state = data.namespace.lock().unwrap();
 
         if let Some(&id) = state.mq.name_to_id.get(&name) {
             // entry already exists (mq_open: -EEXIST only when O_EXCL is set,
@@ -296,7 +296,7 @@ fn find_blocked_sender(unicorn: &Unicorn<'_, Context>, queue_id: u32) -> Option<
 }
 
 fn remove_waiter(unicorn: &Unicorn<'_, Context>, queue_id: u32, tid: u32) {
-    let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+    let mut state = unicorn.get_data().namespace.lock().unwrap();
     if let Some(list) = state.mq.waiters.get_mut(&queue_id) {
         list.retain(|&waiter| waiter != tid);
         if list.is_empty() {
@@ -317,7 +317,7 @@ fn set_runnable_with_result(unicorn: &Unicorn<'_, Context>, tid: u32, result: u3
 
 /// take the message from the queue (highest priority first)
 fn pop_message(unicorn: &Unicorn<'_, Context>, queue_id: u32) -> Option<MqMessage> {
-    let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+    let mut state = unicorn.get_data().namespace.lock().unwrap();
     state.mq.queues.get_mut(&queue_id)?.messages.pop()
 }
 
@@ -330,7 +330,7 @@ fn insert_message_and_take_notify(
     data: Vec<u8>,
     priority: u32,
 ) -> Option<MqNotify> {
-    let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+    let mut state = unicorn.get_data().namespace.lock().unwrap();
     let queue = state.mq.queues.get_mut(&queue_id)?;
     insert_message(&mut queue.messages, data, priority);
     if queue.messages.len() == 1 {
@@ -342,7 +342,7 @@ fn insert_message_and_take_notify(
 }
 
 fn has_free_slot(unicorn: &Unicorn<'_, Context>, queue_id: u32) -> bool {
-    let state = unicorn.get_data().sys_calls_state.lock().unwrap();
+    let state = unicorn.get_data().namespace.lock().unwrap();
     match state.mq.queues.get(&queue_id) {
         Some(queue) => queue.messages.len() < queue.maxmsg as usize,
         None => false,
@@ -456,7 +456,7 @@ fn complete_blocked_sender(unicorn: &mut Unicorn<'_, Context>, queue_id: u32) {
     // no notification here - the kernel's pipelined_receive does not call
     // __do_notify
     {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         if let Some(queue) = state.mq.queues.get_mut(&queue_id) {
             insert_message(&mut queue.messages, buf, priority);
         }
@@ -493,7 +493,7 @@ pub fn mq_timedsend(
     let deadline = read_deadline(unicorn, timeout_addr);
 
     {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         let Some(queue) = state.mq.queues.get_mut(&mqdes) else {
             return EBADF;
         };
@@ -585,7 +585,7 @@ fn do_mq_timedreceive(
     let deadline = read_deadline(unicorn, timeout_addr);
 
     {
-        let state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let state = unicorn.get_data().namespace.lock().unwrap();
         let Some(queue) = state.mq.queues.get(&mqdes) else {
             return EBADF;
         };
@@ -615,7 +615,7 @@ fn do_mq_timedreceive(
 
     // queue is empty
     let nonblock = {
-        let state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let state = unicorn.get_data().namespace.lock().unwrap();
         state.mq.queues.get(&mqdes).map(|q| q.nonblock).unwrap_or(false)
     };
     if nonblock {
@@ -630,7 +630,7 @@ fn do_mq_timedreceive(
     // block until a sender posts a message (or the deadline passes)
     let tid = unicorn.get_data().thread_id();
     {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         state.mq.waiters.entry(mqdes).or_default().push(tid);
     }
 
@@ -657,7 +657,7 @@ pub fn mq_close(unicorn: &mut Unicorn<'_, Context>, mqdes: u32) -> u32 {
         mqdes,
     );
 
-    let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+    let mut state = unicorn.get_data().namespace.lock().unwrap();
     let Some(queue) = state.mq.queues.get_mut(&mqdes) else {
         return EBADF;
     };
@@ -691,7 +691,7 @@ pub fn mq_unlink(unicorn: &mut Unicorn<'_, Context>, name_addr: u32) -> u32 {
         name,
     );
 
-    let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+    let mut state = unicorn.get_data().namespace.lock().unwrap();
     let Some(&id) = state.mq.name_to_id.get(&name) else {
         return ENOENT;
     };
@@ -746,7 +746,7 @@ pub fn mq_getsetattr(
 
     // only mq_flags is writable (the kernel ignores the rest)
     let attr_out = {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         let Some(queue) = state.mq.queues.get_mut(&mqdes) else {
             return EBADF;
         };
@@ -792,7 +792,7 @@ pub fn mq_notify(unicorn: &mut Unicorn<'_, Context>, mqdes: u32, notif_addr: u32
         notif_addr,
     );
 
-    let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+    let mut state = unicorn.get_data().namespace.lock().unwrap();
     let Some(queue) = state.mq.queues.get_mut(&mqdes) else {
         return EBADF;
     };

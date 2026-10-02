@@ -102,7 +102,7 @@ impl Default for IoscState {
 /// subsequent iosc_* calls use.
 pub fn open_iosc(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let fd = {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         state.iosc.alloc_fd()
     };
     log::trace!(
@@ -116,7 +116,7 @@ pub fn open_iosc(unicorn: &mut Unicorn<'_, Context>) -> u32 {
 
 /// close() interception for /dev/iosc fds
 pub fn close_iosc(unicorn: &mut Unicorn<'_, Context>, fd: u32) -> u32 {
-    let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+    let mut state = unicorn.get_data().namespace.lock().unwrap();
     state.iosc.fds.remove(&fd);
     log::trace!(
         "{:#x}: [{}] [IOSC] close({:#x}) => 0",
@@ -131,7 +131,7 @@ pub fn close_iosc(unicorn: &mut Unicorn<'_, Context>, fd: u32) -> u32 {
 pub fn is_iosc_fd(unicorn: &Unicorn<'_, Context>, fd: u32) -> bool {
     unicorn
         .get_data()
-        .sys_calls_state
+        .namespace
         .lock()
         .unwrap()
         .iosc
@@ -242,7 +242,7 @@ fn shared_malloc(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
 /// handle (the id passed by the caller is ignored).
 fn create_event(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let handle = {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         let h = state.iosc.alloc_handle();
         state.iosc.events.insert(h, IoscEvent::default());
         h
@@ -257,7 +257,7 @@ fn set_event(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     let value = read_u32(unicorn, addr + 4);
 
     let woken_tid = {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         match state.iosc.events.get_mut(&event_id) {
             Some(event) => {
                 event.value = value;
@@ -285,7 +285,7 @@ fn wait_for_event(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
 
     // fast path: already set - consume and return
     {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         if let Some(event) = state.iosc.events.get_mut(&event_id) {
             if event.value != 0 {
                 event.value = 0;
@@ -303,7 +303,7 @@ fn wait_for_event(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     }
     let tid = unicorn.get_data().thread_id();
     {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         if let Some(event) = state.iosc.events.get_mut(&event_id) {
             event.waiters.push(tid);
         }
@@ -323,7 +323,7 @@ fn wait_for_event(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
 /// mutex handle (positive on success). Mirrors create_event.
 fn create_mutex(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let handle = {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         let h = state.iosc.alloc_handle();
         state.iosc.mutexes.insert(h, IoscMutex::default());
         h
@@ -338,7 +338,7 @@ fn enter_mutex(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
 
     // fast path: free (or new) - take it
     {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         match state.iosc.mutexes.get_mut(&mutex_id) {
             Some(m) if m.locked => {}
             _ => {
@@ -360,7 +360,7 @@ fn enter_mutex(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     }
     let tid = unicorn.get_data().thread_id();
     {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         if let Some(m) = state.iosc.mutexes.get_mut(&mutex_id) {
             m.waiters.push(tid);
         }
@@ -379,7 +379,7 @@ fn enter_mutex(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
 fn leave_mutex(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     let mutex_id = read_u32(unicorn, addr);
     let woken_tid = {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         match state.iosc.mutexes.get_mut(&mutex_id) {
             Some(m) => {
                 m.locked = false;
@@ -411,7 +411,7 @@ fn create_semaphore(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
         return EINVAL;
     }
     {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         state.iosc.semaphores.insert(
             id,
             IoscSemaphore {
@@ -431,7 +431,7 @@ fn obtain_semaphore(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
 
     // fast path: available now
     {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         match state.iosc.semaphores.get_mut(&sem_id) {
             Some(sem) if sem.count > 0 => {
                 sem.count -= 1;
@@ -448,7 +448,7 @@ fn obtain_semaphore(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     }
     let tid = unicorn.get_data().thread_id();
     {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         if let Some(sem) = state.iosc.semaphores.get_mut(&sem_id) {
             sem.waiters.push(tid);
         }
@@ -469,7 +469,7 @@ fn release_semaphore(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     let value = read_i32(unicorn, addr + 4).max(0) as u32;
 
     let woken_tid = {
-        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
         match state.iosc.semaphores.get_mut(&sem_id) {
             Some(sem) => {
                 sem.count += value;
@@ -518,7 +518,7 @@ pub fn finish_iosc_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32) {
     let res: u32 = match reason {
         Some(BlockReason::IoscMutex { id, .. }) => {
             let granted = {
-                let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+                let mut state = unicorn.get_data().namespace.lock().unwrap();
                 match state.iosc.mutexes.get_mut(&id) {
                     Some(m) => {
                         m.waiters.retain(|&w| w != tid);
@@ -540,7 +540,7 @@ pub fn finish_iosc_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32) {
         }
         Some(BlockReason::IoscEvent { id, .. }) => {
             let fired = {
-                let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+                let mut state = unicorn.get_data().namespace.lock().unwrap();
                 match state.iosc.events.get_mut(&id) {
                     Some(e) => {
                         e.waiters.retain(|&w| w != tid);
@@ -562,7 +562,7 @@ pub fn finish_iosc_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32) {
         }
         Some(BlockReason::IoscSemaphore { id, .. }) => {
             let granted = {
-                let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+                let mut state = unicorn.get_data().namespace.lock().unwrap();
                 match state.iosc.semaphores.get_mut(&id) {
                     Some(s) => {
                         s.waiters.retain(|&w| w != tid);

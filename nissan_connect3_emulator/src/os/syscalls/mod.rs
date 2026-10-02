@@ -1,6 +1,7 @@
 use crate::os::file_system::OpenFileError;
 
 pub mod hook_syscall;
+pub mod namespace;
 pub mod sys_calls_state;
 
 mod fcntl;

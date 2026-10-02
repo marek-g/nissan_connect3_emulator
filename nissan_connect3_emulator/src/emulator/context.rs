@@ -1,6 +1,7 @@
 use crate::emulator::mmu::Mmu;
 use crate::emulator::thread::{GuestThread, ThreadAction};
 use crate::os::file_system::MountFileSystem;
+use crate::os::syscalls::namespace::SystemNamespace;
 use crate::os::SysCallsState;
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -33,6 +34,8 @@ pub struct ContextInner {
     pub mmu: Arc<Mutex<Mmu>>,
     pub file_system: Arc<Mutex<MountFileSystem>>,
     pub sys_calls_state: Arc<Mutex<SysCallsState>>,
+    /// system-wide IPC objects shared by every process (mq, iosc, later shm/sem)
+    pub namespace: Arc<Mutex<SystemNamespace>>,
     pub threads: Arc<Mutex<Vec<GuestThread>>>,
     pub next_thread_id: Arc<AtomicU32>,
 
@@ -53,6 +56,7 @@ impl ContextInner {
         mmu: Arc<Mutex<Mmu>>,
         file_system: Arc<Mutex<MountFileSystem>>,
         sys_calls_state: Arc<Mutex<SysCallsState>>,
+        namespace: Arc<Mutex<SystemNamespace>>,
         threads: Arc<Mutex<Vec<GuestThread>>>,
         next_thread_id: Arc<AtomicU32>,
     ) -> Self {
@@ -60,6 +64,7 @@ impl ContextInner {
             mmu,
             file_system,
             sys_calls_state,
+            namespace,
             threads,
             next_thread_id,
             instruction_tracing: Arc::new(AtomicBool::new(false)),
