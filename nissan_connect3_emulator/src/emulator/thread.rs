@@ -1,4 +1,4 @@
-use crate::emulator::context::Context;
+use crate::emulator::context::{Context, PendingFault};
 use crate::emulator::memory_map::{GET_TLS_ADDR, MQ_NOTIFY_EXIT_STUB};
 use crate::emulator::print::{disasm, print_mmu, print_stack};
 use crate::emulator::utils::pack_u32;
@@ -201,6 +201,20 @@ pub fn set_kernel_traps(unicorn: &mut Unicorn<'_, Context>) {
             &[0x70, 0x0F, 0x1D, 0xEE, 0x0E, 0xF0, 0xA0, 0xE1],
         )
         .unwrap();
+
+    // signal-return trampoline for the no-SA_RESTORER 32-bit path: a handler that
+    // returns via `bx lr` lands here (KERN_SIGRETURN_CODE + idx*4). This mirrors the
+    // kernel's high-page sigreturn code and triggers rt_sigreturn (#173).
+    let sigret = crate::os::syscalls::signal::KERN_SIGRETURN_CODE + 12; // SA_SIGINFO, non-thumb
+    log::debug!("Set kernel trap: sigreturn trampoline at {:#X}", sigret);
+    unicorn
+        .mem_write(
+            sigret as u64,
+            // mov   r7, #173   ; __NR_rt_sigreturn
+            // swi   #0
+            &[0xAF, 0x70, 0xA0, 0xE3, 0xEF, 0x00, 0x00, 0x00],
+        )
+        .unwrap();
 }
 
 pub fn enable_vfp(unicorn: &mut Unicorn<'_, Context>) {
@@ -233,6 +247,13 @@ fn on_mem_fault(
         size,
         value
     );
+
+    // hand the fault to the scheduler, which will deliver a signal (if a handler is
+    // installed) or terminate the thread. Must stay lightweight: no memory reads here.
+    unicorn.get_data().set_pending_fault(PendingFault {
+        addr: address as u32,
+        is_fetch: matches!(memtype, MemType::FETCH),
+    });
 
     false
 }

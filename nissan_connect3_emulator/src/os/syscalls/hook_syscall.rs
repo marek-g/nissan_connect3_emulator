@@ -123,6 +123,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
             unicorn.get_u32_arg(3),
             unicorn.get_u32_arg(4),
         ),
+        173 => signal::rt_sigreturn(unicorn),
         174 => signal::rt_sigaction(
             unicorn,
             unicorn.get_u32_arg(0),

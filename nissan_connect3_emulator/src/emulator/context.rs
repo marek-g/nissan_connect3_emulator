@@ -20,6 +20,15 @@ impl std::ops::Deref for Context {
     }
 }
 
+/// A memory fault captured by the (lightweight) mem hook and handed to the
+/// scheduler, which decides whether to deliver a signal or kill the thread.
+#[derive(Clone, Copy)]
+pub struct PendingFault {
+    /// faulting address (data address for read/write, PC for fetch)
+    pub addr: u32,
+    pub is_fetch: bool,
+}
+
 pub struct ContextInner {
     pub mmu: Arc<Mutex<Mmu>>,
     pub file_system: Arc<Mutex<MountFileSystem>>,
@@ -36,6 +45,7 @@ pub struct ContextInner {
     action: Cell<ThreadAction>,
     process_exit_code: Cell<Option<i32>>,
     last_run_index: Cell<usize>,
+    pending_fault: Cell<Option<PendingFault>>,
 }
 
 impl ContextInner {
@@ -58,7 +68,18 @@ impl ContextInner {
             action: Cell::new(ThreadAction::None),
             process_exit_code: Cell::new(None),
             last_run_index: Cell::new(0),
+            pending_fault: Cell::new(None),
         }
+    }
+
+    /// record a memory fault (called from the mem hook) for the scheduler to handle
+    pub fn set_pending_fault(&self, fault: PendingFault) {
+        self.pending_fault.set(Some(fault));
+    }
+
+    /// consume a pending memory fault (if any)
+    pub fn take_pending_fault(&self) -> Option<PendingFault> {
+        self.pending_fault.take()
     }
 
     /// id of the guest thread currently running on the vCPU

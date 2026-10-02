@@ -13,7 +13,7 @@ mod mman;
 mod prctl;
 mod resource;
 mod sched;
-mod signal;
+pub mod signal;
 mod socket;
 mod stat;
 mod time;

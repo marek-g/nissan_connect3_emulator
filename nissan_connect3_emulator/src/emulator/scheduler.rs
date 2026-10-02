@@ -110,6 +110,22 @@ pub fn run(
 
         let res = unicorn.emu_start(pc as u64, 0, 0, count);
 
+        // a memory fault captured by the mem hook? With the VM stopped we can now read
+        // registers and write the signal frame. Delivery either jumps to the guest's
+        // SIGSEGV handler (or performs a sigreturn), leaving the thread runnable at the
+        // new PC; otherwise the default action applies (terminate).
+        let (fault_handled, had_fault) = match unicorn.get_data().take_pending_fault() {
+            Some(fault) => {
+                let handled = crate::os::syscalls::signal::handle_mem_fault(
+                    unicorn,
+                    fault.addr,
+                    fault.is_fetch,
+                );
+                (handled, true)
+            }
+            None => (false, false),
+        };
+
         // ---- switch out: save the CPU state back to the thread record
         let mut saved_context = unicorn.context_alloc().map_err(map_uc_error)?;
         unicorn.context_save(&mut saved_context).map_err(map_uc_error)?;
@@ -119,32 +135,35 @@ pub fn run(
             let mut threads = data.threads.lock().unwrap();
             if let Some(thread) = threads.iter_mut().find(|t| t.id == next_id) {
                 // a syscall handler may have already changed the status
-                // (blocked / exited); otherwise the timeslice simply expired
+                // (blocked / exited); otherwise decide based on the run result
                 if thread.status == ThreadStatus::Running {
-                    thread.status = ThreadStatus::Runnable;
+                    if fault_handled {
+                        // resumed at the signal handler / post-sigreturn PC
+                        thread.status = ThreadStatus::Runnable;
+                    } else if had_fault {
+                        // unhandled SIGSEGV -> default action: terminate (128 + SIGSEGV)
+                        thread.status = ThreadStatus::Exited(139);
+                    } else if res.is_err() {
+                        thread.status = ThreadStatus::Exited(1);
+                    } else {
+                        // timeslice simply expired
+                        thread.status = ThreadStatus::Runnable;
+                    }
                 }
                 thread.cpu_context = Some(saved_context);
                 thread.pc = pc;
             }
         }
 
-        if let Err(error) = res {
+        if res.is_err() && !fault_handled {
             // the VM is stopped now, so dumping memory is safe
             log::error!(
                 "{:#x}: [{}] Execution error: {:?}",
                 unicorn.reg_read(RegisterARM::PC).unwrap(),
                 next_id,
-                error
+                res.as_ref().err()
             );
             dump_context(unicorn);
-
-            let data = unicorn.get_data();
-            let mut threads = data.threads.lock().unwrap();
-            if let Some(thread) = threads.iter_mut().find(|t| t.id == next_id) {
-                if !matches!(thread.status, ThreadStatus::Blocked(_) | ThreadStatus::Exited(_)) {
-                    thread.status = ThreadStatus::Exited(1);
-                }
-            }
         }
     }
 
