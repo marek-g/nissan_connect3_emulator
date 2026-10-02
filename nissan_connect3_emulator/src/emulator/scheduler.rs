@@ -159,30 +159,41 @@ fn wake_expired(unicorn: &mut Unicorn<'_, Context>) {
 
     let mut expired_futex_waiters: Vec<(u32, u32)> = Vec::new(); // (addr, tid)
     let mut expired_mq_waiters: Vec<u32> = Vec::new(); // tids
+    let mut expired_iosc_waiters: Vec<u32> = Vec::new(); // tids
     {
         let mut threads = data.threads.lock().unwrap();
         for thread in threads.iter_mut() {
-            let is_mq_wait = matches!(
-                thread.status,
-                ThreadStatus::Blocked(BlockReason::MqSend { .. })
-                    | ThreadStatus::Blocked(BlockReason::MqReceive { .. })
-            );
             if let ThreadStatus::Blocked(reason) = &thread.status {
-                let expired = match reason {
-                    BlockReason::FutexWait { deadline, .. } => {
-                        deadline.map(|d| d <= now).unwrap_or(false)
-                    }
-                    BlockReason::SleepUntil(until) => *until <= now,
+                let (expired, is_mq_wait, is_iosc_wait) = match reason {
+                    BlockReason::FutexWait { deadline, .. } => (
+                        deadline.map(|d| d <= now).unwrap_or(false),
+                        false,
+                        false,
+                    ),
+                    BlockReason::SleepUntil(until) => (*until <= now, false, false),
                     BlockReason::MqSend { deadline, .. }
-                    | BlockReason::MqReceive { deadline, .. } => {
-                        deadline.map(|d| d <= now).unwrap_or(false)
-                    }
+                    | BlockReason::MqReceive { deadline, .. } => (
+                        deadline.map(|d| d <= now).unwrap_or(false),
+                        true,
+                        false,
+                    ),
+                    BlockReason::IoscMutex { deadline, .. }
+                    | BlockReason::IoscEvent { deadline, .. }
+                    | BlockReason::IoscSemaphore { deadline, .. } => (
+                        deadline.map(|d| d <= now).unwrap_or(false),
+                        false,
+                        true,
+                    ),
                 };
                 if expired {
                     if is_mq_wait {
                         // completed (re-checked against the queue) by
                         // finish_mq_wait below, which also marks it runnable
                         expired_mq_waiters.push(thread.id);
+                    } else if is_iosc_wait {
+                        // re-checked against the object state by
+                        // finish_iosc_wait below, which also marks it runnable
+                        expired_iosc_waiters.push(thread.id);
                     } else {
                         if let ThreadStatus::Blocked(BlockReason::FutexWait { addr, .. }) =
                             &thread.status
@@ -205,10 +216,13 @@ fn wake_expired(unicorn: &mut Unicorn<'_, Context>) {
         }
     }
 
-    // re-check each timed-out mq wait against the queue state and install the
+    // re-check each timed-out wait against the object state and install the
     // syscall result (must not run while any of our locks are held)
     for tid in expired_mq_waiters {
         crate::os::syscalls::mqueue::finish_mq_wait(unicorn, tid);
+    }
+    for tid in expired_iosc_waiters {
+        crate::os::syscalls::iosc::finish_iosc_wait(unicorn, tid);
     }
 }
 
@@ -260,6 +274,9 @@ fn sleep_until_next_wakeup(unicorn: &Unicorn<'_, Context>) {
         ThreadStatus::Blocked(BlockReason::SleepUntil(until)) => Some(*until),
         ThreadStatus::Blocked(BlockReason::MqSend { deadline, .. })
         | ThreadStatus::Blocked(BlockReason::MqReceive { deadline, .. }) => *deadline,
+        ThreadStatus::Blocked(BlockReason::IoscMutex { deadline, .. })
+        | ThreadStatus::Blocked(BlockReason::IoscEvent { deadline, .. })
+        | ThreadStatus::Blocked(BlockReason::IoscSemaphore { deadline, .. }) => *deadline,
         _ => None,
     });
 

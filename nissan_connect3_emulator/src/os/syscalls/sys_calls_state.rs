@@ -1,3 +1,4 @@
+use crate::os::syscalls::iosc::IoscState;
 use crate::os::syscalls::mqueue::MqState;
 use std::collections::HashMap;
 
@@ -10,6 +11,9 @@ pub struct SysCallsState {
 
     // POSIX message queues (mq_* syscalls)
     pub mq: MqState,
+
+    // Bosch IOSC IPC driver (/dev/iosc): mutexes, events, semaphores, shared mem
+    pub iosc: IoscState,
 }
 
 impl SysCallsState {
@@ -18,6 +22,7 @@ impl SysCallsState {
             get_dents_list: HashMap::new(),
             futex_waiters: HashMap::new(),
             mq: MqState::new(),
+            iosc: IoscState::new(),
         }
     }
 }

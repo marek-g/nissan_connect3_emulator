@@ -99,6 +99,11 @@ pub fn close(unicorn: &mut Unicorn<'_, Context>, fd: u32) -> u32 {
         return crate::os::syscalls::mqueue::mq_close(unicorn, fd);
     }
 
+    // /dev/iosc descriptors are backed by the emulated IOSC driver, not the fs
+    if crate::os::syscalls::iosc::is_iosc_fd(unicorn, fd) {
+        return crate::os::syscalls::iosc::close_iosc(unicorn, fd);
+    }
+
     unicorn
         .get_data()
         .inner

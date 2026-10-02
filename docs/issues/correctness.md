@@ -2,11 +2,11 @@
 
 Bugs where the emulated guest behaves wrongly (wrong syscall semantics, data corruption, hangs).
 
-## IOSC message queues unimplemented → most processes fail at queue creation
+## IOSC `/dev/iosc` device emulation — implemented, pending end-to-end verification
 
-- **Location:** libosal `OSAL_s32MessageQueueCreate`/`u32CreateMsgQueue` (IOSC path) → `libiosclib_so.so` `iosc_enter_mutex`/`iosc_create_event`/`iosc_create_semaphore`/`iosc_shared_malloc_with_id` → `/dev/iosc`
-- **Problem:** `s32CheckForIOSCQueue` classifies every queue as IOSC unless its name starts with `"NOIOSC"`, so the default IPC path is the IOSC kernel driver (`/dev/iosc`), not POSIX mqueue. In the emulator `iosc_enter_mutex` fails, hits `OSAL_vAssertFunction`, and the reset handler reboots (observed with `procvoice_out.out`). The POSIX mqueue syscalls are now implemented (they only serve the `"NOIOSC*"` local-queue fallback used e.g. by `procmapengine.out`), but IOSC itself is not emulated.
-- **Fix:** emulate the IOSC primitives. Either hook the `iosc_*` client functions in `libiosclib_so.so` (like the existing libosal/libtrace hooks) and back them with cross-process shared state, or emulate the `/dev/iosc` character device (open + ioctrl/read/write protocol). Needed before any non-NOIOSC process can reach its main loop.
+- **Location:** `nissan_connect3_emulator/src/os/syscalls/iosc.rs`; wired into `fcntl::open_internal`, `ioctl::ioctl`, `unistd::close`, and the scheduler deadline handling.
+- **State:** The `/dev/iosc` character device is now emulated. `open("/dev/iosc")` hands out a reserved fd (verified at runtime: returns a valid fd); `ioctl(fd, 0x534f00XX, &arg)` dispatches the recovered command set — shared-malloc (0x00), create/obtain/release semaphore (0x02/0x04/0x05), enter/leave mutex (0x0c/0x0d), create/wait/set event (0x0e/0x10/0x11) — backed by shared Rust state in `IoscState`, with blocking ops using the `BlockReason`/`pending_result` machinery (same as mqueue).
+- **Remaining / verification gap:** With this in place `procvoice_out.out` gets through early init (opens `/dev/iosc`, spawns threads, sizes the message pool) but still dies during message-queue setup — at the null-deref in `OSAL_s32IOClose` (libosal+0x19FB4) described in the next entry, with a corrupted return address (bad function pointer from a half-initialised object). No IOSC ioctls are observed before that fault, so the blocking primitives still need an end-to-end run to confirm. Root-causing whether the null-deref is downstream of an IOSC failure (or independent) is part of the signal-delivery work below.
 
 ## Memory fault kills the guest thread; no signal delivery
 

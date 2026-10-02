@@ -28,6 +28,12 @@ pub enum BlockReason {
         prio_ptr: u32,
         deadline: Option<Instant>,
     },
+    /// waiting in iosc_enter_mutex for the IOSC mutex to be released
+    IoscMutex { id: u32, deadline: Option<Instant> },
+    /// waiting in iosc_wait_for_event for the IOSC event to be set
+    IoscEvent { id: u32, deadline: Option<Instant> },
+    /// waiting in iosc_obtain_semaphore for the IOSC semaphore count
+    IoscSemaphore { id: u32, deadline: Option<Instant> },
 }
 
 /// Action requested by a syscall handler; consumed by the syscall hook wrapper.

@@ -194,6 +194,12 @@ pub fn fcntl64(unicorn: &mut Unicorn<'_, Context>, fd: u32, cmd: u32, arg1: u32)
 }
 
 fn open_internal(unicorn: &mut Unicorn<'_, Context>, path_name: &str, flags: u32, _mode: u32) -> u32 {
+    // the Bosch IOSC IPC driver is not a real file - hand out a reserved fd and
+    // let the ioctl dispatch back it (see iosc.rs)
+    if path_name == "/dev/iosc" {
+        return crate::os::syscalls::iosc::open_iosc(unicorn);
+    }
+
     let open_file_flags = convert_open_file_flags(flags);
 
     if let Ok(fd) = unicorn
