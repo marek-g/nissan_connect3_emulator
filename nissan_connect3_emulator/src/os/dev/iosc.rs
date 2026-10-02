@@ -216,14 +216,16 @@ fn write_result(unicorn: &mut Unicorn<'_, Context>, result_ptr: u32, value: u32)
 
 // ---- shared memory --------------------------------------------------------
 
-/// iosc_shared_malloc_with_id: arg struct is
-/// `{ result_ptr, id, size, out_ptr }` - the driver allocates `size` bytes of
-/// zeroed shared memory and writes its base address to `*result_ptr`.
+/// iosc_shared_malloc_with_id: arg struct is `{ ppMem, id, size, pResult }`.
+/// The driver allocates `size` bytes of zeroed shared memory and writes its
+/// base address to `*ppMem` (offset 0). Like a real Linux ioctl it returns 0 on
+/// success - libiosclib's wrapper only reads `*ppMem` when the ioctl returned
+/// >= 0, so a non-zero return here would be misread as an error.
 fn shared_malloc(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
-    let result_ptr = read_u32(unicorn, addr);
+    let pp_mem = read_u32(unicorn, addr);
     let size = read_u32(unicorn, addr + 8);
     if size == 0 {
-        return 0;
+        return EINVAL;
     }
 
     let base = {
@@ -239,12 +241,16 @@ fn shared_malloc(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     unicorn
         .mem_write(base as u64, &vec![0u8; size as usize])
         .unwrap();
-    if result_ptr != 0 {
+    if pp_mem != 0 {
         unicorn
-            .mem_write(result_ptr as u64, &pack_u32(base))
+            .mem_write(pp_mem as u64, &pack_u32(base))
             .unwrap();
     }
-    base
+    log::trace!(
+        "[IOSC] shared_malloc(size={:#x}) => base {:#x} via *ppMem({:#x})",
+        size, base, pp_mem
+    );
+    0
 }
 
 // ---- events ---------------------------------------------------------------

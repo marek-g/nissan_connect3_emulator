@@ -6,12 +6,6 @@ use unicorn_engine::{RegisterARM, Unicorn};
 pub fn hook_trace_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     // original base address: 0x484d8000
     add_code_hook!(unicorn, "LIBOSAL", base_address + 0x304B0, v_init_trace);
-    add_code_hook!(
-        unicorn,
-        "LIBOSAL",
-        base_address + 0x34A5C,
-        v_init_osal_core_iosc
-    );
     add_code_hook!(unicorn, "LIBOSAL", base_address + 0x446F8, trace_string);
     add_code_hook!(unicorn, "LIBOSAL", base_address + 0x36940, v_trace_mq_info);
     add_code_hook!(
@@ -23,10 +17,6 @@ pub fn hook_trace_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
 }
 
 pub fn v_init_trace(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
-    0u32
-}
-
-pub fn v_init_osal_core_iosc(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
     0u32
 }
 
