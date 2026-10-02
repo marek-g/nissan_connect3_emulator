@@ -2,11 +2,11 @@
 
 Bugs where the emulated guest behaves wrongly (wrong syscall semantics, data corruption, hangs).
 
-## mq_open unimplemented → OSAL message queue creation fails → reboot loop
+## IOSC message queues unimplemented → most processes fail at queue creation
 
-- **Location:** `nissan_connect3_emulator/src/os/syscalls/hook_syscall.rs` (fallback arm, ARM #274), libosal `u32CreateMsgQueue`/`OSAL_s32MessageQueueCreate`
-- **Problem:** libosal's `u32CreateMsgQueue` calls `mq_open` (ARM #274) which returns `-ENOSYS`; the failure maps to an IOSC error, hits `OSAL_vAssertFunction`, and the firmware reset handler reboots ("rebooting", write to `/sys/devices/platform/dexcep/trigger_exception`). The guest never reaches its main loop. This is the current blocker for running the navigation app.
-- **Fix:** implement POSIX message queues per `fs/mqueue.c` (mq_open #274, mq_getattr #275, mq_setattr #276, mq_notify #277, mq_unlink #278, mq_close #279, mq_timedsend #280, mq_receive #281, mq_timedreceive #282), or stub `u32CreateMsgQueue` at the OSAL hook level as a stopgap.
+- **Location:** libosal `OSAL_s32MessageQueueCreate`/`u32CreateMsgQueue` (IOSC path) → `libiosclib_so.so` `iosc_enter_mutex`/`iosc_create_event`/`iosc_create_semaphore`/`iosc_shared_malloc_with_id` → `/dev/iosc`
+- **Problem:** `s32CheckForIOSCQueue` classifies every queue as IOSC unless its name starts with `"NOIOSC"`, so the default IPC path is the IOSC kernel driver (`/dev/iosc`), not POSIX mqueue. In the emulator `iosc_enter_mutex` fails, hits `OSAL_vAssertFunction`, and the reset handler reboots (observed with `procvoice_out.out`). The POSIX mqueue syscalls are now implemented (they only serve the `"NOIOSC*"` local-queue fallback used e.g. by `procmapengine.out`), but IOSC itself is not emulated.
+- **Fix:** emulate the IOSC primitives. Either hook the `iosc_*` client functions in `libiosclib_so.so` (like the existing libosal/libtrace hooks) and back them with cross-process shared state, or emulate the `/dev/iosc` character device (open + ioctrl/read/write protocol). Needed before any non-NOIOSC process can reach its main loop.
 
 ## Memory fault kills the guest thread; no signal delivery
 

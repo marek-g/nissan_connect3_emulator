@@ -1,9 +1,8 @@
 use crate::emulator::context::Context;
 use crate::emulator::thread::{block_current_thread, exit_current_thread, exit_process, ThreadAction};
-use crate::emulator::utils::read_string;
 use crate::os::syscalls::{
-    fcntl, futex, ioctl, linux, mman, prctl, resource, sched, signal, socket, stat, time, uio,
-    unistd, utsname,
+    fcntl, futex, ioctl, linux, mman, mqueue, prctl, resource, sched, signal, socket, stat, time,
+    uio, unistd, utsname,
 };
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -189,6 +188,37 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         248 => unistd::exit_group(unicorn, unicorn.get_u32_arg(0)),
         256 => unistd::set_tid_address(unicorn, unicorn.get_u32_arg(0)),
         263 => time::clock_gettime(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        274 => mqueue::mq_open(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+            unicorn.get_u32_arg(3),
+        ),
+        275 => mqueue::mq_unlink(unicorn, unicorn.get_u32_arg(0)),
+        276 => mqueue::mq_timedsend(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+            unicorn.get_u32_arg(3),
+            unicorn.get_u32_arg(4),
+        ),
+        277 => mqueue::mq_timedreceive(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+            unicorn.get_u32_arg(3),
+            unicorn.get_u32_arg(4),
+        ),
+        278 => mqueue::mq_notify(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        279 => mqueue::mq_getsetattr(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
         281 => socket::socket(
             unicorn,
             unicorn.get_u32_arg(0),
@@ -225,16 +255,11 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         338 => futex::set_robust_list(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         983045 => linux::set_tls(unicorn, unicorn.get_u32_arg(0)),
         x => {
-            if x == 274 {
-                // mq_open
-                let path = read_string(unicorn, unicorn.get_u32_arg(0));
-                log::trace!("mq_open: {}", path);
-            }
             log::error!(
                 "{:#x}: [{}] not implemented syscall #{} (int {}), args: {:#x}, {:#x}, {:#x}, ...",
                 unicorn.reg_read(RegisterARM::PC).unwrap(),
                 unicorn.get_data().thread_id(),
-                unicorn.get_syscall_number(),
+                x,
                 int_no,
                 unicorn.get_u32_arg(0),
                 unicorn.get_u32_arg(1),

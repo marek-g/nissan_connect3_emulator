@@ -248,6 +248,7 @@ pub fn clone(
             status: ThreadStatus::Runnable,
             cpu_context: Some(child_context),
             pc,
+            pending_result: None,
         });
     }
 

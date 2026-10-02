@@ -56,6 +56,7 @@ pub fn run(
             status: ThreadStatus::Runnable,
             cpu_context: Some(cpu_context),
             pc: interp_entry_point,
+            pending_result: None,
         });
     }
 
@@ -77,15 +78,27 @@ pub fn run(
         };
 
         // ---- switch in: restore the thread's CPU state onto the shared vCPU
-        let (cpu_context, pc) = {
+        let (cpu_context, pc, pending_result) = {
             let data = unicorn.get_data();
             let mut threads = data.threads.lock().unwrap();
             let thread = threads.iter_mut().find(|t| t.id == next_id).unwrap();
             thread.status = ThreadStatus::Running;
-            (thread.cpu_context.take().unwrap(), thread.pc)
+            (
+                thread.cpu_context.take().unwrap(),
+                thread.pc,
+                thread.pending_result.take(),
+            )
         };
         unicorn.get_data().set_thread_id(next_id);
         unicorn.context_restore(&cpu_context).map_err(map_uc_error)?;
+
+        // a completed blocked syscall (e.g. woken mq receive) parks its result
+        // here instead of in the saved context
+        if let Some(result) = pending_result {
+            unicorn
+                .reg_write(RegisterARM::R0 as i32, result as u64)
+                .unwrap();
+        }
 
         // timeslice only when there is another runnable thread to switch to
         let count = if other_runnable_exists(unicorn) {
@@ -139,28 +152,44 @@ pub fn run(
 }
 
 /// wake blocked threads whose deadline has passed
-fn wake_expired(unicorn: &Unicorn<'_, Context>) {
+fn wake_expired(unicorn: &mut Unicorn<'_, Context>) {
     let now = Instant::now();
     let data = unicorn.get_data();
 
     let mut expired_futex_waiters: Vec<(u32, u32)> = Vec::new(); // (addr, tid)
+    let mut expired_mq_waiters: Vec<u32> = Vec::new(); // tids
     {
         let mut threads = data.threads.lock().unwrap();
         for thread in threads.iter_mut() {
+            let is_mq_wait = matches!(
+                thread.status,
+                ThreadStatus::Blocked(BlockReason::MqSend { .. })
+                    | ThreadStatus::Blocked(BlockReason::MqReceive { .. })
+            );
             if let ThreadStatus::Blocked(reason) = &thread.status {
                 let expired = match reason {
                     BlockReason::FutexWait { deadline, .. } => {
                         deadline.map(|d| d <= now).unwrap_or(false)
                     }
                     BlockReason::SleepUntil(until) => *until <= now,
+                    BlockReason::MqSend { deadline, .. }
+                    | BlockReason::MqReceive { deadline, .. } => {
+                        deadline.map(|d| d <= now).unwrap_or(false)
+                    }
                 };
                 if expired {
-                    if let ThreadStatus::Blocked(BlockReason::FutexWait { addr, .. }) =
-                        &thread.status
-                    {
-                        expired_futex_waiters.push((*addr, thread.id));
+                    if is_mq_wait {
+                        // completed (re-checked against the queue) by
+                        // finish_mq_wait below, which also marks it runnable
+                        expired_mq_waiters.push(thread.id);
+                    } else {
+                        if let ThreadStatus::Blocked(BlockReason::FutexWait { addr, .. }) =
+                            &thread.status
+                        {
+                            expired_futex_waiters.push((*addr, thread.id));
+                        }
+                        thread.status = ThreadStatus::Runnable;
                     }
-                    thread.status = ThreadStatus::Runnable;
                 }
             }
         }
@@ -173,6 +202,12 @@ fn wake_expired(unicorn: &Unicorn<'_, Context>) {
                 list.retain(|&waiter| waiter != tid);
             }
         }
+    }
+
+    // re-check each timed-out mq wait against the queue state and install the
+    // syscall result (must not run while any of our locks are held)
+    for tid in expired_mq_waiters {
+        crate::os::syscalls::mqueue::finish_mq_wait(unicorn, tid);
     }
 }
 
@@ -222,6 +257,8 @@ fn sleep_until_next_wakeup(unicorn: &Unicorn<'_, Context>) {
     let next_deadline = threads.iter().find_map(|t| match &t.status {
         ThreadStatus::Blocked(BlockReason::FutexWait { deadline, .. }) => *deadline,
         ThreadStatus::Blocked(BlockReason::SleepUntil(until)) => Some(*until),
+        ThreadStatus::Blocked(BlockReason::MqSend { deadline, .. })
+        | ThreadStatus::Blocked(BlockReason::MqReceive { deadline, .. }) => *deadline,
         _ => None,
     });
 

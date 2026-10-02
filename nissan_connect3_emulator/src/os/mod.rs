@@ -1,5 +1,5 @@
 pub mod file_system;
-mod syscalls;
+pub(crate) mod syscalls;
 
 use crate::emulator::context::Context;
 use crate::libs::libtrace::libtrace_add_code_hooks;

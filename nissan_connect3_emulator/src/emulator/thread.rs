@@ -1,5 +1,5 @@
 use crate::emulator::context::Context;
-use crate::emulator::memory_map::GET_TLS_ADDR;
+use crate::emulator::memory_map::{GET_TLS_ADDR, MQ_NOTIFY_EXIT_STUB};
 use crate::emulator::print::{disasm, print_mmu, print_stack};
 use std::time::Instant;
 use unicorn_engine::unicorn_const::{MemType, Prot};
@@ -11,6 +11,22 @@ use unicorn_engine::Context as CpuContext;
 pub enum BlockReason {
     FutexWait { addr: u32, deadline: Option<Instant> },
     SleepUntil(Instant),
+    /// waiting in mq_timedsend for a free slot on the queue
+    MqSend {
+        queue_id: u32,
+        msg_ptr: u32,
+        msg_len: u32,
+        priority: u32,
+        deadline: Option<Instant>,
+    },
+    /// waiting in mq_receive/mq_timedreceive for a message on the queue
+    MqReceive {
+        queue_id: u32,
+        msg_ptr: u32,
+        msg_len: u32,
+        prio_ptr: u32,
+        deadline: Option<Instant>,
+    },
 }
 
 /// Action requested by a syscall handler; consumed by the syscall hook wrapper.
@@ -43,6 +59,9 @@ pub struct GuestThread {
     pub cpu_context: Option<CpuContext>,
     /// PC to start from when switching in (valid when not Running)
     pub pc: u32,
+    /// syscall result to install into R0 on the next switch-in (set by the code
+    /// that completes a blocked operation, e.g. a woken mq receiver)
+    pub pending_result: Option<u32>,
 }
 
 pub fn block_current_thread(unicorn: &mut Unicorn<'_, Context>, reason: BlockReason) {
@@ -122,6 +141,24 @@ pub fn set_kernel_traps(unicorn: &mut Unicorn<'_, Context>) {
             &[
                 0x00, 0x30, 0x92, 0xE5, 0x00, 0x30, 0x53, 0xE0, 0x00, 0x10, 0x82, 0x05, 0x00, 0x00,
                 0x73, 0xE2, 0x0E, 0xF0, 0xA0, 0xE1,
+            ],
+        )
+        .unwrap();
+
+    // mq-notify exit stub - a SIGEV_THREAD notification thread returns to here
+    // after its handler function returns and exits (exit syscall), mirroring
+    // how glibc's rt notify thread terminates the spawned thread
+    log::debug!(
+        "Set kernel trap: mq-notify exit stub at {:#X}",
+        MQ_NOTIFY_EXIT_STUB
+    );
+    unicorn
+        .mem_write(
+            MQ_NOTIFY_EXIT_STUB as u64,
+            // mov   r7, #1     ; exit
+            // swi   #0
+            &[
+                0x01, 0x70, 0xA0, 0xE3, 0x00, 0x00, 0x00, 0xEF,
             ],
         )
         .unwrap();

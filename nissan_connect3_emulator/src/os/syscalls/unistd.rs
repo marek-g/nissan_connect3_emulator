@@ -89,6 +89,16 @@ pub fn close(unicorn: &mut Unicorn<'_, Context>, fd: u32) -> u32 {
         fd,
     );
 
+    // POSIX message queue handles are not file-system fds - glibc's mq_close()
+    // closes them through the plain close syscall (kernel: mqueue file)
+    let is_mq_handle = {
+        let state = unicorn.get_data().inner.sys_calls_state.lock().unwrap();
+        state.mq.queues.contains_key(&fd)
+    };
+    if is_mq_handle {
+        return crate::os::syscalls::mqueue::mq_close(unicorn, fd);
+    }
+
     unicorn
         .get_data()
         .inner

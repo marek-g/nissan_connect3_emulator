@@ -1,3 +1,4 @@
+use crate::os::syscalls::mqueue::MqState;
 use std::collections::HashMap;
 
 pub struct SysCallsState {
@@ -6,6 +7,9 @@ pub struct SysCallsState {
 
     // maps futex `uaddr` to list of blocked guest thread ids waiting on that address
     pub futex_waiters: HashMap<u32, Vec<u32>>,
+
+    // POSIX message queues (mq_* syscalls)
+    pub mq: MqState,
 }
 
 impl SysCallsState {
@@ -13,6 +17,7 @@ impl SysCallsState {
         Self {
             get_dents_list: HashMap::new(),
             futex_waiters: HashMap::new(),
+            mq: MqState::new(),
         }
     }
 }
