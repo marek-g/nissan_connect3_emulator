@@ -56,7 +56,14 @@ impl Wake {
 /// Why a guest thread is blocked (waiting to be woken by the scheduler).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum BlockReason {
+    /// futex wait on a process-private word (pthread mutex/condvar, tid clear):
+    /// waiters live in this process' own `SysCallsState`.
     FutexWait { addr: u32, deadline: Option<Instant> },
+    /// futex wait on a word that lives in shared memory (`/dev/shm/*`, e.g. a
+    /// POSIX named semaphore via `sem_open`). The wait is recorded in the global
+    /// `SystemNamespace` so a `FUTEX_WAKE` from another process can signal it;
+    /// `id` indexes that registry and the owning process' host thread reaps it.
+    FutexWaitShared { id: usize, deadline: Option<Instant> },
     SleepUntil(Instant),
     /// waiting in mq_timedsend for a free slot on the queue
     MqSend {

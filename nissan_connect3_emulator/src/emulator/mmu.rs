@@ -147,9 +147,27 @@ impl Mmu {
         );
     }
 
+    /// Canonical identity of a word that lives in named shared memory
+    /// (`/dev/shm/*`): `(shm_path, offset)`. Two processes that mapped the same
+    /// shm object alias the same host bytes, so this key is the same for the
+    /// same word in every process - exactly what a shared futex needs to be
+    /// matched across processes. Returns `None` for a word in process-private
+    /// memory (which has no cross-process identity).
+    pub fn shared_futex_key(&self, addr: u32) -> Option<(String, u32)> {
+        self.regions.iter().find_map(|r| {
+            if addr >= r.memory_start
+                && addr <= r.memory_end
+                && r.filepath.starts_with("/dev/shm/")
+            {
+                Some((r.filepath.clone(), addr - r.memory_start))
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn unmap(&mut self, unicorn: &mut Unicorn<'_, Context>, address: u32, size: u32) {
         self.remove_internal(unicorn, address, size);
-
         log::debug!(
             "mmu_unmap: {:#x} - {:#x}",
             address,

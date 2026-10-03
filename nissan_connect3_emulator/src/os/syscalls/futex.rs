@@ -48,8 +48,10 @@ pub fn futex(
     );
 
     if futex_op & 0x80 == 0 {
-        // FUTEX_PRIVATE_FLAG - if not set synchronization between processes is needed
-        log::error!("futex without FUTEX_PRIVATE_FLAG not implemented");
+        // no FUTEX_PRIVATE_FLAG: cross-process synchronization may be needed. If
+        // the word lives in shared memory it is dispatched to the global futex
+        // registry (see shm_futex_key below); otherwise it is handled per-process.
+        log::trace!("futex without FUTEX_PRIVATE_FLAG");
     }
 
     let res = match futex_op & 0x7F {
@@ -73,6 +75,19 @@ pub fn futex(
                 let deadline = read_timeout_deadline(unicorn, timeout);
                 let data = unicorn.get_data();
                 let thread_id = data.thread_id();
+
+                if let Some(key) = shm_futex_key(unicorn, uaddr) {
+                    // word is in shared memory: register globally so another
+                    // process' FUTEX_WAKE can signal it; this process' host
+                    // thread reaps it via advance_blocked.
+                    let namespace = data.namespace.clone();
+                    let id = namespace.lock().unwrap().futex_wait_shared(key);
+                    unicorn.get_data().set_action(ThreadAction::Block(
+                        BlockReason::FutexWaitShared { id, deadline },
+                    ));
+                    return 0;
+                }
+
                 {
                     let state = &mut data.inner.sys_calls_state.lock().unwrap();
                     state
@@ -99,7 +114,15 @@ pub fn futex(
         0x01 | 0x0A | 0x05 => {
             // FUTEX_WAKE / FUTEX_WAKE_BITSET / FUTEX_WAKE_OP (op semantics not
             // evaluated - a plain wake of `val` waiters covers the common cases)
-            wake_waiters(unicorn, uaddr, val)
+            if let Some(key) = shm_futex_key(unicorn, uaddr) {
+                let namespace = unicorn.get_data().namespace.clone();
+                let count = namespace.lock().unwrap().futex_wake_shared(&key, val as usize);
+                // ring every doorbell so each parked owner reaps its signaled waiter
+                namespace.lock().unwrap().notify_waiters();
+                count as u32
+            } else {
+                wake_waiters(unicorn, uaddr, val)
+            }
         }
         op => {
             log::error!("unsupported futex operation: {}", op);
@@ -150,6 +173,18 @@ pub(crate) fn wake_waiters(unicorn: &mut Unicorn<'_, Context>, uaddr: u32, val: 
     }
 
     count as u32
+}
+
+/// Canonical identity of a futex word if it lives in named shared memory. A
+/// `FUTEX_WAIT`/`FUTEX_WAKE` on such a word must be seen by every process (they
+/// alias the same bytes), so it is routed to the global futex registry keyed by
+/// `(shm_path, offset)`. Returns `None` for a process-private word.
+fn shm_futex_key(unicorn: &Unicorn<'_, Context>, uaddr: u32) -> Option<(String, u32)> {
+    let mmu = unicorn.get_data().mmu.clone();
+    let guard = mmu.lock().unwrap();
+    let key = guard.shared_futex_key(uaddr);
+    drop(guard);
+    key
 }
 
 /// read an optional `struct timespec` timeout from guest memory

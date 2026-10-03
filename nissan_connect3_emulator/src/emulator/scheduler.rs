@@ -225,9 +225,13 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
 
     // take the Arcs we need and release the borrow on `unicorn`, so the
     // completion helpers (which need &mut Unicorn) can run
-    let (threads, sys_calls_state) = {
+    let (threads, sys_calls_state, namespace) = {
         let data = unicorn.get_data();
-        (data.threads.clone(), data.sys_calls_state.clone())
+        (
+            data.threads.clone(),
+            data.sys_calls_state.clone(),
+            data.namespace.clone(),
+        )
     };
 
     // collect the blocked threads first (finish_* re-locks the thread list)
@@ -253,7 +257,30 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
             BlockReason::FutexWait { addr, deadline } => {
                 if deadline.map(|d| d <= now).unwrap_or(false) {
                     expired_futex.push((addr, tid));
-                    set_runnable(unicorn, tid, None);
+                    set_runnable(unicorn, tid, Some(-110i32 as u32)); // -ETIMEDOUT
+                }
+            }
+            BlockReason::FutexWaitShared { id, deadline } => {
+                // a shared-memory futex (e.g. a POSIX named semaphore): woken by
+                // any process' FUTEX_WAKE (signalled in the global registry), or
+                // timed out. The registry entry is reaped here, in this owner.
+                let outcome = {
+                    let mut ns = namespace.lock().unwrap();
+                    match ns.futex_poll_shared(id) {
+                        crate::os::syscalls::namespace::SharedFutexPoll::Woken => Some(0u32),
+                        crate::os::syscalls::namespace::SharedFutexPoll::Waiting => {
+                            if deadline.map(|d| d <= now).unwrap_or(false) {
+                                ns.futex_remove_shared(id);
+                                Some(-110i32 as u32) // -ETIMEDOUT
+                            } else {
+                                None
+                            }
+                        }
+                        crate::os::syscalls::namespace::SharedFutexPoll::Gone => None,
+                    }
+                };
+                if let Some(result) = outcome {
+                    set_runnable(unicorn, tid, Some(result));
                 }
             }
             BlockReason::MqSend { .. } | BlockReason::MqReceive { .. } => {
@@ -298,6 +325,7 @@ fn park_duration(unicorn: &Unicorn<'_, Context>) -> Duration {
 
     let next = threads.iter().find_map(|t| match &t.status {
         ThreadStatus::Blocked(BlockReason::FutexWait { deadline, .. }) => *deadline,
+        ThreadStatus::Blocked(BlockReason::FutexWaitShared { deadline, .. }) => *deadline,
         ThreadStatus::Blocked(BlockReason::SleepUntil(until)) => Some(*until),
         ThreadStatus::Blocked(BlockReason::MqSend { deadline, .. } | BlockReason::MqReceive { deadline, .. }) => {
             *deadline

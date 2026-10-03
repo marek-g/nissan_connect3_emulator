@@ -94,13 +94,19 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     // IPC (message queues / IOSC) works. procbaselx is the process manager; on the
     // real unit it would fork+exec prochmi itself, which the emulator cannot do, so
     // we launch it as a second top-level process instead.
-    let specs = vec![
-        ProcessSpec::new("/opt/bosch/processes/procbaselx_out.out").envs(envs.clone()),
-        ProcessSpec::new("/opt/bosch/processes/prochmi_out.out").envs(envs),
-        //"/opt/bosch/processes/proccgs_out.out".to_string(),
-        //"/opt/bosch/processes/procvoice_out.out".to_string(),
-        //"/var/opt/bosch/dynamic/CRYPTNAV/DNL/BIN/NAV/COMMON/DAPIAPP.OUT".to_string(),
-    ];
+    // Default process set; override with EMU_PROCESSES="path1:path2" to debug a
+    // single process or a different combination without editing this file.
+    let specs = match std::env::var("EMU_PROCESSES") {
+        Ok(list) => list
+            .split(':')
+            .filter(|s| !s.is_empty())
+            .map(|p| ProcessSpec::new(p).envs(envs.clone()))
+            .collect(),
+        Err(_) => vec![
+            ProcessSpec::new("/opt/bosch/processes/procbaselx_out.out").envs(envs.clone()),
+            ProcessSpec::new("/opt/bosch/processes/prochmi_out.out").envs(envs),
+        ],
+    };
     emulator.run_processes(specs)?;
 
     Ok(())
