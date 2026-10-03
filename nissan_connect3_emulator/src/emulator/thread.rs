@@ -341,6 +341,13 @@ pub fn dump_context(unicorn: &Unicorn<'_, Context>) {
         unicorn.reg_read(RegisterARM::SP).unwrap(),
         unicorn.reg_read(RegisterARM::FP).unwrap()
     );
+    println!(
+        "R0: {:#10x}, R1: {:#10x}, R2: {:#10x}, R3: {:#10x}",
+        unicorn.reg_read(RegisterARM::R0).unwrap(),
+        unicorn.reg_read(RegisterARM::R1).unwrap(),
+        unicorn.reg_read(RegisterARM::R2).unwrap(),
+        unicorn.reg_read(RegisterARM::R3).unwrap()
+    );
     print_mmu(unicorn);
 
     let pc = unicorn.reg_read(RegisterARM::PC).unwrap() as u32;
