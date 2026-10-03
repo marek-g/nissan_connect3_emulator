@@ -158,6 +158,12 @@ impl FileSystem for TmpFileSystem {
     }
 
     fn link(&mut self, old_path: &str, new_path: &str) -> Result<(), OpenFileError> {
+        // link(2): EEXIST if newpath already exists. glibc's sem_open() creates a
+        // temp file then link()s it to the named path, relying on this failure to
+        // detect that another process already owns the named semaphore.
+        if self.files.contains_key(new_path) {
+            return Err(OpenFileError::FileExists);
+        }
         if let Some(file_data) = self.files.get(old_path) {
             self.files.insert(new_path.to_string(), file_data.clone());
             Ok(())
