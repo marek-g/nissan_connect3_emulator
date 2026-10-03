@@ -291,23 +291,31 @@ fn set_event(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     0
 }
 
-/// iosc_wait_for_event: arg struct `{ event_id, _, _, _, timeout }`. Blocks
-/// until the event is set (then consumes it), returning 0.
+/// iosc_wait_for_event: arg struct `{ event_id, _, _, _, timeout, result_ptr }`.
+/// Blocks until the event is set (then consumes it). The libiosclib wrapper
+/// returns `*result_ptr` (not the ioctl return) once the ioctl succeeds, so the
+/// driver must write the outcome (0 == event obtained) to that buffer; if it is
+/// left stale, OSAL's u32MapErrorCodeIOSC asserts.
 fn wait_for_event(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     let event_id = read_u32(unicorn, addr);
     let deadline = timeout_to_deadline(read_i32(unicorn, addr + 16));
+    let result_ptr = read_u32(unicorn, addr + 20);
 
-    // fast path: already set - consume and return
-    {
+    // fast path: already set - consume and publish success
+    let already_set = {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
-        if let Some(event) = state.iosc.events.get_mut(&event_id) {
-            if event.value != 0 {
+        match state.iosc.events.get_mut(&event_id) {
+            Some(event) if event.value != 0 => {
                 event.value = 0;
-                return 0;
+                true
             }
-        } else {
-            return EINVAL;
+            Some(_) => false,
+            None => return EINVAL,
         }
+    };
+    if already_set {
+        write_result(unicorn, result_ptr, 0);
+        return 0;
     }
 
     // slow path: block
@@ -327,6 +335,7 @@ fn wait_for_event(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
         .set_action(ThreadAction::Block(BlockReason::IoscEvent {
             id: event_id,
             deadline,
+            result_ptr,
         }));
     0 // overwritten by pending_result when the wait completes
 }
@@ -557,22 +566,34 @@ pub fn finish_iosc_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, now: Insta
                 None => Some(ETIMEDOUT),
             }
         }
-        Some(BlockReason::IoscEvent { id, deadline }) => {
+        Some(BlockReason::IoscEvent {
+            id,
+            deadline,
+            result_ptr,
+        }) => {
             let mut state = unicorn.get_data().namespace.lock().unwrap();
             match state.iosc.events.get_mut(&id) {
                 Some(e) => {
                     if e.value != 0 {
                         e.value = 0;
                         e.waiters.retain(|&w| w != tid);
+                        drop(state);
+                        write_result(unicorn, result_ptr, 0);
                         Some(0)
                     } else if deadline.map(|d| d <= now).unwrap_or(false) {
                         e.waiters.retain(|&w| w != tid);
+                        drop(state);
+                        write_result(unicorn, result_ptr, ETIMEDOUT);
                         Some(ETIMEDOUT)
                     } else {
                         None
                     }
                 }
-                None => Some(ETIMEDOUT),
+                None => {
+                    drop(state);
+                    write_result(unicorn, result_ptr, EINVAL);
+                    Some(ETIMEDOUT)
+                }
             }
         }
         Some(BlockReason::IoscSemaphore { id, deadline }) => {
