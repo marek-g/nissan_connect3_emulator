@@ -1,33 +1,43 @@
 use crate::emulator::context::Context;
-use crate::os::add_code_hook;
-use unicorn_engine::{RegisterARM, Unicorn};
+use crate::os::code_stub::add_code_stub;
+use unicorn_engine::Unicorn;
 
 pub fn hook_trace_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
-    add_code_hook!(unicorn, "LIBTRACE", base_address + 0x00002f58, trace_init);
-    add_code_hook!(
+    add_code_stub(unicorn, "LIBTRACE", base_address + 0x00002f58, "trace_init", trace_init);
+    add_code_stub(
         unicorn,
         "LIBTRACE",
         base_address + 0x00004634,
-        trace_tr_chan_access
+        "trace_tr_chan_access",
+        trace_tr_chan_access,
     );
-    add_code_hook!(
+    add_code_stub(
         unicorn,
         "LIBTRACE",
         base_address + 0x000043a0,
-        trace_tr_core_uw_trace_out
+        "trace_tr_core_uw_trace_out",
+        trace_tr_core_uw_trace_out,
     );
-    add_code_hook!(
+    add_code_stub(
         unicorn,
         "LIBTRACE",
         base_address + 0x00007864,
-        trace_sharedmem_create_dual_os
+        "trace_sharedmem_create_dual_os",
+        trace_sharedmem_create_dual_os,
     );
-    add_code_hook!(unicorn, "LIBTRACE", base_address + 0x0000513c, trace_stop);
-    add_code_hook!(
+    add_code_stub(
+        unicorn,
+        "LIBTRACE",
+        base_address + 0x0000513c,
+        "trace_stop",
+        trace_stop,
+    );
+    add_code_stub(
         unicorn,
         "LIBTRACE",
         base_address + 0x000076e4,
-        trace_tr_core_is_class_selected
+        "trace_tr_core_is_class_selected",
+        trace_tr_core_is_class_selected,
     );
 }
 

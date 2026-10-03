@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use unicorn_engine::Unicorn;
 
 pub fn libtrace_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
-    // All code hooks (named entry hooks + per-method trace hooks) make Unicorn check
-    // every executed instruction against the whole hook set; ~1000 of them dominates
-    // runtime. Opt-in via EMU_CODE_HOOKS for debugging.
+    // Stubbed functions are patched to `svc #0` and dispatched from the single
+    // intr hook, so no per-instruction Unicorn code hooks are registered. Still
+    // opt-in via EMU_CODE_HOOKS because it changes guest behavior (bodies skipped).
     if std::env::var("EMU_CODE_HOOKS").map(|v| v == "1").unwrap_or(false) {
         hook_trace_code(unicorn, base_address);
 

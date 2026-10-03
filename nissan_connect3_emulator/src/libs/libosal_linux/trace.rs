@@ -1,18 +1,25 @@
 use crate::emulator::context::Context;
 use crate::emulator::utils::read_string;
-use crate::os::add_code_hook;
+use crate::os::code_stub::add_code_stub;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn hook_trace_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     // original base address: 0x484d8000
-    add_code_hook!(unicorn, "LIBOSAL", base_address + 0x304B0, v_init_trace);
-    add_code_hook!(unicorn, "LIBOSAL", base_address + 0x446F8, trace_string);
-    add_code_hook!(unicorn, "LIBOSAL", base_address + 0x36940, v_trace_mq_info);
-    add_code_hook!(
+    add_code_stub(unicorn, "LIBOSAL", base_address + 0x304B0, "v_init_trace", v_init_trace);
+    add_code_stub(unicorn, "LIBOSAL", base_address + 0x446F8, "trace_string", trace_string);
+    add_code_stub(
+        unicorn,
+        "LIBOSAL",
+        base_address + 0x36940,
+        "v_trace_mq_info",
+        v_trace_mq_info,
+    );
+    add_code_stub(
         unicorn,
         "LIBOSAL",
         base_address + 0x13E7C,
-        v_write_to_err_mem
+        "v_write_to_err_mem",
+        v_write_to_err_mem,
     );
 }
 

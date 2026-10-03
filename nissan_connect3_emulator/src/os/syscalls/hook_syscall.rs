@@ -7,6 +7,35 @@ use crate::os::syscalls::{
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
+    // A stubbed function entry was patched to `svc #0`. When it executes the intr
+    // hook fires with PC already advanced past the svc, so the entry address is
+    // PC - 4. If this interrupt came from one of our stubs, run its handler, return
+    // the value in R0 and jump back to the caller (PC = LR), skipping the original
+    // body (which never runs). Otherwise fall through to a real syscall.
+    let pc = unicorn.reg_read(RegisterARM::PC).unwrap() as u32;
+    let stub = {
+        let map = unicorn.get_data().code_stubs.lock().unwrap();
+        map.get(&pc.wrapping_sub(4)).copied()
+    };
+    if let Some(stub) = stub {
+        let tid = unicorn.get_data().thread_id();
+        log::trace!("{:#x}: [{}] [{} HOOK] {}() [IN]", pc, tid, stub.lib, stub.name);
+        let res = (stub.handler)(unicorn);
+        log::trace!(
+            "{:#x}: [{}] [{} HOOK] {}() => {}",
+            pc,
+            tid,
+            stub.lib,
+            stub.name,
+            res
+        );
+        unicorn.reg_write(RegisterARM::R0, res as u64).unwrap();
+        unicorn
+            .reg_write(RegisterARM::PC, unicorn.reg_read(RegisterARM::LR).unwrap())
+            .unwrap();
+        return;
+    }
+
     // table:
     // - https://marcin.juszkiewicz.com.pl/download/tables/syscalls.html
     // - https://github.com/qilingframework/qiling/blob/master/qiling/os/linux/map_syscall.py

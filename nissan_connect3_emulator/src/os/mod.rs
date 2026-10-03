@@ -1,3 +1,4 @@
+pub mod code_stub;
 pub mod dev;
 pub mod file_system;
 pub(crate) mod syscalls;
@@ -8,36 +9,6 @@ pub use crate::libs::libosal_linux::libosal_add_code_hooks;
 pub use syscalls::hook_syscall::hook_syscall;
 pub use syscalls::sys_calls_state::SysCallsState;
 use unicorn_engine::Unicorn;
-
-macro_rules! add_code_hook {
-    ($unicorn:ident, $lib:literal, $address:expr, $func:ident) => {
-        $unicorn
-            .add_code_hook($address as u64, $address as u64, |uc, _addr, _| {
-                log::trace!(
-                    "{:#x}: [{}] [{} HOOK] {}() [IN]",
-                    uc.reg_read(RegisterARM::PC).unwrap(),
-                    uc.get_data().inner.thread_id(),
-                    $lib,
-                    stringify!($func)
-                );
-                let res = $func(uc);
-                log::trace!(
-                    "{:#x}: [{}] [{} HOOK] {}() => {}",
-                    uc.reg_read(RegisterARM::PC).unwrap(),
-                    uc.get_data().inner.thread_id(),
-                    $lib,
-                    stringify!($func),
-                    res
-                );
-                uc.reg_write(RegisterARM::R0, res as u64).unwrap();
-                uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
-                    .unwrap();
-            })
-            .unwrap();
-    };
-}
-
-pub(crate) use add_code_hook;
 
 pub fn add_library_hook(unicorn: &mut Unicorn<'_, Context>, library: &str, base_address: u32) {
     match library {

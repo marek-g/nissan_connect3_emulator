@@ -1,10 +1,11 @@
 use crate::emulator::mmu::Mmu;
 use crate::emulator::thread::{GuestThread, ThreadAction};
+use crate::os::code_stub::CodeStub;
 use crate::os::file_system::MountFileSystem;
 use crate::os::syscalls::namespace::SystemNamespace;
 use crate::os::SysCallsState;
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
 
@@ -41,6 +42,10 @@ pub struct ContextInner {
 
     pub instruction_tracing: Arc<AtomicBool>,
     pub hooked_libraries: Arc<Mutex<HashSet<String>>>,
+    /// guest functions replaced with a `svc #0` trap, keyed by entry address.
+    /// Built at library load and read from the intr hook. ContextInner lives behind
+    /// an Arc, so the table uses interior mutability to be updated through a shared ref.
+    pub code_stubs: Mutex<HashMap<u32, CodeStub>>,
 
     // scheduler-owned state - accessed only from the single scheduler host thread,
     // so plain Cell is used instead of atomics/mutexes
@@ -69,6 +74,7 @@ impl ContextInner {
             next_thread_id,
             instruction_tracing: Arc::new(AtomicBool::new(false)),
             hooked_libraries: Arc::new(Mutex::new(HashSet::new())),
+            code_stubs: Mutex::new(HashMap::new()),
             current_thread_id: Cell::new(0),
             action: Cell::new(ThreadAction::None),
             process_exit_code: Cell::new(None),
