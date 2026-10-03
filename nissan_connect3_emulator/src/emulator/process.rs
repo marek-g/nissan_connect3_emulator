@@ -12,12 +12,15 @@ use std::sync::{Arc, Mutex};
 use unicorn_engine::unicorn_const::{Arch, Mode};
 use unicorn_engine::Unicorn;
 
+/// A guest process: the state shared with the other processes (the file system
+/// and the "kernel" namespace) plus the id counter. The process' *private* state
+/// (its address space, syscall state and guest-thread list) is created lazily in
+/// [`Process::setup`], which runs on that process' own host thread - the
+/// guest-thread list holds raw Unicorn CPU contexts that are not `Send`, so it
+/// must never be built on, or moved from, another thread.
 pub struct Process {
-    mmu: Arc<Mutex<Mmu>>,
     file_system: Arc<Mutex<MountFileSystem>>,
-    sys_calls_state: Arc<Mutex<SysCallsState>>,
     namespace: Arc<Mutex<SystemNamespace>>,
-    threads: Arc<Mutex<Vec<crate::emulator::thread::GuestThread>>>,
     next_thread_id: Arc<AtomicU32>,
 }
 
@@ -28,21 +31,18 @@ impl Process {
         // shared across every process so guest thread ids are globally unique
         next_thread_id: Arc<AtomicU32>,
     ) -> Self {
-        let mmu = Arc::new(Mutex::new(Mmu::new()));
-        let sys_calls_state = Arc::new(Mutex::new(SysCallsState::new()));
         Self {
-            mmu,
             file_system,
-            sys_calls_state,
             namespace,
-            threads: Arc::new(Mutex::new(Vec::new())),
             next_thread_id,
         }
     }
 
-    /// Create this process' VM (it owns its Context and, through it, clones of
-    /// the shared mmu/threads/namespace), load the ELF into it and register the
-    /// main thread. The returned Unicorn is self-contained and ready to schedule.
+    /// Create this process' VM (its own address space and Context, sharing the
+    /// file system and namespace), load the ELF into it and register the main
+    /// guest thread. Must run on the host thread that will run the process: it
+    /// builds the `Unicorn` and the guest-thread list here so that the non-`Send`
+    /// CPU contexts never cross a thread boundary.
     pub fn setup(
         &self,
         elf_filepath: &str,
@@ -51,11 +51,11 @@ impl Process {
     ) -> Result<Unicorn<'static, Context>, Box<dyn Error + Send + Sync + 'static>> {
         let context = Context {
             inner: Arc::new(ContextInner::new(
-                self.mmu.clone(),
+                Arc::new(Mutex::new(Mmu::new())),
                 self.file_system.clone(),
-                self.sys_calls_state.clone(),
+                Arc::new(Mutex::new(SysCallsState::new())),
                 self.namespace.clone(),
-                self.threads.clone(),
+                Arc::new(Mutex::new(Vec::new())),
                 self.next_thread_id.clone(),
             )),
         };

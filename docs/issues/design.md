@@ -20,11 +20,13 @@ Structural problems: inconsistent abstractions, duplication, hardcoded data, bui
 - **Problem:** Near-identical delegation shims over `TmpFileSystem`; the trace-log + lock + unwrap boilerplate is copy-pasted into every syscall function across `os/syscalls/`.
 - **Fix:** extract a common delegating base/helper; centralize the log+lock+unwrap wrapper.
 
-## Misleading Result / by-value parameters in the public API
+## Parallel-process model: one host thread + one Unicorn VM per process
 
-- **Locations:** `nissan_connect3_emulator/src/emulator/emulator.rs:12, 20`
-- **Problem:** `Emulator::new` returns `Result<_, uc_error>` but never produces an error (no Unicorn created there); `run_process` takes `elf_filepath: String` by value.
-- **Fix:** drop the misleading `Result`; take `&str`.
+The threading architecture is documented in [`docs/threading.md`](../threading.md).
+Its load-bearing invariants (a saved `Unicorn::Context` is per-VM and never
+crosses a thread; guest memory is private, so cross-process IPC completion runs
+in the waiter's own VM) are enforced by the code in `emulator/` - the main trap
+to avoid is reintroducing any direct read/write of another process' guest memory.
 
 ## Interpreter and non-PIE executables can overlap at address 0
 

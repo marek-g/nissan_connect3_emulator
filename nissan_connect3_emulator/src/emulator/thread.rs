@@ -2,10 +2,56 @@ use crate::emulator::context::{Context, PendingFault};
 use crate::emulator::memory_map::{GET_TLS_ADDR, MQ_NOTIFY_EXIT_STUB};
 use crate::emulator::print::{disasm, print_mmu, print_stack};
 use crate::emulator::utils::pack_u32;
-use std::time::Instant;
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 use unicorn_engine::unicorn_const::{MemType, Prot};
 use unicorn_engine::{RegisterARM, Unicorn};
 use unicorn_engine::Context as CpuContext;
+
+/// A doorbell used to park a guest process' host thread while none of its guest
+/// threads can run, and to wake it as soon as some other host thread opens a
+/// resource it might be waiting on (an IPC object, shared memory, ...).
+///
+/// It is deliberately stateless and `Sync` so it can be shared across host
+/// threads: the only thing two host threads ever exchange to coordinate a
+/// wakeup is "something may have changed, re-check". Each process' guest-thread
+/// list, saved CPU contexts and VM stay private to its own host thread.
+///
+/// The `bool` flag closes the lost-wakeup race: a waker sets the flag (under the
+/// same mutex the waiter holds while deciding to park) before signalling, so a
+/// wake that lands just before parking is not lost. Every wait is additionally
+/// bounded by a short timeout, so even a missed wake only delays progress by one
+/// poll tick rather than hanging.
+pub struct Wake {
+    ready: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Wake {
+    pub fn new() -> Self {
+        Self {
+            ready: Mutex::new(false),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Signal a possible state change; wakes a parked host thread.
+    pub fn notify(&self) {
+        *self.ready.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+
+    /// Park for at most `timeout`, returning early if `notify` fired in the
+    /// meantime (or a stale wake is pending).
+    pub fn wait_timeout(&self, timeout: Duration) {
+        let mut ready = self.ready.lock().unwrap();
+        if !*ready {
+            let (guard, _timed_out) = self.cv.wait_timeout(ready, timeout).unwrap();
+            ready = guard;
+        }
+        *ready = false;
+    }
+}
 
 /// Why a guest thread is blocked (waiting to be woken by the scheduler).
 #[derive(Clone, Copy, PartialEq, Debug)]

@@ -268,30 +268,23 @@ fn create_event(unicorn: &mut Unicorn<'_, Context>) -> u32 {
 }
 
 /// iosc_set_event(event_id, value): arg struct `{ event_id, value }`. A
-/// non-zero value sets the event and wakes one waiter.
+/// non-zero value sets the event; waiters are woken to consume it in their own
+/// VM (see finish_iosc_wait).
 fn set_event(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     let event_id = read_u32(unicorn, addr);
     let value = read_u32(unicorn, addr + 4);
     let result_ptr = read_u32(unicorn, addr + 8);
 
-    let woken_tid = {
+    {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
         match state.iosc.events.get_mut(&event_id) {
             Some(event) => {
                 event.value = value;
-                if value != 0 {
-                    event.waiters.pop()
-                } else {
-                    None
-                }
             }
             None => return EINVAL,
         }
-    };
-
-    if let Some(tid) = woken_tid {
-        set_runnable_with_result(unicorn, tid, 0);
     }
+    notify_waiters(unicorn);
     // libiosclib's iosc_set_event wrapper reads the outcome back from *result_ptr
     // (arg offset 8) and feeds it to u32MapErrorCodeIOSC; write success there.
     write_result(unicorn, result_ptr, 0);
@@ -408,24 +401,13 @@ fn enter_mutex(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
 fn leave_mutex(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     let mutex_id = read_u32(unicorn, addr);
     let result_ptr = read_u32(unicorn, addr + 4);
-    let woken_tid = {
+    {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
         if let Some(m) = state.iosc.mutexes.get_mut(&mutex_id) {
             m.locked = false;
-            match m.waiters.pop() {
-                Some(tid) => {
-                    m.locked = true; // hand the lock to the woken thread
-                    Some(tid)
-                }
-                None => None,
-            }
-        } else {
-            None
         }
-    };
-    if let Some(tid) = woken_tid {
-        set_runnable_with_result(unicorn, tid, 0);
     }
+    notify_waiters(unicorn);
     write_result(unicorn, result_ptr, 0);
     0
 }
@@ -508,28 +490,27 @@ fn release_semaphore(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     let value = read_i32(unicorn, addr + 4).max(0) as u32;
     let result_ptr = read_u32(unicorn, addr + 8);
 
-    let woken_tid = {
+    {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
         match state.iosc.semaphores.get_mut(&sem_id) {
             Some(sem) => {
                 sem.count += value;
-                if sem.count > 0 {
-                    sem.waiters.pop()
-                } else {
-                    None
-                }
             }
             None => return EINVAL,
         }
-    };
-    if let Some(tid) = woken_tid {
-        set_runnable_with_result(unicorn, tid, 0);
     }
+    notify_waiters(unicorn);
     write_result(unicorn, result_ptr, 0);
     0
 }
 
 // ---- blocking completion (scheduler / timeout path) -----------------------
+
+/// ring every process' doorbell so parked host threads re-check the IOSC
+/// objects they may be blocked on. Called after releasing an object.
+fn notify_waiters(unicorn: &Unicorn<'_, Context>) {
+    unicorn.get_data().namespace.lock().unwrap().notify_waiters();
+}
 
 /// mark a blocked thread runnable and install its syscall result in R0 on the
 /// next switch-in (mirrors mqueue::set_runnable_with_result)
@@ -543,11 +524,12 @@ fn set_runnable_with_result(unicorn: &Unicorn<'_, Context>, tid: u32, result: u3
     }
 }
 
-/// resolve a timed-out (or otherwise expired) blocked IOSC wait, re-checking the
-/// object state and installing the syscall result. Called by the scheduler from
-/// wake_expired once the thread's deadline passes. Each arm removes `tid` from
-/// the waiter list and re-attempts the operation atomically.
-pub fn finish_iosc_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32) {
+/// Re-evaluate a guest thread blocked in an IOSC wait, called from the owning
+/// process' host thread. The object is grabbed atomically under the namespace
+/// lock, so when several processes wake on the same object exactly one wins.
+/// The thread is completed if the object is now available, failed with
+/// -ETIMEDOUT if its deadline passed, or left blocked otherwise.
+pub fn finish_iosc_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, now: Instant) {
     let reason = {
         let threads = unicorn.get_data().threads.lock().unwrap();
         threads.iter().find(|t| t.id == tid).and_then(|t| match t.status {
@@ -556,75 +538,65 @@ pub fn finish_iosc_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32) {
         })
     };
 
-    let res: u32 = match reason {
-        Some(BlockReason::IoscMutex { id, .. }) => {
-            let granted = {
-                let mut state = unicorn.get_data().namespace.lock().unwrap();
-                match state.iosc.mutexes.get_mut(&id) {
-                    Some(m) => {
+    let result: Option<u32> = match reason {
+        Some(BlockReason::IoscMutex { id, deadline }) => {
+            let mut state = unicorn.get_data().namespace.lock().unwrap();
+            match state.iosc.mutexes.get_mut(&id) {
+                Some(m) => {
+                    if !m.locked {
+                        m.locked = true;
                         m.waiters.retain(|&w| w != tid);
-                        if !m.locked {
-                            m.locked = true;
-                            true
-                        } else {
-                            false
-                        }
+                        Some(0)
+                    } else if deadline.map(|d| d <= now).unwrap_or(false) {
+                        m.waiters.retain(|&w| w != tid);
+                        Some(ETIMEDOUT)
+                    } else {
+                        None
                     }
-                    None => false,
                 }
-            };
-            if granted {
-                0
-            } else {
-                ETIMEDOUT
+                None => Some(ETIMEDOUT),
             }
         }
-        Some(BlockReason::IoscEvent { id, .. }) => {
-            let fired = {
-                let mut state = unicorn.get_data().namespace.lock().unwrap();
-                match state.iosc.events.get_mut(&id) {
-                    Some(e) => {
+        Some(BlockReason::IoscEvent { id, deadline }) => {
+            let mut state = unicorn.get_data().namespace.lock().unwrap();
+            match state.iosc.events.get_mut(&id) {
+                Some(e) => {
+                    if e.value != 0 {
+                        e.value = 0;
                         e.waiters.retain(|&w| w != tid);
-                        if e.value != 0 {
-                            e.value = 0;
-                            true
-                        } else {
-                            false
-                        }
+                        Some(0)
+                    } else if deadline.map(|d| d <= now).unwrap_or(false) {
+                        e.waiters.retain(|&w| w != tid);
+                        Some(ETIMEDOUT)
+                    } else {
+                        None
                     }
-                    None => false,
                 }
-            };
-            if fired {
-                0
-            } else {
-                ETIMEDOUT
+                None => Some(ETIMEDOUT),
             }
         }
-        Some(BlockReason::IoscSemaphore { id, .. }) => {
-            let granted = {
-                let mut state = unicorn.get_data().namespace.lock().unwrap();
-                match state.iosc.semaphores.get_mut(&id) {
-                    Some(s) => {
+        Some(BlockReason::IoscSemaphore { id, deadline }) => {
+            let mut state = unicorn.get_data().namespace.lock().unwrap();
+            match state.iosc.semaphores.get_mut(&id) {
+                Some(s) => {
+                    if s.count > 0 {
+                        s.count -= 1;
                         s.waiters.retain(|&w| w != tid);
-                        if s.count > 0 {
-                            s.count -= 1;
-                            true
-                        } else {
-                            false
-                        }
+                        Some(0)
+                    } else if deadline.map(|d| d <= now).unwrap_or(false) {
+                        s.waiters.retain(|&w| w != tid);
+                        Some(ETIMEDOUT)
+                    } else {
+                        None
                     }
-                    None => false,
                 }
-            };
-            if granted {
-                0
-            } else {
-                ETIMEDOUT
+                None => Some(ETIMEDOUT),
             }
         }
         _ => return, // not an IOSC wait - nothing to do
     };
 
-    set_runnable_with_result(unicorn, tid, res);
+    if let Some(res) = result {
+        set_runnable_with_result(unicorn, tid, res);
+    }
 }

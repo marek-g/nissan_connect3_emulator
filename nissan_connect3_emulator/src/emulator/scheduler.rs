@@ -1,7 +1,7 @@
 use crate::emulator::context::Context;
 use crate::emulator::elf_loader::load_elf;
 use crate::emulator::thread::{
-    dump_context, enable_vfp, set_kernel_traps, BlockReason, GuestThread, ThreadStatus,
+    dump_context, enable_vfp, set_kernel_traps, BlockReason, GuestThread, ThreadStatus, Wake,
 };
 use crate::emulator::utils::load_binary;
 use std::error::Error;
@@ -14,11 +14,14 @@ fn map_uc_error(error: uc_error) -> Box<dyn Error + Send + Sync + 'static> {
     format!("Unicorn error: {:?}", error).into()
 }
 
-/// instructions to run per timeslice when multiple guest threads are runnable
+/// instructions to run per guest thread when more than one is runnable in a
+/// process, so a busy thread cannot starve its siblings on the same host thread
 const TIMESLICE_INSTRUCTIONS: usize = 10_000;
 
-/// host sleep tick when all guest threads are blocked without a deadline
-const IDLE_TICK: Duration = Duration::from_millis(500);
+/// upper bound on how long a host thread parks before re-checking the shared
+/// IPC objects. Cross-process wakeups are also pushed via doorbells, so this is
+/// only a safety net that bounds the latency of any missed wake.
+const POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// Load an ELF into a fresh VM and register its main guest thread. Called once
 /// per process before the cooperative scheduling loop begins. The returned
@@ -173,111 +176,155 @@ fn process_is_done(unicorn: &Unicorn<'_, Context>) -> bool {
     unicorn.get_data().process_exit_code().is_some() || all_exited(unicorn)
 }
 
-/// Cooperatively schedule the guest threads of every process on their own VMs,
-/// round-robin across processes. Runs until every process has exited.
-pub fn run_all(
-    mut unicorns: Vec<Unicorn<'_, Context>>,
+/// Run one guest process on the calling (host) thread until it exits. This is
+/// the per-process entry point for the parallel model: every process has its own
+/// host thread and its own VM, so guest threads of *different* processes run
+/// truly in parallel, while the guest threads *within* a process still
+/// cooperate round-robin on this one host thread. `wake` is this process'
+/// doorbell - parked on when nothing can run, rung by peers on IPC activity.
+pub fn run_process_loop(
+    unicorn: &mut Unicorn<'_, Context>,
+    wake: &Wake,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    // bound each quantum only when more than one process is active, so a busy
-    // process cannot starve the others; a lone process runs until it blocks.
-    let timeslice = if unicorns.len() > 1 { TIMESLICE_INSTRUCTIONS } else { 0 };
-
     loop {
-        let mut any_runnable = false;
-        for unicorn in unicorns.iter_mut() {
-            wake_expired(unicorn);
-            if process_is_done(unicorn) {
-                continue;
-            }
-            if run_quantum(unicorn, timeslice)? {
-                any_runnable = true;
-            }
+        // re-evaluate blocked guest threads: complete the ones whose IPC object is
+        // now ready or whose deadline passed (memory work happens here, in this
+        // process' own VM, so cross-process delivery never touches foreign memory)
+        advance_blocked(unicorn);
+
+        if process_is_done(unicorn) {
+            break;
         }
 
-        if !any_runnable {
-            if unicorns.iter().all(process_is_done) {
-                break;
-            }
-            sleep_until_next_wakeup(&unicorns);
+        // give each runnable guest thread a slice only when there is contention,
+        // so a lone thread runs until it blocks/exits instead of being preempted
+        let timeslice = if count_runnable(unicorn) > 1 {
+            TIMESLICE_INSTRUCTIONS
+        } else {
+            0
+        };
+
+        if run_quantum(unicorn, timeslice)? {
+            continue;
         }
+
+        // nothing runnable: park until a peer rings our doorbell, the nearest
+        // blocked-thread deadline elapses, or the poll tick fires
+        wake.wait_timeout(park_duration(unicorn));
     }
 
-    log::info!("========== Program done ==========");
+    log::info!("========== Process done ==========");
     Ok(())
 }
 
-/// wake blocked threads whose deadline has passed
-fn wake_expired(unicorn: &mut Unicorn<'_, Context>) {
+/// wake blocked threads whose deadline has passed and re-check the ones waiting
+/// on shared IPC objects. Called from the process' own host thread with the VM
+/// stopped, so the completion memory reads/writes target this process' memory.
+fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
     let now = Instant::now();
-    let data = unicorn.get_data();
 
-    let mut expired_futex_waiters: Vec<(u32, u32)> = Vec::new(); // (addr, tid)
-    let mut expired_mq_waiters: Vec<u32> = Vec::new(); // tids
-    let mut expired_iosc_waiters: Vec<u32> = Vec::new(); // tids
-    {
-        let mut threads = data.threads.lock().unwrap();
-        for thread in threads.iter_mut() {
-            if let ThreadStatus::Blocked(reason) = &thread.status {
-                let (expired, is_mq_wait, is_iosc_wait) = match reason {
-                    BlockReason::FutexWait { deadline, .. } => (
-                        deadline.map(|d| d <= now).unwrap_or(false),
-                        false,
-                        false,
-                    ),
-                    BlockReason::SleepUntil(until) => (*until <= now, false, false),
-                    BlockReason::MqSend { deadline, .. }
-                    | BlockReason::MqReceive { deadline, .. } => (
-                        deadline.map(|d| d <= now).unwrap_or(false),
-                        true,
-                        false,
-                    ),
-                    BlockReason::IoscMutex { deadline, .. }
-                    | BlockReason::IoscEvent { deadline, .. }
-                    | BlockReason::IoscSemaphore { deadline, .. } => (
-                        deadline.map(|d| d <= now).unwrap_or(false),
-                        false,
-                        true,
-                    ),
-                };
-                if expired {
-                    if is_mq_wait {
-                        // completed (re-checked against the queue) by
-                        // finish_mq_wait below, which also marks it runnable
-                        expired_mq_waiters.push(thread.id);
-                    } else if is_iosc_wait {
-                        // re-checked against the object state by
-                        // finish_iosc_wait below, which also marks it runnable
-                        expired_iosc_waiters.push(thread.id);
-                    } else {
-                        if let ThreadStatus::Blocked(BlockReason::FutexWait { addr, .. }) =
-                            &thread.status
-                        {
-                            expired_futex_waiters.push((*addr, thread.id));
-                        }
-                        thread.status = ThreadStatus::Runnable;
-                    }
+    // take the Arcs we need and release the borrow on `unicorn`, so the
+    // completion helpers (which need &mut Unicorn) can run
+    let (threads, sys_calls_state) = {
+        let data = unicorn.get_data();
+        (data.threads.clone(), data.sys_calls_state.clone())
+    };
+
+    // collect the blocked threads first (finish_* re-locks the thread list)
+    let blocked: Vec<(u32, BlockReason)> = threads
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|t| match t.status {
+            ThreadStatus::Blocked(reason) => Some((t.id, reason)),
+            _ => None,
+        })
+        .collect();
+
+    let mut expired_futex: Vec<(u32, u32)> = Vec::new(); // (addr, tid)
+
+    for (tid, reason) in blocked {
+        match reason {
+            BlockReason::SleepUntil(until) => {
+                if until <= now {
+                    set_runnable(unicorn, tid, None);
                 }
+            }
+            BlockReason::FutexWait { addr, deadline } => {
+                if deadline.map(|d| d <= now).unwrap_or(false) {
+                    expired_futex.push((addr, tid));
+                    set_runnable(unicorn, tid, None);
+                }
+            }
+            BlockReason::MqSend { .. } | BlockReason::MqReceive { .. } => {
+                // completes if the queue allows it, else times out if the deadline
+                // passed, else leaves the thread blocked (deadline-aware internally)
+                crate::os::syscalls::mqueue::finish_mq_wait(unicorn, tid, now);
+            }
+            BlockReason::IoscMutex { .. }
+            | BlockReason::IoscEvent { .. }
+            | BlockReason::IoscSemaphore { .. } => {
+                crate::os::dev::iosc::finish_iosc_wait(unicorn, tid, now);
             }
         }
     }
 
-    if !expired_futex_waiters.is_empty() {
-        let mut state = data.sys_calls_state.lock().unwrap();
-        for (addr, tid) in expired_futex_waiters {
+    if !expired_futex.is_empty() {
+        let mut state = sys_calls_state.lock().unwrap();
+        for (addr, tid) in expired_futex {
             if let Some(list) = state.futex_waiters.get_mut(&addr) {
                 list.retain(|&waiter| waiter != tid);
             }
         }
     }
+}
 
-    // re-check each timed-out wait against the object state and install the
-    // syscall result (must not run while any of our locks are held)
-    for tid in expired_mq_waiters {
-        crate::os::syscalls::mqueue::finish_mq_wait(unicorn, tid);
+fn set_runnable(unicorn: &mut Unicorn<'_, Context>, tid: u32, result: Option<u32>) {
+    let mut threads = unicorn.get_data().threads.lock().unwrap();
+    if let Some(thread) = threads.iter_mut().find(|t| t.id == tid) {
+        if matches!(thread.status, ThreadStatus::Blocked(_)) {
+            thread.status = ThreadStatus::Runnable;
+            thread.pending_result = result;
+        }
     }
-    for tid in expired_iosc_waiters {
-        crate::os::dev::iosc::finish_iosc_wait(unicorn, tid);
+}
+
+/// how long to park: the nearest blocked-thread deadline (clamped to
+/// `POLL_INTERVAL` so a missed cross-process wake costs at most one tick)
+fn park_duration(unicorn: &Unicorn<'_, Context>) -> Duration {
+    let now = Instant::now();
+    let data = unicorn.get_data();
+    let threads = data.threads.lock().unwrap();
+
+    let next = threads.iter().find_map(|t| match &t.status {
+        ThreadStatus::Blocked(BlockReason::FutexWait { deadline, .. }) => *deadline,
+        ThreadStatus::Blocked(BlockReason::SleepUntil(until)) => Some(*until),
+        ThreadStatus::Blocked(BlockReason::MqSend { deadline, .. } | BlockReason::MqReceive { deadline, .. }) => {
+            *deadline
+        }
+        ThreadStatus::Blocked(
+            BlockReason::IoscMutex { deadline, .. }
+            | BlockReason::IoscEvent { deadline, .. }
+            | BlockReason::IoscSemaphore { deadline, .. },
+        ) => *deadline,
+        _ => None,
+    });
+
+    match next {
+        Some(deadline) if deadline > now => deadline.duration_since(now).min(POLL_INTERVAL),
+        Some(_) => Duration::ZERO,
+        None => POLL_INTERVAL,
     }
+}
+
+/// number of guest threads in this process that can run right now
+fn count_runnable(unicorn: &Unicorn<'_, Context>) -> usize {
+    let data = unicorn.get_data();
+    let threads = data.threads.lock().unwrap();
+    threads
+        .iter()
+        .filter(|t| t.status == ThreadStatus::Runnable)
+        .count()
 }
 
 /// round-robin pick of the next runnable thread
@@ -310,41 +357,4 @@ fn all_exited(unicorn: &Unicorn<'_, Context>) -> bool {
     let data = unicorn.get_data();
     let threads = data.threads.lock().unwrap();
     !threads.is_empty() && threads.iter().all(|t| matches!(t.status, ThreadStatus::Exited(_)))
-}
-
-/// sleep the host until the nearest blocked-thread deadline across all
-/// processes (or a short tick if none is pending)
-fn sleep_until_next_wakeup(unicorns: &[Unicorn<'_, Context>]) {
-    let now = Instant::now();
-    let mut next_deadline = None;
-    for unicorn in unicorns {
-        let data = unicorn.get_data();
-        let threads = data.threads.lock().unwrap();
-        let d = threads.iter().find_map(|t| match &t.status {
-            ThreadStatus::Blocked(BlockReason::FutexWait { deadline, .. }) => *deadline,
-            ThreadStatus::Blocked(BlockReason::SleepUntil(until)) => Some(*until),
-            ThreadStatus::Blocked(
-                BlockReason::MqSend { deadline, .. } | BlockReason::MqReceive { deadline, .. },
-            ) => *deadline,
-            ThreadStatus::Blocked(
-                BlockReason::IoscMutex { deadline, .. }
-                | BlockReason::IoscEvent { deadline, .. }
-                | BlockReason::IoscSemaphore { deadline, .. },
-            ) => *deadline,
-            _ => None,
-        });
-        drop(threads);
-
-        next_deadline = match (next_deadline, d) {
-            (Some(a), Some(b)) if b < a => Some(b),
-            (Some(a), _) => Some(a),
-            (None, b) => b,
-        };
-    }
-
-    let duration = match next_deadline {
-        Some(deadline) if deadline > now => deadline.duration_since(now),
-        _ => IDLE_TICK,
-    };
-    std::thread::sleep(duration);
 }

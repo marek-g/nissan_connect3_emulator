@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         //("LD_DEBUG".to_string(), "files".to_string()),
     ];
 
-    let emulator = Emulator::new(file_system).unwrap();
+    let emulator = Emulator::new(file_system);
 
     /*emulator.run_process(
         "/bin/echo.coreutils".to_string(),

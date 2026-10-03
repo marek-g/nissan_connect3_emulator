@@ -7,6 +7,7 @@
 //! a waiter routes through the process that owns it (see the scheduler / wake
 //! machinery). Named shared memory and named semaphores will be added here too.
 
+use crate::emulator::thread::Wake;
 use crate::os::dev::iosc::IoscState;
 use crate::os::syscalls::mqueue::MqState;
 use std::collections::HashMap;
@@ -20,6 +21,13 @@ pub struct SystemNamespace {
     /// Named shared memory (`/dev/shm/*`): host-backed buffers shared by every
     /// process so that `mmap(MAP_SHARED)` of the same file maps the same bytes.
     pub shm: ShmState,
+    /// One doorbell per running guest process. Each process runs on its own host
+    /// thread and parks on its doorbell when none of its guest threads can run;
+    /// a host thread that opens a resource (mq message, iosc mutex/event/
+    /// semaphore) rings every doorbell so each parked process re-checks the
+    /// objects it is blocked on. This is the only cross-thread coordination
+    /// needed - guest state stays private to each process' host thread.
+    pub wakes: Vec<Arc<Wake>>,
 }
 
 impl SystemNamespace {
@@ -28,6 +36,27 @@ impl SystemNamespace {
             iosc: IoscState::new(),
             mq: MqState::new(),
             shm: ShmState::new(),
+            wakes: Vec::new(),
+        }
+    }
+
+    /// Register a process' doorbell so other host threads can wake it.
+    pub fn register_process(&mut self, wake: &Arc<Wake>) {
+        self.wakes.push(wake.clone());
+    }
+
+    /// Remove a process' doorbell once its host thread is finished.
+    pub fn unregister_process(&mut self, wake: &Arc<Wake>) {
+        self.wakes.retain(|w| !Arc::ptr_eq(w, wake));
+    }
+
+    /// Ring every process' doorbell (call after mutating a shared IPC object).
+    /// Must be called with the namespace lock held or released - it only takes
+    /// each doorbell's own (independent) lock, so it never deadlocks against a
+    /// caller that still holds the namespace lock.
+    pub fn notify_waiters(&self) {
+        for wake in &self.wakes {
+            wake.notify();
         }
     }
 }

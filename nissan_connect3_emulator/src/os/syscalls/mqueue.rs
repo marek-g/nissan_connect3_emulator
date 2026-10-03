@@ -88,6 +88,12 @@ pub struct MqState {
     /// queue id -> blocked guest tids (senders and receivers share the list,
     /// distinguished by their BlockReason)
     pub waiters: HashMap<u32, Vec<u32>>,
+    /// bytes staged by a blocked sender, keyed by tid: `(queue_id, data, priority)`.
+    /// The sender copies its message out of its own (private) address space when
+    /// it blocks; whichever host thread later frees a slot moves these staged
+    /// bytes into the queue, so a sender in one VM never needs its memory read by
+    /// another process' VM.
+    pub staged: HashMap<u32, (u32, Vec<u8>, u32)>,
     next_id: u32,
 }
 
@@ -103,6 +109,7 @@ impl MqState {
             queues: HashMap::new(),
             name_to_id: HashMap::new(),
             waiters: HashMap::new(),
+            staged: HashMap::new(),
             next_id: MQ_HANDLE_BASE,
         }
     }
@@ -259,53 +266,10 @@ pub fn mq_open(
     res
 }
 
-/// find a guest thread blocked in mq_receive on `queue_id`
-fn find_blocked_receiver(unicorn: &Unicorn<'_, Context>, queue_id: u32) -> Option<(u32, u32, u32)> {
-    let threads = unicorn.get_data().threads.lock().unwrap();
-    threads.iter().find_map(|t| {
-        if let ThreadStatus::Blocked(BlockReason::MqReceive {
-            queue_id: qid,
-            msg_ptr,
-            prio_ptr,
-            ..
-        }) = t.status
-        {
-            if qid == queue_id {
-                return Some((t.id, msg_ptr, prio_ptr));
-            }
-        }
-        None
-    })
-}
-
-/// find a guest thread blocked in mq_timedsend on `queue_id`
-fn find_blocked_sender(unicorn: &Unicorn<'_, Context>, queue_id: u32) -> Option<(u32, u32, u32, u32)> {
-    let threads = unicorn.get_data().threads.lock().unwrap();
-    threads.iter().find_map(|t| {
-        if let ThreadStatus::Blocked(BlockReason::MqSend {
-            queue_id: qid,
-            msg_ptr,
-            msg_len,
-            priority,
-            ..
-        }) = t.status
-        {
-            if qid == queue_id {
-                return Some((t.id, msg_ptr, msg_len, priority));
-            }
-        }
-        None
-    })
-}
-
-fn remove_waiter(unicorn: &Unicorn<'_, Context>, queue_id: u32, tid: u32) {
-    let mut state = unicorn.get_data().namespace.lock().unwrap();
-    if let Some(list) = state.mq.waiters.get_mut(&queue_id) {
-        list.retain(|&waiter| waiter != tid);
-        if list.is_empty() {
-            state.mq.waiters.remove(&queue_id);
-        }
-    }
+/// ring every process' doorbell so any host thread parked on an mq wait
+/// re-checks its queue in its own VM (where its message buffers live).
+fn notify_waiters(unicorn: &Unicorn<'_, Context>) {
+    unicorn.get_data().namespace.lock().unwrap().notify_waiters();
 }
 
 fn set_runnable_with_result(unicorn: &Unicorn<'_, Context>, tid: u32, result: u32) {
@@ -342,14 +306,6 @@ fn insert_message_and_take_notify(
         }
     }
     None
-}
-
-fn has_free_slot(unicorn: &Unicorn<'_, Context>, queue_id: u32) -> bool {
-    let state = unicorn.get_data().namespace.lock().unwrap();
-    match state.mq.queues.get(&queue_id) {
-        Some(queue) => queue.messages.len() < queue.maxmsg as usize,
-        None => false,
-    }
 }
 
 /// deliver a registered notification (called with no locks held)
@@ -420,53 +376,6 @@ fn spawn_notify_thread(unicorn: &mut Unicorn<'_, Context>, function: u32, sigval
     );
 }
 
-/// hand the sender's message directly to a blocked receiver (kernel:
-/// pipelined_send) - returns true if a receiver was completed
-fn complete_blocked_receiver(
-    unicorn: &mut Unicorn<'_, Context>,
-    queue_id: u32,
-    msg_ptr: u32,
-    msg_len: u32,
-    priority: u32,
-) -> bool {
-    let Some((tid, dst_ptr, prio_ptr)) = find_blocked_receiver(unicorn, queue_id) else {
-        return false;
-    };
-
-    remove_waiter(unicorn, queue_id, tid);
-
-    let mut buf = vec![0u8; msg_len as usize];
-    unicorn.mem_read(msg_ptr as u64, &mut buf).unwrap();
-    unicorn.mem_write(dst_ptr as u64, &buf).unwrap();
-    if prio_ptr != 0 {
-        unicorn.mem_write(prio_ptr as u64, &pack_u32(priority)).unwrap();
-    }
-    set_runnable_with_result(unicorn, tid, buf.len() as u32);
-    true
-}
-
-/// give a freed slot to a blocked sender (kernel: pipelined_receive - the
-/// sender's message is re-read from its still-valid buffer and inserted)
-fn complete_blocked_sender(unicorn: &mut Unicorn<'_, Context>, queue_id: u32) {
-    let Some((tid, msg_ptr, msg_len, priority)) = find_blocked_sender(unicorn, queue_id) else {
-        return;
-    };
-
-    remove_waiter(unicorn, queue_id, tid);
-
-    let mut buf = vec![0u8; msg_len as usize];
-    unicorn.mem_read(msg_ptr as u64, &mut buf).unwrap();
-    // no notification here - the kernel's pipelined_receive does not call
-    // __do_notify
-    {
-        let mut state = unicorn.get_data().namespace.lock().unwrap();
-        if let Some(queue) = state.mq.queues.get_mut(&queue_id) {
-            insert_message(&mut queue.messages, buf, priority);
-        }
-    }
-    set_runnable_with_result(unicorn, tid, 0);
-}
-
 /// mq_timedsend(mqdes, msg_ptr, msg_len, msg_prio, abs_timeout) -
 /// ipc/mqueue.c SYSCALL_DEFINE5(mq_timedsend). Also serves as mq_send
 /// (glibc passes a NULL timeout).
@@ -495,6 +404,12 @@ pub fn mq_timedsend(
 
     let deadline = read_deadline(unicorn, timeout_addr);
 
+    // snapshot the message from the sender's own address space now: if the queue
+    // is full it is staged in the namespace so a peer process can move it into
+    // the queue later without ever touching this process' memory
+    let mut buf = vec![0u8; msg_len as usize];
+    unicorn.mem_read(msg_ptr as u64, &mut buf).unwrap();
+
     {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
         let Some(queue) = state.mq.queues.get_mut(&mqdes) else {
@@ -514,9 +429,11 @@ pub fn mq_timedsend(
                 _ => {}
             }
 
-            // block until a receiver frees a slot (or the deadline passes)
+            // block until a receiver frees a slot (or the deadline passes); stage
+            // the message so whoever frees the slot can enqueue it for us
             let tid = unicorn.get_data().thread_id();
             state.mq.waiters.entry(mqdes).or_default().push(tid);
+            state.mq.staged.insert(tid, (mqdes, buf, msg_prio));
             drop(state);
 
             unicorn.get_data().set_action(ThreadAction::Block(BlockReason::MqSend {
@@ -533,15 +450,12 @@ pub fn mq_timedsend(
         }
     }
 
-    // there is a free slot: either hand the message straight to a waiting
-    // receiver (pipelined_send) or insert it into the queue
-    if !complete_blocked_receiver(unicorn, mqdes, msg_ptr, msg_len, msg_prio) {
-        let mut buf = vec![0u8; msg_len as usize];
-        unicorn.mem_read(msg_ptr as u64, &mut buf).unwrap();
-        if let Some(notify) = insert_message_and_take_notify(unicorn, mqdes, buf, msg_prio) {
-            fire_notification(unicorn, notify);
-        }
+    // there is a free slot: insert the message (firing a queued notification if
+    // the queue just became non-empty) and wake any receiver blocked on it
+    if let Some(notify) = insert_message_and_take_notify(unicorn, mqdes, buf, msg_prio) {
+        fire_notification(unicorn, notify);
     }
+    notify_waiters(unicorn);
 
     log::trace!(
         "{:#x}: [{}] [SYSCALL] mq_timedsend => 0",
@@ -603,8 +517,8 @@ fn do_mq_timedreceive(
         if prio_ptr != 0 {
             unicorn.mem_write(prio_ptr as u64, &pack_u32(message.priority)).unwrap();
         }
-        // there is now a free slot - a blocked sender may proceed
-        complete_blocked_sender(unicorn, mqdes);
+        // there is now a free slot - wake any blocked sender so it can enqueue
+        notify_waiters(unicorn);
 
         let res = message.data.len() as u32;
         log::trace!(
@@ -847,12 +761,14 @@ pub fn mq_notify(unicorn: &mut Unicorn<'_, Context>, mqdes: u32, notif_addr: u32
     0
 }
 
-/// re-evaluate a guest thread whose MqSend/MqReceive wait expired (called from
-/// the scheduler's wake_expired, with no locks held). Mirrors the kernel's
-/// wq_sleep timeout path: re-check the queue, then either complete the
-/// operation or return -ETIMEDOUT. The result is parked in
-/// `GuestThread::pending_result` for the next switch-in.
-pub fn finish_mq_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32) {
+/// Re-evaluate a guest thread blocked in an mq wait, called from the owning
+/// process' host thread with the VM stopped. The queue is mutated atomically
+/// under the namespace lock; any message copy into the receiver's buffer happens
+/// here, in this process' own address space (so cross-process delivery never
+/// touches foreign memory). The thread is completed if the queue allows it,
+/// failed with -ETIMEDOUT if its deadline passed, or left blocked otherwise. The
+/// result (if any) is parked in `GuestThread::pending_result`.
+pub fn finish_mq_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, now: Instant) {
     let reason = {
         let threads = unicorn.get_data().threads.lock().unwrap();
         threads.iter().find(|t| t.id == tid).and_then(|t| match t.status {
@@ -861,49 +777,96 @@ pub fn finish_mq_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32) {
         })
     };
 
-    let res: u32 = match reason {
+    match reason {
         Some(BlockReason::MqReceive {
             queue_id,
             msg_ptr,
             prio_ptr,
+            deadline,
             ..
         }) => {
-            remove_waiter(unicorn, queue_id, tid);
-            if let Some(message) = pop_message(unicorn, queue_id) {
-                unicorn.mem_write(msg_ptr as u64, &message.data).unwrap();
-                if prio_ptr != 0 {
-                    unicorn
-                        .mem_write(prio_ptr as u64, &pack_u32(message.priority))
-                        .unwrap();
+            let message = {
+                let mut state = unicorn.get_data().namespace.lock().unwrap();
+                let pop = state
+                    .mq
+                    .queues
+                    .get_mut(&queue_id)
+                    .and_then(|q| q.messages.pop());
+                match &pop {
+                    Some(_) => remove_waiter_locked(&mut state, queue_id, tid),
+                    None if deadline.map(|d| d <= now).unwrap_or(false) => {
+                        remove_waiter_locked(&mut state, queue_id, tid)
+                    }
+                    None => {}
                 }
-                complete_blocked_sender(unicorn, queue_id);
-                message.data.len() as u32
-            } else {
-                ETIMEDOUT
+                pop
+            };
+
+            match message {
+                Some(message) => {
+                    unicorn.mem_write(msg_ptr as u64, &message.data).unwrap();
+                    if prio_ptr != 0 {
+                        unicorn
+                            .mem_write(prio_ptr as u64, &pack_u32(message.priority))
+                            .unwrap();
+                    }
+                    set_runnable_with_result(unicorn, tid, message.data.len() as u32);
+                    // the freed slot may let a blocked sender proceed
+                    notify_waiters(unicorn);
+                }
+                None if deadline.map(|d| d <= now).unwrap_or(false) => {
+                    set_runnable_with_result(unicorn, tid, ETIMEDOUT)
+                }
+                None => {}
             }
         }
         Some(BlockReason::MqSend {
             queue_id,
-            msg_ptr,
-            msg_len,
-            priority,
+            deadline,
             ..
         }) => {
-            remove_waiter(unicorn, queue_id, tid);
-            if has_free_slot(unicorn, queue_id) {
-                let mut buf = vec![0u8; msg_len as usize];
-                unicorn.mem_read(msg_ptr as u64, &mut buf).unwrap();
-                let notify = insert_message_and_take_notify(unicorn, queue_id, buf, priority);
-                if let Some(notify) = notify {
-                    fire_notification(unicorn, notify);
+            let mut completed = false;
+            let mut timed_out = false;
+            {
+                let mut state = unicorn.get_data().namespace.lock().unwrap();
+                let free_slot = state
+                    .mq
+                    .queues
+                    .get(&queue_id)
+                    .map(|q| q.messages.len() < q.maxmsg as usize)
+                    .unwrap_or(false);
+                if free_slot {
+                    if let Some((_, bytes, priority)) = state.mq.staged.remove(&tid) {
+                        if let Some(q) = state.mq.queues.get_mut(&queue_id) {
+                            insert_message(&mut q.messages, bytes, priority);
+                        }
+                    }
+                    remove_waiter_locked(&mut state, queue_id, tid);
+                    completed = true;
+                } else if deadline.map(|d| d <= now).unwrap_or(false) {
+                    state.mq.staged.remove(&tid);
+                    remove_waiter_locked(&mut state, queue_id, tid);
+                    timed_out = true;
                 }
-                0
-            } else {
-                ETIMEDOUT
+            }
+
+            if completed {
+                set_runnable_with_result(unicorn, tid, 0);
+                notify_waiters(unicorn);
+            } else if timed_out {
+                set_runnable_with_result(unicorn, tid, ETIMEDOUT);
             }
         }
         _ => return, // not an mq wait - nothing to do
-    };
+    }
+}
 
-    set_runnable_with_result(unicorn, tid, res);
+/// remove `tid` from a queue's waiter list, already holding the namespace lock
+fn remove_waiter_locked(state: &mut crate::os::syscalls::namespace::SystemNamespace, queue_id: u32, tid: u32) {
+    if let Some(list) = state.mq.waiters.get_mut(&queue_id) {
+        list.retain(|&waiter| waiter != tid);
+        if list.is_empty() {
+            state.mq.waiters.remove(&queue_id);
+        }
+    }
 }
