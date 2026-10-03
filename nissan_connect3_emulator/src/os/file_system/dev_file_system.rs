@@ -28,6 +28,13 @@ impl DevFileSystem {
             FileType::File,
             "???????????????".to_string().as_bytes().to_vec(),
         );
+        // Standard char devices present on the real system. The firmware opens
+        // these during startup; if open() fails its error path corrupts the
+        // heap (glibc "free(): invalid pointer") and aborts. /dev/tty is the
+        // controlling terminal — always valid on hardware, so it must exist here.
+        for name in ["/tty", "/null", "/console"] {
+            tmp_fs.insert_entry(name, FileType::File, Vec::new());
+        }
         Self { tmp_fs }
     }
 }
