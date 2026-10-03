@@ -272,6 +272,7 @@ fn create_event(unicorn: &mut Unicorn<'_, Context>) -> u32 {
 fn set_event(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     let event_id = read_u32(unicorn, addr);
     let value = read_u32(unicorn, addr + 4);
+    let result_ptr = read_u32(unicorn, addr + 8);
 
     let woken_tid = {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
@@ -291,6 +292,9 @@ fn set_event(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     if let Some(tid) = woken_tid {
         set_runnable_with_result(unicorn, tid, 0);
     }
+    // libiosclib's iosc_set_event wrapper reads the outcome back from *result_ptr
+    // (arg offset 8) and feeds it to u32MapErrorCodeIOSC; write success there.
+    write_result(unicorn, result_ptr, 0);
     0
 }
 
