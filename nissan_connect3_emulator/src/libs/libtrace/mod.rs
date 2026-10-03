@@ -7,17 +7,22 @@ use std::collections::HashMap;
 use unicorn_engine::Unicorn;
 
 pub fn libtrace_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
-    hook_trace_code(unicorn, base_address);
+    // All code hooks (named entry hooks + per-method trace hooks) make Unicorn check
+    // every executed instruction against the whole hook set; ~1000 of them dominates
+    // runtime. Opt-in via EMU_CODE_HOOKS for debugging.
+    if std::env::var("EMU_CODE_HOOKS").map(|v| v == "1").unwrap_or(false) {
+        hook_trace_code(unicorn, base_address);
 
-    let mut method_entries = HashMap::new();
-    insert_libtrace_method_entries(&mut method_entries);
-    for (mut address, method_name) in method_entries {
-        address = base_address + address;
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
-                handle_hook(uc, addr, method_name)
-            })
-            .unwrap();
+        let mut method_entries = HashMap::new();
+        insert_libtrace_method_entries(&mut method_entries);
+        for (mut address, method_name) in method_entries {
+            address = base_address + address;
+            unicorn
+                .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+                    handle_hook(uc, addr, method_name)
+                })
+                .unwrap();
+        }
     }
 }
 

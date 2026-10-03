@@ -16,20 +16,25 @@ use std::sync::atomic::Ordering;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
-    hook_core_code(unicorn, base_address);
-    hook_io_code(unicorn, base_address);
-    hook_message_code(unicorn, base_address);
-    hook_trace_code(unicorn, base_address);
+    // All code hooks (named entry hooks + per-method trace hooks) make Unicorn check
+    // every executed instruction against the whole hook set; ~1000 of them dominates
+    // runtime. Opt-in via EMU_CODE_HOOKS for debugging.
+    if std::env::var("EMU_CODE_HOOKS").map(|v| v == "1").unwrap_or(false) {
+        hook_core_code(unicorn, base_address);
+        hook_io_code(unicorn, base_address);
+        hook_message_code(unicorn, base_address);
+        hook_trace_code(unicorn, base_address);
 
-    let mut method_entries = HashMap::new();
-    insert_libosal_method_entries(&mut method_entries);
-    for (address, method_name) in method_entries {
-        //address = address - 0x484d8000 + base_address;
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
-                handle_hook(uc, addr, method_name)
-            })
-            .unwrap();
+        let mut method_entries = HashMap::new();
+        insert_libosal_method_entries(&mut method_entries);
+        for (address, method_name) in method_entries {
+            //address = address - 0x484d8000 + base_address;
+            unicorn
+                .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+                    handle_hook(uc, addr, method_name)
+                })
+                .unwrap();
+        }
     }
 }
 
