@@ -17,25 +17,22 @@ use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     // Stubbed functions are patched to `svc #0` and dispatched from the single
-    // intr hook, so no per-instruction Unicorn code hooks are registered. Still
-    // opt-in via EMU_CODE_HOOKS because it changes guest behavior (bodies skipped).
-    if std::env::var("EMU_CODE_HOOKS").map(|v| v == "1").unwrap_or(false) {
-        hook_core_code(unicorn, base_address);
-        hook_io_code(unicorn, base_address);
-        hook_message_code(unicorn, base_address);
-        hook_trace_code(unicorn, base_address);
+    // intr hook, so no per-instruction Unicorn code hooks are registered.
+    hook_core_code(unicorn, base_address);
+    hook_io_code(unicorn, base_address);
+    hook_message_code(unicorn, base_address);
+    hook_trace_code(unicorn, base_address);
 
-        /*let mut method_entries = HashMap::new();
-        insert_libosal_method_entries(&mut method_entries);
-        for (address, method_name) in method_entries {
-            //address = address - 0x484d8000 + base_address;
-            unicorn
-                .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
-                    handle_hook(uc, addr, method_name)
-                })
-                .unwrap();
-        }*/
-    }
+    /*let mut method_entries = HashMap::new();
+    insert_libosal_method_entries(&mut method_entries);
+    for (address, method_name) in method_entries {
+        //address = address - 0x484d8000 + base_address;
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+                handle_hook(uc, addr, method_name)
+            })
+            .unwrap();
+    }*/
 }
 
 // fn handle_hook(uc: &mut Unicorn<'_, Context>, addr: u64, method_name: &str) {

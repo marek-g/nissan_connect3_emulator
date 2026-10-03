@@ -11,6 +11,12 @@ pub use syscalls::sys_calls_state::SysCallsState;
 use unicorn_engine::Unicorn;
 
 pub fn add_library_hook(unicorn: &mut Unicorn<'_, Context>, library: &str, base_address: u32) {
+    // Code hooks change guest behavior (stubbed bodies are skipped), so they
+    // are enabled by default and can be turned off with EMU_CODE_HOOKS_DISABLED=1.
+    if std::env::var("EMU_CODE_HOOKS_DISABLED").map(|v| v == "1").unwrap_or(false) {
+        return;
+    }
+
     match library {
         "/usr/lib/libtrace.so" => libtrace_add_code_hooks(unicorn, base_address),
         "/opt/bosch/processes/libosal_linux_so.so" => libosal_add_code_hooks(unicorn, base_address),
