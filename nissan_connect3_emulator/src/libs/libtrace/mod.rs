@@ -13,7 +13,7 @@ pub fn libtrace_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address:
     if std::env::var("EMU_CODE_HOOKS").map(|v| v == "1").unwrap_or(false) {
         hook_trace_code(unicorn, base_address);
 
-        let mut method_entries = HashMap::new();
+        /*let mut method_entries = HashMap::new();
         insert_libtrace_method_entries(&mut method_entries);
         for (mut address, method_name) in method_entries {
             address = base_address + address;
@@ -22,11 +22,11 @@ pub fn libtrace_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address:
                     handle_hook(uc, addr, method_name)
                 })
                 .unwrap();
-        }
+        }*/
     }
 }
 
-fn handle_hook(uc: &mut Unicorn<'_, Context>, addr: u64, method_name: &str) {
+/*fn handle_hook(uc: &mut Unicorn<'_, Context>, addr: u64, method_name: &str) {
     log::trace!(
         "{:#x} [{}] [LIBTRACE] {}() [IN]",
         addr,
@@ -173,3 +173,4 @@ fn insert_libtrace_method_entries(method_entries: &mut HashMap<u32, &str>) {
     //method_entries.insert(0x00002f58, "_init");
     method_entries.insert(0x00007270, "TRACE_socket_init");
 }
+ */

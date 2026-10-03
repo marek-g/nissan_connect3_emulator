@@ -25,7 +25,7 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         hook_message_code(unicorn, base_address);
         hook_trace_code(unicorn, base_address);
 
-        let mut method_entries = HashMap::new();
+        /*let mut method_entries = HashMap::new();
         insert_libosal_method_entries(&mut method_entries);
         for (address, method_name) in method_entries {
             //address = address - 0x484d8000 + base_address;
@@ -34,111 +34,111 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     handle_hook(uc, addr, method_name)
                 })
                 .unwrap();
-        }
+        }*/
     }
 }
 
-fn handle_hook(uc: &mut Unicorn<'_, Context>, addr: u64, method_name: &str) {
-    let tracing = uc
-        .get_data()
-        .inner
-        .instruction_tracing
-        .load(Ordering::Relaxed);
+// fn handle_hook(uc: &mut Unicorn<'_, Context>, addr: u64, method_name: &str) {
+//     let tracing = uc
+//         .get_data()
+//         .inner
+//         .instruction_tracing
+//         .load(Ordering::Relaxed);
 
-    let addr = addr as u32;
+//     let addr = addr as u32;
 
-    log::trace!(
-        "-- {:#x} [{}] [OSAL] {}() [IN]",
-        addr,
-        uc.get_data().inner.thread_id(),
-        method_name
-    );
+//     log::trace!(
+//         "-- {:#x} [{}] [OSAL] {}() [IN]",
+//         addr,
+//         uc.get_data().inner.thread_id(),
+//         method_name
+//     );
 
-    /*if method_name == "vInitTrace" {
-        // skip method that normally crashes
-        uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
-            .unwrap();
-    }
+//     /*if method_name == "vInitTrace" {
+//         // skip method that normally crashes
+//         uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
+//             .unwrap();
+//     }
 
-    if method_name == "DEV_FFD_s32IODeviceInit" {
-        uc.reg_write(RegisterARM::R0, 1).unwrap();
-        uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
-            .unwrap();
-    }
+//     if method_name == "DEV_FFD_s32IODeviceInit" {
+//         uc.reg_write(RegisterARM::R0, 1).unwrap();
+//         uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
+//             .unwrap();
+//     }
 
-    if method_name == "LockOsal" || method_name == "UnLockOsal" {
-        uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
-            .unwrap();
-    }
+//     if method_name == "LockOsal" || method_name == "UnLockOsal" {
+//         uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
+//             .unwrap();
+//     }
 
-    if method_name == "LLD_bIsTraceActive" {
-        uc.reg_write(RegisterARM::R0, 1u64).unwrap();
-        uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
-            .unwrap();
-    }
+//     if method_name == "LLD_bIsTraceActive" {
+//         uc.reg_write(RegisterARM::R0, 1u64).unwrap();
+//         uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
+//             .unwrap();
+//     }
 
-    if method_name == "OSAL_vAssertFunction" {
-        let str1 = read_string(uc, uc.reg_read(RegisterARM::R0).unwrap() as u32);
-        let str2 = read_string(uc, uc.reg_read(RegisterARM::R0).unwrap() as u32);
-        if str1 == str2 {
-            log::trace!("OSAL assert OK: {} = {}", str1, str2);
-        } else {
-            log::error!("OSAL assert ERROR: {} != {}", str1, str2);
-        }
-        uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
-            .unwrap();
-    }
+//     if method_name == "OSAL_vAssertFunction" {
+//         let str1 = read_string(uc, uc.reg_read(RegisterARM::R0).unwrap() as u32);
+//         let str2 = read_string(uc, uc.reg_read(RegisterARM::R0).unwrap() as u32);
+//         if str1 == str2 {
+//             log::trace!("OSAL assert OK: {} = {}", str1, str2);
+//         } else {
+//             log::error!("OSAL assert ERROR: {} != {}", str1, str2);
+//         }
+//         uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
+//             .unwrap();
+//     }
 
-    if method_name == "OSAL_s32MessageQueueOpen" {
-        let str = read_string(uc, uc.reg_read(RegisterARM::R0).unwrap() as u32);
-        log::trace!("OSAL_s32MessageQueueOpen: {}", str);
-    }
+//     if method_name == "OSAL_s32MessageQueueOpen" {
+//         let str = read_string(uc, uc.reg_read(RegisterARM::R0).unwrap() as u32);
+//         log::trace!("OSAL_s32MessageQueueOpen: {}", str);
+//     }
 
-    if method_name == "vTraceMqInfo" {
-        uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
-            .unwrap();
-    }
+//     if method_name == "vTraceMqInfo" {
+//         uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
+//             .unwrap();
+//     }
 
-    if method_name == "TraceIOString" {
-        let str = read_string(uc, uc.reg_read(RegisterARM::R0).unwrap() as u32);
-        log::warn!("TraceIOString: {}", str);
-        uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
-            .unwrap();
-    }*/
+//     if method_name == "TraceIOString" {
+//         let str = read_string(uc, uc.reg_read(RegisterARM::R0).unwrap() as u32);
+//         log::warn!("TraceIOString: {}", str);
+//         uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
+//             .unwrap();
+//     }*/
 
-    if tracing {
-        let cs = Capstone::new()
-            .arm()
-            .mode(ArchMode::Arm)
-            .endian(Endian::Little)
-            .detail(true)
-            .build()
-            .unwrap();
+//     if tracing {
+//         let cs = Capstone::new()
+//             .arm()
+//             .mode(ArchMode::Arm)
+//             .endian(Endian::Little)
+//             .detail(true)
+//             .build()
+//             .unwrap();
 
-        let mut vec = [0u8; 4];
-        uc.mem_read(addr as u64, &mut vec).unwrap();
-        let disasm = cs.disasm_all(&vec, addr as u64).unwrap();
-        let disasm = format!("{}", disasm);
-        log::trace!(
-                        "R0: {:#x}, R1: {:#x}, R2: {:#x}, R3: {:#x}, R4: {:#x}, R5: {:#x}, R6: {:#x}, R7: {:#x}, R8: {:#x}, LR: {:#x}, IP: {:#x}",
-                        uc.reg_read(RegisterARM::R0).unwrap(),
-                        uc.reg_read(RegisterARM::R1).unwrap(),
-                        uc.reg_read(RegisterARM::R2).unwrap(),
-                        uc.reg_read(RegisterARM::R3).unwrap(),
-                        uc.reg_read(RegisterARM::R4).unwrap(),
-                        uc.reg_read(RegisterARM::R5).unwrap(),
-                        uc.reg_read(RegisterARM::R6).unwrap(),
-                        uc.reg_read(RegisterARM::R7).unwrap(),
-                        uc.reg_read(RegisterARM::R8).unwrap(),
-                        uc.reg_read(RegisterARM::LR).unwrap(),
-                        uc.reg_read(RegisterARM::IP).unwrap()
-                    );
-        log::trace!("{}", &disasm[0..disasm.len() - 1]);
-    }
-}
+//         let mut vec = [0u8; 4];
+//         uc.mem_read(addr as u64, &mut vec).unwrap();
+//         let disasm = cs.disasm_all(&vec, addr as u64).unwrap();
+//         let disasm = format!("{}", disasm);
+//         log::trace!(
+//                         "R0: {:#x}, R1: {:#x}, R2: {:#x}, R3: {:#x}, R4: {:#x}, R5: {:#x}, R6: {:#x}, R7: {:#x}, R8: {:#x}, LR: {:#x}, IP: {:#x}",
+//                         uc.reg_read(RegisterARM::R0).unwrap(),
+//                         uc.reg_read(RegisterARM::R1).unwrap(),
+//                         uc.reg_read(RegisterARM::R2).unwrap(),
+//                         uc.reg_read(RegisterARM::R3).unwrap(),
+//                         uc.reg_read(RegisterARM::R4).unwrap(),
+//                         uc.reg_read(RegisterARM::R5).unwrap(),
+//                         uc.reg_read(RegisterARM::R6).unwrap(),
+//                         uc.reg_read(RegisterARM::R7).unwrap(),
+//                         uc.reg_read(RegisterARM::R8).unwrap(),
+//                         uc.reg_read(RegisterARM::LR).unwrap(),
+//                         uc.reg_read(RegisterARM::IP).unwrap()
+//                     );
+//         log::trace!("{}", &disasm[0..disasm.len() - 1]);
+//     }
+// }
 
 // rabin2 -E ./libosal_linux_so.so
-fn insert_libosal_method_entries(method_entries: &mut HashMap<u32, &str>) {
+/*fn insert_libosal_method_entries(method_entries: &mut HashMap<u32, &str>) {
     method_entries.insert(0x484ecf50, "vRegisterOsalIO_Callback");
     method_entries.insert(0x48530a68, "bReadPublicKey");
     method_entries.insert(0x485140f4, "tThreadTableGetFreeEntry");
@@ -1128,3 +1128,4 @@ fn insert_libosal_method_entries(method_entries: &mut HashMap<u32, &str>) {
     method_entries.insert(0x48571a09, "cCurRcvByte");
     method_entries.insert(0x48535eb8, "libminxml_plat_fclose");
 }
+*/
