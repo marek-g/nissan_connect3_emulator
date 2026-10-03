@@ -264,6 +264,12 @@ fn deliver_sigsegv(unicorn: &mut Unicorn<'_, Context>, fault_addr: u32) -> bool 
         let act = state.signals.actions[SIGSEGV as usize];
         if act.handler == 0 || act.handler == 1 {
             // SIG_DFL / SIG_IGN -> default action is to terminate
+            log::error!(
+                "{:#x}: [{}] unhandled SIGSEGV at addr {:#x} (no handler) -> terminating",
+                unicorn.reg_read(RegisterARM::PC).unwrap() as u32,
+                unicorn.get_data().inner.thread_id(),
+                fault_addr
+            );
             return false;
         }
         // re-fault guard: same faulting PC too many times in a row -> give up

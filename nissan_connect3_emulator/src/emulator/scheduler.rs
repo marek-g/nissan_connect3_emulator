@@ -144,6 +144,11 @@ fn run_quantum(
                     thread.status = ThreadStatus::Runnable;
                 }
             }
+            // surface silent thread death (an unhandled fault / exit leaves no other
+            // trace, which makes a vanished process very hard to diagnose)
+            if let ThreadStatus::Exited(code) = &thread.status {
+                log::warn!("[{}] thread exited with code {}", next_id, code);
+            }
             thread.cpu_context = Some(saved_context);
             thread.pc = pc;
         }

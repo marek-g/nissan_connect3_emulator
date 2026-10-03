@@ -1,5 +1,6 @@
 use crate::emulator::context::Context;
 use crate::emulator::utils::{mem_align_down, mem_align_up};
+use std::ffi::c_void;
 use std::io::SeekFrom;
 use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::{RegisterARM, Unicorn};
@@ -187,6 +188,48 @@ fn mmapx(
 
             let _ = fs.seek(fd as i32, SeekFrom::Start(file_pos));
         }
+    }
+
+    // Named shared memory (/dev/shm/*): back the mapping with a single host
+    // buffer shared across every process (via mem_map_ptr) so that all mappings
+    // of the same file see coherent memory - what shm_open/sem_open rely on.
+    // This bypasses the private copy path (mem_map + mem_write) below.
+    if filepath.starts_with("/dev/shm/") {
+        let host_buf = {
+            let mut ns = unicorn.get_data().inner.namespace.lock().unwrap();
+            ns.shm.get_or_create(&filepath, length as usize, &buf)
+        };
+        // never map more host bytes than the buffer holds (sizes normally match;
+        // this guards a larger re-mapping of an already-created buffer)
+        let map_len = std::cmp::min(length as usize, host_buf.len()) as u32;
+        if map_len < length {
+            log::warn!(
+                "shm map of {} requests {:#x} but shared buffer is only {:#x}; mapping {:#x}",
+                filepath,
+                length,
+                host_buf.len(),
+                map_len
+            );
+        }
+        let host_ptr = host_buf.as_ptr() as *mut c_void;
+
+        let mmu_arc = unicorn.get_data().inner.mmu.clone();
+        return if flags & 0x10 != 0 || addr != 0 {
+            // MAP_FIXED
+            mmu_arc
+                .lock()
+                .unwrap()
+                .map_shared(unicorn, addr, map_len, perms, "[shm]", &filepath, host_ptr);
+            addr
+        } else {
+            mmu_arc.lock().unwrap().heap_alloc_shared(
+                unicorn,
+                map_len,
+                perms,
+                &filepath,
+                host_ptr,
+            )
+        };
     }
 
     // allocate memory

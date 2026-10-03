@@ -1,6 +1,7 @@
 use crate::emulator::context::Context;
 use crate::emulator::utils::mem_align_up;
 use crate::os::add_library_hook;
+use std::ffi::c_void;
 use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::Unicorn;
 
@@ -100,6 +101,52 @@ impl Mmu {
         );
     }
 
+    /// Map a shared-memory region backed by a caller-provided host buffer via
+    /// `mem_map_ptr`. Unlike [`Mmu::map`] (which allocates fresh, private guest
+    /// memory), the guest region here is a view onto `host_ptr`, so every process
+    /// that maps the same buffer aliases the same physical (host) bytes.
+    pub fn map_shared(
+        &mut self,
+        unicorn: &mut Unicorn<'_, Context>,
+        address: u32,
+        size: u32,
+        perms: Prot,
+        description: &str,
+        filepath: &str,
+        host_ptr: *mut c_void,
+    ) {
+        self.remove_internal(unicorn, address, size);
+
+        unsafe {
+            unicorn
+                .mem_map_ptr(address as u64, size as u64, perms, host_ptr)
+                .unwrap();
+        }
+
+        let desc = match description.len() {
+            0 => String::from("[shared]"),
+            _ => String::from(description),
+        };
+
+        self.regions.push(MmuRegion {
+            memory_start: address,
+            memory_end: address.checked_add(size).unwrap().checked_sub(1).unwrap(),
+            memory_perms: perms,
+            description: desc.clone(),
+            filepath: filepath.to_owned(),
+        });
+
+        log::debug!(
+            "mmu_map_shared: {:#x} - {:#x} (size: {:#x}), {:?} {} {}",
+            address,
+            address + size - 1,
+            size,
+            perms,
+            desc,
+            filepath
+        );
+    }
+
     pub fn unmap(&mut self, unicorn: &mut Unicorn<'_, Context>, address: u32, size: u32) {
         self.remove_internal(unicorn, address, size);
 
@@ -174,6 +221,26 @@ impl Mmu {
 
         let size = mem_align_up(size, None);
         self.map(unicorn, heap_addr, size, perms, "[heap]", filepath);
+
+        self.heap_mem_end = heap_addr + size;
+
+        heap_addr
+    }
+
+    /// Like [`Mmu::heap_alloc`] but backs the region with a shared host buffer
+    /// (`mem_map_ptr`) instead of fresh private memory.
+    pub fn heap_alloc_shared(
+        &mut self,
+        unicorn: &mut Unicorn<'_, Context>,
+        size: u32,
+        perms: Prot,
+        filepath: &str,
+        host_ptr: *mut c_void,
+    ) -> u32 {
+        let heap_addr = self.heap_mem_end;
+
+        let size = mem_align_up(size, None);
+        self.map_shared(unicorn, heap_addr, size, perms, "[heap (shared)]", filepath, host_ptr);
 
         self.heap_mem_end = heap_addr + size;
 

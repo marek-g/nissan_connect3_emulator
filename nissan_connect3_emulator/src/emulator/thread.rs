@@ -8,7 +8,7 @@ use unicorn_engine::{RegisterARM, Unicorn};
 use unicorn_engine::Context as CpuContext;
 
 /// Why a guest thread is blocked (waiting to be woken by the scheduler).
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum BlockReason {
     FutexWait { addr: u32, deadline: Option<Instant> },
     SleepUntil(Instant),
