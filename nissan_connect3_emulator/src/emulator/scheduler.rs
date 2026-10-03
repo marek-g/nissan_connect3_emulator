@@ -32,7 +32,7 @@ pub fn setup_process(
     program_args: Vec<String>,
     program_envs: Vec<(String, String)>,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    let buf = load_binary(unicorn, elf_filepath);
+    let buf = load_binary(unicorn, elf_filepath)?;
 
     let (interp_entry_point, elf_entry, stack_ptr) =
         load_elf(unicorn, elf_filepath, &buf, &program_args, &program_envs)?;

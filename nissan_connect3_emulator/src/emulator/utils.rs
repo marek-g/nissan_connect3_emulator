@@ -1,22 +1,31 @@
 use crate::emulator::context::Context;
 use crate::os::file_system::OpenFileFlags;
 use byteorder::{ByteOrder, LittleEndian};
+use std::error::Error;
 use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::Unicorn;
 use xmas_elf::program;
 
-pub fn load_binary(unicorn: &mut Unicorn<'_, Context>, filepath: &str) -> Vec<u8> {
+pub fn load_binary(
+    unicorn: &mut Unicorn<'_, Context>,
+    filepath: &str,
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync + 'static>> {
     let data = unicorn.get_data().inner.clone();
-    let file_system = &mut data.file_system.lock().unwrap();
-    if let Ok(fd) = file_system.open(filepath, OpenFileFlags::READ) {
-        let size = file_system.get_length(fd);
-        let mut content = vec![0u8; size as usize];
-        file_system.read_all(fd, &mut content).unwrap();
-        file_system.close(fd).unwrap();
-        content
-    } else {
-        panic!("Cannot load file: {}", filepath);
-    }
+    let mut file_system = data.file_system.lock().unwrap();
+    let fd = match file_system.open(filepath, OpenFileFlags::READ) {
+        Ok(fd) => fd,
+        Err(_) => return Err(format!("Cannot load file: {}", filepath).into()),
+    };
+    let size = file_system.get_length(fd) as usize;
+    let mut content = vec![0u8; size];
+    let read_res = file_system.read_all(fd, &mut content);
+    let close_res = file_system.close(fd);
+    // release the shared file-system lock before returning so a failure here can
+    // never poison it (a panic under this lock would stall every other process)
+    drop(file_system);
+    read_res.map_err(|_| format!("Cannot read file: {}", filepath))?;
+    close_res.map_err(|_| format!("Cannot close file: {}", filepath))?;
+    Ok(content)
 }
 
 /// Converts NULL terminated string to rust string
