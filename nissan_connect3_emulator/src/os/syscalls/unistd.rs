@@ -1,7 +1,7 @@
 use crate::emulator::context::Context;
 use crate::emulator::thread::ThreadAction;
 use crate::emulator::utils::{mem_align_up, pack_u16, pack_u64, read_string};
-use crate::os::file_system::{FileType, MountFileSystem};
+use crate::os::file_system::{FileType, MountFileSystem, OpenFileFlags};
 use crate::os::syscalls::SysCallError;
 use std::io::SeekFrom;
 use std::path::Path;
@@ -702,4 +702,105 @@ pub fn ftruncate(unicorn: &mut Unicorn<'_, Context>, fd: u32, length: u32) -> u3
     );
 
     res
+}
+
+pub fn dup(unicorn: &mut Unicorn<'_, Context>, old_fd: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] dup(fd: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id(),
+        old_fd
+    );
+
+    let new_fd = unicorn
+        .get_data()
+        .inner
+        .file_system
+        .lock()
+        .unwrap()
+        .dup(old_fd as i32);
+
+    let res = match new_fd {
+        Some(fd) => fd as u32,
+        None => -1i32 as u32,
+    };
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] dup => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id(),
+        res
+    );
+    res
+}
+
+pub fn dup2(unicorn: &mut Unicorn<'_, Context>, old_fd: u32, new_fd: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] dup2(old: {:#x}, new: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id(),
+        old_fd,
+        new_fd
+    );
+
+    if old_fd == new_fd {
+        return new_fd;
+    }
+    let ok = unicorn
+        .get_data()
+        .inner
+        .file_system
+        .lock()
+        .unwrap()
+        .dup2(old_fd as i32, new_fd as i32);
+    if ok {
+        new_fd
+    } else {
+        -1i32 as u32
+    }
+}
+
+/// inotify_init / inotify_init1(flags): hand out a descriptor. The automount
+/// watcher in libosal only opens the handle and registers watches, so a
+/// plain readable handle (backed by /dev/null, which reports EOF on read) is
+/// enough to keep it out of its failure path.
+pub fn inotify_init(unicorn: &mut Unicorn<'_, Context>, _flags: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] inotify_init [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id()
+    );
+    let res = match unicorn
+        .get_data()
+        .inner
+        .file_system
+        .lock()
+        .unwrap()
+        .open("/dev/null", OpenFileFlags::READ)
+    {
+        Ok(fd) => fd as u32,
+        Err(_) => -1i32 as u32,
+    };
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] inotify_init => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id(),
+        res
+    );
+    res
+}
+
+/// inotify_add_watch(fd, path, mask): accept and return a watch descriptor.
+pub fn inotify_add_watch(
+    _unicorn: &mut Unicorn<'_, Context>,
+    _fd: u32,
+    _path: u32,
+    _mask: u32,
+) -> u32 {
+    static NEXT_WD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    NEXT_WD.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// inotify_rm_watch(fd, wd): always succeeds (no watches are tracked).
+pub fn inotify_rm_watch(_unicorn: &mut Unicorn<'_, Context>, _fd: u32, _wd: u32) -> u32 {
+    0u32
 }

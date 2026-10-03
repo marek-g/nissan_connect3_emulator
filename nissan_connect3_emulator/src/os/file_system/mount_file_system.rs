@@ -201,6 +201,66 @@ impl MountFileSystem {
         res
     }
 
+    /// Duplicate `old_fd` onto `new_fd` (a not-yet-used descriptor), making both
+    /// refer to the same file. Implemented by re-opening the source file's path
+    /// on the same mount under `new_fd`. The offset is not shared with the
+    /// original (unlike a real `dup`), which is fine for the head-unit's use of
+    /// dup (saving/redirecting standard descriptors during setup). Returns
+    /// `false` if the source is not a path-backed, openable file (e.g. a stdio
+    /// descriptor or a driver fd), in which case the caller reports an error.
+    pub fn dup2(&mut self, old_fd: i32, new_fd: i32) -> bool {
+        let (path, flags) = match self.file_data.get(&old_fd) {
+            Some(data) => (data.file_path.clone(), OpenFileFlags::READ),
+            None => return false,
+        };
+        let absolute_path = self.path_convert_to_absolute(&path);
+        // free the target descriptor first (dup2 closes it if open)
+        if self.is_open(new_fd) {
+            let _ = self.close(new_fd);
+        }
+        if self.is_open(new_fd) {
+            let _ = self.close(new_fd);
+        }
+        let mount_name = {
+            let (mount_point, translated_path) = match self.resolve_mount(&absolute_path) {
+                Some(pair) => pair,
+                None => return false,
+            };
+            if mount_point
+                .file_system
+                .open(&translated_path, flags, new_fd)
+                .is_err()
+            {
+                return false;
+            }
+            mount_point.mount_point.clone()
+        };
+        self.file_data.insert(
+            new_fd,
+            MountFsFileData {
+                file_path: absolute_path,
+                mount_point: mount_name,
+                file_status_flags: 0,
+            },
+        );
+        true
+    }
+
+    /// Allocate the next free descriptor and duplicate `old_fd` onto it. Returns
+    /// the new descriptor, or `None` if `old_fd` cannot be duplicated.
+    pub fn dup(&mut self, old_fd: i32) -> Option<i32> {
+        if !self.is_open(old_fd) {
+            return None;
+        }
+        let new_fd = self.get_unique_fd();
+        if self.dup2(old_fd, new_fd) {
+            Some(new_fd)
+        } else {
+            None
+        }
+    }
+
+
     pub fn link(&mut self, old_path: &str, new_path: &str) -> Result<(), OpenFileError> {
         if let Some((mount_point, old_file_path)) = self.get_mount_point_from_filepath_mut(old_path)
         {

@@ -17,6 +17,7 @@ pub mod signal;
 mod socket;
 mod stat;
 mod time;
+mod timer;
 mod uio;
 mod unistd;
 mod utsname;

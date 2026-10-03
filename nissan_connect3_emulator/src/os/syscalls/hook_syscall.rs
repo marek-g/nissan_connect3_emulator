@@ -2,7 +2,7 @@ use crate::emulator::context::Context;
 use crate::emulator::thread::{block_current_thread, exit_current_thread, exit_process, ThreadAction};
 use crate::os::syscalls::{
     fcntl, futex, ioctl, linux, mman, mqueue, prctl, resource, sched, signal, socket, stat, time,
-    uio, unistd, utsname,
+    timer, uio, unistd, utsname,
 };
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -75,6 +75,8 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         20 => unistd::get_pid(unicorn),
         33 => unistd::access(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         39 => stat::mkdir(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        41 => unistd::dup(unicorn, unicorn.get_u32_arg(0)),
+        63 => unistd::dup2(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         45 => unistd::brk(unicorn, unicorn.get_u32_arg(0)),
         54 => ioctl::ioctl(
             unicorn,
@@ -218,6 +220,22 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         248 => unistd::exit_group(unicorn, unicorn.get_u32_arg(0)),
         256 => unistd::set_tid_address(unicorn, unicorn.get_u32_arg(0)),
         263 => time::clock_gettime(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        257 => timer::timer_create(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
+        258 => timer::timer_settime(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+            unicorn.get_u32_arg(3),
+        ),
+        259 => timer::timer_gettime(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        260 => timer::timer_getoverrun(unicorn, unicorn.get_u32_arg(0)),
+        261 => timer::timer_delete(unicorn, unicorn.get_u32_arg(0)),
         274 => mqueue::mq_open(
             unicorn,
             unicorn.get_u32_arg(0),
@@ -268,6 +286,14 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
             unicorn.get_u32_arg(2),
             unicorn.get_u32_arg(3),
         ),
+        316 => unistd::inotify_init(unicorn, 0),
+        317 => unistd::inotify_add_watch(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
+        318 => unistd::inotify_rm_watch(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         322 => fcntl::openat(
             unicorn,
             unicorn.get_u32_arg(0),
