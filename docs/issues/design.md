@@ -52,6 +52,12 @@ to avoid is reintroducing any direct read/write of another process' guest memory
 - **Problem:** 2 hard clippy errors block `cargo clippy -p nissan_connect3_emulator` for the workspace.
 - **Fix:** mark the relevant FFI wrapper functions `unsafe fn`.
 
+## RTOS boot backend bypasses guest `OSAL_ProcessSpawn`
+
+- **Locations:** `nissan_connect3_emulator/src/rtos/boot.rs`, `nissan_connect3_emulator/src/emulator/emulator.rs:41-105`, `nissan_connect3_emulator/src/main.rs:104-121`
+- **Problem:** The new RTOS backend logs the Linux OSAL `0x1a` start-process payload but actually launches `prochmi_out.out` through `ProcessFactory` as another top-level guest process. The target is not a child of `procbaselx`, `fork`/`execve`/waitpid semantics are bypassed, and the guest-side `vSysCallbackHandler`/`OSAL_ProcessSpawn` code is never exercised.
+- **Fix:** Either implement guest `OSAL_ProcessSpawn`/`fork`/`execve` interception so spawned processes become children of `procbaselx`, or inject a callback-header message that causes `vSysCallbackHandler` to run inside `procbaselx`.
+
 ## main.rs: hardcoded absolute paths and commented-out process selection
 
 - **Location:** `nissan_connect3_emulator/src/main.rs:17-102`

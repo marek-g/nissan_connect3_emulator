@@ -8,6 +8,7 @@ use std::path::PathBuf;
 mod emulator;
 mod libs;
 mod os;
+mod rtos;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     pretty_env_logger::init();
@@ -101,11 +102,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     //emulator.run_process("/bin/date.coreutils".to_string(), vec![], envs)?;
     //emulator.run_process("/bin/pwd.coreutils".to_string(), vec![], envs)?;
     //emulator.run_process("/bin/ls.coreutils".to_string(), vec![], envs)?;
-    // Run the base process and the GUI/HMI process together: each gets its own VM
-    // + address space but they share the file system and kernel namespace so their
-    // IPC (message queues / IOSC) works. procbaselx is the process manager; on the
-    // real unit it would fork+exec prochmi itself, which the emulator cannot do, so
-    // we launch it as a second top-level process instead.
+    // Start the base process only: the in-crate RTOS backend now plays the
+    // boot-controller role that the real triton_dualos side has on the unit,
+    // injecting/launching configured Linux start-process commands once the OSAL
+    // callback queues exist. Use EMU_RTOS=off to disable it, or EMU_RTOS_START
+    // to choose the logical process(es) it should start.
     // Default process set; override with EMU_PROCESSES="path1:path2" to debug a
     // single process or a different combination without editing this file.
     let specs = match std::env::var("EMU_PROCESSES") {
@@ -114,10 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
             .filter(|s| !s.is_empty())
             .map(|p| ProcessSpec::new(p).envs(envs.clone()))
             .collect(),
-        Err(_) => vec![
-            ProcessSpec::new("/opt/bosch/processes/procbaselx_out.out").envs(envs.clone()),
-            ProcessSpec::new("/opt/bosch/processes/prochmi_out.out").envs(envs),
-        ],
+        Err(_) => vec![ProcessSpec::new("/opt/bosch/processes/procbaselx_out.out").envs(envs)],
     };
     emulator.run_processes(specs)?;
 

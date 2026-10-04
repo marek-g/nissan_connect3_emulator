@@ -3,9 +3,14 @@ use crate::emulator::scheduler;
 use crate::emulator::thread::Wake;
 use crate::os::file_system::MountFileSystem;
 use crate::os::syscalls::namespace::SystemNamespace;
+use crate::rtos;
 use std::error::Error;
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+pub type ProcessResult = Result<(), Box<dyn Error + Send + Sync + 'static>>;
+pub type ProcessHandle = JoinHandle<ProcessResult>;
 
 /// One program to launch: its ELF image plus argv/envp.
 pub struct ProcessSpec {
@@ -34,6 +39,58 @@ impl ProcessSpec {
     }
 }
 
+/// Cloneable handle that can create process host threads without borrowing the
+/// whole [`Emulator`]. The RTOS backend needs this because dynamically started
+/// processes are spawned after `run_processes` has already begun.
+#[derive(Clone)]
+pub struct ProcessFactory {
+    file_system: Arc<Mutex<MountFileSystem>>,
+    namespace: Arc<Mutex<SystemNamespace>>,
+    next_thread_id: Arc<AtomicU32>,
+}
+
+impl ProcessFactory {
+    fn new(
+        file_system: Arc<Mutex<MountFileSystem>>,
+        namespace: Arc<Mutex<SystemNamespace>>,
+        next_thread_id: Arc<AtomicU32>,
+    ) -> Self {
+        Self { file_system, namespace, next_thread_id }
+    }
+
+    pub fn namespace(&self) -> Arc<Mutex<SystemNamespace>> {
+        self.namespace.clone()
+    }
+
+    pub fn spawn_process(&self, spec: ProcessSpec) -> ProcessHandle {
+        let process = Process::new(
+            self.file_system.clone(),
+            self.namespace.clone(),
+            self.next_thread_id.clone(),
+        );
+        let namespace = self.namespace.clone();
+
+        std::thread::spawn(move || -> ProcessResult {
+            let wake = Arc::new(Wake::new());
+            namespace.lock().unwrap().register_process(&wake);
+
+            let result = (|| -> ProcessResult {
+                let elf_filepath = spec.elf_filepath;
+                let program_args = spec.program_args;
+                let program_envs = spec.program_envs;
+
+                let mut unicorn = process.setup(&elf_filepath, program_args, program_envs)?;
+                let result = scheduler::run_process_loop(&mut unicorn, &wake);
+                drop(unicorn);
+                result
+            })();
+
+            namespace.lock().unwrap().unregister_process(&wake);
+            result
+        })
+    }
+}
+
 pub struct Emulator {
     file_system: Arc<Mutex<MountFileSystem>>,
     /// shared across every process this emulator runs (the "kernel" IPC state)
@@ -56,60 +113,55 @@ impl Emulator {
     /// the kernel namespace, so guest threads of different processes run on
     /// separate cores and their IPC (message queues / IOSC / shared memory)
     /// works. Blocks until every process has exited.
-    pub fn run_processes(
-        &self,
-        specs: Vec<ProcessSpec>,
-    ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-        let mut handles = Vec::with_capacity(specs.len());
+    pub fn run_processes(&self, specs: Vec<ProcessSpec>) -> ProcessResult {
+        let factory = ProcessFactory::new(
+            self.file_system.clone(),
+            self.namespace.clone(),
+            self.next_thread_id.clone(),
+        );
+        let rtos_config = rtos::RtosBootConfig::from_env_with_default_envs(&specs);
+        let handles = Arc::new(Mutex::new(Vec::with_capacity(specs.len())));
 
         for spec in specs {
-            let process = Process::new(
-                self.file_system.clone(),
-                self.namespace.clone(),
-                self.next_thread_id.clone(),
-            );
-            let namespace = self.namespace.clone();
-
-            let handle = std::thread::spawn(move || -> Result<
-                (),
-                Box<dyn Error + Send + Sync + 'static>,
-            > {
-                // Each process parks on this doorbell; peers ring it on IPC
-                // activity. It is `Sync`, so registering it is the only state
-                // this host thread shares with the others.
-                let wake = Arc::new(Wake::new());
-                namespace.lock().unwrap().register_process(&wake);
-
-                let result = (|| {
-                    // The VM and the guest-thread list are built here, on this
-                    // host thread, so the (non-Send) CPU contexts stay local.
-                    let mut unicorn =
-                        process.setup(&spec.elf_filepath, spec.program_args, spec.program_envs)?;
-                    let r = scheduler::run_process_loop(&mut unicorn, &wake);
-                    drop(unicorn);
-                    r
-                })();
-
-                namespace.lock().unwrap().unregister_process(&wake);
-                result
-            });
-            handles.push(handle);
+            let handle = factory.spawn_process(spec);
+            handles.lock().unwrap().push(handle);
         }
 
+        let rtos_service = rtos::RtosBootService::new(factory, handles.clone(), rtos_config).start();
+
         let mut first_error = None;
-        for handle in handles {
-            match handle.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
+        if rtos_service.join().is_err() {
+            first_error = Some(
+                Box::<dyn Error + Send + Sync>::from("the RTOS boot host thread panicked")
+                    as Box<dyn Error + Send + Sync + 'static>,
+            );
+        }
+
+        loop {
+            let batch: Vec<ProcessHandle> = {
+                let mut guard = handles.lock().unwrap();
+                if guard.is_empty() {
+                    break;
                 }
-                Err(_) => {
-                    if first_error.is_none() {
-                        first_error = Some(
-                            Box::<dyn Error + Send + Sync>::from("a process host thread panicked"),
-                        );
+                std::mem::take(&mut *guard)
+            };
+
+            for handle in batch {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                    Err(_) => {
+                        if first_error.is_none() {
+                            first_error = Some(
+                                Box::<dyn Error + Send + Sync>::from(
+                                    "a process host thread panicked",
+                                ),
+                            );
+                        }
                     }
                 }
             }
