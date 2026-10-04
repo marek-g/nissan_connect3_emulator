@@ -1,6 +1,8 @@
 use crate::common::osal_queues::OsalQueueService;
 use crate::emulator::context::Context;
+use crate::emulator::thread::{BlockReason, ThreadStatus};
 use crate::emulator::utils::pack_u32;
+use std::time::{Duration, Instant};
 use unicorn_engine::{RegisterARM, Unicorn};
 
 /// Message-queue observation and OSAL service bridge hooks.
@@ -83,8 +85,9 @@ fn handle_queue_api(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address:
                     words[3]
                 );
             } else {
+                let stack_timeout = read_stack_timeout(unicorn, api_name);
                 log::info!(
-                    "0x{:x} [{}] [LIBOSAL] {}(handle=0x{:x}, info=0x{:x}, type={}, name={}, r1=0x{:x}, timeout=0x{:x})",
+                    "0x{:x} [{}] [LIBOSAL] {}(handle=0x{:x}, info=0x{:x}, type={}, name={}, buf=0x{:x}, size=0x{:x}, timeout=0x{:x})",
                     addr - base_address + 0x484d8000,
                     thread,
                     api_name,
@@ -93,11 +96,13 @@ fn handle_queue_api(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address:
                     decoded.queue_type,
                     decoded.name,
                     r1,
-                    r2
+                    r2,
+                    stack_timeout
                 );
             }
 
-            if bridge_guest_osal_queue(unicorn, api_name, &decoded.name, r1, r2, r3) {
+            let stack_timeout = read_stack_timeout(unicorn, api_name);
+            if bridge_guest_osal_queue(unicorn, api_name, &decoded.name, r1, r2, r3, stack_timeout) {
                 log::info!(
                     "0x{:x} [{}] [LIBOSAL-OSAL-SERVICE] {} handled name={}",
                     addr - base_address + 0x484d8000,
@@ -110,13 +115,23 @@ fn handle_queue_api(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address:
     }
 }
 
+fn read_stack_timeout(unicorn: &Unicorn<'_, Context>, api_name: &str) -> u32 {
+    if matches!(api_name, "OSAL_s32MessageQueueWait" | "OSAL_s32MessageQueuePriorityWait") {
+        let sp = unicorn.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+        read_u32_or_invalid(unicorn, sp)
+    } else {
+        0
+    }
+}
+
 fn bridge_guest_osal_queue(
     unicorn: &mut Unicorn<'_, Context>,
     api_name: &str,
     name: &str,
-    r1: u32,
-    r2: u32,
-    r3: u32,
+    msg_ptr: u32,
+    msg_len: u32,
+    prio_ptr: u32,
+    timeout: u32,
 ) -> bool {
     match api_name {
         "OSAL_s32MessageQueuePost" => {
@@ -124,15 +139,14 @@ fn bridge_guest_osal_queue(
                 return false;
             }
 
-            let len = r2 as usize;
-            let data = match read_guest_buffer(unicorn, r1, len) {
+            let data = match read_guest_buffer(unicorn, msg_ptr, msg_len as usize) {
                 Some(data) => data,
                 None => return false,
             };
 
             let accepted = {
                 let mut state = unicorn.get_data().namespace.lock().unwrap();
-                let accepted = OsalQueueService::guest_post(&mut state.mq, name, data, r3);
+                let accepted = OsalQueueService::guest_post(&mut state.mq, name, data, prio_ptr);
                 if accepted {
                     state.notify_waiters();
                 }
@@ -149,29 +163,44 @@ fn bridge_guest_osal_queue(
                 return false;
             }
 
-            let message = {
+            let (queue_id, message) = {
                 let mut state = unicorn.get_data().namespace.lock().unwrap();
-                let message = OsalQueueService::guest_wait_nonblock(&mut state.mq, name, r2 as usize);
+                let queue_id = OsalQueueService::ensure_queue(&mut state.mq, name);
+                let message = OsalQueueService::pop_guest_message(&mut state.mq, queue_id, msg_len as usize);
                 if message.is_some() {
                     state.notify_waiters();
                 }
-                message
+                (queue_id, message)
             };
 
-            let Some(message) = message else {
-                return false;
-            };
+            if let Some(message) = message {
+                if !message.data.is_empty() && unicorn.mem_write(msg_ptr as u64, &message.data).is_err()
+                {
+                    return false;
+                }
+                if prio_ptr != 0
+                    && unicorn.mem_write(prio_ptr as u64, &pack_u32(message.priority)).is_err()
+                {
+                    return false;
+                }
 
-            if !message.data.is_empty()
-                && unicorn.mem_write(r1 as u64, &message.data).is_err()
-            {
-                return false;
-            }
-            if r3 != 0 && unicorn.mem_write(r3 as u64, &pack_u32(message.priority)).is_err() {
-                return false;
+                return_to_caller(unicorn, message.data.len() as u32);
+                return true;
             }
 
-            return_to_caller(unicorn, message.data.len() as u32);
+            if timeout == 0 {
+                return_to_caller(unicorn, 0);
+                return true;
+            }
+
+            block_guest_osal_wait(
+                unicorn,
+                queue_id,
+                msg_ptr,
+                msg_len,
+                prio_ptr,
+                deadline_from_osal_timeout(timeout),
+            );
             true
         }
         _ => false,
@@ -186,6 +215,42 @@ fn read_guest_buffer(unicorn: &Unicorn<'_, Context>, addr: u32, len: usize) -> O
     let mut data = vec![0u8; len];
     unicorn.mem_read(addr as u64, &mut data).ok()?;
     Some(data)
+}
+
+fn deadline_from_osal_timeout(timeout: u32) -> Option<Instant> {
+    if timeout == u32::MAX {
+        None
+    } else {
+        Some(Instant::now() + Duration::from_millis(timeout as u64))
+    }
+}
+
+fn block_guest_osal_wait(
+    unicorn: &mut Unicorn<'_, Context>,
+    queue_id: u32,
+    msg_ptr: u32,
+    msg_len: u32,
+    prio_ptr: u32,
+    deadline: Option<Instant>,
+) {
+    return_to_caller(unicorn, 0);
+
+    let tid = unicorn.get_data().thread_id();
+    {
+        let threads = unicorn.get_data().threads.clone();
+        let mut threads = threads.lock().unwrap();
+        if let Some(thread) = threads.iter_mut().find(|thread| thread.id == tid) {
+            thread.status = ThreadStatus::Blocked(BlockReason::OsalQueueReceive {
+                queue_id,
+                msg_ptr,
+                msg_len,
+                prio_ptr,
+                deadline,
+            });
+        }
+    }
+
+    unicorn.emu_stop().unwrap();
 }
 
 fn return_to_caller(unicorn: &mut Unicorn<'_, Context>, ret: u32) {

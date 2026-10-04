@@ -81,6 +81,16 @@ pub enum BlockReason {
         prio_ptr: u32,
         deadline: Option<Instant>,
     },
+    /// waiting in an intercepted libosal OSAL message queue for a host-backed
+    /// RTOS/Linux message. The completion is handled by `OsalQueueService`, not
+    /// by POSIX mqueue, because OSAL priority and return-value semantics differ.
+    OsalQueueReceive {
+        queue_id: u32,
+        msg_ptr: u32,
+        msg_len: u32,
+        prio_ptr: u32,
+        deadline: Option<Instant>,
+    },
     /// waiting in iosc_enter_mutex for the IOSC mutex to be released
     IoscMutex { id: u32, deadline: Option<Instant> },
     /// waiting in iosc_wait_for_event for the IOSC event to be set

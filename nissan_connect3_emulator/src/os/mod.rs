@@ -1,6 +1,7 @@
 pub mod code_stub;
 pub mod dev;
 pub mod file_system;
+pub(crate) mod osal_queue;
 pub(crate) mod syscalls;
 
 use crate::emulator::context::Context;

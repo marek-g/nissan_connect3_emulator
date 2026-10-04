@@ -288,6 +288,9 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
                 // passed, else leaves the thread blocked (deadline-aware internally)
                 crate::os::syscalls::mqueue::finish_mq_wait(unicorn, tid, now);
             }
+            BlockReason::OsalQueueReceive { .. } => {
+                crate::os::osal_queue::finish_guest_wait(unicorn, tid, now);
+            }
             BlockReason::IoscMutex { .. }
             | BlockReason::IoscEvent { .. }
             | BlockReason::IoscSemaphore { .. } => {
@@ -330,6 +333,7 @@ fn park_duration(unicorn: &Unicorn<'_, Context>) -> Duration {
         ThreadStatus::Blocked(BlockReason::MqSend { deadline, .. } | BlockReason::MqReceive { deadline, .. }) => {
             *deadline
         }
+        ThreadStatus::Blocked(BlockReason::OsalQueueReceive { deadline, .. }) => *deadline,
         ThreadStatus::Blocked(
             BlockReason::IoscMutex { deadline, .. }
             | BlockReason::IoscEvent { deadline, .. }

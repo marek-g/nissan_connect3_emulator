@@ -142,6 +142,17 @@ impl OsalQueueService {
         Self::is_rtos_intercepted_queue(name)
     }
 
+    pub fn ensure_queue(mq: &mut MqState, name: &str) -> u32 {
+        let name = canonical_mq_name(name);
+        if let Some(id) = mq.queue_id_for_name(&name) {
+            return id;
+        }
+
+        let spec = spec_for_name(&name)
+            .unwrap_or_else(|| default_queue_spec(&name, OSAL_DEFAULT_MSGSIZE));
+        mq.rtos_open_or_create(&spec.name, spec.maxmsg, spec.msgsize)
+    }
+
     pub fn guest_post(mq: &mut MqState, name: &str, data: Vec<u8>, osal_priority: u32) -> bool {
         let name = canonical_mq_name(name);
         let requested_msgsize = data.len() as i64;
@@ -170,9 +181,13 @@ impl OsalQueueService {
         max_len: usize,
     ) -> Option<OsalMessage> {
         let id = mq.queue_id_for_name(name)?;
+        Self::pop_guest_message(mq, id, max_len)
+    }
+
+    pub fn pop_guest_message(mq: &mut MqState, queue_id: u32, max_len: usize) -> Option<OsalMessage> {
         let fits = mq
             .queues
-            .get(&id)
+            .get(&queue_id)
             .and_then(|queue| queue.messages.last())
             .map(|message| message.data.len() <= max_len)
             .unwrap_or(false);
@@ -180,7 +195,7 @@ impl OsalQueueService {
             return None;
         }
 
-        let message = mq.pop_message(id)?;
+        let message = mq.pop_message(queue_id)?;
         Some(OsalMessage::from_mq_message(message))
     }
 }
