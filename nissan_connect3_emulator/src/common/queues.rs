@@ -16,9 +16,11 @@ pub const DP_MASTER: &str = "DpMaster";
 
 pub const DEFAULT_READY_QUEUE: &str = "NOIOSC_CB_HDR_LI_0";
 
-pub const TERM_MQ_MAXMSG: i64 = 30;
+pub const TERM_MQ_MAXMSG: i64 = 10;
 pub const TERM_MQ_MSGSIZE: i64 = 0x50;
 pub const OSAL_CB_HDR_MAXMSG: i64 = 0xf0;
+pub const OSAL_CB_HDR_LI_MAIN_MAXMSG: i64 = 0xf0;
+pub const OSAL_CB_HDR_TE_MAXMSG: i64 = 0x78;
 pub const OSAL_CB_HDR_MSGSIZE: i64 = 0x50;
 
 const MQ_HANDLE_BASE: u32 = 1000;

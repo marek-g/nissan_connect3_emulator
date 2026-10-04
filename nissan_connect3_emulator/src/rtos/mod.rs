@@ -1,5 +1,5 @@
 pub mod boot;
-pub mod queues;
+pub mod interaction;
 
 pub use boot::{RtosBootConfig, RtosBootService};
-pub use queues::RtosQueueSimulator;
+pub use interaction::RtosQueueInteraction;

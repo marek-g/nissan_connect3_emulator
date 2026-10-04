@@ -1,5 +1,7 @@
-use crate::common::queues;
+use crate::common::queues::{self, LI_TERM_MQ};
 use crate::emulator::emulator::{ProcessFactory, ProcessHandle, ProcessSpec};
+use crate::rtos::interaction::{RtosInteractionConfig, RtosQueueMessageFormat, RtosStartupQueueMessage};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -55,6 +57,10 @@ impl StartProcessCommand {
 pub struct RtosBootConfig {
     enabled: bool,
     commands: Vec<StartProcessCommand>,
+    start_queue: String,
+    queue_boot: bool,
+    start_message_format: RtosQueueMessageFormat,
+    direct_spawn: bool,
     ready_queue: String,
     ready_timeout: Duration,
     initial_delay: Duration,
@@ -68,6 +74,10 @@ impl Default for RtosBootConfig {
             commands: vec![StartProcessCommand::start_proc(
                 "/opt/bosch/processes/prochmi_out.out",
             )],
+            start_queue: LI_TERM_MQ.to_string(),
+            queue_boot: false,
+            start_message_format: RtosQueueMessageFormat::Terminal,
+            direct_spawn: true,
             ready_queue: DEFAULT_READY_QUEUE.to_string(),
             ready_timeout: Duration::from_secs(30),
             initial_delay: Duration::ZERO,
@@ -97,6 +107,24 @@ impl RtosBootConfig {
                 .collect();
         }
 
+        if let Ok(value) = std::env::var("EMU_RTOS_START_QUEUE") {
+            if !value.is_empty() {
+                cfg.start_queue = value;
+            }
+        }
+
+        cfg.queue_boot = env_flag("EMU_RTOS_QUEUE_BOOT", cfg.queue_boot);
+        cfg.direct_spawn = env_flag("EMU_RTOS_DIRECT_SPAWN", cfg.direct_spawn);
+        if let Ok(value) = std::env::var("EMU_RTOS_START_MESSAGE_FORMAT") {
+            match value.as_str() {
+                "callback" | "cb" | "syscallback" => {
+                    cfg.start_message_format = RtosQueueMessageFormat::Callback
+                }
+                "terminal" | "term" => cfg.start_message_format = RtosQueueMessageFormat::Terminal,
+                _ => {}
+            }
+        }
+
         if let Ok(value) = std::env::var("EMU_RTOS_READY_QUEUE") {
             if !value.is_empty() {
                 cfg.ready_queue = value;
@@ -115,6 +143,37 @@ impl RtosBootConfig {
 
     pub fn commands(&self) -> &[StartProcessCommand] {
         &self.commands
+    }
+
+    pub fn queue_boot_enabled(&self) -> bool {
+        self.enabled && self.queue_boot && !self.commands.is_empty()
+    }
+
+    pub fn interaction_config(&self) -> RtosInteractionConfig {
+        RtosInteractionConfig::default()
+    }
+
+    pub fn startup_messages(&self) -> VecDeque<RtosStartupQueueMessage> {
+        self.commands
+            .iter()
+            .map(|command| {
+                let path = command.path();
+                let mut message = match self.start_message_format {
+                    RtosQueueMessageFormat::Callback => RtosStartupQueueMessage::start_proc(
+                        self.start_queue.clone(),
+                        command.command(),
+                        path,
+                    ),
+                    RtosQueueMessageFormat::Terminal => RtosStartupQueueMessage::terminal_start_proc(
+                        self.start_queue.clone(),
+                        command.command(),
+                        path,
+                    ),
+                };
+                message.format = self.start_message_format;
+                message
+            })
+            .collect()
     }
 }
 
@@ -159,9 +218,16 @@ impl RtosBootService {
             );
         }
 
+        if !self.config.direct_spawn {
+            if self.config.queue_boot {
+                log::debug!("RTOS boot service direct spawn disabled; startup commands are queued by RTOS interaction service");
+            }
+            return;
+        }
+
         for command in self.config.commands() {
             log::info!(
-                "RTOS boot: start-process command 0x{:02x} path {} payload {:02x?}",
+                "RTOS direct start-process command 0x{:02x} path {} payload {:02x?}",
                 command.command(),
                 command.path(),
                 command.payload()
@@ -194,6 +260,17 @@ impl RtosBootService {
 
     fn ready_observed(&self, mq: &queues::MqState) -> bool {
         mq.has_guest_ready_queue(&self.config.ready_queue)
+    }
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => match value.as_str() {
+            "0" | "off" | "false" | "FALSE" => false,
+            "1" | "on" | "true" | "TRUE" => true,
+            _ => default,
+        },
+        Err(_) => default,
     }
 }
 

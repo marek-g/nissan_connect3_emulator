@@ -12,8 +12,9 @@
 use crate::common::queues::{canonical_mq_name, MqMessage, MqState};
 
 pub use crate::common::queues::{
-    DP_MASTER, LI_TERM_MQ, NOIOSC_CB_HDR_LI_PREFIX, OSAL_CB_HDR_LI_MAIN, OSAL_CB_HDR_MAXMSG,
-    OSAL_CB_HDR_MSGSIZE, OSAL_CB_HDR_TE, TE_TERM_MQ, TERM_MQ_MAXMSG, TERM_MQ_MSGSIZE,
+    DP_MASTER, LI_TERM_MQ, NOIOSC_CB_HDR_LI_PREFIX, OSAL_CB_HDR_LI_MAIN,
+    OSAL_CB_HDR_LI_MAIN_MAXMSG, OSAL_CB_HDR_MAXMSG, OSAL_CB_HDR_MSGSIZE, OSAL_CB_HDR_TE,
+    OSAL_CB_HDR_TE_MAXMSG, TE_TERM_MQ, TERM_MQ_MAXMSG, TERM_MQ_MSGSIZE,
 };
 
 pub const RTOS_TERMINAL_READY: u8 = 0x0e;
@@ -110,21 +111,46 @@ impl OsalQueueService {
         }
     }
 
+    pub fn create_rtos_terminal_queues(mq: &mut MqState) {
+        mq.rtos_open_or_create(TE_TERM_MQ, TERM_MQ_MAXMSG, TERM_MQ_MSGSIZE);
+        mq.rtos_open_or_create(LI_TERM_MQ, TERM_MQ_MAXMSG, TERM_MQ_MSGSIZE);
+    }
+
+    pub fn create_rtos_callback_queues(mq: &mut MqState) {
+        mq.rtos_open_or_create(OSAL_CB_HDR_LI_MAIN, OSAL_CB_HDR_LI_MAIN_MAXMSG, OSAL_CB_HDR_MSGSIZE);
+        mq.rtos_open_or_create(OSAL_CB_HDR_TE, OSAL_CB_HDR_TE_MAXMSG, OSAL_CB_HDR_MSGSIZE);
+    }
+
+    pub fn rtos_terminal_bootstrap(mq: &mut MqState) -> bool {
+        Self::create_rtos_terminal_queues(mq);
+        Self::post_rtos_terminal_ready(mq)
+    }
+
+    pub fn rtos_callback_bootstrap(mq: &mut MqState) {
+        Self::create_rtos_callback_queues(mq);
+    }
+
     pub fn rtos_post_message(mq: &mut MqState, name: &str, data: Vec<u8>, osal_priority: u32) -> bool {
-        mq.host_post(name, data, osal_priority_to_mq_priority(osal_priority))
+        let name = canonical_mq_name(name);
+        Self::ensure_queue(mq, &name);
+        mq.host_post(&name, data, osal_priority_to_mq_priority(osal_priority))
     }
 
     pub fn post_terminal_message(mq: &mut MqState, name: &str, command: u8) -> bool {
-        Self::rtos_post_message(mq, name, make_terminal_message(command), OSAL_MQ_PRIORITY_MAX)
+        Self::rtos_post_message(mq, name, make_terminal_message(command), 0)
     }
 
     pub fn post_rtos_terminal_ready(mq: &mut MqState) -> bool {
         Self::post_terminal_message(mq, LI_TERM_MQ, RTOS_TERMINAL_READY)
     }
 
-    pub fn receive_rtos_terminal_message(mq: &mut MqState) -> Option<OsalMessage> {
-        let message = mq.host_receive(TE_TERM_MQ)?;
+    pub fn receive_message(mq: &mut MqState, name: &str) -> Option<OsalMessage> {
+        let message = mq.host_receive(name)?;
         Some(OsalMessage::from_mq_message(message))
+    }
+
+    pub fn receive_rtos_terminal_message(mq: &mut MqState) -> Option<OsalMessage> {
+        Self::receive_message(mq, TE_TERM_MQ)
     }
 
     pub fn is_rtos_intercepted_queue(name: &str) -> bool {
@@ -217,13 +243,13 @@ pub fn rtos_boot_queue_specs() -> Vec<OsalQueueSpec> {
         OsalQueueSpec::new(
             OSAL_CB_HDR_LI_MAIN,
             OsalQueueKind::OsalCallbackMain,
-            OSAL_CB_HDR_MAXMSG,
+            OSAL_CB_HDR_LI_MAIN_MAXMSG,
             OSAL_CB_HDR_MSGSIZE,
         ),
         OsalQueueSpec::new(
             OSAL_CB_HDR_TE,
             OsalQueueKind::OsalCallbackTe,
-            OSAL_CB_HDR_MAXMSG,
+            OSAL_CB_HDR_TE_MAXMSG,
             OSAL_CB_HDR_MSGSIZE,
         ),
     ]
@@ -237,9 +263,18 @@ pub fn spec_for_name(name: &str) -> Option<OsalQueueSpec> {
         OsalQueueKind::RtosTerminalInbound | OsalQueueKind::RtosTerminalOutbound => {
             Some(OsalQueueSpec::new(name, kind, TERM_MQ_MAXMSG, TERM_MQ_MSGSIZE))
         }
-        OsalQueueKind::OsalCallbackMain | OsalQueueKind::OsalCallbackTe => {
-            Some(OsalQueueSpec::new(name, kind, OSAL_CB_HDR_MAXMSG, OSAL_CB_HDR_MSGSIZE))
-        }
+        OsalQueueKind::OsalCallbackMain => Some(OsalQueueSpec::new(
+            name,
+            kind,
+            OSAL_CB_HDR_LI_MAIN_MAXMSG,
+            OSAL_CB_HDR_MSGSIZE,
+        )),
+        OsalQueueKind::OsalCallbackTe => Some(OsalQueueSpec::new(
+            name,
+            kind,
+            OSAL_CB_HDR_TE_MAXMSG,
+            OSAL_CB_HDR_MSGSIZE,
+        )),
         OsalQueueKind::DatapoolMaster => Some(OsalQueueSpec::new(
             name,
             kind,
@@ -294,8 +329,27 @@ pub fn make_terminal_message(command: u8) -> Vec<u8> {
     data
 }
 
+pub fn make_terminal_command_message(command: u8, payload: &[u8]) -> Vec<u8> {
+    let mut data = vec![0u8; 4];
+    data[0] = command;
+    data.extend_from_slice(payload);
+    data.resize(TERM_MQ_MSGSIZE as usize, 0);
+    data
+}
+
+pub fn make_callback_command_message(command: u8, payload: &[u8]) -> Vec<u8> {
+    let mut data = vec![0, 0, command];
+    data.extend_from_slice(payload);
+    data.resize(OSAL_CB_HDR_MSGSIZE.max(TERM_MQ_MSGSIZE) as usize, 0);
+    data
+}
+
 pub fn message_command(data: &[u8]) -> Option<u8> {
     data.first().copied()
+}
+
+pub fn callback_message_command(data: &[u8]) -> Option<u8> {
+    data.get(2).copied()
 }
 
 pub fn message_words(data: &[u8]) -> [u32; 4] {
