@@ -486,6 +486,11 @@ pub fn rt_sigtimedwait(
     // the cooperative scheduler), block briefly so other threads make progress;
     // the guest then re-polls. This approximates a blocking wait for an idle
     // thread without risking a deadlock from never being woken.
+    //
+    // OSAL worker/main threads commonly block here on a real-time signal
+    // (SIGRTMIN..SIGRTMAX) used as the message-queue notification, expecting a
+    // peer to tgkill it when a message is posted. Cross-process signal delivery
+    // is not implemented, so the wait never finds a pending signal.
     let res = -11i32 as u32; // EAGAIN
     unicorn.get_data().set_action(ThreadAction::Block(BlockReason::SleepUntil(
         Instant::now() + Duration::from_millis(1),
