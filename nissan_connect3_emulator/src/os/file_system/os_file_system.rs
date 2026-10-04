@@ -106,6 +106,15 @@ impl FileSystem for OsFileSystem {
         }
     }
 
+    fn read_link(&mut self, file_path: &str) -> Option<String> {
+        let real = self.path_transform_to_real(file_path)?;
+        // read_link (unlike metadata) does not follow the link, so it also works
+        // for a link whose absolute target only exists in the guest mount tree
+        std::fs::read_link(real)
+            .ok()
+            .map(|target| target.to_string_lossy().into_owned())
+    }
+
     fn link(&mut self, _old_path: &str, _new_path: &str) -> Result<(), OpenFileError> {
         Err(OpenFileError::NoPermission)
     }

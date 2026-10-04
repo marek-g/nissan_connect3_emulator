@@ -150,43 +150,65 @@ impl MountFileSystem {
 
     pub fn open(&mut self, file_path: &str, flags: OpenFileFlags) -> Result<i32, OpenFileError> {
         let fd = self.get_unique_fd();
-        let absolute_path = self.path_convert_to_absolute(file_path);
-        if let Some((mount_point, translated_path)) = self.resolve_mount(&absolute_path) {
-            if mount_point.is_read_only
-                && (flags.contains(OpenFileFlags::WRITE)
-                    || flags.contains(OpenFileFlags::CREATE)
-                        && flags.contains(OpenFileFlags::EXCLUSIVE)
-                    || flags.contains(OpenFileFlags::TEMP_FILE))
-            {
-                log::warn!(
-                    "Open file for saving ignored for readonly file system! File: ({}), flags: {:?}",
-                    translated_path, flags
-                );
-                return Err(OpenFileError::NoPermission);
+        let mut path = self.path_convert_to_absolute(file_path);
+
+        // follow symbolic links: the stored target is a *guest* path, so each hop
+        // must be re-resolved through the mount table (a bare host follow would
+        // resolve an absolute target against the host root and miss it)
+        for _ in 0..8 {
+            let absolute_path = path.clone();
+            if let Some((mount_point, translated_path)) = self.resolve_mount(&absolute_path) {
+                if mount_point.is_read_only
+                    && (flags.contains(OpenFileFlags::WRITE)
+                        || flags.contains(OpenFileFlags::CREATE)
+                            && flags.contains(OpenFileFlags::EXCLUSIVE)
+                        || flags.contains(OpenFileFlags::TEMP_FILE))
+                {
+                    log::warn!(
+                        "Open file for saving ignored for readonly file system! File: ({}), flags: {:?}",
+                        translated_path, flags
+                    );
+                    return Err(OpenFileError::NoPermission);
+                }
+
+                if let Some(target) = mount_point.file_system.read_link(&translated_path) {
+                    path = if target.starts_with('/') {
+                        target
+                    } else {
+                        let parent = absolute_path
+                            .rsplit_once('/')
+                            .map(|(p, _)| p)
+                            .unwrap_or("");
+                        format!("{}/{}", parent, target)
+                    };
+                    continue;
+                }
+
+                let res = mount_point
+                    .file_system
+                    .open(&translated_path, flags, fd)
+                    .map(|_| fd);
+
+                if res.is_ok() {
+                    // store the global path (not the mount-relative one) so that
+                    // dirfd-based operations (openat, getdents) re-resolve entries
+                    // against the file's real location
+                    let mount_fs_file_data = MountFsFileData {
+                        file_path: absolute_path.clone(),
+                        mount_point: mount_point.mount_point.clone(),
+                        file_status_flags: 0,
+                    };
+
+                    self.file_data.insert(fd, mount_fs_file_data);
+                }
+
+                return res;
+            } else {
+                return Err(OpenFileError::FileSystemNotMounted);
             }
-
-            let res = mount_point
-                .file_system
-                .open(&translated_path, flags, fd)
-                .map(|_| fd);
-
-            if res.is_ok() {
-                // store the global path (not the mount-relative one) so that
-                // dirfd-based operations (openat, getdents) re-resolve entries
-                // against the file's real location
-                let mount_fs_file_data = MountFsFileData {
-                    file_path: absolute_path.clone(),
-                    mount_point: mount_point.mount_point.clone(),
-                    file_status_flags: 0,
-                };
-
-                self.file_data.insert(fd, mount_fs_file_data);
-            }
-
-            res
-        } else {
-            Err(OpenFileError::FileSystemNotMounted)
         }
+
+        Err(OpenFileError::NoSuchFileOrDirectory)
     }
 
     pub fn close(&mut self, fd: i32) -> Result<(), CloseFileError> {

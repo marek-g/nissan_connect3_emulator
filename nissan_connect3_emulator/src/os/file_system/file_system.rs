@@ -56,6 +56,13 @@ pub trait FileSystem {
     fn open(&mut self, file_path: &str, flags: OpenFileFlags, fd: i32)
         -> Result<(), OpenFileError>;
 
+    /// If the entry at `file_path` is a symbolic link, return its stored target
+    /// (as a guest path). Returns `None` for non-links. File systems that cannot
+    /// host symlinks keep the default.
+    fn read_link(&mut self, _file_path: &str) -> Option<String> {
+        None
+    }
+
     /// Close the file.
     fn close(&mut self, fd: i32) -> Result<(), CloseFileError>;
 

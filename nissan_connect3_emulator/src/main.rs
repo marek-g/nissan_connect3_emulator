@@ -22,6 +22,18 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
             ))),
             is_read_only: true,
         },
+        // dynamic process binaries (e.g. DAPIAPP.OUT): the map card's mount above
+        // shadows the firmware's /var/opt/bosch/dynamic, but the stock binaries
+        // symlink /opt/bosch/processes/*.OUT into /var/opt/bosch/dynamic/processes
+        // which only the firmware root actually contains. Mount that directory
+        // over the (map-card) mount so those symlinks resolve to real ELFs.
+        MountPoint {
+            mount_point: "/var/opt/bosch/dynamic/processes".to_string(),
+            file_system: Box::new(OsFileSystem::new(PathBuf::from(
+                "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/D605_unpacked/lx001.tar.gz/var/opt/bosch/dynamic/processes",
+            ))),
+            is_read_only: true,
+        },
         // volatile temp-fs
         MountPoint {
             mount_point: "/var/volatile".to_string(),
