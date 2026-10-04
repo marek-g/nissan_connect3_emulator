@@ -1,11 +1,11 @@
+use crate::common::queues;
 use crate::emulator::emulator::{ProcessFactory, ProcessHandle, ProcessSpec};
-use crate::os::syscalls::namespace::SystemNamespace;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub const LINUX_OSAAL_START_PROC_COMMAND: u8 = 0x1a;
-pub const DEFAULT_READY_QUEUE: &str = "NOIOSC_CB_HDR_LI_0";
+pub const DEFAULT_READY_QUEUE: &str = queues::DEFAULT_READY_QUEUE;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartProcessCommand {
@@ -178,7 +178,7 @@ impl RtosBootService {
         let deadline = Instant::now() + self.config.ready_timeout;
 
         while Instant::now() < deadline {
-            if self.ready_observed(&namespace.lock().unwrap()) {
+            if self.ready_observed(&namespace.lock().unwrap().mq) {
                 log::debug!(
                     "RTOS boot service observed ready queue(s) around {}",
                     self.config.ready_queue
@@ -192,30 +192,9 @@ impl RtosBootService {
         false
     }
 
-    fn ready_observed(&self, namespace: &SystemNamespace) -> bool {
-        namespace
-            .mq
-            .name_to_id
-            .keys()
-            .any(|name| is_boot_ready_queue(name, &self.config.ready_queue))
+    fn ready_observed(&self, mq: &queues::MqState) -> bool {
+        mq.has_guest_ready_queue(&self.config.ready_queue)
     }
-}
-
-fn is_boot_ready_queue(name: &str, configured: &str) -> bool {
-    matches!(
-        name,
-        "NOIOSC_CB_HDR_LI_0"
-            | "/NOIOSC_CB_HDR_LI_0"
-            | "OSAL_CB_HDR_LI_MAIN"
-            | "/OSAL_CB_HDR_LI_MAIN"
-            | "TE_TERM_MQ"
-            | "/TE_TERM_MQ"
-            | "LI_TERM_MQ"
-            | "/LI_TERM_MQ"
-    ) || name.starts_with("NOIOSC_CB_HDR_LI_")
-        || name.starts_with("/NOIOSC_CB_HDR_LI_")
-        || name == configured
-        || name == format!("/{configured}")
 }
 
 fn env_duration_ms(name: &str, default: Duration) -> Duration {

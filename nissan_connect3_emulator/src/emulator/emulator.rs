@@ -122,11 +122,20 @@ impl Emulator {
         let rtos_config = rtos::RtosBootConfig::from_env_with_default_envs(&specs);
         let handles = Arc::new(Mutex::new(Vec::with_capacity(specs.len())));
 
+        if rtos_config.is_enabled() {
+            rtos::RtosQueueSimulator::bootstrap(&factory.namespace());
+        }
+
         for spec in specs {
             let handle = factory.spawn_process(spec);
             handles.lock().unwrap().push(handle);
         }
 
+        let rtos_queues = if rtos_config.is_enabled() {
+            Some(rtos::RtosQueueSimulator::start(factory.namespace()))
+        } else {
+            None
+        };
         let rtos_service = rtos::RtosBootService::new(factory, handles.clone(), rtos_config).start();
 
         let mut first_error = None;
@@ -165,6 +174,10 @@ impl Emulator {
                     }
                 }
             }
+        }
+
+        if let Some(rtos_queues) = rtos_queues {
+            rtos_queues.stop();
         }
 
         match first_error {

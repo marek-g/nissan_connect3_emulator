@@ -12,6 +12,8 @@ use crate::emulator::context::Context;
 use crate::emulator::thread::{BlockReason, ThreadAction, ThreadStatus};
 use crate::emulator::utils::{pack_u32, unpack_u32};
 use std::collections::{HashMap, HashSet};
+use std::os::raw::c_void;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::{RegisterARM, Unicorn};
@@ -67,6 +69,10 @@ pub struct IoscState {
     mutexes: HashMap<u32, IoscMutex>,
     events: HashMap<u32, IoscEvent>,
     semaphores: HashMap<u32, IoscSemaphore>,
+    /// IOSC shared objects allocated with an explicit id. These back OSAL IOSC
+    /// message queues and are shared across every guest process, just like the
+    /// real driver's shared segment.
+    shared_regions: HashMap<u32, Arc<Vec<u8>>>,
 }
 
 impl IoscState {
@@ -78,6 +84,7 @@ impl IoscState {
             mutexes: HashMap::new(),
             events: HashMap::new(),
             semaphores: HashMap::new(),
+            shared_regions: HashMap::new(),
         }
     }
 
@@ -89,6 +96,16 @@ impl IoscState {
     fn alloc_handle(&mut self) -> u32 {
         self.next_handle += 1;
         self.next_handle
+    }
+
+    fn get_or_create_shared(&mut self, id: u32, size: u32) -> Arc<Vec<u8>> {
+        if let Some(buf) = self.shared_regions.get(&id) {
+            return buf.clone();
+        }
+
+        let buf = Arc::new(vec![0u8; size as usize]);
+        self.shared_regions.insert(id, buf.clone());
+        buf
     }
 }
 
@@ -223,34 +240,47 @@ fn write_result(unicorn: &mut Unicorn<'_, Context>, result_ptr: u32, value: u32)
 /// >= 0, so a non-zero return here would be misread as an error.
 fn shared_malloc(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
     let pp_mem = read_u32(unicorn, addr);
+    let id = read_u32(unicorn, addr + 4);
     let size = read_u32(unicorn, addr + 8);
     if size == 0 {
         return EINVAL;
     }
+    let map_size = page_align_up(size);
 
+    let host_buf = {
+        let mut namespace = unicorn.get_data().namespace.lock().unwrap();
+        namespace.iosc.get_or_create_shared(id, map_size)
+    };
+    let host_ptr = host_buf.as_ptr() as *mut c_void;
     let base = {
         let mmu_arc = unicorn.get_data().mmu.clone();
-        let base = mmu_arc.lock().unwrap().heap_alloc(
+        let base = mmu_arc.lock().unwrap().heap_alloc_shared(
             unicorn,
-            size,
+            map_size,
             Prot::READ | Prot::WRITE,
-            "iosc-shm",
+            &format!("/dev/iosc/shared/{:08x}", id),
+            host_ptr,
         );
         base
     };
-    unicorn
-        .mem_write(base as u64, &vec![0u8; size as usize])
-        .unwrap();
     if pp_mem != 0 {
         unicorn
             .mem_write(pp_mem as u64, &pack_u32(base))
             .unwrap();
     }
     log::trace!(
-        "[IOSC] shared_malloc(size={:#x}) => base {:#x} via *ppMem({:#x})",
-        size, base, pp_mem
+        "[IOSC] shared_malloc(id={:#x}, size={:#x}, mapped={:#x}) => base {:#x} via *ppMem({:#x})",
+        id,
+        size,
+        map_size,
+        base,
+        pp_mem
     );
     0
+}
+
+fn page_align_up(size: u32) -> u32 {
+    (size + 0xfff) & !0xfff
 }
 
 // ---- events ---------------------------------------------------------------
