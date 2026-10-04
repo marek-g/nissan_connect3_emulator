@@ -18,11 +18,11 @@
 //! completes it and stores the syscall result in `GuestThread::pending_result`,
 //! which the scheduler installs into R0 on the next switch-in.
 
+use crate::common::queues::{canonical_mq_name, MqGuestOpen, MqNotify};
 use crate::emulator::context::Context;
 use crate::emulator::memory_map::{MQ_NOTIFY_EXIT_STUB, STACK_SIZE};
 use crate::emulator::thread::{BlockReason, GuestThread, ThreadAction, ThreadStatus};
 use crate::emulator::utils::{pack_u32, read_string, unpack_u32};
-use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 use unicorn_engine::unicorn_const::Prot;
@@ -51,74 +51,6 @@ const EMSGSIZE: u32 = -90i32 as u32;
 const ENAMETOOLONG: u32 = -36i32 as u32;
 const ENOENT: u32 = -2i32 as u32;
 const ETIMEDOUT: u32 = -110i32 as u32;
-
-#[derive(Clone, Copy)]
-pub enum MqNotify {
-    SigevNone,
-    Signal { signo: i32, sigval: u32 },
-    Thread { function: u32, sigval: u32 },
-}
-
-pub struct MqMessage {
-    pub data: Vec<u8>,
-    pub priority: u32,
-}
-
-pub struct MqQueue {
-    pub name: String,
-    pub maxmsg: i64,
-    pub msgsize: i64,
-    /// O_NONBLOCK was passed by any opener (the kernel checks it per fd; the
-    /// firmware only ever opens with O_RDWR)
-    pub nonblock: bool,
-    /// sorted by ascending priority (index 0 = lowest); pop from the back for
-    /// the highest priority, FIFO within equal priorities (msg_insert in
-    /// ipc/mqueue.c)
-    pub messages: Vec<MqMessage>,
-    pub open_count: u32,
-    pub unlinked: bool,
-    /// guest tid that registered the notification (kernel: notify_owner)
-    pub notify_owner: Option<u32>,
-    pub notify: Option<MqNotify>,
-}
-
-pub struct MqState {
-    pub queues: HashMap<u32, MqQueue>,
-    pub name_to_id: HashMap<String, u32>,
-    /// queue id -> blocked guest tids (senders and receivers share the list,
-    /// distinguished by their BlockReason)
-    pub waiters: HashMap<u32, Vec<u32>>,
-    /// bytes staged by a blocked sender, keyed by tid: `(queue_id, data, priority)`.
-    /// The sender copies its message out of its own (private) address space when
-    /// it blocks; whichever host thread later frees a slot moves these staged
-    /// bytes into the queue, so a sender in one VM never needs its memory read by
-    /// another process' VM.
-    pub staged: HashMap<u32, (u32, Vec<u8>, u32)>,
-    next_id: u32,
-}
-
-/// mq handles must not collide with file-system fds (glibc's mq_close() uses
-/// the plain close syscall, which dispatches on the number); file fds are
-/// allocated from 0 upwards (MountFileSystem::get_unique_fd), so start well
-/// above any realistic simultaneous fd count
-const MQ_HANDLE_BASE: u32 = 1000;
-
-impl MqState {
-    pub fn new() -> Self {
-        Self {
-            queues: HashMap::new(),
-            name_to_id: HashMap::new(),
-            waiters: HashMap::new(),
-            staged: HashMap::new(),
-            next_id: MQ_HANDLE_BASE,
-        }
-    }
-
-    fn alloc_id(&mut self) -> u32 {
-        self.next_id += 1;
-        self.next_id
-    }
-}
 
 /// outcome of converting an absolute CLOCK_REALTIME timeout
 enum Deadline {
@@ -157,17 +89,6 @@ fn read_deadline(unicorn: &Unicorn<'_, Context>, addr: u32) -> Deadline {
     }
 }
 
-/// insert a message keeping the kernel's priority ordering (ipc/mqueue.c
-/// msg_insert: higher priority towards the back of the vector)
-fn insert_message(messages: &mut Vec<MqMessage>, data: Vec<u8>, priority: u32) {
-    let pos = messages
-        .iter()
-        .rposition(|m| m.priority >= priority)
-        .map(|i| i + 1)
-        .unwrap_or(messages.len());
-    messages.insert(pos, MqMessage { data, priority });
-}
-
 /// mq_open(name, oflag, mode, attr) - ipc/mqueue.c SYSCALL_DEFINE4(mq_open)
 pub fn mq_open(
     unicorn: &mut Unicorn<'_, Context>,
@@ -176,12 +97,13 @@ pub fn mq_open(
     _mode: u32,
     attr_addr: u32,
 ) -> u32 {
-    let name = read_string(unicorn, name_addr);
+    let raw_name = read_string(unicorn, name_addr);
+    let name = canonical_mq_name(&raw_name);
     log::trace!(
         "{:#x}: [{}] [SYSCALL] mq_open(name = \"{}\", oflag: {:#x}, mode: {:#x}, attr: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().thread_id(),
-        name,
+        raw_name,
         oflag,
         _mode,
         attr_addr,
@@ -189,9 +111,9 @@ pub fn mq_open(
 
     // The kernel roots mqueue names at '/' and forbids any other '/'. The
     // firmware's non-IOSC OSAL path instead names queues with bare identifiers
-    // (e.g. "NOIOSC_CB_HDR_LI_0") - accept both conventions, rejecting only an
-    // empty name or an embedded '/'.
-    let res = if name.is_empty() || name[1..].contains('/') {
+    // (e.g. "NOIOSC_CB_HDR_LI_0") - canonicalize both conventions into one
+    // namespace key, rejecting only an empty name or an embedded '/'.
+    let res = if name.is_empty() || name.contains('/') {
         EINVAL
     } else if name.len() > NAME_MAX {
         ENAMETOOLONG
@@ -199,60 +121,32 @@ pub fn mq_open(
         // (O_RDWR | O_WRONLY) is not a valid access mode (do_open)
         EINVAL
     } else {
-        let attr = if attr_addr != 0 {
+        let (maxmsg, msgsize) = if attr_addr != 0 {
             let mut buf = [0u8; 8];
             unicorn.mem_read(attr_addr as u64 + 4, &mut buf).unwrap();
-            Some((unpack_u32(&buf[0..4]) as i64, unpack_u32(&buf[4..8]) as i64))
+            (unpack_u32(&buf[0..4]) as i64, unpack_u32(&buf[4..8]) as i64)
         } else {
-            None
+            (DFLT_MSGMAX, DFLT_MSGSIZEMAX)
         };
 
         let data = unicorn.get_data();
         let mut state = data.namespace.lock().unwrap();
 
-        if let Some(&id) = state.mq.name_to_id.get(&name) {
-            // entry already exists (mq_open: -EEXIST only when O_EXCL is set,
-            // otherwise the existing queue is just opened)
-            if oflag & O_CREAT != 0 && oflag & O_EXCL != 0 {
-                EEXIST
-            } else {
-                let queue = state.mq.queues.get_mut(&id).unwrap();
-                queue.open_count += 1;
-                queue.nonblock |= oflag & O_NONBLOCK != 0;
+        match state.mq.guest_open_or_create(
+            &name,
+            maxmsg,
+            msgsize,
+            oflag & O_CREAT != 0,
+            oflag & O_EXCL != 0,
+            oflag & O_NONBLOCK != 0,
+        ) {
+            MqGuestOpen::Opened(id) | MqGuestOpen::Created(id) => {
+                state.notify_waiters();
                 id
             }
-        } else if oflag & O_CREAT != 0 {
-            // mqueue_get_inode: attr validation + defaults
-            let (maxmsg, msgsize) = match attr {
-                Some((m, s)) => (m, s),
-                None => (DFLT_MSGMAX, DFLT_MSGSIZEMAX),
-            };
-            if maxmsg <= 0 || msgsize <= 0 {
-                return EINVAL;
-            }
-
-            let id = state.mq.alloc_id();
-            state
-                .mq
-                .queues
-                .insert(
-                    id,
-                    MqQueue {
-                        name: name.clone(),
-                        maxmsg,
-                        msgsize,
-                        nonblock: oflag & O_NONBLOCK != 0,
-                        messages: Vec::new(),
-                        open_count: 1,
-                        unlinked: false,
-                        notify_owner: None,
-                        notify: None,
-                    },
-                );
-            state.mq.name_to_id.insert(name, id);
-            id
-        } else {
-            ENOENT
+            MqGuestOpen::AlreadyExists => EEXIST,
+            MqGuestOpen::NotFound => ENOENT,
+            MqGuestOpen::InvalidAttrs => EINVAL,
         }
     };
 
@@ -280,32 +174,6 @@ fn set_runnable_with_result(unicorn: &Unicorn<'_, Context>, tid: u32, result: u3
             thread.pending_result = Some(result);
         }
     }
-}
-
-/// take the message from the queue (highest priority first)
-fn pop_message(unicorn: &Unicorn<'_, Context>, queue_id: u32) -> Option<MqMessage> {
-    let mut state = unicorn.get_data().namespace.lock().unwrap();
-    state.mq.queues.get_mut(&queue_id)?.messages.pop()
-}
-
-/// insert a message; if the queue just became non-empty and a notification is
-/// registered, take it (kernel: __do_notify fires only on empty -> not empty
-/// with no synchronous receiver waiting, then unregisters)
-fn insert_message_and_take_notify(
-    unicorn: &Unicorn<'_, Context>,
-    queue_id: u32,
-    data: Vec<u8>,
-    priority: u32,
-) -> Option<MqNotify> {
-    let mut state = unicorn.get_data().namespace.lock().unwrap();
-    let queue = state.mq.queues.get_mut(&queue_id)?;
-    insert_message(&mut queue.messages, data, priority);
-    if queue.messages.len() == 1 {
-        if queue.notify_owner.take().is_some() {
-            return queue.notify.take();
-        }
-    }
-    None
 }
 
 /// deliver a registered notification (called with no locks held)
@@ -452,7 +320,11 @@ pub fn mq_timedsend(
 
     // there is a free slot: insert the message (firing a queued notification if
     // the queue just became non-empty) and wake any receiver blocked on it
-    if let Some(notify) = insert_message_and_take_notify(unicorn, mqdes, buf, msg_prio) {
+    let notify = {
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
+        state.mq.insert_message_and_take_notify(mqdes, buf, msg_prio)
+    };
+    if let Some(notify) = notify {
         fire_notification(unicorn, notify);
     }
     notify_waiters(unicorn);
@@ -512,7 +384,11 @@ fn do_mq_timedreceive(
         }
     }
 
-    if let Some(message) = pop_message(unicorn, mqdes) {
+    let message = {
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
+        state.mq.pop_message(mqdes)
+    };
+    if let Some(message) = message {
         unicorn.mem_write(msg_ptr as u64, &message.data).unwrap();
         if prio_ptr != 0 {
             unicorn.mem_write(prio_ptr as u64, &pack_u32(message.priority)).unwrap();
@@ -533,7 +409,7 @@ fn do_mq_timedreceive(
     // queue is empty
     let nonblock = {
         let state = unicorn.get_data().namespace.lock().unwrap();
-        state.mq.queues.get(&mqdes).map(|q| q.nonblock).unwrap_or(false)
+        state.mq.queue_nonblock(mqdes)
     };
     if nonblock {
         return EAGAIN;
@@ -787,19 +663,11 @@ pub fn finish_mq_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, now: Instant
         }) => {
             let message = {
                 let mut state = unicorn.get_data().namespace.lock().unwrap();
-                let pop = state
-                    .mq
-                    .queues
-                    .get_mut(&queue_id)
-                    .and_then(|q| q.messages.pop());
-                match &pop {
-                    Some(_) => remove_waiter_locked(&mut state, queue_id, tid),
-                    None if deadline.map(|d| d <= now).unwrap_or(false) => {
-                        remove_waiter_locked(&mut state, queue_id, tid)
-                    }
-                    None => {}
+                let message = state.mq.pop_message(queue_id);
+                if message.is_some() || deadline.map(|d| d <= now).unwrap_or(false) {
+                    state.mq.remove_waiter(queue_id, tid);
                 }
-                pop
+                message
             };
 
             match message {
@@ -829,23 +697,16 @@ pub fn finish_mq_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, now: Instant
             let mut timed_out = false;
             {
                 let mut state = unicorn.get_data().namespace.lock().unwrap();
-                let free_slot = state
-                    .mq
-                    .queues
-                    .get(&queue_id)
-                    .map(|q| q.messages.len() < q.maxmsg as usize)
-                    .unwrap_or(false);
+                let free_slot = state.mq.has_free_slot(queue_id);
                 if free_slot {
                     if let Some((_, bytes, priority)) = state.mq.staged.remove(&tid) {
-                        if let Some(q) = state.mq.queues.get_mut(&queue_id) {
-                            insert_message(&mut q.messages, bytes, priority);
-                        }
+                        state.mq.insert_message(queue_id, bytes, priority);
                     }
-                    remove_waiter_locked(&mut state, queue_id, tid);
+                    state.mq.remove_waiter(queue_id, tid);
                     completed = true;
                 } else if deadline.map(|d| d <= now).unwrap_or(false) {
                     state.mq.staged.remove(&tid);
-                    remove_waiter_locked(&mut state, queue_id, tid);
+                    state.mq.remove_waiter(queue_id, tid);
                     timed_out = true;
                 }
             }
@@ -858,15 +719,5 @@ pub fn finish_mq_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, now: Instant
             }
         }
         _ => return, // not an mq wait - nothing to do
-    }
-}
-
-/// remove `tid` from a queue's waiter list, already holding the namespace lock
-fn remove_waiter_locked(state: &mut crate::os::syscalls::namespace::SystemNamespace, queue_id: u32, tid: u32) {
-    if let Some(list) = state.mq.waiters.get_mut(&queue_id) {
-        list.retain(|&waiter| waiter != tid);
-        if list.is_empty() {
-            state.mq.waiters.remove(&queue_id);
-        }
     }
 }

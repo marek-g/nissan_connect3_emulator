@@ -7,9 +7,9 @@
 //! a waiter routes through the process that owns it (see the scheduler / wake
 //! machinery). Named shared memory and named semaphores will be added here too.
 
+use crate::common::queues::MqState;
 use crate::emulator::thread::Wake;
 use crate::os::dev::iosc::IoscState;
-use crate::os::syscalls::mqueue::MqState;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 

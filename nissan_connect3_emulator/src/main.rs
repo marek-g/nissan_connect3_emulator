@@ -5,6 +5,7 @@ use crate::os::file_system::{
 };
 use std::path::PathBuf;
 
+mod common;
 mod emulator;
 mod libs;
 mod os;
