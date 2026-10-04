@@ -7,9 +7,8 @@
 //! `0xe` terminal-ready notification toward Linux, and drains the Linux-to-RTOS
 //! terminal queue so guest messages are not left unread.
 
-use crate::common::queues::{
-    LI_TERM_MQ, OSAL_CB_HDR_LI_MAIN, OSAL_CB_HDR_MAXMSG, OSAL_CB_HDR_MSGSIZE, OSAL_CB_HDR_TE,
-    TE_TERM_MQ, TERM_MQ_MAXMSG, TERM_MQ_MSGSIZE,
+use crate::common::osal_queues::{
+    message_command, message_words, OsalQueueService, LI_TERM_MQ, TE_TERM_MQ,
 };
 use crate::os::syscalls::namespace::SystemNamespace;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,16 +28,8 @@ impl RtosQueueSimulator {
     pub fn bootstrap(namespace: &Arc<Mutex<SystemNamespace>>) {
         let mut namespace = namespace.lock().unwrap();
 
-        namespace.mq.rtos_open_or_create(TE_TERM_MQ, TERM_MQ_MAXMSG, TERM_MQ_MSGSIZE);
-        namespace.mq.rtos_open_or_create(LI_TERM_MQ, TERM_MQ_MAXMSG, TERM_MQ_MSGSIZE);
-        namespace
-            .mq
-            .rtos_open_or_create(OSAL_CB_HDR_LI_MAIN, OSAL_CB_HDR_MAXMSG, OSAL_CB_HDR_MSGSIZE);
-        namespace
-            .mq
-            .rtos_open_or_create(OSAL_CB_HDR_TE, OSAL_CB_HDR_MAXMSG, OSAL_CB_HDR_MSGSIZE);
-
-        if namespace.mq.host_post(LI_TERM_MQ, vec![0x0e], 0) {
+        OsalQueueService::bootstrap_rtos_queues(&mut namespace.mq);
+        if OsalQueueService::post_rtos_terminal_ready(&mut namespace.mq) {
             log::info!("RTOS terminal posted startup notification 0x0e to {}", LI_TERM_MQ);
         }
 
@@ -71,16 +62,18 @@ impl RtosQueueSimulator {
 fn poll_once(namespace: &Arc<Mutex<SystemNamespace>>) -> bool {
     let message = {
         let mut namespace = namespace.lock().unwrap();
-        namespace.mq.host_receive(TE_TERM_MQ)
+        OsalQueueService::receive_rtos_terminal_message(&mut namespace.mq)
     };
 
     match message {
         Some(message) => {
             let words = message_words(&message.data);
+            let command = message_command(&message.data).unwrap_or(0);
             log::info!(
-                "RTOS terminal received {} command 0x{:02x} (len {}, data [{}, {}, {}, {}])",
+                "RTOS terminal received {} command 0x{:02x} (prio {}, len {}, data [{}, {}, {}, {}])",
                 TE_TERM_MQ,
-                words[0] & 0xff,
+                command,
+                message.priority,
                 message.data.len(),
                 words[0],
                 words[1],
@@ -94,20 +87,4 @@ fn poll_once(namespace: &Arc<Mutex<SystemNamespace>>) -> bool {
     namespace.lock().unwrap().notify_waiters();
 
     true
-}
-
-fn message_words(data: &[u8]) -> [u32; 4] {
-    let mut words = [0u32; 4];
-    for (index, word) in words.iter_mut().enumerate() {
-        let offset = index * 4;
-        if offset + 4 <= data.len() {
-            *word = u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]);
-        }
-    }
-    words
 }
