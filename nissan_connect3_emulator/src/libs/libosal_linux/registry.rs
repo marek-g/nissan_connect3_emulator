@@ -47,6 +47,7 @@ fn open(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let path_addr = reg(unicorn, RegisterARM::R0);
     let flags = reg(unicorn, RegisterARM::R1);
     let out_addr = reg(unicorn, RegisterARM::R3);
+    let caller = reg(unicorn, RegisterARM::R14);
 
     if path_addr == 0 || out_addr == 0 {
         return ERROR_PARAM;
@@ -67,11 +68,33 @@ fn open(unicorn: &mut Unicorn<'_, Context>) -> u32 {
             if !write_u32(unicorn, out_addr, handle) {
                 return ERROR_PARAM;
             }
-            log::trace!("REGISTRY_u32IOOpen({}) flags={:#x} -> handle={:#x}", path, flags, handle);
+            log::trace!(
+                "REGISTRY_u32IOOpen(caller={:#x}, {}) flags={:#x} -> handle={:#x}",
+                caller,
+                path,
+                flags,
+                handle,
+            );
             SUCCESS
         }
-        None if !matches!(flags, 1 | 2 | 4) => ERROR_FLAGS,
-        None => ERROR_NOT_FOUND,
+        None if !matches!(flags, 1 | 2 | 4) => {
+            log::trace!(
+                "REGISTRY_u32IOOpen(caller={:#x}, {}) flags={:#x} -> bad flags",
+                caller,
+                path,
+                flags,
+            );
+            ERROR_FLAGS
+        }
+        None => {
+            log::trace!(
+                "REGISTRY_u32IOOpen(caller={:#x}, {}) flags={:#x} -> not found",
+                caller,
+                path,
+                flags,
+            );
+            ERROR_NOT_FOUND
+        }
     }
 }
 
@@ -131,7 +154,7 @@ fn io_control(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     );
 
     match command {
-        1 => query_value(unicorn, info.path(), info.flags(), buffer),
+        1 | 4 => query_value(unicorn, info.path(), info.flags(), buffer),
         10 => lookup_app_path(unicorn, info.path(), info.flags(), buffer),
         0xb => lookup_service_path(unicorn, info.path(), info.flags(), buffer),
         _ => {

@@ -129,8 +129,24 @@ impl Registry {
         }
 
         registry.load_referenced_process_registries(&dir);
+        registry.load_compatibility_entries();
         registry.mark_process_started("LBASE");
         registry
+    }
+
+    pub fn load_compatibility_entries(&mut self) -> usize {
+        let path = default_registry_compat_file();
+        match self.load_file(&path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                log::debug!(
+                    "registry: compatibility file {} unavailable: {}",
+                    path.display(),
+                    error,
+                );
+                0
+            }
+        }
     }
 
     pub fn load_files<P: AsRef<Path>>(&mut self, files: impl IntoIterator<Item = P>) -> usize {
@@ -401,6 +417,16 @@ pub fn default_registry_files(dir: &Path) -> Vec<PathBuf> {
         .iter()
         .map(|file| dir.join(file))
         .collect()
+}
+
+pub fn default_registry_compat_file() -> PathBuf {
+    env::var_os("EMU_REGISTRY_COMPAT_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("data")
+                .join("registry_compat.reg")
+        })
 }
 
 pub fn normalize_registry_path(path: &str) -> Vec<String> {
