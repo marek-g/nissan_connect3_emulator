@@ -1,7 +1,7 @@
 use crate::emulator::emulator::{Emulator, ProcessSpec};
 use crate::os::file_system::{
-    DevFileSystem, MountFileSystem, MountPoint, OsFileSystem, ProcFileSystem, StdFileSystem,
-    TmpFileSystem,
+    DevFileSystem, FileType, MountFileSystem, MountPoint, OsFileSystem, ProcFileSystem,
+    StdFileSystem, TmpFileSystem,
 };
 use std::path::PathBuf;
 
@@ -40,6 +40,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         MountPoint {
             mount_point: "/var/volatile".to_string(),
             file_system: Box::new(TmpFileSystem::new()),
+            is_read_only: false,
+        },
+        // tmp-fs: OSAL/PRM expects /tmp to be writable and automount-ready
+        MountPoint {
+            mount_point: "/tmp".to_string(),
+            file_system: {
+                let mut tmp_fs = TmpFileSystem::new();
+                tmp_fs.insert_entry("/.automount", FileType::Directory, vec![]);
+                Box::new(tmp_fs)
+            },
             is_read_only: false,
         },
         // lib temp-fs

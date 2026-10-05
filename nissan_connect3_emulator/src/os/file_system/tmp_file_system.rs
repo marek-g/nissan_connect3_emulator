@@ -59,8 +59,27 @@ impl FileSystem for TmpFileSystem {
         self.files.contains_key(file_path)
     }
 
-    fn mkdir(&mut self, _file_path: &str, _mode: u32) -> Result<(), OpenFileError> {
-        Err(OpenFileError::NoPermission)
+    fn mkdir(&mut self, file_path: &str, _mode: u32) -> Result<(), OpenFileError> {
+        let path = normalize_path(file_path);
+        if self.files.contains_key(&path) {
+            return Err(OpenFileError::FileExists);
+        }
+
+        if path != "/" {
+            let parent = path.rsplit_once('/').map_or("/", |(parent, _)| {
+                if parent.is_empty() {
+                    "/"
+                } else {
+                    parent
+                }
+            });
+            if !self.files.contains_key(parent) {
+                return Err(OpenFileError::NoSuchFileOrDirectory);
+            }
+        }
+
+        self.insert_entry(&path, FileType::Directory, vec![]);
+        Ok(())
     }
 
     fn read_dir(&mut self, dir_path: &str) -> Result<Vec<String>, ()> {
@@ -330,5 +349,15 @@ impl FileSystem for TmpFileSystem {
         _addr: u32,
     ) -> i32 {
         todo!()
+    }
+}
+
+fn normalize_path(path: &str) -> String {
+    if path.is_empty() {
+        "/".to_string()
+    } else if path.len() > 1 && path.ends_with('/') {
+        path[..path.len() - 1].to_string()
+    } else {
+        path.to_string()
     }
 }
