@@ -25,7 +25,15 @@ fn log_thread_call(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address: 
     let r0 = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
     let thread = unicorn.get_data().inner.thread_id();
     let details = if name == "OSAL_ThreadCreate" {
-        format!("params={:#x}", r0)
+        let name_ptr = read_u32(unicorn, r0);
+        let stack_size = read_u32(unicorn, r0 + 8);
+        let entry = read_u32(unicorn, r0 + 0x0c);
+        let arg = read_u32(unicorn, r0 + 0x10);
+        let name = read_c_string(unicorn, name_ptr).unwrap_or_else(|| "<bad name ptr>".to_string());
+        if name.starts_with("AE_") {
+            hook_ail_entry(unicorn, entry);
+        }
+        format!("name={name}, entry=0x{entry:x}, arg=0x{arg:x}, stack=0x{stack_size:x}")
     } else {
         format!("tid={}", r0)
     };
@@ -36,4 +44,54 @@ fn log_thread_call(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address: 
         name,
         details
     );
+}
+
+fn hook_ail_entry(unicorn: &mut Unicorn<'_, Context>, entry: u32) {
+    if entry == 0 {
+        return;
+    }
+
+    unicorn
+        .add_code_hook(entry as u64, entry as u64, |uc, addr, _| {
+            let obj = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let vtable = read_u32(uc, obj);
+            let app_entry = read_u32(uc, vtable + 0x10);
+            let thread = uc.get_data().inner.thread_id();
+            log::info!(
+                "0x{:x} [{}] [PROCHMI] AIL entry(obj=0x{:x}, vtable=0x{:x}, vStart=0x{:x})",
+                addr,
+                thread,
+                obj,
+                vtable,
+                app_entry
+            );
+        })
+        .unwrap();
+}
+
+fn read_u32(unicorn: &Unicorn<'_, Context>, addr: u32) -> u32 {
+    if addr == 0 {
+        return 0;
+    }
+    let mut buf = [0; 4];
+    match unicorn.mem_read(addr as u64, &mut buf) {
+        Ok(()) => u32::from_le_bytes(buf),
+        Err(_) => 0,
+    }
+}
+
+fn read_c_string(unicorn: &Unicorn<'_, Context>, addr: u32) -> Option<String> {
+    if addr == 0 {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    for offset in 0..64 {
+        let mut byte = [0; 1];
+        unicorn.mem_read((addr + offset) as u64, &mut byte).ok()?;
+        if byte[0] == 0 {
+            break;
+        }
+        bytes.push(byte[0]);
+    }
+    String::from_utf8(bytes).ok()
 }

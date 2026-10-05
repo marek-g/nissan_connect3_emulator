@@ -5,8 +5,13 @@ const ORIGINAL_BASE: u32 = 0x484d_8000;
 const OSAL_CORE_GLOBAL: u32 = 0x4856_79e0;
 use crate::emulator::thread::{BlockReason, ThreadStatus};
 use crate::emulator::utils::pack_u32;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::{RegisterARM, Unicorn};
+
+static SYNTH_PWR_START_CONF_SENT: AtomicBool = AtomicBool::new(false);
+static SYNTH_PWR_START_CONF_CONTENT: AtomicU32 = AtomicU32::new(0);
 
 /// Message-queue observation and OSAL service bridge hooks.
 ///
@@ -26,6 +31,7 @@ pub fn hook_message_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     const QUEUE_PRIORITY_WAIT: u32 = 0x4850d8a8 - 0x484d8000;
     const GET_FROM_MQ: u32 = 0x48509c8c - 0x484d8000;
     const CHECK_FOR_IOS_QUEUE: u32 = 0x48509744 - 0x484d8000;
+    const MESSAGE_DELETE: u32 = 0x48513850 - 0x484d8000;
 
     unicorn
         .add_code_hook(
@@ -62,9 +68,22 @@ pub fn hook_message_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
             )
             .unwrap();
     }
+
+    unicorn
+        .add_code_hook(
+            (base_address + MESSAGE_DELETE) as u64,
+            (base_address + MESSAGE_DELETE) as u64,
+            move |uc, addr, _| suppress_synthetic_message_delete(uc, addr as u32, base_address),
+        )
+        .unwrap();
 }
 
-fn handle_queue_api(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address: u32, api_name: &str) {
+fn handle_queue_api(
+    unicorn: &mut Unicorn<'_, Context>,
+    addr: u32,
+    base_address: u32,
+    api_name: &str,
+) {
     let thread = unicorn.get_data().inner.thread_id();
     let r0 = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
     let r1 = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -139,13 +158,22 @@ fn handle_queue_api(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address:
             }
 
             let stack_timeout = read_stack_timeout(unicorn, api_name);
-            if bridge_guest_osal_queue(unicorn, api_name, &decoded.name, r1, r2, r3, stack_timeout) {
+            if bridge_guest_osal_queue(unicorn, api_name, &decoded.name, r1, r2, r3, stack_timeout)
+            {
                 log::info!(
                     "0x{:x} [{}] [LIBOSAL-OSAL-SERVICE] {} handled name={}",
                     addr - base_address + 0x484d8000,
                     thread,
                     api_name,
                     decoded.name
+                );
+            } else {
+                let _ = synthesize_ail_power_start_conf(
+                    unicorn,
+                    api_name,
+                    &decoded.name,
+                    r1,
+                    stack_timeout,
                 );
             }
         }
@@ -226,12 +254,8 @@ fn fallback_open_to_create(
     );
 
     // OSAL_s32MessageQueueCreate(char *name, uint maxmsg, uint msgsize, int type, handle *out)
-    unicorn
-        .reg_write(RegisterARM::R1, max_msg as u64)
-        .unwrap();
-    unicorn
-        .reg_write(RegisterARM::R2, msg_size as u64)
-        .unwrap();
+    unicorn.reg_write(RegisterARM::R1, max_msg as u64).unwrap();
+    unicorn.reg_write(RegisterARM::R2, msg_size as u64).unwrap();
     unicorn.reg_write(RegisterARM::R3, flags as u64).unwrap();
     unicorn
         .reg_write(RegisterARM::PC, (base_address + create_offset) as u64)
@@ -331,12 +355,107 @@ fn read_u8_or_invalid(unicorn: &Unicorn<'_, Context>, addr: u32) -> u32 {
 }
 
 fn read_stack_timeout(unicorn: &Unicorn<'_, Context>, api_name: &str) -> u32 {
-    if matches!(api_name, "OSAL_s32MessageQueueWait" | "OSAL_s32MessageQueuePriorityWait") {
+    if matches!(
+        api_name,
+        "OSAL_s32MessageQueueWait" | "OSAL_s32MessageQueuePriorityWait"
+    ) {
         let sp = unicorn.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
         read_u32_or_invalid(unicorn, sp)
     } else {
         0
     }
+}
+
+fn synthesize_ail_power_start_conf(
+    unicorn: &mut Unicorn<'_, Context>,
+    api_name: &str,
+    name: &str,
+    buf: u32,
+    stack_timeout: u32,
+) -> bool {
+    const TARGET_QUEUE: &str = "mbx_265";
+    const CONTENT_LEN: u32 = 0x20;
+
+    if !matches!(
+        api_name,
+        "OSAL_s32MessageQueueWait" | "OSAL_s32MessageQueuePriorityWait"
+    ) {
+        return false;
+    }
+    if name != TARGET_QUEUE || stack_timeout != u32::MAX {
+        return false;
+    }
+    if buf == 0 || buf > 0xf000_0000 {
+        return false;
+    }
+    if SYNTH_PWR_START_CONF_SENT.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+
+    let mmu_arc = unicorn.get_data().mmu.clone();
+    let content = mmu_arc.lock().unwrap().heap_alloc(
+        unicorn,
+        CONTENT_LEN,
+        Prot::READ | Prot::WRITE,
+        "[synthetic-cca-power-conf]",
+    );
+    if content == 0 {
+        SYNTH_PWR_START_CONF_SENT.store(false, Ordering::Relaxed);
+        return false;
+    }
+
+    let mut body = [0u8; CONTENT_LEN as usize];
+    body[0x00..0x02].copy_from_slice(&0x0109u16.to_le_bytes());
+    body[0x04..0x08].copy_from_slice(&CONTENT_LEN.to_le_bytes());
+    body[0x08..0x0a].copy_from_slice(&0x0002u16.to_le_bytes());
+    body[0x0b] = 0x40;
+    body[0x0c..0x0e].copy_from_slice(&0x0001u16.to_le_bytes());
+    body[0x14..0x16].copy_from_slice(&0x0003u16.to_le_bytes());
+
+    if unicorn.mem_write(content as u64, &body).is_err()
+        || unicorn.mem_write(buf as u64, &1u32.to_le_bytes()).is_err()
+        || unicorn
+            .mem_write((buf + 4) as u64, &content.to_le_bytes())
+            .is_err()
+    {
+        SYNTH_PWR_START_CONF_SENT.store(false, Ordering::Relaxed);
+        return false;
+    }
+
+    SYNTH_PWR_START_CONF_CONTENT.store(content, Ordering::Relaxed);
+    let thread = unicorn.get_data().inner.thread_id();
+    log::info!(
+        "[{}] [LIBOSAL] {}({}) answered with synthetic PWR_PROXY_START_CONF content=0x{:x}",
+        thread,
+        api_name,
+        name,
+        content
+    );
+    return_to_caller(unicorn, 8);
+    true
+}
+
+fn suppress_synthetic_message_delete(
+    unicorn: &mut Unicorn<'_, Context>,
+    addr: u32,
+    base_address: u32,
+) {
+    let handle = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+    let content = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+    let synthetic = SYNTH_PWR_START_CONF_CONTENT.load(Ordering::Relaxed);
+    if synthetic == 0 || (handle & 0xff) != 1 || content != synthetic {
+        return;
+    }
+
+    SYNTH_PWR_START_CONF_CONTENT.store(0, Ordering::Relaxed);
+    let thread = unicorn.get_data().inner.thread_id();
+    log::info!(
+        "0x{:x} [{}] [LIBOSAL] OSAL_s32MessageDelete ignored synthetic PWR_PROXY_START_CONF content=0x{:x}",
+        addr - base_address + ORIGINAL_BASE,
+        thread,
+        content
+    );
+    return_to_caller(unicorn, 0);
 }
 
 fn bridge_guest_osal_queue(
@@ -381,7 +500,8 @@ fn bridge_guest_osal_queue(
             let (queue_id, message) = {
                 let mut state = unicorn.get_data().namespace.lock().unwrap();
                 let queue_id = OsalQueueService::ensure_queue(&mut state.mq, name);
-                let message = OsalQueueService::pop_guest_message(&mut state.mq, queue_id, msg_len as usize);
+                let message =
+                    OsalQueueService::pop_guest_message(&mut state.mq, queue_id, msg_len as usize);
                 if message.is_some() {
                     state.notify_waiters();
                 }
@@ -389,12 +509,15 @@ fn bridge_guest_osal_queue(
             };
 
             if let Some(message) = message {
-                if !message.data.is_empty() && unicorn.mem_write(msg_ptr as u64, &message.data).is_err()
+                if !message.data.is_empty()
+                    && unicorn.mem_write(msg_ptr as u64, &message.data).is_err()
                 {
                     return false;
                 }
                 if prio_ptr != 0
-                    && unicorn.mem_write(prio_ptr as u64, &pack_u32(message.priority)).is_err()
+                    && unicorn
+                        .mem_write(prio_ptr as u64, &pack_u32(message.priority))
+                        .is_err()
                 {
                     return false;
                 }
@@ -495,7 +618,11 @@ fn decode_queue_handle(unicorn: &Unicorn<'_, Context>, handle: u32) -> DecodedQu
 
     let queue_type = read_u16_or_invalid(unicorn, info_addr + 0x0a);
     let name = read_cstr(unicorn, info_addr + 0x38, 0x20);
-    DecodedQueueHandle { info: info_addr, queue_type, name }
+    DecodedQueueHandle {
+        info: info_addr,
+        queue_type,
+        name,
+    }
 }
 
 fn read_u32_or_invalid(unicorn: &Unicorn<'_, Context>, addr: u32) -> u32 {
@@ -519,7 +646,10 @@ fn read_cstr(unicorn: &Unicorn<'_, Context>, addr: u32, limit: usize) -> String 
     let mut byte = [0u8; 1];
 
     for offset in 0..limit {
-        if unicorn.mem_read((addr + offset as u32) as u64, &mut byte).is_err() {
+        if unicorn
+            .mem_read((addr + offset as u32) as u64, &mut byte)
+            .is_err()
+        {
             break;
         }
         if byte[0] == 0 {
