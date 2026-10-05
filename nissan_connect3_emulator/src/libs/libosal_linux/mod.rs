@@ -1,16 +1,22 @@
+mod event;
 mod init;
 mod io;
 mod message;
 mod prm;
 mod registry;
+mod svg;
+mod thread;
 mod trace;
 
 use crate::emulator::context::Context;
+use crate::libs::libosal_linux::event::hook_event_code;
 use crate::libs::libosal_linux::init::hook_core_code;
 use crate::libs::libosal_linux::io::hook_io_code;
 use crate::libs::libosal_linux::message::hook_message_code;
 use crate::libs::libosal_linux::prm::hook_prm_code;
 use crate::libs::libosal_linux::registry::hook_registry_code;
+use crate::libs::libosal_linux::svg::hook_svg_code;
+use crate::libs::libosal_linux::thread::hook_thread_code;
 use crate::libs::libosal_linux::trace::hook_trace_code;
 use capstone::arch::arm::ArchMode;
 use capstone::prelude::*;
@@ -26,7 +32,10 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     hook_io_code(unicorn, base_address);
     hook_registry_code(unicorn, base_address);
     hook_message_code(unicorn, base_address);
+    hook_event_code(unicorn, base_address);
     hook_prm_code(unicorn, base_address);
+    hook_svg_code(unicorn, base_address);
+    hook_thread_code(unicorn, base_address);
     hook_trace_code(unicorn, base_address);
 
     /*let mut method_entries = HashMap::new();
