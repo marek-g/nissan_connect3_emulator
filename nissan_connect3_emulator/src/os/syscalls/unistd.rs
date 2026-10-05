@@ -1,6 +1,6 @@
 use crate::emulator::context::Context;
 use crate::emulator::thread::ThreadAction;
-use crate::emulator::utils::{mem_align_up, pack_u16, pack_u64, read_string};
+use crate::emulator::utils::{mem_align_up, pack_u16, pack_u32, pack_u64, read_string};
 use crate::os::file_system::{FileType, MountFileSystem, OpenFileFlags};
 use crate::os::syscalls::SysCallError;
 use std::io::SeekFrom;
@@ -347,6 +347,152 @@ pub fn getdents64(unicorn: &mut Unicorn<'_, Context>, fd: u32, dirp: u32, count:
     );
 
     res
+}
+
+pub fn getdents(unicorn: &mut Unicorn<'_, Context>, fd: u32, dirp: u32, count: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] getdents(fd: {:#x}, dirp: {:#x}, count: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id(),
+        fd,
+        dirp,
+        count,
+    );
+
+    let file_system = unicorn.get_data().inner.file_system.clone();
+
+    let dir_entries = if let Some(prev_list) = unicorn
+        .get_data()
+        .inner
+        .sys_calls_state
+        .lock()
+        .unwrap()
+        .get_dents_list
+        .remove(&fd)
+    {
+        Some(prev_list)
+    } else {
+        let dir_info = file_system.lock().unwrap().get_file_info(fd as i32);
+        if let Some(dir_info) = dir_info {
+            let read_dir = file_system.lock().unwrap().read_dir(&dir_info.file_path);
+            if let Ok(mut dir_entries) = read_dir {
+                dir_entries.insert(0, ".".to_string());
+                dir_entries.insert(1, "..".to_string());
+                Some(dir_entries)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    let res = get_dents_old_internal(unicorn, fd, dirp, count, file_system, dir_entries);
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] getdents => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id(),
+        res,
+    );
+
+    res
+}
+
+fn get_dents_old_internal(
+    unicorn: &mut Unicorn<'_, Context>,
+    fd: u32,
+    dirp: u32,
+    count: u32,
+    file_system: Arc<Mutex<MountFileSystem>>,
+    dir_entries: Option<Vec<String>>,
+) -> u32 {
+    if let Some(dir_entries) = &dir_entries {
+        if dir_entries.len() == 0 {
+            return 0u32;
+        }
+    }
+
+    if let Some(dir_entries) = dir_entries {
+        let mut res = Vec::new();
+        let dir_info = file_system.lock().unwrap().get_file_info(fd as i32);
+        if let Some(dir_info) = dir_info {
+            let mut not_enough_space = false;
+            let mut no_copied_entries = 0;
+            for dir_entry in &dir_entries {
+                let full_path = Path::new(&dir_info.file_path).join(dir_entry);
+                let full_path = full_path.to_str().unwrap();
+
+                let name_len = dir_entry.as_bytes().len();
+                let rec_len = align_up_u16(12 + name_len as u16, 8);
+                if res.len() + rec_len as usize > count as usize {
+                    not_enough_space = true;
+                    break;
+                }
+
+                if let Some(file_info) = file_system
+                    .lock()
+                    .unwrap()
+                    .get_file_info_from_filepath(full_path)
+                {
+                    let d_type = match file_info.file_details.file_type {
+                        FileType::File => 8u8,
+                        FileType::Link => 10u8,
+                        FileType::Directory => 4u8,
+                        FileType::Socket => 12u8,
+                        FileType::BlockDevice => 6u8,
+                        FileType::CharacterDevice => 2u8,
+                        FileType::NamedPipe => 1u8,
+                    };
+
+                    res.extend_from_slice(&pack_u32(file_info.inode as u32));
+                    res.extend_from_slice(&pack_u32(no_copied_entries as u32 + 1));
+                    res.extend_from_slice(&pack_u16(rec_len));
+                    res.extend_from_slice(dir_entry.as_bytes());
+                    res.push(0u8);
+                    while res.len() % 8 != 7 {
+                        res.push(0u8);
+                    }
+                    res.push(d_type);
+
+                    if res.len() % 8 != 0 {
+                        while res.len() % 8 != 0 {
+                            res.push(0u8);
+                        }
+                    }
+                }
+
+                no_copied_entries += 1;
+            }
+
+            return if not_enough_space && res.len() == 0 {
+                22u32
+            } else {
+                unicorn.mem_write(dirp as u64, &res).unwrap();
+
+                let mut rest_entries = Vec::new();
+                rest_entries.extend_from_slice(&dir_entries[no_copied_entries..]);
+                unicorn
+                    .get_data()
+                    .inner
+                    .sys_calls_state
+                    .lock()
+                    .unwrap()
+                    .get_dents_list
+                    .insert(fd, rest_entries);
+
+                res.len() as u32
+            };
+        }
+    }
+
+    -1i32 as u32
+}
+
+fn align_up_u16(value: u16, alignment: u16) -> u16 {
+    let alignment = alignment.max(1) as u32;
+    let value = value as u32;
+    (((value + alignment - 1) / alignment) * alignment) as u16
 }
 
 fn get_dents_internal(

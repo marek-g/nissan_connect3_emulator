@@ -129,6 +129,12 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
             unicorn.get_u32_arg(3),
             unicorn.get_u32_arg(4),
         ),
+        141 => unistd::getdents(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
         146 => uio::writev(
             unicorn,
             unicorn.get_u32_arg(0),
