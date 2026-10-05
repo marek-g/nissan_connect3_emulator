@@ -241,13 +241,16 @@ impl MqState {
         queue_id: u32,
         data: Vec<u8>,
         priority: u32,
-    ) -> Option<MqNotify> {
+    ) -> Option<(u32, MqNotify)> {
         let queue = self.queues.get_mut(&queue_id)?;
         insert_message(&mut queue.messages, data, priority);
-        if queue.messages.len() == 1 && queue.notify_owner.take().is_some() {
-            return queue.notify.take();
+        if queue.messages.len() != 1 {
+            return None;
         }
-        None
+
+        let owner = queue.notify_owner.take()?;
+        let notify = queue.notify.take()?;
+        Some((owner, notify))
     }
 
     pub fn pop_message(&mut self, queue_id: u32) -> Option<MqMessage> {

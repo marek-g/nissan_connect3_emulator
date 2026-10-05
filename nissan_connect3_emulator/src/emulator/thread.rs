@@ -103,6 +103,8 @@ pub enum BlockReason {
     IoscSemaphore { id: u32, deadline: Option<Instant> },
     /// waiting in read() on an emulated inotify descriptor for the first event
     InotifyRead { fd: u32, deadline: Option<Instant> },
+    /// waiting in rt_sigtimedwait for one of `set` signals to be delivered
+    SignalWait { set: u64, deadline: Option<Instant> },
 }
 
 /// Action requested by a syscall handler; consumed by the syscall hook wrapper.

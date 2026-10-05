@@ -23,6 +23,7 @@ use crate::emulator::context::Context;
 use crate::emulator::memory_map::{MQ_NOTIFY_EXIT_STUB, STACK_SIZE};
 use crate::emulator::thread::{BlockReason, GuestThread, ThreadAction, ThreadStatus};
 use crate::emulator::utils::{pack_u32, read_string, unpack_u32};
+use crate::os::syscalls::signal;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 use unicorn_engine::unicorn_const::Prot;
@@ -177,17 +178,17 @@ fn set_runnable_with_result(unicorn: &Unicorn<'_, Context>, tid: u32, result: u3
 }
 
 /// deliver a registered notification (called with no locks held)
-fn fire_notification(unicorn: &mut Unicorn<'_, Context>, notify: MqNotify) {
+fn fire_notification(unicorn: &mut Unicorn<'_, Context>, owner: u32, notify: MqNotify) {
     match notify {
         MqNotify::SigevNone => {}
         MqNotify::Signal { signo, sigval } => {
-            // signal delivery is not implemented yet - the notification is
-            // consumed (kernel unregisters after firing) but the signal is lost
-            log::warn!(
-                "mq_notify SIGEV_SIGNAL fired (signo = {}, sigval = {:#x}) - signal delivery not implemented",
+            log::trace!(
+                "mq_notify SIGEV_SIGNAL fired (owner = {:#x}, signo = {}, sigval = {:#x})",
+                owner,
                 signo,
                 sigval,
             );
+            signal::deliver_signal(unicorn, owner, signo as u32);
         }
         MqNotify::Thread { function, sigval } => {
             spawn_notify_thread(unicorn, function, sigval);
@@ -324,8 +325,8 @@ pub fn mq_timedsend(
         let mut state = unicorn.get_data().namespace.lock().unwrap();
         state.mq.insert_message_and_take_notify(mqdes, buf, msg_prio)
     };
-    if let Some(notify) = notify {
-        fire_notification(unicorn, notify);
+    if let Some((owner, notify)) = notify {
+        fire_notification(unicorn, owner, notify);
     }
     notify_waiters(unicorn);
 
@@ -613,7 +614,10 @@ pub fn mq_notify(unicorn: &mut Unicorn<'_, Context>, mqdes: u32, notif_addr: u32
             if signo < 1 || signo > SIGMAX {
                 return EINVAL;
             }
-            MqNotify::Signal { signo, sigval: value }
+            MqNotify::Signal {
+                signo,
+                sigval: value,
+            }
         }
         2 => {
             // SIGEV_THREAD - read the glibc cookie at sigev_value

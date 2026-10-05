@@ -223,9 +223,16 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
             unicorn.get_u32_arg(4),
             unicorn.get_u32_arg(5),
         ),
+        238 => signal::tkill(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
         248 => unistd::exit_group(unicorn, unicorn.get_u32_arg(0)),
         256 => unistd::set_tid_address(unicorn, unicorn.get_u32_arg(0)),
         263 => time::clock_gettime(unicorn, unicorn.get_u32_arg(0), unicorn.get_u32_arg(1)),
+        268 => signal::tgkill(
+            unicorn,
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+        ),
         257 => timer::timer_create(
             unicorn,
             unicorn.get_u32_arg(0),

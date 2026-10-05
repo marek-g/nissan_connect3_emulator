@@ -1,7 +1,9 @@
 use crate::emulator::context::Context;
-use crate::emulator::thread::{BlockReason, ThreadAction};
-use std::time::{Duration, Instant};
+use crate::emulator::thread::{BlockReason, ThreadAction, ThreadStatus};
+use std::time::Instant;
 use unicorn_engine::{RegisterARM, Unicorn};
+
+const EAGAIN: u32 = -11i32 as u32;
 
 // ---- ARM rt_sigframe layout (arch/arm/kernel/signal.c + asm/ucontext.h) ----
 //
@@ -58,17 +60,30 @@ pub struct SigAction {
     pub handler: u32, // 0 = SIG_DFL, 1 = SIG_IGN, else code address
     pub flags: u32,
     pub restorer: u32,
-    pub mask: u32,
+    pub mask: u64,
 }
 
-#[derive(Default)]
 pub struct SignalState {
-    pub actions: [SigAction; 32],
-    /// current blocked signal set (low word) - restored on sigreturn
-    pub blocked: u32,
+    pub actions: [SigAction; 64],
+    /// current blocked signal set, low and high words (signals 1..64)
+    pub blocked: u64,
+    /// signals posted but not yet consumed by rt_sigtimedwait
+    pub pending: u64,
     // re-fault guard
     refault_pc: u32,
     refault_count: u32,
+}
+
+impl Default for SignalState {
+    fn default() -> Self {
+        Self {
+            actions: [SigAction::default(); 64],
+            blocked: 0,
+            pending: 0,
+            refault_pc: 0,
+            refault_count: 0,
+        }
+    }
 }
 
 impl SignalState {
@@ -87,6 +102,35 @@ fn wr(unicorn: &mut Unicorn<'_, Context>, addr: u32, v: u32) -> bool {
     unicorn.mem_write(addr as u64, &v.to_le_bytes()).is_ok()
 }
 
+fn sigset_bit(signum: u32) -> Option<u64> {
+    if signum == 0 || signum > 64 {
+        None
+    } else {
+        Some(1u64 << (signum - 1))
+    }
+}
+
+fn lowest_signum(mask: u64) -> Option<u32> {
+    (0..64).find(|bit| mask & (1u64 << *bit) != 0).map(|bit| bit + 1)
+}
+
+fn read_sigset(unicorn: &Unicorn<'_, Context>, addr: u32) -> u64 {
+    if addr == 0 {
+        return 0;
+    }
+
+    let low = rd(unicorn, addr).unwrap_or(0) as u64;
+    let high = rd(unicorn, addr + 4).unwrap_or(0) as u64;
+    low | (high << 32)
+}
+
+fn write_sigset(unicorn: &mut Unicorn<'_, Context>, addr: u32, mask: u64) {
+    if addr != 0 {
+        wr(unicorn, addr, mask as u32);
+        wr(unicorn, addr + 4, (mask >> 32) as u32);
+    }
+}
+
 pub fn rt_sigaction(
     unicorn: &mut Unicorn<'_, Context>,
     signum: u32,
@@ -103,7 +147,11 @@ pub fn rt_sigaction(
     );
 
     let mut res = 0u32;
-    if signum < 32 {
+    let index = match signum {
+        1..=64 => Some((signum - 1) as usize),
+        _ => None,
+    };
+    if let Some(index) = index {
         // copy the old action out before touching guest memory (the lock borrows `unicorn`)
         let old = unicorn
             .get_data()
@@ -111,21 +159,21 @@ pub fn rt_sigaction(
             .lock()
             .unwrap()
             .signals
-            .actions[signum as usize];
+            .actions[index];
         if old_action != 0 {
             // kernel struct sigaction: handler@0, flags@4, restorer@8, mask@12
             wr(unicorn, old_action, old.handler);
             wr(unicorn, old_action + 4, old.flags);
             wr(unicorn, old_action + 8, old.restorer);
-            wr(unicorn, old_action + 12, old.mask);
+            write_sigset(unicorn, old_action + 12, old.mask);
         }
         if action != 0 {
             let handler = rd(unicorn, action).unwrap_or(0);
             let flags = rd(unicorn, action + 4).unwrap_or(0);
             let restorer = rd(unicorn, action + 8).unwrap_or(0);
-            let mask = rd(unicorn, action + 12).unwrap_or(0);
+            let mask = read_sigset(unicorn, action + 12);
             log::info!(
-                "rt_sigaction: sig {:#x} -> handler {:#x}, flags {:#x}, restorer {:#x}, mask {:#x}",
+                "rt_sigaction: sig {:#x} -> handler {:#x}, flags {:#x}, restorer {:#x}, mask {:#018x}",
                 signum,
                 handler,
                 flags,
@@ -138,7 +186,7 @@ pub fn rt_sigaction(
                 .lock()
                 .unwrap()
                 .signals
-                .actions[signum as usize] = SigAction {
+                .actions[index] = SigAction {
                     handler,
                     flags,
                     restorer,
@@ -230,9 +278,12 @@ fn do_sigreturn_core(unicorn: &mut Unicorn<'_, Context>, frame: u32) -> Result<u
         .map_err(|_| ())?;
 
     // restore the blocked signal set from uc_sigmask
-    if let Some(mask) = rd(unicorn, UC_SIGMASK + frame) {
-        unicorn.get_data().sys_calls_state.lock().unwrap().signals.blocked = mask;
-    }
+    let mask = {
+        let low = rd(unicorn, UC_SIGMASK + frame).ok_or(())? as u64;
+        let high = rd(unicorn, UC_SIGMASK + frame + 4).unwrap_or(0) as u64;
+        low | (high << 32)
+    };
+    unicorn.get_data().sys_calls_state.lock().unwrap().signals.blocked = mask;
     log::trace!(
         "rt_sigreturn: restored pc={:#x} sp={:#x} lr={:#x} r0={:#x}",
         pc,
@@ -286,7 +337,7 @@ fn deliver_sigsegv(unicorn: &mut Unicorn<'_, Context>, fault_addr: u32) -> bool 
             let new_blocked = if act.flags & SA_NODEFER != 0 {
                 state.signals.blocked
             } else {
-                state.signals.blocked | (1 << SIGSEGV)
+                state.signals.blocked | (1u64 << (SIGSEGV - 1))
             };
             state.signals.blocked = new_blocked;
         }
@@ -354,9 +405,9 @@ fn deliver_sigsegv(unicorn: &mut Unicorn<'_, Context>, fault_addr: u32) -> bool 
     wr(unicorn, mc + SC_CPSR, cpsr);
     wr(unicorn, mc + SC_FAULT_ADDR, fault_addr);
 
-    // uc_sigmask (new blocked set) - low word at UC_SIGMASK, rest zeroed
+    // uc_sigmask (new blocked set)
     let blocked = unicorn.get_data().sys_calls_state.lock().unwrap().signals.blocked;
-    wr(unicorn, UC_SIGMASK + frame, blocked);
+    write_sigset(unicorn, UC_SIGMASK + frame, blocked);
 
     // retcode[]
     let lr = if flags & SA_RESTORER != 0 {
@@ -405,21 +456,20 @@ pub fn rt_sigprocmask(
         sig_set_size,
     );
 
+    let mask = read_sigset(unicorn, set);
     let mut res = 0u32;
     let old_blocked = {
         let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
         let old = state.signals.blocked;
         match how {
-            0 => state.signals.blocked = old | set, // SIG_BLOCK
-            1 => state.signals.blocked = old & !set, // SIG_UNBLOCK
-            2 => state.signals.blocked = set, // SIG_SETMASK
+            0 => state.signals.blocked = old | mask, // SIG_BLOCK
+            1 => state.signals.blocked = old & !mask, // SIG_UNBLOCK
+            2 => state.signals.blocked = mask,        // SIG_SETMASK
             _ => res = 0xffff_f5e8,
         }
         old
     };
-    if old_set != 0 {
-        wr(unicorn, old_set, old_blocked);
-    }
+    write_sigset(unicorn, old_set, old_blocked);
 
     log::trace!(
         "{:#x}: [{}] [SYSCALL] rt_sigprocmask => {:#x}",
@@ -470,34 +520,221 @@ pub fn rt_sigtimedwait(
     timeout: u32,
     sig_set_size: u32,
 ) -> u32 {
+    let set_mask = read_sigset(unicorn, set);
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] rt_sigtimedwait(set: {:#x}, info: {:#x}, timeout: {:#x}, sig_set_size: {:#x}) [IN]",
+        "{:#x}: [{}] [SYSCALL] rt_sigtimedwait(set: {:#x} mask {:#018x}, info: {:#x}, timeout: {:#x}, sig_set_size: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id(),
         set,
+        set_mask,
         info,
         timeout,
         sig_set_size,
     );
 
-    // No per-thread pending-signal delivery yet, so a wait for a signal finds
-    // none. Rather than return EAGAIN immediately (which makes OSAL's
-    // sigtimedwait-based wait loops busy-spin at full emulation speed and starve
-    // the cooperative scheduler), block briefly so other threads make progress;
-    // the guest then re-polls. This approximates a blocking wait for an idle
-    // thread without risking a deadlock from never being woken.
-    //
-    // OSAL worker/main threads commonly block here on a real-time signal
-    // (SIGRTMIN..SIGRTMAX) used as the message-queue notification, expecting a
-    // peer to tgkill it when a message is posted. Cross-process signal delivery
-    // is not implemented, so the wait never finds a pending signal.
-    let res = -11i32 as u32; // EAGAIN
-    unicorn.get_data().set_action(ThreadAction::Block(BlockReason::SleepUntil(
-        Instant::now() + Duration::from_millis(1),
-    )));
+    if info != 0 {
+        let _ = unicorn.mem_write(info as u64, &vec![0u8; 128]);
+    }
 
+    let delivered = {
+        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let matching = state.signals.pending & set_mask;
+        let signo = lowest_signum(matching);
+        if let Some(signo) = signo {
+            state.signals.pending &= !(1u64 << (signo - 1));
+        }
+        signo
+    };
+
+    if let Some(signo) = delivered {
+        log::trace!(
+            "{:#x}: [{}] [SYSCALL] rt_sigtimedwait => consumed signal {}",
+            unicorn.reg_read(RegisterARM::PC).unwrap(),
+            unicorn.get_data().inner.thread_id(),
+            signo
+        );
+        return signo;
+    }
+
+    let deadline = if timeout == 0 {
+        None
+    } else {
+        read_timeout_deadline(unicorn, timeout)
+    };
+
+    unicorn
+        .get_data()
+        .set_action(ThreadAction::Block(BlockReason::SignalWait {
+            set: set_mask,
+            deadline,
+        }));
+    0u32
+}
+
+fn read_timeout_deadline(unicorn: &Unicorn<'_, Context>, timeout: u32) -> Option<Instant> {
+    if timeout == 0 {
+        return None;
+    }
+
+    let seconds = rd(unicorn, timeout)? as u64;
+    let nanoseconds = rd(unicorn, timeout + 4)? as u64;
+    // The kernel uses an absolute CLOCK_REALTIME deadline. The emulator has no
+    // guest wall clock yet, so approximate the remaining wait as relative to
+    // now. This preserves timeouts for short waits without busy-polling.
+    Some(Instant::now() + std::time::Duration::new(seconds, nanoseconds as u32))
+}
+
+pub fn deliver_signal(unicorn: &mut Unicorn<'_, Context>, tid: u32, signum: u32) -> i32 {
+    let bit = match sigset_bit(signum) {
+        Some(bit) => bit,
+        None => return -22,
+    };
+
+    if signum == 0 {
+        return 0;
+    }
+
+    let tid_exists = {
+        let threads = unicorn.get_data().threads.lock().unwrap();
+        tid == 0 || threads.iter().any(|thread| thread.id == tid)
+    };
+    if !tid_exists {
+        return -3;
+    }
+
+    unicorn
+        .get_data()
+        .sys_calls_state
+        .lock()
+        .unwrap()
+        .signals
+        .pending |= bit;
+
+    if wake_signal_waiter(unicorn, bit, signum) {
+        log::trace!(
+            "signal {} delivered to rt_sigtimedwait waiter (tid {:#x})",
+            signum,
+            tid
+        );
+    } else {
+        log::trace!(
+            "signal {} marked pending for tid {:#x}; no rt_sigtimedwait waiter yet",
+            signum,
+            tid
+        );
+    }
+
+    0
+}
+
+fn wake_signal_waiter(unicorn: &mut Unicorn<'_, Context>, bit: u64, signum: u32) -> bool {
+    let waiter = {
+        let threads = unicorn.get_data().threads.lock().unwrap();
+        threads
+            .iter()
+            .find(|thread| {
+                matches!(
+                    thread.status,
+                    ThreadStatus::Blocked(BlockReason::SignalWait { set, .. }) if set & bit != 0
+                )
+            })
+            .map(|thread| thread.id)
+    };
+
+    let Some(tid) = waiter else {
+        return false;
+    };
+
+    set_runnable(unicorn, tid, signum);
+    unicorn
+        .get_data()
+        .sys_calls_state
+        .lock()
+        .unwrap()
+        .signals
+        .pending &= !bit;
+    true
+}
+
+pub fn finish_signal_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, now: Instant) {
+    let (set, timed_out) = {
+        let threads = unicorn.get_data().threads.lock().unwrap();
+        match threads
+            .iter()
+            .find(|thread| thread.id == tid)
+            .map(|thread| thread.status)
+        {
+            Some(ThreadStatus::Blocked(BlockReason::SignalWait { set, deadline })) => (
+                set,
+                deadline.map(|deadline| deadline <= now).unwrap_or(false),
+            ),
+            _ => return,
+        }
+    };
+
+    if timed_out {
+        set_runnable(unicorn, tid, EAGAIN);
+        return;
+    }
+
+    let signo = {
+        let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
+        let matching = state.signals.pending & set;
+        let signo = lowest_signum(matching);
+        if let Some(signo) = signo {
+            state.signals.pending &= !(1u64 << (signo - 1));
+        }
+        signo
+    };
+
+    if let Some(signo) = signo {
+        set_runnable(unicorn, tid, signo);
+    }
+}
+
+fn set_runnable(unicorn: &mut Unicorn<'_, Context>, tid: u32, result: u32) {
+    let mut threads = unicorn.get_data().threads.lock().unwrap();
+    if let Some(thread) = threads.iter_mut().find(|thread| thread.id == tid) {
+        if matches!(thread.status, ThreadStatus::Blocked(_)) {
+            thread.status = ThreadStatus::Runnable;
+            thread.pending_result = Some(result);
+        }
+    }
+}
+
+pub fn tgkill(unicorn: &mut Unicorn<'_, Context>, tgid: u32, tid: u32, sig: u32) -> u32 {
     log::trace!(
-        "{:#x}: [{}] [SYSCALL] rt_sigtimedwait => {:#x}",
+        "{:#x}: [{}] [SYSCALL] tgkill(tgid: {:#x}, tid: {:#x}, sig: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id(),
+        tgid,
+        tid,
+        sig,
+    );
+
+    let _ = tgid;
+    let res = deliver_signal(unicorn, tid, sig) as u32;
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] tgkill => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id(),
+        res
+    );
+    res
+}
+
+pub fn tkill(unicorn: &mut Unicorn<'_, Context>, tid: u32, sig: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] tkill(tid: {:#x}, sig: {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id(),
+        tid,
+        sig,
+    );
+
+    let res = deliver_signal(unicorn, tid, sig) as u32;
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] tkill => {:#x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.get_data().inner.thread_id(),
         res
