@@ -296,6 +296,11 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
             | BlockReason::IoscSemaphore { .. } => {
                 crate::os::dev::iosc::finish_iosc_wait(unicorn, tid, now);
             }
+            BlockReason::InotifyRead { deadline, .. } => {
+                if deadline.map(|d| d <= now).unwrap_or(false) {
+                    set_runnable(unicorn, tid, Some(-11i32 as u32)); // -EAGAIN
+                }
+            }
         }
     }
 
@@ -337,7 +342,8 @@ fn park_duration(unicorn: &Unicorn<'_, Context>) -> Duration {
         ThreadStatus::Blocked(
             BlockReason::IoscMutex { deadline, .. }
             | BlockReason::IoscEvent { deadline, .. }
-            | BlockReason::IoscSemaphore { deadline, .. },
+            | BlockReason::IoscSemaphore { deadline, .. }
+            | BlockReason::InotifyRead { deadline, .. },
         ) => *deadline,
         _ => None,
     });

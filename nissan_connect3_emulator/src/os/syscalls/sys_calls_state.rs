@@ -1,5 +1,5 @@
 use crate::os::syscalls::signal::SignalState;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Per-process syscall state. System-wide IPC objects (POSIX message queues and
 /// the IOSC driver) do NOT live here - they live in the shared
@@ -12,6 +12,9 @@ pub struct SysCallsState {
     // maps futex `uaddr` to list of blocked guest thread ids waiting on that address
     pub futex_waiters: HashMap<u32, Vec<u32>>,
 
+    // descriptors returned by inotify_init(); reads on them block instead of EOFing
+    pub inotify_fds: HashSet<u32>,
+
     // signal dispositions + blocked mask (rt_sigaction / rt_sigreturn / SIGSEGV delivery)
     pub signals: SignalState,
 }
@@ -21,6 +24,7 @@ impl SysCallsState {
         Self {
             get_dents_list: HashMap::new(),
             futex_waiters: HashMap::new(),
+            inotify_fds: HashSet::new(),
             signals: SignalState::new(),
         }
     }

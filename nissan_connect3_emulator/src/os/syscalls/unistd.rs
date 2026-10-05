@@ -1,5 +1,5 @@
 use crate::emulator::context::Context;
-use crate::emulator::thread::ThreadAction;
+use crate::emulator::thread::{BlockReason, ThreadAction};
 use crate::emulator::utils::{mem_align_up, pack_u16, pack_u32, pack_u64, read_string};
 use crate::os::file_system::{FileType, MountFileSystem, OpenFileFlags};
 use crate::os::syscalls::SysCallError;
@@ -104,14 +104,11 @@ pub fn close(unicorn: &mut Unicorn<'_, Context>, fd: u32) -> u32 {
         return crate::os::dev::iosc::close_iosc(unicorn, fd);
     }
 
-    unicorn
-        .get_data()
-        .inner
-        .sys_calls_state
-        .lock()
-        .unwrap()
-        .get_dents_list
-        .remove(&fd);
+    {
+        let state = &mut unicorn.get_data().inner.sys_calls_state.lock().unwrap();
+        state.get_dents_list.remove(&fd);
+        state.inotify_fds.remove(&fd);
+    }
 
     let res = if let Ok(_) = unicorn
         .get_data()
@@ -145,6 +142,24 @@ pub fn read(unicorn: &mut Unicorn<'_, Context>, fd: u32, buf: u32, length: u32) 
         buf,
         length,
     );
+
+    let is_inotify_fd = unicorn
+        .get_data()
+        .inner
+        .sys_calls_state
+        .lock()
+        .unwrap()
+        .inotify_fds
+        .contains(&fd);
+    if is_inotify_fd {
+        unicorn
+            .get_data()
+            .set_action(ThreadAction::Block(BlockReason::InotifyRead {
+                fd,
+                deadline: None,
+            }));
+        return 0u32;
+    }
 
     let mut buf2 = vec![0u8; length as usize];
     let file_system = &mut unicorn.get_data().inner.file_system.clone();
@@ -923,7 +938,17 @@ pub fn inotify_init(unicorn: &mut Unicorn<'_, Context>, _flags: u32) -> u32 {
         .unwrap()
         .open("/dev/null", OpenFileFlags::READ)
     {
-        Ok(fd) => fd as u32,
+        Ok(fd) => {
+            unicorn
+                .get_data()
+                .inner
+                .sys_calls_state
+                .lock()
+                .unwrap()
+                .inotify_fds
+                .insert(fd as u32);
+            fd as u32
+        }
         Err(_) => -1i32 as u32,
     };
     log::trace!(
