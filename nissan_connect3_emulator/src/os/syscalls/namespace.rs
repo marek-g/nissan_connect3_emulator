@@ -8,6 +8,7 @@
 //! machinery). Named shared memory and named semaphores will be added here too.
 
 use crate::common::queues::MqState;
+use crate::common::registry::Registry;
 use crate::emulator::thread::Wake;
 use crate::os::dev::iosc::IoscState;
 use std::collections::{HashMap, VecDeque};
@@ -36,6 +37,8 @@ pub struct SystemNamespace {
     pub iosc: IoscState,
     /// POSIX message queues (named, system-wide).
     pub mq: MqState,
+    /// IOSC shared registry (`/dev/registry`).
+    pub registry: Registry,
     /// Named shared memory (`/dev/shm/*`): host-backed buffers shared by every
     /// process so that `mmap(MAP_SHARED)` of the same file maps the same bytes.
     pub shm: ShmState,
@@ -59,6 +62,7 @@ impl SystemNamespace {
         Self {
             iosc: IoscState::new(),
             mq: MqState::new(),
+            registry: Registry::from_default_paths(),
             shm: ShmState::new(),
             futex_slab: HashMap::new(),
             futex_by_key: HashMap::new(),
