@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::io;
@@ -79,15 +79,38 @@ impl RegistryNode {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct RegistryHandle {
+    path: String,
+    flags: u32,
+}
+
+impl RegistryHandle {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Registry {
     root: RegistryNode,
     loaded_files: Vec<PathBuf>,
+    open_handles: HashMap<u32, RegistryHandle>,
+    next_handle: u32,
 }
 
 impl Registry {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            root: RegistryNode::default(),
+            loaded_files: Vec::new(),
+            open_handles: HashMap::new(),
+            next_handle: 0xc0ff_ee00,
+        }
     }
 
     pub fn from_default_paths() -> Self {
@@ -106,6 +129,7 @@ impl Registry {
         }
 
         registry.load_referenced_process_registries(&dir);
+        registry.mark_process_started("LBASE");
         registry
     }
 
@@ -236,10 +260,30 @@ impl Registry {
         self.set_value(path, value, RegistryValue::String(text.into()));
     }
 
-    pub fn create_key(&mut self, path: &str) -> bool {
+    pub fn mark_process_started(&mut self, process: &str) {
+        let path = format!(
+            "/dev/registry/LOCAL_MACHINE/SOFTWARE/BLAUPUNKT/PROCESS/{}",
+            process
+        );
+        self.set_u32(&path, "PROCSTARTED", 1);
+    }
+
+    pub fn create_key(&mut self, path: &str) -> CreateKeyResult {
         let path = normalize_registry_path(path);
+        if self.root.find_path(&path).is_some() {
+            return CreateKeyResult::Exists;
+        }
+        if path.is_empty() {
+            return CreateKeyResult::Created;
+        }
+
+        let parent = &path[..path.len() - 1];
+        if self.root.find_path(parent).is_none() {
+            return CreateKeyResult::NoParent;
+        }
+
         self.root.ensure_path(&path);
-        true
+        CreateKeyResult::Created
     }
 
     pub fn remove_value(&mut self, path: &str, value: &str) -> bool {
@@ -249,6 +293,72 @@ impl Registry {
             None => false,
         }
     }
+
+    pub fn open_key(&mut self, path: &str, flags: u32) -> Option<u32> {
+        if !matches!(flags, 1 | 2 | 4) {
+            return None;
+        }
+        if !self.has_path(path) {
+            return None;
+        }
+
+        let handle = self.next_handle;
+        self.next_handle = self.next_handle.wrapping_add(1);
+        self.open_handles.insert(
+            handle,
+            RegistryHandle {
+                path: path.to_string(),
+                flags,
+            },
+        );
+        Some(handle)
+    }
+
+    pub fn create_key_and_open(&mut self, path: &str, flags: u32) -> OpenKeyResult {
+        if !matches!(flags, 1 | 2 | 4) {
+            return OpenKeyResult::BadFlags;
+        }
+
+        match self.create_key(path) {
+            CreateKeyResult::Exists => OpenKeyResult::Exists,
+            CreateKeyResult::NoParent => OpenKeyResult::NoParent,
+            CreateKeyResult::Created => match self.open_key(path, flags) {
+                Some(handle) => OpenKeyResult::Handle(handle),
+                None => OpenKeyResult::Error,
+            },
+        }
+    }
+
+    pub fn handle_info(&self, handle: u32) -> Option<&RegistryHandle> {
+        self.open_handles.get(&handle)
+    }
+
+    pub fn close_handle(&mut self, handle: u32) -> bool {
+        self.open_handles.remove(&handle).is_some()
+    }
+
+    pub fn find_key_by_u32_value(&self, value_name: &str, id: u32) -> Option<String> {
+        let mut matches = Vec::new();
+        collect_paths_with_u32(&self.root, "/dev/registry", value_name, id, &mut matches);
+        matches.sort();
+        matches.into_iter().next()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateKeyResult {
+    Created,
+    Exists,
+    NoParent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenKeyResult {
+    Handle(u32),
+    Exists,
+    NoParent,
+    BadFlags,
+    Error,
 }
 
 impl RegistryNode {
@@ -334,6 +444,24 @@ fn normalize_hive_path(path: &str) -> Vec<String> {
         .filter(|part| !part.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn collect_paths_with_u32(
+    node: &RegistryNode,
+    prefix: &str,
+    value_name: &str,
+    id: u32,
+    matches: &mut Vec<String>,
+) {
+    if let Some(RegistryValue::U32(value)) = node.values.get(value_name) {
+        if *value == id {
+            matches.push(prefix.to_string());
+        }
+    }
+
+    for (child, child_node) in node.children.iter() {
+        collect_paths_with_u32(child_node, &format!("{}/{}", prefix, child), value_name, id, matches);
+    }
 }
 
 fn parse_registry_text(text: &str, root: &mut RegistryNode) -> usize {
