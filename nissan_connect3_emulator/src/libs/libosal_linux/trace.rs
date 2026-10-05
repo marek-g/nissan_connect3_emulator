@@ -29,7 +29,12 @@ pub fn v_init_trace(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
 
 pub fn trace_string(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let text = read_string(unicorn, unicorn.reg_read(RegisterARM::R0).unwrap() as u32);
-    log::warn!("{}", text);
+    log::warn!(
+        "[{}] trace: {} (caller={:#x})",
+        unicorn.get_data().inner.thread_id(),
+        text,
+        unicorn.reg_read(RegisterARM::LR).unwrap_or(0) as u32
+    );
     0u32
 }
 
@@ -37,7 +42,14 @@ pub fn v_trace_mq_info(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let addr = unicorn.reg_read(RegisterARM::R0).unwrap() as u32;
     let arg2 = unicorn.reg_read(RegisterARM::R1).unwrap() as u32;
     let arg3 = unicorn.reg_read(RegisterARM::R2).unwrap() as u32;
-    log::warn!("{:#x} {:#x} {:#x}", addr, arg2, arg3);
+    log::warn!(
+        "[{}] mq info {:#x} {:#x} {:#x} (caller={:#x})",
+        unicorn.get_data().inner.thread_id(),
+        addr,
+        arg2,
+        arg3,
+        unicorn.reg_read(RegisterARM::LR).unwrap_or(0) as u32
+    );
     if addr != 0 {
         let text = read_string(unicorn, addr);
         log::warn!("{}", text);
@@ -48,7 +60,13 @@ pub fn v_trace_mq_info(unicorn: &mut Unicorn<'_, Context>) -> u32 {
 pub fn v_write_to_err_mem(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let arg1 = unicorn.reg_read(RegisterARM::R0).unwrap() as u32;
     let arg2 = unicorn.reg_read(RegisterARM::R1).unwrap() as u32;
-    log::warn!("{:#x} {:#x}", arg1, arg2);
+    log::warn!(
+        "[{}] err {:#x} {:#x} (caller={:#x})",
+        unicorn.get_data().inner.thread_id(),
+        arg1,
+        arg2,
+        unicorn.reg_read(RegisterARM::LR).unwrap_or(0) as u32
+    );
     if arg2 != 0 {
         let text = read_string(unicorn, arg2);
         log::warn!("{}", text);

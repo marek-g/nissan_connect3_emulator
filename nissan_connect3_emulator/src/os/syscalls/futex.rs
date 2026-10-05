@@ -73,6 +73,7 @@ pub fn futex(
                     unicorn.reg_read(RegisterARM::R14).unwrap(),
                 );
 
+                log_futex_backtrace(unicorn, uaddr);
                 let deadline = read_timeout_deadline(unicorn, timeout);
                 let data = unicorn.get_data();
                 let thread_id = data.thread_id();
@@ -189,6 +190,47 @@ fn shm_futex_key(unicorn: &Unicorn<'_, Context>, uaddr: u32) -> Option<(String, 
 }
 
 /// read an optional `struct timespec` timeout from guest memory
+fn log_futex_backtrace(unicorn: &Unicorn<'_, Context>, uaddr: u32) {
+    let sp = unicorn.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+    let lr = unicorn.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+    let mut seen = std::collections::HashSet::new();
+    let mut frames = Vec::new();
+
+    if let Some((library, offset)) = unicorn.get_data().mmu.lock().unwrap().executable_location(lr)
+    {
+        frames.push(format!("{}+{:#x}", library, offset));
+    }
+
+    let mmu = unicorn.get_data().mmu.clone();
+    for index in 0..128u32 {
+        let addr = sp.wrapping_add(index * 4);
+        let mut buf = [0u8; 4];
+        if unicorn.mem_read(addr as u64, &mut buf).is_err() {
+            break;
+        }
+
+        let candidate = unpack_u32(&buf);
+        let location = {
+            let guard = mmu.lock().unwrap();
+            guard
+                .executable_location(candidate)
+                .map(|(library, offset)| (library.to_string(), offset))
+        };
+        if let Some((library, offset)) = location {
+            if seen.insert((library.clone(), offset)) {
+                frames.push(format!("{}+{:#x}", library, offset));
+            }
+        }
+    }
+
+    log::trace!(
+        "futex backtrace uaddr={:#x} sp={:#x}: {}",
+        uaddr,
+        sp,
+        frames.join(" <- ")
+    );
+}
+
 fn read_timeout_deadline(unicorn: &Unicorn<'_, Context>, timeout: u32) -> Option<Instant> {
     if timeout == 0 {
         return None;

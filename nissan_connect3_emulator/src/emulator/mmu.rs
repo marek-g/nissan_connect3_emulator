@@ -205,6 +205,16 @@ impl Mmu {
             .collect()
     }
 
+    pub fn executable_location(&self, addr: u32) -> Option<(&str, u32)> {
+        self.regions
+            .iter()
+            .filter(|region| {
+                (region.memory_perms & Prot::EXEC) != Prot::NONE && region.filepath.len() > 0
+            })
+            .find(|region| addr >= region.memory_start && addr <= region.memory_end)
+            .map(|region| (region.filepath.as_str(), addr - region.memory_start))
+    }
+
     /// Adds code hooks for newly mapped libraries to the (single) VM.
     pub fn update_library_hooks(&self, unicorn: &mut Unicorn<'_, Context>) {
         let libraries = self.get_libraries_and_base_addresses();
