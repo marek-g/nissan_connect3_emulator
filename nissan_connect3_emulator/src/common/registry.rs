@@ -120,11 +120,7 @@ impl Registry {
 
         for file in files {
             if let Err(error) = registry.load_file(&file) {
-                log::warn!(
-                    "registry: cannot load {}: {}",
-                    file.display(),
-                    error
-                );
+                log::warn!("registry: cannot load {}: {}", file.display(), error);
             }
         }
 
@@ -486,7 +482,13 @@ fn collect_paths_with_u32(
     }
 
     for (child, child_node) in node.children.iter() {
-        collect_paths_with_u32(child_node, &format!("{}/{}", prefix, child), value_name, id, matches);
+        collect_paths_with_u32(
+            child_node,
+            &format!("{}/{}", prefix, child),
+            value_name,
+            id,
+            matches,
+        );
     }
 }
 
@@ -581,7 +583,9 @@ fn parse_registry_value(raw_value: &str) -> Option<RegistryValue> {
         }
     }
 
-    Some(RegistryValue::String(strip_inline_comment(raw_value).to_string()))
+    Some(RegistryValue::String(
+        strip_inline_comment(raw_value).to_string(),
+    ))
 }
 
 fn parse_quoted_string(value: &str) -> Option<String> {
@@ -635,7 +639,10 @@ mod tests {
         let mut registry = Registry::new();
         assert_eq!(parse_registry_text(text, &mut registry.root), 3);
         assert_eq!(
-            registry.query_u32("/dev/registry/LOCAL_MACHINE/SOFTWARE/BLAUPUNKT", "MAXPOOLSIZE"),
+            registry.query_u32(
+                "/dev/registry/LOCAL_MACHINE/SOFTWARE/BLAUPUNKT",
+                "MAXPOOLSIZE"
+            ),
             Some(0x000f_a000)
         );
         assert_eq!(
@@ -646,11 +653,12 @@ mod tests {
             Some(0x1c)
         );
         assert_eq!(
-            registry.query_string(
-                "/dev/registry/LOCAL_MACHINE/SOFTWARE/BLAUPUNKT/PROCESS/LBASE/SPMSLV",
-                "SERVICEID"
-            )
-            .as_deref(),
+            registry
+                .query_string(
+                    "/dev/registry/LOCAL_MACHINE/SOFTWARE/BLAUPUNKT/PROCESS/LBASE/SPMSLV",
+                    "SERVICEID"
+                )
+                .as_deref(),
             Some("0x5f")
         );
     }

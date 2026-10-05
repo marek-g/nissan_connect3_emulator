@@ -1,6 +1,8 @@
 use crate::common::queues::{self, LI_TERM_MQ};
 use crate::emulator::emulator::{ProcessFactory, ProcessHandle, ProcessSpec};
-use crate::rtos::interaction::{RtosInteractionConfig, RtosQueueMessageFormat, RtosStartupQueueMessage};
+use crate::rtos::interaction::{
+    RtosInteractionConfig, RtosQueueMessageFormat, RtosStartupQueueMessage,
+};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -17,7 +19,10 @@ pub struct StartProcessCommand {
 
 impl StartProcessCommand {
     pub fn new(command: u8, path: impl Into<String>) -> Self {
-        Self { command, path: path.into() }
+        Self {
+            command,
+            path: path.into(),
+        }
     }
 
     pub fn start_proc(path: impl Into<String>) -> Self {
@@ -164,11 +169,13 @@ impl RtosBootConfig {
                         command.command(),
                         path,
                     ),
-                    RtosQueueMessageFormat::Terminal => RtosStartupQueueMessage::terminal_start_proc(
-                        self.start_queue.clone(),
-                        command.command(),
-                        path,
-                    ),
+                    RtosQueueMessageFormat::Terminal => {
+                        RtosStartupQueueMessage::terminal_start_proc(
+                            self.start_queue.clone(),
+                            command.command(),
+                            path,
+                        )
+                    }
                 };
                 message.format = self.start_message_format;
                 message
@@ -189,7 +196,11 @@ impl RtosBootService {
         handles: Arc<Mutex<Vec<ProcessHandle>>>,
         config: RtosBootConfig,
     ) -> Self {
-        Self { factory, handles, config }
+        Self {
+            factory,
+            handles,
+            config,
+        }
     }
 
     pub fn start(self) -> JoinHandle<()> {

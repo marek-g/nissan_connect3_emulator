@@ -28,6 +28,16 @@ pub fn writev(unicorn: &mut Unicorn<'_, Context>, fd: u32, iov: u32, iovcnt: u32
             let len = unpack_u32(&iov_buf[index * 8 + 4..index * 8 + 8]);
             let mut buf = vec![0u8; len as usize];
             unicorn.mem_read(addr as u64, &mut buf).unwrap();
+            if fd <= 10 {
+                log::trace!(
+                    "{:#x}: [{}] [WRITEV fd {} seg {}] {:?}",
+                    unicorn.reg_read(RegisterARM::PC).unwrap(),
+                    unicorn.get_data().inner.thread_id(),
+                    fd,
+                    index,
+                    String::from_utf8_lossy(&buf)
+                );
+            }
 
             match unicorn
                 .get_data()

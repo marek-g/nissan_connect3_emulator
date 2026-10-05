@@ -55,7 +55,11 @@ impl ProcessFactory {
         namespace: Arc<Mutex<SystemNamespace>>,
         next_thread_id: Arc<AtomicU32>,
     ) -> Self {
-        Self { file_system, namespace, next_thread_id }
+        Self {
+            file_system,
+            namespace,
+            next_thread_id,
+        }
     }
 
     pub fn namespace(&self) -> Arc<Mutex<SystemNamespace>> {
@@ -146,14 +150,14 @@ impl Emulator {
         } else {
             None
         };
-        let rtos_service = rtos::RtosBootService::new(factory, handles.clone(), rtos_config).start();
+        let rtos_service =
+            rtos::RtosBootService::new(factory, handles.clone(), rtos_config).start();
 
         let mut first_error = None;
         if rtos_service.join().is_err() {
-            first_error = Some(
-                Box::<dyn Error + Send + Sync>::from("the RTOS boot host thread panicked")
-                    as Box<dyn Error + Send + Sync + 'static>,
-            );
+            first_error = Some(Box::<dyn Error + Send + Sync>::from(
+                "the RTOS boot host thread panicked",
+            ) as Box<dyn Error + Send + Sync + 'static>);
         }
 
         loop {
@@ -175,11 +179,9 @@ impl Emulator {
                     }
                     Err(_) => {
                         if first_error.is_none() {
-                            first_error = Some(
-                                Box::<dyn Error + Send + Sync>::from(
-                                    "a process host thread panicked",
-                                ),
-                            );
+                            first_error = Some(Box::<dyn Error + Send + Sync>::from(
+                                "a process host thread panicked",
+                            ));
                         }
                     }
                 }

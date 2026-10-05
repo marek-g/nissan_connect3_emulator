@@ -66,13 +66,17 @@ impl FileSystem for TmpFileSystem {
         }
 
         if path != "/" {
-            let parent = path.rsplit_once('/').map_or("/", |(parent, _)| {
-                if parent.is_empty() {
-                    "/"
-                } else {
-                    parent
-                }
-            });
+            let parent =
+                path.rsplit_once('/').map_or(
+                    "/",
+                    |(parent, _)| {
+                        if parent.is_empty() {
+                            "/"
+                        } else {
+                            parent
+                        }
+                    },
+                );
             if !self.files.contains_key(parent) {
                 return Err(OpenFileError::NoSuchFileOrDirectory);
             }
@@ -309,9 +313,8 @@ impl FileSystem for TmpFileSystem {
             }
 
             let bytes_to_read = (file_data.data.len() - opened_file.pos).min(content.len());
-            content[0..bytes_to_read].copy_from_slice(
-                &file_data.data[opened_file.pos..opened_file.pos + bytes_to_read],
-            );
+            content[0..bytes_to_read]
+                .copy_from_slice(&file_data.data[opened_file.pos..opened_file.pos + bytes_to_read]);
             opened_file.pos += bytes_to_read;
             return Ok(bytes_to_read as u64);
         }
@@ -337,7 +340,9 @@ impl FileSystem for TmpFileSystem {
                 .copy_from_slice(&content[0..bytes_to_override]);
             let bytes_to_append = content.len() - bytes_to_override;
             if bytes_to_append > 0 {
-                file_data.data.extend_from_slice(&content[bytes_to_override..]);
+                file_data
+                    .data
+                    .extend_from_slice(&content[bytes_to_override..]);
             }
             opened_file.pos += content.len();
             return Ok(content.len() as u64);

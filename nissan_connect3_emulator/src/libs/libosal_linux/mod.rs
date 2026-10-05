@@ -9,6 +9,7 @@ mod thread;
 mod trace;
 
 use crate::emulator::context::Context;
+use crate::os::code_stub::{add_code_stub, CodeStubHandler};
 use crate::libs::libosal_linux::event::hook_event_code;
 use crate::libs::libosal_linux::init::hook_core_code;
 use crate::libs::libosal_linux::io::hook_io_code;
@@ -25,9 +26,21 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use unicorn_engine::{RegisterARM, Unicorn};
 
+fn stub_zero(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
+    0
+}
+
 pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     // Stubbed functions are patched to `svc #0` and dispatched from the single
     // intr hook, so no per-instruction Unicorn code hooks are registered.
+    const EXIT_EXCEPTION_HANDLER: u32 = 0x4851_f044 - 0x484d_8000;
+    add_code_stub(
+        unicorn,
+        "/opt/bosch/processes/libosal_linux_so.so",
+        base_address + EXIT_EXCEPTION_HANDLER,
+        "exit_exception_handler",
+        stub_zero as CodeStubHandler,
+    );
     hook_core_code(unicorn, base_address);
     hook_io_code(unicorn, base_address);
     hook_registry_code(unicorn, base_address);
@@ -117,7 +130,6 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
 //         uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
 //             .unwrap();
 //     }*/
-
 //     if tracing {
 //         let cs = Capstone::new()
 //             .arm()

@@ -5,8 +5,8 @@ use crate::emulator::utils::pack_u32;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 use unicorn_engine::unicorn_const::{MemType, Prot};
-use unicorn_engine::{RegisterARM, Unicorn};
 use unicorn_engine::Context as CpuContext;
+use unicorn_engine::{RegisterARM, Unicorn};
 
 /// A doorbell used to park a guest process' host thread while none of its guest
 /// threads can run, and to wake it as soon as some other host thread opens a
@@ -58,12 +58,18 @@ impl Wake {
 pub enum BlockReason {
     /// futex wait on a process-private word (pthread mutex/condvar, tid clear):
     /// waiters live in this process' own `SysCallsState`.
-    FutexWait { addr: u32, deadline: Option<Instant> },
+    FutexWait {
+        addr: u32,
+        deadline: Option<Instant>,
+    },
     /// futex wait on a word that lives in shared memory (`/dev/shm/*`, e.g. a
     /// POSIX named semaphore via `sem_open`). The wait is recorded in the global
     /// `SystemNamespace` so a `FUTEX_WAKE` from another process can signal it;
     /// `id` indexes that registry and the owning process' host thread reaps it.
-    FutexWaitShared { id: usize, deadline: Option<Instant> },
+    FutexWaitShared {
+        id: usize,
+        deadline: Option<Instant>,
+    },
     SleepUntil(Instant),
     /// waiting in mq_timedsend for a free slot on the queue
     MqSend {
@@ -92,7 +98,10 @@ pub enum BlockReason {
         deadline: Option<Instant>,
     },
     /// waiting in iosc_enter_mutex for the IOSC mutex to be released
-    IoscMutex { id: u32, deadline: Option<Instant> },
+    IoscMutex {
+        id: u32,
+        deadline: Option<Instant>,
+    },
     /// waiting in iosc_wait_for_event for the IOSC event to be set
     IoscEvent {
         id: u32,
@@ -100,13 +109,25 @@ pub enum BlockReason {
         result_ptr: u32,
     },
     /// waiting in iosc_obtain_semaphore for the IOSC semaphore count
-    IoscSemaphore { id: u32, deadline: Option<Instant> },
+    IoscSemaphore {
+        id: u32,
+        deadline: Option<Instant>,
+    },
     /// waiting in read() on an emulated inotify descriptor for the first event
-    InotifyRead { fd: u32, deadline: Option<Instant> },
+    InotifyRead {
+        fd: u32,
+        deadline: Option<Instant>,
+    },
     /// waiting in recvmsg() on an emulated socket with no host backend yet
-    SocketRead { fd: u32, deadline: Option<Instant> },
+    SocketRead {
+        fd: u32,
+        deadline: Option<Instant>,
+    },
     /// waiting in rt_sigtimedwait for one of `set` signals to be delivered
-    SignalWait { set: u64, deadline: Option<Instant> },
+    SignalWait {
+        set: u64,
+        deadline: Option<Instant>,
+    },
 }
 
 /// Action requested by a syscall handler; consumed by the syscall hook wrapper.
@@ -207,11 +228,7 @@ pub fn exit_process(unicorn: &mut Unicorn<'_, Context>, code: i32) {
 pub fn set_kernel_traps(unicorn: &mut Unicorn<'_, Context>) {
     // allocate memory directly by unicorn (not mmu object)
     unicorn
-        .mem_map(
-            0xFFFF0000u64,
-            0x1000u64,
-            Prot::READ | Prot::EXEC,
-        )
+        .mem_map(0xFFFF0000u64, 0x1000u64, Prot::READ | Prot::EXEC)
         .unwrap();
 
     // memory_barrier
@@ -257,9 +274,7 @@ pub fn set_kernel_traps(unicorn: &mut Unicorn<'_, Context>) {
             MQ_NOTIFY_EXIT_STUB as u64,
             // mov   r7, #1     ; exit
             // swi   #0
-            &[
-                0x01, 0x70, 0xA0, 0xE3, 0x00, 0x00, 0x00, 0xEF,
-            ],
+            &[0x01, 0x70, 0xA0, 0xE3, 0x00, 0x00, 0x00, 0xEF],
         )
         .unwrap();
 

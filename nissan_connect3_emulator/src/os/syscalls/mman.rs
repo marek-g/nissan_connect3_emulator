@@ -142,7 +142,10 @@ fn mmapx(
 ) -> u32 {
     let perms = prot_to_permission(prot);
 
-    // MAP_ANONYMOUS - do not use fd
+    if length == 0 {
+        return -22i32 as u32; // -EINVAL, matches Linux mmap() behavior
+    }
+
     if flags & 0x20u32 != 0 {
         fd = 0xFFFFFFFFu32;
     }
@@ -178,8 +181,8 @@ fn mmapx(
                 if fs.seek(fd as i32, SeekFrom::Start(off_t as u64)).is_err() {
                     return -22i32 as u32; // -EINVAL
                 }
-                let bytes_to_read = (length as u64)
-                    .min(file_len.saturating_sub(off_t as u64)) as u32;
+                let bytes_to_read =
+                    (length as u64).min(file_len.saturating_sub(off_t as u64)) as u32;
                 buf.resize(bytes_to_read as usize, 0u8);
                 if fs.read_all(fd as i32, &mut buf).is_err() {
                     return -5i32 as u32; // -EIO
@@ -214,28 +217,28 @@ fn mmapx(
         let host_ptr = host_buf.as_ptr() as *mut c_void;
 
         let mmu_arc = unicorn.get_data().inner.mmu.clone();
-        return if flags & 0x10 != 0 || addr != 0 {
-            // MAP_FIXED
+        return if flags & 0x10u32 != 0 {
             mmu_arc
                 .lock()
                 .unwrap()
                 .map_shared(unicorn, addr, map_len, perms, "[shm]", &filepath, host_ptr);
             addr
+        } else if addr != 0 {
+            mmu_arc
+                .lock()
+                .unwrap()
+                .heap_alloc_shared_hint(unicorn, addr, map_len, perms, &filepath, host_ptr)
         } else {
-            mmu_arc.lock().unwrap().heap_alloc_shared(
-                unicorn,
-                map_len,
-                perms,
-                &filepath,
-                host_ptr,
-            )
+            mmu_arc
+                .lock()
+                .unwrap()
+                .heap_alloc_shared(unicorn, map_len, perms, &filepath, host_ptr)
         };
     }
 
     // allocate memory
     let mmu_arc = unicorn.get_data().inner.mmu.clone();
-    let addr = if flags & 0x10 != 0 || addr != 0 {
-        // MAP_FIXED - don't interpret addr as a hint
+    let addr = if flags & 0x10u32 != 0 {
         mmu_arc.lock().unwrap().map(
             unicorn,
             addr,
@@ -245,8 +248,16 @@ fn mmapx(
             &filepath,
         );
         addr
+    } else if addr != 0 {
+        mmu_arc
+            .lock()
+            .unwrap()
+            .heap_alloc_hint(unicorn, addr, length, perms, &filepath)
     } else {
-        mmu_arc.lock().unwrap().heap_alloc(unicorn, length, perms, &filepath)
+        mmu_arc
+            .lock()
+            .unwrap()
+            .heap_alloc(unicorn, length, perms, &filepath)
     };
 
     // write file

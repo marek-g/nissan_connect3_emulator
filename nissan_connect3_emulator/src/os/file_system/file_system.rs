@@ -93,5 +93,11 @@ pub trait FileSystem {
 
     fn truncate(&mut self, fd: i32, length: u32) -> Result<(), ()>;
 
-    fn ioctl(&mut self, unicorn: &mut Unicorn<'_, Context>, fd: i32, request: u32, addr: u32) -> i32;
+    fn ioctl(
+        &mut self,
+        unicorn: &mut Unicorn<'_, Context>,
+        fd: i32,
+        request: u32,
+        addr: u32,
+    ) -> i32;
 }

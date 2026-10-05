@@ -212,10 +212,11 @@ pub fn clone(
     let mut child_stack = child_stack;
     if child_stack == 0 {
         let mmu_arc = unicorn.get_data().inner.mmu.clone();
-        let new_base = mmu_arc
-            .lock()
-            .unwrap()
-            .heap_alloc(unicorn, STACK_SIZE, Prot::READ | Prot::WRITE, "");
+        let new_base =
+            mmu_arc
+                .lock()
+                .unwrap()
+                .heap_alloc(unicorn, STACK_SIZE, Prot::READ | Prot::WRITE, "");
         let mut buf = vec![0u8; STACK_SIZE as usize];
         unicorn.mem_read(STACK_BASE as u64, &mut buf).unwrap();
         unicorn.mem_write(new_base as u64, &buf).unwrap();

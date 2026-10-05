@@ -6,10 +6,10 @@ pub mod sys_calls_state;
 
 mod fcntl;
 pub(crate) mod futex;
-pub mod mqueue;
 mod ioctl;
 mod linux;
 mod mman;
+pub mod mqueue;
 mod prctl;
 mod resource;
 mod sched;

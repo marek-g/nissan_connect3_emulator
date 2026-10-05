@@ -155,9 +155,7 @@ impl Mmu {
     /// memory (which has no cross-process identity).
     pub fn shared_futex_key(&self, addr: u32) -> Option<(String, u32)> {
         self.regions.iter().find_map(|r| {
-            if addr >= r.memory_start
-                && addr <= r.memory_end
-                && r.filepath.starts_with("/dev/shm/")
+            if addr >= r.memory_start && addr <= r.memory_end && r.filepath.starts_with("/dev/shm/")
             {
                 Some((r.filepath.clone(), addr - r.memory_start))
             } else {
@@ -168,11 +166,7 @@ impl Mmu {
 
     pub fn unmap(&mut self, unicorn: &mut Unicorn<'_, Context>, address: u32, size: u32) {
         self.remove_internal(unicorn, address, size);
-        log::debug!(
-            "mmu_unmap: {:#x} - {:#x}",
-            address,
-            address + size,
-        );
+        log::debug!("mmu_unmap: {:#x} - {:#x}", address, address + size,);
     }
 
     pub fn mem_protect(
@@ -186,7 +180,9 @@ impl Mmu {
         self.split_internal(unicorn, address);
         self.split_internal(unicorn, address + size);
 
-        unicorn.mem_protect(address as u64, size as u64, perms).unwrap();
+        unicorn
+            .mem_protect(address as u64, size as u64, perms)
+            .unwrap();
 
         for item in &mut self.regions {
             if item.memory_start >= address && item.memory_end <= address + size - 1 {
@@ -268,11 +264,82 @@ impl Mmu {
         let heap_addr = self.heap_mem_end;
 
         let size = mem_align_up(size, None);
-        self.map_shared(unicorn, heap_addr, size, perms, "[heap (shared)]", filepath, host_ptr);
+        self.map_shared(
+            unicorn,
+            heap_addr,
+            size,
+            perms,
+            "[heap (shared)]",
+            filepath,
+            host_ptr,
+        );
 
         self.heap_mem_end = heap_addr + size;
 
         heap_addr
+    }
+
+    pub fn heap_alloc_hint(
+        &mut self,
+        unicorn: &mut Unicorn<'_, Context>,
+        hint: u32,
+        size: u32,
+        perms: Prot,
+        filepath: &str,
+    ) -> u32 {
+        let size = mem_align_up(size, None);
+
+        if hint != 0 && self.is_free(hint, size) {
+            self.map(unicorn, hint, size, perms, "[heap (hint)]", filepath);
+            if hint + size > self.heap_mem_end {
+                self.heap_mem_end = hint + size;
+            }
+            return hint;
+        }
+
+        self.heap_alloc(unicorn, size, perms, filepath)
+    }
+
+    pub fn heap_alloc_shared_hint(
+        &mut self,
+        unicorn: &mut Unicorn<'_, Context>,
+        hint: u32,
+        size: u32,
+        perms: Prot,
+        filepath: &str,
+        host_ptr: *mut c_void,
+    ) -> u32 {
+        let size = mem_align_up(size, None);
+
+        if hint != 0 && self.is_free(hint, size) {
+            self.map_shared(
+                unicorn,
+                hint,
+                size,
+                perms,
+                "[heap (shared hint)]",
+                filepath,
+                host_ptr,
+            );
+            if hint + size > self.heap_mem_end {
+                self.heap_mem_end = hint + size;
+            }
+            return hint;
+        }
+
+        self.heap_alloc_shared(unicorn, size, perms, filepath, host_ptr)
+    }
+
+    pub fn is_free(&self, address: u32, size: u32) -> bool {
+        let end = match address.checked_add(size).and_then(|x| x.checked_sub(1)) {
+            Some(end) => end,
+            None => return false,
+        };
+
+        !self
+            .regions
+            .iter()
+            .any(|r| r.memory_start <= end && r.memory_end >= address)
     }
 
     /// unmap all regions fully covered by [address, address + size)
@@ -324,7 +391,9 @@ impl Mmu {
 
             // read the whole region's contents
             let mut data = vec![0u8; size as usize];
-            unicorn.mem_read(item.memory_start as u64, &mut data).unwrap();
+            unicorn
+                .mem_read(item.memory_start as u64, &mut data)
+                .unwrap();
 
             // remove the old region from the VM and the bookkeeping
             self.unmap_internal(unicorn, item.memory_start, size);
@@ -333,7 +402,11 @@ impl Mmu {
 
             // left part
             unicorn
-                .mem_map(item.memory_start as u64, left_size as u64, item.memory_perms)
+                .mem_map(
+                    item.memory_start as u64,
+                    left_size as u64,
+                    item.memory_perms,
+                )
                 .unwrap();
             unicorn
                 .mem_write(item.memory_start as u64, &data[..split_offset])
@@ -350,7 +423,9 @@ impl Mmu {
             unicorn
                 .mem_map(address as u64, right_size as u64, item.memory_perms)
                 .unwrap();
-            unicorn.mem_write(address as u64, &data[split_offset..]).unwrap();
+            unicorn
+                .mem_write(address as u64, &data[split_offset..])
+                .unwrap();
             self.regions.push(MmuRegion {
                 memory_start: address,
                 memory_end: item.memory_end,

@@ -209,6 +209,15 @@ pub fn write(unicorn: &mut Unicorn<'_, Context>, fd: u32, buf: u32, length: u32)
 
     let mut buf2 = vec![0u8; length as usize];
     unicorn.mem_read(buf as u64, &mut buf2).unwrap();
+    if fd <= 10 {
+        log::trace!(
+            "{:#x}: [{}] [WRITE fd {}] {:?}",
+            unicorn.reg_read(RegisterARM::PC).unwrap(),
+            unicorn.get_data().inner.thread_id(),
+            fd,
+            String::from_utf8_lossy(&buf2)
+        );
+    }
     let file_system = &mut unicorn.get_data().inner.file_system.clone();
     let is_open = file_system.lock().unwrap().is_open(fd as i32);
     let res = if is_open {
@@ -724,9 +733,7 @@ pub fn reboot(unicorn: &mut Unicorn<'_, Context>, status: u32) -> u32 {
         status,
     );
 
-    unicorn
-        .get_data()
-        .set_action(ThreadAction::ExitProcess(0));
+    unicorn.get_data().set_action(ThreadAction::ExitProcess(0));
 
     log::trace!(
         "{:#x}: [{}] [SYSCALL] reboot => {:#x}",

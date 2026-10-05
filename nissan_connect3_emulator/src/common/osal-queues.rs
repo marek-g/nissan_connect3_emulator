@@ -14,7 +14,7 @@ use crate::common::queues::{canonical_mq_name, MqMessage, MqState};
 pub use crate::common::queues::{
     DP_MASTER, LI_TERM_MQ, NOIOSC_CB_HDR_LI_PREFIX, OSAL_CB_HDR_LI_MAIN,
     OSAL_CB_HDR_LI_MAIN_MAXMSG, OSAL_CB_HDR_MAXMSG, OSAL_CB_HDR_MSGSIZE, OSAL_CB_HDR_TE,
-    OSAL_CB_HDR_TE_MAXMSG, TE_TERM_MQ, TERM_MQ_MAXMSG, TERM_MQ_MSGSIZE,
+    OSAL_CB_HDR_TE_MAXMSG, TERM_MQ_MAXMSG, TERM_MQ_MSGSIZE, TE_TERM_MQ,
 };
 
 pub const RTOS_TERMINAL_READY: u8 = 0x0e;
@@ -42,12 +42,8 @@ pub const OSAL_QUEUE_TYPE_LOCAL: u32 = 1;
 pub const OSAL_QUEUE_TYPE_CALLBACK: u32 = 2;
 pub const OSAL_QUEUE_TYPE_IOSC: u32 = 3;
 
-pub const RTOS_INTERCEPTED_OSAL_QUEUES: &[&str] = &[
-    TE_TERM_MQ,
-    LI_TERM_MQ,
-    OSAL_CB_HDR_TE,
-    OSAL_CB_HDR_LI_MAIN,
-];
+pub const RTOS_INTERCEPTED_OSAL_QUEUES: &[&str] =
+    &[TE_TERM_MQ, LI_TERM_MQ, OSAL_CB_HDR_TE, OSAL_CB_HDR_LI_MAIN];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OsalQueueKind {
@@ -71,7 +67,12 @@ pub struct OsalQueueSpec {
 
 impl OsalQueueSpec {
     pub fn new(name: impl Into<String>, kind: OsalQueueKind, maxmsg: i64, msgsize: i64) -> Self {
-        Self { name: name.into(), kind, maxmsg, msgsize }
+        Self {
+            name: name.into(),
+            kind,
+            maxmsg,
+            msgsize,
+        }
     }
 }
 
@@ -85,7 +86,10 @@ pub struct OsalMessage {
 
 impl OsalMessage {
     pub fn from_mq_message(message: MqMessage) -> Self {
-        Self { data: message.data, priority: mq_priority_to_osal_priority(message.priority) }
+        Self {
+            data: message.data,
+            priority: mq_priority_to_osal_priority(message.priority),
+        }
     }
 }
 
@@ -117,7 +121,11 @@ impl OsalQueueService {
     }
 
     pub fn create_rtos_callback_queues(mq: &mut MqState) {
-        mq.rtos_open_or_create(OSAL_CB_HDR_LI_MAIN, OSAL_CB_HDR_LI_MAIN_MAXMSG, OSAL_CB_HDR_MSGSIZE);
+        mq.rtos_open_or_create(
+            OSAL_CB_HDR_LI_MAIN,
+            OSAL_CB_HDR_LI_MAIN_MAXMSG,
+            OSAL_CB_HDR_MSGSIZE,
+        );
         mq.rtos_open_or_create(OSAL_CB_HDR_TE, OSAL_CB_HDR_TE_MAXMSG, OSAL_CB_HDR_MSGSIZE);
     }
 
@@ -130,7 +138,12 @@ impl OsalQueueService {
         Self::create_rtos_callback_queues(mq);
     }
 
-    pub fn rtos_post_message(mq: &mut MqState, name: &str, data: Vec<u8>, osal_priority: u32) -> bool {
+    pub fn rtos_post_message(
+        mq: &mut MqState,
+        name: &str,
+        data: Vec<u8>,
+        osal_priority: u32,
+    ) -> bool {
         let name = canonical_mq_name(name);
         Self::ensure_queue(mq, &name);
         mq.host_post(&name, data, osal_priority_to_mq_priority(osal_priority))
@@ -174,16 +187,17 @@ impl OsalQueueService {
             return id;
         }
 
-        let spec = spec_for_name(&name)
-            .unwrap_or_else(|| default_queue_spec(&name, OSAL_DEFAULT_MSGSIZE));
+        let spec =
+            spec_for_name(&name).unwrap_or_else(|| default_queue_spec(&name, OSAL_DEFAULT_MSGSIZE));
         mq.rtos_open_or_create(&spec.name, spec.maxmsg, spec.msgsize)
     }
 
     pub fn guest_post(mq: &mut MqState, name: &str, data: Vec<u8>, osal_priority: u32) -> bool {
         let name = canonical_mq_name(name);
         let requested_msgsize = data.len() as i64;
-        let spec = spec_for_name(&name)
-            .unwrap_or_else(|| default_queue_spec(&name, OSAL_DEFAULT_MSGSIZE.max(requested_msgsize)));
+        let spec = spec_for_name(&name).unwrap_or_else(|| {
+            default_queue_spec(&name, OSAL_DEFAULT_MSGSIZE.max(requested_msgsize))
+        });
 
         let id = match mq.queue_id_for_name(&name) {
             Some(id) => id,
@@ -210,7 +224,11 @@ impl OsalQueueService {
         Self::pop_guest_message(mq, id, max_len)
     }
 
-    pub fn pop_guest_message(mq: &mut MqState, queue_id: u32, max_len: usize) -> Option<OsalMessage> {
+    pub fn pop_guest_message(
+        mq: &mut MqState,
+        queue_id: u32,
+        max_len: usize,
+    ) -> Option<OsalMessage> {
         let fits = mq
             .queues
             .get(&queue_id)
@@ -260,9 +278,9 @@ pub fn spec_for_name(name: &str) -> Option<OsalQueueSpec> {
     let kind = queue_kind(&name);
 
     match kind {
-        OsalQueueKind::RtosTerminalInbound | OsalQueueKind::RtosTerminalOutbound => {
-            Some(OsalQueueSpec::new(name, kind, TERM_MQ_MAXMSG, TERM_MQ_MSGSIZE))
-        }
+        OsalQueueKind::RtosTerminalInbound | OsalQueueKind::RtosTerminalOutbound => Some(
+            OsalQueueSpec::new(name, kind, TERM_MQ_MAXMSG, TERM_MQ_MSGSIZE),
+        ),
         OsalQueueKind::OsalCallbackMain => Some(OsalQueueSpec::new(
             name,
             kind,
@@ -281,13 +299,19 @@ pub fn spec_for_name(name: &str) -> Option<OsalQueueSpec> {
             OSAL_DEFAULT_MAXMSG,
             DP_MASTER_MSGSIZE,
         )),
-        OsalQueueKind::LinuxLocalCallback => {
-            Some(OsalQueueSpec::new(name, kind, OSAL_CB_HDR_MAXMSG, OSAL_CB_HDR_MSGSIZE))
-        }
+        OsalQueueKind::LinuxLocalCallback => Some(OsalQueueSpec::new(
+            name,
+            kind,
+            OSAL_CB_HDR_MAXMSG,
+            OSAL_CB_HDR_MSGSIZE,
+        )),
         OsalQueueKind::Unknown => None,
-        OsalQueueKind::Iosc => {
-            Some(OsalQueueSpec::new(name, kind, OSAL_DEFAULT_MAXMSG, OSAL_DEFAULT_MSGSIZE))
-        }
+        OsalQueueKind::Iosc => Some(OsalQueueSpec::new(
+            name,
+            kind,
+            OSAL_DEFAULT_MAXMSG,
+            OSAL_DEFAULT_MSGSIZE,
+        )),
     }
 }
 

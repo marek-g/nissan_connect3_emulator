@@ -13,10 +13,13 @@ use unicorn_engine::Unicorn;
 pub(crate) fn finish_guest_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, now: Instant) {
     let reason = {
         let threads = unicorn.get_data().threads.lock().unwrap();
-        threads.iter().find(|thread| thread.id == tid).and_then(|thread| match thread.status {
-            ThreadStatus::Blocked(reason) => Some(reason),
-            _ => None,
-        })
+        threads
+            .iter()
+            .find(|thread| thread.id == tid)
+            .and_then(|thread| match thread.status {
+                ThreadStatus::Blocked(reason) => Some(reason),
+                _ => None,
+            })
     };
 
     let Some(BlockReason::OsalQueueReceive {
@@ -32,7 +35,8 @@ pub(crate) fn finish_guest_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, no
 
     let message = {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
-        let message = OsalQueueService::pop_guest_message(&mut state.mq, queue_id, msg_len as usize);
+        let message =
+            OsalQueueService::pop_guest_message(&mut state.mq, queue_id, msg_len as usize);
         if message.is_some() || deadline.map(|deadline| deadline <= now).unwrap_or(false) {
             state.mq.remove_waiter(queue_id, tid);
         }
@@ -45,7 +49,9 @@ pub(crate) fn finish_guest_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, no
                 unicorn.mem_write(msg_ptr as u64, &message.data).unwrap();
             }
             if prio_ptr != 0 {
-                unicorn.mem_write(prio_ptr as u64, &pack_u32(message.priority)).unwrap();
+                unicorn
+                    .mem_write(prio_ptr as u64, &pack_u32(message.priority))
+                    .unwrap();
             }
             set_runnable_with_result(unicorn, tid, message.data.len() as u32);
         }

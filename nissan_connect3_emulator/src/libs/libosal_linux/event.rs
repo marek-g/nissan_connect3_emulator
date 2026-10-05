@@ -67,7 +67,10 @@ fn event_object(unicorn: &mut Unicorn<'_, Context>, object: u32) -> String {
     let magic = read_u32(unicorn, object);
     let name = read_string(unicorn, object.wrapping_add(0x18));
     let sem = read_u32(unicorn, object.wrapping_add(0x10));
-    format!("{} magic={:#x} sem={} object={:#x}", name, magic, sem, object)
+    format!(
+        "{} magic={:#x} sem={} object={:#x}",
+        name, magic, sem, object
+    )
 }
 
 fn read_name(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> String {

@@ -85,8 +85,10 @@ fn read_deadline(unicorn: &Unicorn<'_, Context>, addr: u32) -> Deadline {
 
     match abs_nanos - now_nanos {
         delta if delta < 0 => Deadline::At(Instant::now()), // already expired
-        delta => Deadline::At(Instant::now()
-            + Duration::new(delta as u64 / 1_000_000_000, (delta % 1_000_000_000) as u32)),
+        delta => Deadline::At(
+            Instant::now()
+                + Duration::new(delta as u64 / 1_000_000_000, (delta % 1_000_000_000) as u32),
+        ),
     }
 }
 
@@ -164,7 +166,12 @@ pub fn mq_open(
 /// ring every process' doorbell so any host thread parked on an mq wait
 /// re-checks its queue in its own VM (where its message buffers live).
 fn notify_waiters(unicorn: &Unicorn<'_, Context>) {
-    unicorn.get_data().namespace.lock().unwrap().notify_waiters();
+    unicorn
+        .get_data()
+        .namespace
+        .lock()
+        .unwrap()
+        .notify_waiters();
 }
 
 fn set_runnable_with_result(unicorn: &Unicorn<'_, Context>, tid: u32, result: u32) {
@@ -200,14 +207,19 @@ fn fire_notification(unicorn: &mut Unicorn<'_, Context>, owner: u32, notify: MqN
 /// `sigval` in R0; when it returns, the thread exits (kernel: glibc's rt
 /// thread calls the user function and then terminates)
 fn spawn_notify_thread(unicorn: &mut Unicorn<'_, Context>, function: u32, sigval: u32) {
-    let tid = unicorn.get_data().next_thread_id.fetch_add(1, Ordering::Relaxed);
+    let tid = unicorn
+        .get_data()
+        .next_thread_id
+        .fetch_add(1, Ordering::Relaxed);
 
     // fresh stack for the notification thread
     let mmu_arc = unicorn.get_data().mmu.clone();
-    let stack_base = mmu_arc
-        .lock()
-        .unwrap()
-        .heap_alloc(unicorn, STACK_SIZE, Prot::READ | Prot::WRITE, "mq-notify");
+    let stack_base = mmu_arc.lock().unwrap().heap_alloc(
+        unicorn,
+        STACK_SIZE,
+        Prot::READ | Prot::WRITE,
+        "mq-notify",
+    );
     unicorn
         .mem_write(stack_base as u64, &vec![0u8; STACK_SIZE as usize])
         .unwrap();
@@ -218,7 +230,9 @@ fn spawn_notify_thread(unicorn: &mut Unicorn<'_, Context>, function: u32, sigval
     unicorn
         .reg_write(RegisterARM::SP as i32, (stack_base + STACK_SIZE - 8) as u64)
         .unwrap();
-    unicorn.reg_write(RegisterARM::R0 as i32, sigval as u64).unwrap();
+    unicorn
+        .reg_write(RegisterARM::R0 as i32, sigval as u64)
+        .unwrap();
     unicorn
         .reg_write(RegisterARM::LR as i32, MQ_NOTIFY_EXIT_STUB as u64)
         .unwrap();
@@ -305,16 +319,18 @@ pub fn mq_timedsend(
             state.mq.staged.insert(tid, (mqdes, buf, msg_prio));
             drop(state);
 
-            unicorn.get_data().set_action(ThreadAction::Block(BlockReason::MqSend {
-                queue_id: mqdes,
-                msg_ptr,
-                msg_len,
-                priority: msg_prio,
-                deadline: match &deadline {
-                    Deadline::At(at) => Some(*at),
-                    _ => None,
-                },
-            }));
+            unicorn
+                .get_data()
+                .set_action(ThreadAction::Block(BlockReason::MqSend {
+                    queue_id: mqdes,
+                    msg_ptr,
+                    msg_len,
+                    priority: msg_prio,
+                    deadline: match &deadline {
+                        Deadline::At(at) => Some(*at),
+                        _ => None,
+                    },
+                }));
             return 0; // overwritten by pending_result when the wait completes
         }
     }
@@ -323,7 +339,9 @@ pub fn mq_timedsend(
     // the queue just became non-empty) and wake any receiver blocked on it
     let notify = {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
-        state.mq.insert_message_and_take_notify(mqdes, buf, msg_prio)
+        state
+            .mq
+            .insert_message_and_take_notify(mqdes, buf, msg_prio)
     };
     if let Some((owner, notify)) = notify {
         fire_notification(unicorn, owner, notify);
@@ -392,7 +410,9 @@ fn do_mq_timedreceive(
     if let Some(message) = message {
         unicorn.mem_write(msg_ptr as u64, &message.data).unwrap();
         if prio_ptr != 0 {
-            unicorn.mem_write(prio_ptr as u64, &pack_u32(message.priority)).unwrap();
+            unicorn
+                .mem_write(prio_ptr as u64, &pack_u32(message.priority))
+                .unwrap();
         }
         // there is now a free slot - wake any blocked sender so it can enqueue
         notify_waiters(unicorn);
@@ -428,16 +448,18 @@ fn do_mq_timedreceive(
         state.mq.waiters.entry(mqdes).or_default().push(tid);
     }
 
-    unicorn.get_data().set_action(ThreadAction::Block(BlockReason::MqReceive {
-        queue_id: mqdes,
-        msg_ptr,
-        msg_len,
-        prio_ptr,
-        deadline: match &deadline {
-            Deadline::At(at) => Some(*at),
-            _ => None,
-        },
-    }));
+    unicorn
+        .get_data()
+        .set_action(ThreadAction::Block(BlockReason::MqReceive {
+            queue_id: mqdes,
+            msg_ptr,
+            msg_len,
+            prio_ptr,
+            deadline: match &deadline {
+                Deadline::At(at) => Some(*at),
+                _ => None,
+            },
+        }));
 
     0 // overwritten by pending_result when the wait completes
 }
@@ -651,10 +673,13 @@ pub fn mq_notify(unicorn: &mut Unicorn<'_, Context>, mqdes: u32, notif_addr: u32
 pub fn finish_mq_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, now: Instant) {
     let reason = {
         let threads = unicorn.get_data().threads.lock().unwrap();
-        threads.iter().find(|t| t.id == tid).and_then(|t| match t.status {
-            ThreadStatus::Blocked(reason) => Some(reason),
-            _ => None,
-        })
+        threads
+            .iter()
+            .find(|t| t.id == tid)
+            .and_then(|t| match t.status {
+                ThreadStatus::Blocked(reason) => Some(reason),
+                _ => None,
+            })
     };
 
     match reason {
@@ -693,9 +718,7 @@ pub fn finish_mq_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, now: Instant
             }
         }
         Some(BlockReason::MqSend {
-            queue_id,
-            deadline,
-            ..
+            queue_id, deadline, ..
         }) => {
             let mut completed = false;
             let mut timed_out = false;

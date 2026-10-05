@@ -227,7 +227,9 @@ fn timeout_to_deadline(ms: i32) -> Option<Instant> {
 /// (the libiosclib wrappers read it back and feed it to u32MapErrorCodeIOSC)
 fn write_result(unicorn: &mut Unicorn<'_, Context>, result_ptr: u32, value: u32) {
     if result_ptr != 0 {
-        unicorn.mem_write(result_ptr as u64, &pack_u32(value)).unwrap();
+        unicorn
+            .mem_write(result_ptr as u64, &pack_u32(value))
+            .unwrap();
     }
 }
 
@@ -264,9 +266,7 @@ fn shared_malloc(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
         base
     };
     if pp_mem != 0 {
-        unicorn
-            .mem_write(pp_mem as u64, &pack_u32(base))
-            .unwrap();
+        unicorn.mem_write(pp_mem as u64, &pack_u32(base)).unwrap();
     }
     log::trace!(
         "[IOSC] shared_malloc(id={:#x}, size={:#x}, mapped={:#x}) => base {:#x} via *ppMem({:#x})",
@@ -548,7 +548,12 @@ fn release_semaphore(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
 /// ring every process' doorbell so parked host threads re-check the IOSC
 /// objects they may be blocked on. Called after releasing an object.
 fn notify_waiters(unicorn: &Unicorn<'_, Context>) {
-    unicorn.get_data().namespace.lock().unwrap().notify_waiters();
+    unicorn
+        .get_data()
+        .namespace
+        .lock()
+        .unwrap()
+        .notify_waiters();
 }
 
 /// mark a blocked thread runnable and install its syscall result in R0 on the
@@ -571,10 +576,13 @@ fn set_runnable_with_result(unicorn: &Unicorn<'_, Context>, tid: u32, result: u3
 pub fn finish_iosc_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, now: Instant) {
     let reason = {
         let threads = unicorn.get_data().threads.lock().unwrap();
-        threads.iter().find(|t| t.id == tid).and_then(|t| match t.status {
-            ThreadStatus::Blocked(reason) => Some(reason),
-            _ => None,
-        })
+        threads
+            .iter()
+            .find(|t| t.id == tid)
+            .and_then(|t| match t.status {
+                ThreadStatus::Blocked(reason) => Some(reason),
+                _ => None,
+            })
     };
 
     let result: Option<u32> = match reason {

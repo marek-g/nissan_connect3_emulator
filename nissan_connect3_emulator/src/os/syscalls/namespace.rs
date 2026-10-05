@@ -76,7 +76,13 @@ impl SystemNamespace {
     pub fn futex_wait_shared(&mut self, key: (String, u32)) -> usize {
         let id = self.next_futex_waiter;
         self.next_futex_waiter += 1;
-        self.futex_slab.insert(id, SharedFutexWaiter { key: key.clone(), signaled: false });
+        self.futex_slab.insert(
+            id,
+            SharedFutexWaiter {
+                key: key.clone(),
+                signaled: false,
+            },
+        );
         self.futex_by_key.entry(key).or_default().push_back(id);
         id
     }

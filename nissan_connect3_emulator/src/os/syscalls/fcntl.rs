@@ -1,6 +1,7 @@
 use crate::emulator::context::Context;
 use crate::emulator::utils::read_string;
 use crate::os::file_system::OpenFileFlags;
+use super::SysCallError;
 use std::path::PathBuf;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -193,7 +194,12 @@ pub fn fcntl64(unicorn: &mut Unicorn<'_, Context>, fd: u32, cmd: u32, arg1: u32)
     res
 }
 
-fn open_internal(unicorn: &mut Unicorn<'_, Context>, path_name: &str, flags: u32, _mode: u32) -> u32 {
+fn open_internal(
+    unicorn: &mut Unicorn<'_, Context>,
+    path_name: &str,
+    flags: u32,
+    _mode: u32,
+) -> u32 {
     // the Bosch IOSC IPC driver is not a real file - hand out a reserved fd and
     // let the ioctl dispatch back it (see iosc.rs)
     if path_name == "/dev/iosc" {
@@ -202,7 +208,7 @@ fn open_internal(unicorn: &mut Unicorn<'_, Context>, path_name: &str, flags: u32
 
     let open_file_flags = convert_open_file_flags(flags);
 
-    if let Ok(fd) = unicorn
+    match unicorn
         .get_data()
         .inner
         .file_system
@@ -210,9 +216,8 @@ fn open_internal(unicorn: &mut Unicorn<'_, Context>, path_name: &str, flags: u32
         .unwrap()
         .open(&path_name, open_file_flags)
     {
-        fd as u32
-    } else {
-        -1i32 as u32
+        Ok(fd) => fd as u32,
+        Err(err) => err.to_syscall_error(),
     }
 }
 

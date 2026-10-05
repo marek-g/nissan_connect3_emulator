@@ -15,8 +15,8 @@
 
 use crate::common::osal_queues::{
     callback_message_command, make_callback_command_message, make_terminal_command_message,
-    message_command, message_words, OsalQueueService, OsalMessage, OSAL_CB_MESSAGE_MAIN,
-    LI_TERM_MQ, OSAL_CB_HDR_TE, RTOS_TERMINAL_READY, TE_TERM_MQ,
+    message_command, message_words, OsalMessage, OsalQueueService, LI_TERM_MQ, OSAL_CB_HDR_TE,
+    OSAL_CB_MESSAGE_MAIN, RTOS_TERMINAL_READY, TE_TERM_MQ,
 };
 use crate::os::syscalls::namespace::SystemNamespace;
 use std::collections::VecDeque;
@@ -89,8 +89,12 @@ impl RtosStartupQueueMessage {
 
     fn encoded(&self) -> Vec<u8> {
         match self.format {
-            RtosQueueMessageFormat::Callback => make_callback_command_message(self.command, &self.payload),
-            RtosQueueMessageFormat::Terminal => make_terminal_command_message(self.command, &self.payload),
+            RtosQueueMessageFormat::Callback => {
+                make_callback_command_message(self.command, &self.payload)
+            }
+            RtosQueueMessageFormat::Terminal => {
+                make_terminal_command_message(self.command, &self.payload)
+            }
         }
     }
 }
@@ -112,7 +116,10 @@ impl Default for RtosInteractionConfig {
         Self {
             ack_terminal_ready: env_flag("EMU_RTOS_TERMINAL_ACK"),
             wait_for_terminal_handshake: env_flag_or_default("EMU_RTOS_WAIT_TE_READY", true),
-            startup_handshake_timeout: env_duration_ms("EMU_RTOS_TE_READY_TIMEOUT_MS", Duration::from_millis(1500)),
+            startup_handshake_timeout: env_duration_ms(
+                "EMU_RTOS_TE_READY_TIMEOUT_MS",
+                Duration::from_millis(1500),
+            ),
         }
     }
 }
@@ -128,7 +135,10 @@ impl RtosQueueInteraction {
 
         let ready_posted = OsalQueueService::rtos_terminal_bootstrap(&mut namespace.mq);
         if ready_posted {
-            log::info!("RTOS terminal task posted ready notification to {}", LI_TERM_MQ);
+            log::info!(
+                "RTOS terminal task posted ready notification to {}",
+                LI_TERM_MQ
+            );
         }
 
         OsalQueueService::rtos_callback_bootstrap(&mut namespace.mq);
@@ -167,7 +177,10 @@ impl RtosQueueInteraction {
             }
         });
 
-        Self { stop, handles: vec![terminal_handle, callback_handle] }
+        Self {
+            stop,
+            handles: vec![terminal_handle, callback_handle],
+        }
     }
 
     pub fn stop(self) {
@@ -237,7 +250,8 @@ fn callback_header_task_poll_once(namespace: &Arc<Mutex<SystemNamespace>>) {
     {
         let mut namespace = namespace.lock().unwrap();
 
-        while let Some(message) = OsalQueueService::receive_message(&mut namespace.mq, OSAL_CB_HDR_TE)
+        while let Some(message) =
+            OsalQueueService::receive_message(&mut namespace.mq, OSAL_CB_HDR_TE)
         {
             notify = true;
             handle_inbound_callback_message(&message);
@@ -357,7 +371,10 @@ fn handle_inbound_callback_message(message: &OsalMessage) {
     if message_type == OSAL_CB_MESSAGE_MAIN {
         log::debug!("RTOS callback-header task type 7: RTOS table dispatch not emulated");
     } else if message_type == 6 || message_type == 0xf {
-        log::debug!("RTOS callback-header task skipped callback type {} per RTOS wait loop", message_type);
+        log::debug!(
+            "RTOS callback-header task skipped callback type {} per RTOS wait loop",
+            message_type
+        );
     } else {
         log::debug!(
             "RTOS callback-header task ignored non-7 callback type {} per RTOS wait loop",

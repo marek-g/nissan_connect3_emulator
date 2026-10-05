@@ -98,7 +98,9 @@ pub fn nanosleep(unicorn: &mut Unicorn<'_, Context>, req: u32, rem: u32) -> u32 
     let duration = Duration::new(seconds as u64, nanoseconds as u32);
     unicorn
         .get_data()
-        .set_action(ThreadAction::Block(BlockReason::SleepUntil(Instant::now() + duration)));
+        .set_action(ThreadAction::Block(BlockReason::SleepUntil(
+            Instant::now() + duration,
+        )));
 
     log::trace!(
         "{:#x}: [{}] [SYSCALL] nanosleep => {:#x}",

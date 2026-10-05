@@ -99,10 +99,12 @@ pub fn futex(
                         .push(thread_id);
                 }
 
-                unicorn.get_data().set_action(ThreadAction::Block(BlockReason::FutexWait {
-                    addr: uaddr,
-                    deadline,
-                }));
+                unicorn
+                    .get_data()
+                    .set_action(ThreadAction::Block(BlockReason::FutexWait {
+                        addr: uaddr,
+                        deadline,
+                    }));
 
                 log::trace!(
                     "{:#x}: [{}] [SYSCALL] futex - woken up",
@@ -118,7 +120,10 @@ pub fn futex(
             // evaluated - a plain wake of `val` waiters covers the common cases)
             if let Some(key) = shm_futex_key(unicorn, uaddr) {
                 let namespace = unicorn.get_data().namespace.clone();
-                let count = namespace.lock().unwrap().futex_wake_shared(&key, val as usize);
+                let count = namespace
+                    .lock()
+                    .unwrap()
+                    .futex_wake_shared(&key, val as usize);
                 // ring every doorbell so each parked owner reaps its signaled waiter
                 namespace.lock().unwrap().notify_waiters();
                 count as u32
@@ -196,7 +201,12 @@ fn log_futex_backtrace(unicorn: &Unicorn<'_, Context>, uaddr: u32) {
     let mut seen = std::collections::HashSet::new();
     let mut frames = Vec::new();
 
-    if let Some((library, offset)) = unicorn.get_data().mmu.lock().unwrap().executable_location(lr)
+    if let Some((library, offset)) = unicorn
+        .get_data()
+        .mmu
+        .lock()
+        .unwrap()
+        .executable_location(lr)
     {
         frames.push(format!("{}+{:#x}", library, offset));
     }

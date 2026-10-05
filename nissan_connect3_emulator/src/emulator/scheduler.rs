@@ -95,7 +95,9 @@ fn run_quantum(
         )
     };
     unicorn.get_data().set_thread_id(next_id);
-    unicorn.context_restore(&cpu_context).map_err(map_uc_error)?;
+    unicorn
+        .context_restore(&cpu_context)
+        .map_err(map_uc_error)?;
 
     // a completed blocked syscall (e.g. woken mq receive) parks its result
     // here instead of in the saved context
@@ -113,11 +115,8 @@ fn run_quantum(
     // new PC; otherwise the default action applies (terminate).
     let (fault_handled, had_fault) = match unicorn.get_data().take_pending_fault() {
         Some(fault) => {
-            let handled = crate::os::syscalls::signal::handle_mem_fault(
-                unicorn,
-                fault.addr,
-                fault.is_fetch,
-            );
+            let handled =
+                crate::os::syscalls::signal::handle_mem_fault(unicorn, fault.addr, fault.is_fetch);
             (handled, true)
         }
         None => (false, false),
@@ -125,7 +124,9 @@ fn run_quantum(
 
     // ---- switch out: save the CPU state back to the thread record
     let mut saved_context = unicorn.context_alloc().map_err(map_uc_error)?;
-    unicorn.context_save(&mut saved_context).map_err(map_uc_error)?;
+    unicorn
+        .context_save(&mut saved_context)
+        .map_err(map_uc_error)?;
     let pc = unicorn.reg_read(RegisterARM::PC).unwrap() as u32;
     {
         let data = unicorn.get_data();
@@ -343,9 +344,9 @@ fn park_duration(unicorn: &Unicorn<'_, Context>) -> Duration {
         ThreadStatus::Blocked(BlockReason::FutexWait { deadline, .. }) => *deadline,
         ThreadStatus::Blocked(BlockReason::FutexWaitShared { deadline, .. }) => *deadline,
         ThreadStatus::Blocked(BlockReason::SleepUntil(until)) => Some(*until),
-        ThreadStatus::Blocked(BlockReason::MqSend { deadline, .. } | BlockReason::MqReceive { deadline, .. }) => {
-            *deadline
-        }
+        ThreadStatus::Blocked(
+            BlockReason::MqSend { deadline, .. } | BlockReason::MqReceive { deadline, .. },
+        ) => *deadline,
         ThreadStatus::Blocked(BlockReason::OsalQueueReceive { deadline, .. }) => *deadline,
         ThreadStatus::Blocked(
             BlockReason::IoscMutex { deadline, .. }
@@ -404,5 +405,8 @@ fn pick_next_runnable(unicorn: &Unicorn<'_, Context>) -> Option<u32> {
 fn all_exited(unicorn: &Unicorn<'_, Context>) -> bool {
     let data = unicorn.get_data();
     let threads = data.threads.lock().unwrap();
-    !threads.is_empty() && threads.iter().all(|t| matches!(t.status, ThreadStatus::Exited(_)))
+    !threads.is_empty()
+        && threads
+            .iter()
+            .all(|t| matches!(t.status, ThreadStatus::Exited(_)))
 }

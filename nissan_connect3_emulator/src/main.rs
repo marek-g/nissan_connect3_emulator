@@ -51,6 +51,15 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
             ))),
             is_read_only: true,
         },
+        // Dynamic FFS is writable on the unit. The SD-card mount above is
+        // read-only, so shadow only the mutable FFS tree with a host overlay.
+        MountPoint {
+            mount_point: "/var/opt/bosch/dynamic/ffs".to_string(),
+            file_system: Box::new(OsFileSystem::new(PathBuf::from(
+                "/tmp/opencode/nissan_emu/ffs_dynamic",
+            ))),
+            is_read_only: false,
+        },
         // Keep the software watchdog from rebooting the emulated process.
         MountPoint {
             mount_point: "/opt/bosch/disable_reset.txt".to_string(),
@@ -118,6 +127,13 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
             mount_point: "/dev".to_string(),
             file_system: Box::new(DevFileSystem::new()),
             is_read_only: false,
+        },
+        MountPoint {
+            mount_point: "/dev/ffs2".to_string(),
+            file_system: Box::new(OsFileSystem::new(PathBuf::from(
+                "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/D605_unpacked/lx001.tar.gz/var/opt/bosch",
+            ))),
+            is_read_only: true,
         },
         // firmware
         MountPoint {

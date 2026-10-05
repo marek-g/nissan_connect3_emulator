@@ -1,5 +1,7 @@
 use crate::emulator::context::Context;
-use crate::emulator::thread::{block_current_thread, exit_current_thread, exit_process, ThreadAction};
+use crate::emulator::thread::{
+    block_current_thread, exit_current_thread, exit_process, ThreadAction,
+};
 use crate::os::syscalls::{
     fcntl, futex, ioctl, linux, mman, mqueue, prctl, resource, sched, signal, socket, stat, time,
     timer, uio, unistd, utsname,
@@ -19,7 +21,13 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
     };
     if let Some(stub) = stub {
         let tid = unicorn.get_data().thread_id();
-        log::trace!("{:#x}: [{}] [{} HOOK] {}() [IN]", pc, tid, stub.lib, stub.name);
+        log::trace!(
+            "{:#x}: [{}] [{} HOOK] {}() [IN]",
+            pc,
+            tid,
+            stub.lib,
+            stub.name
+        );
         let res = (stub.handler)(unicorn);
         log::trace!(
             "{:#x}: [{}] [{} HOOK] {}() => {}",

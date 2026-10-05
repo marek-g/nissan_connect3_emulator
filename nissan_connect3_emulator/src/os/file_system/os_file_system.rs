@@ -37,8 +37,13 @@ impl FileSystem for OsFileSystem {
         }
     }
 
-    fn mkdir(&mut self, _file_path: &str, _mode: u32) -> Result<(), OpenFileError> {
-        Err(OpenFileError::NoPermission)
+    fn mkdir(&mut self, file_path: &str, _mode: u32) -> Result<(), OpenFileError> {
+        let path = match self.path_transform_to_real(file_path) {
+            Some(path) => path,
+            None => return Err(OpenFileError::NoSuchFileOrDirectory),
+        };
+        std::fs::create_dir_all(path).map_err(|_| OpenFileError::NoPermission)?;
+        Ok(())
     }
 
     fn read_dir(&mut self, dir_path: &str) -> Result<Vec<String>, ()> {
@@ -81,11 +86,7 @@ impl FileSystem for OsFileSystem {
             None => return Err(OpenFileError::NoSuchFileOrDirectory),
         };
 
-        log::debug!(
-            "Opening: {}, flags: {:?}",
-            full_path_name.display(),
-            flags
-        );
+        log::debug!("Opening: {}, flags: {:?}", full_path_name.display(), flags);
 
         let open_options = self.get_open_options(flags);
 

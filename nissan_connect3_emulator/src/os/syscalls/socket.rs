@@ -31,7 +31,12 @@ fn block_for_receive(unicorn: &mut Unicorn<'_, Context>, socket_fd: u32, flags: 
     0u32
 }
 
-pub fn socket(unicorn: &mut Unicorn<'_, Context>, domain: u32, socket_type: u32, protocol: u32) -> u32 {
+pub fn socket(
+    unicorn: &mut Unicorn<'_, Context>,
+    domain: u32,
+    socket_type: u32,
+    protocol: u32,
+) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] socket(domain = {:#x}, socket_type: {:#x}, protocol: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -62,7 +67,12 @@ pub fn socket(unicorn: &mut Unicorn<'_, Context>, domain: u32, socket_type: u32,
     res
 }
 
-pub fn connect(unicorn: &mut Unicorn<'_, Context>, socket_fd: u32, addr: u32, addr_len: u32) -> u32 {
+pub fn connect(
+    unicorn: &mut Unicorn<'_, Context>,
+    socket_fd: u32,
+    addr: u32,
+    addr_len: u32,
+) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] connect(socket_fd = {:#x}, addr: {:#x}, addr_len: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -85,12 +95,7 @@ pub fn connect(unicorn: &mut Unicorn<'_, Context>, socket_fd: u32, addr: u32, ad
     res
 }
 
-pub fn bind(
-    unicorn: &mut Unicorn<'_, Context>,
-    socket_fd: u32,
-    addr: u32,
-    addr_len: u32,
-) -> u32 {
+pub fn bind(unicorn: &mut Unicorn<'_, Context>, socket_fd: u32, addr: u32, addr_len: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] bind(socket_fd = {:#x}, addr: {:#x}, addr_len: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -205,7 +210,13 @@ pub fn getsockopt(
     res
 }
 
-pub fn send(unicorn: &mut Unicorn<'_, Context>, socket_fd: u32, buf: u32, len: u32, flags: u32) -> u32 {
+pub fn send(
+    unicorn: &mut Unicorn<'_, Context>,
+    socket_fd: u32,
+    buf: u32,
+    len: u32,
+    flags: u32,
+) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] send(socket_fd = {:#x}, buf: {:#x}, len: {:#x}, flags: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -281,12 +292,7 @@ pub fn listen(unicorn: &mut Unicorn<'_, Context>, socket_fd: u32, backlog: u32) 
     res
 }
 
-pub fn accept(
-    unicorn: &mut Unicorn<'_, Context>,
-    socket_fd: u32,
-    addr: u32,
-    addr_len: u32,
-) -> u32 {
+pub fn accept(unicorn: &mut Unicorn<'_, Context>, socket_fd: u32, addr: u32, addr_len: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] accept(socket_fd = {:#x}, addr: {:#x}, addr_len: {:#x}) [IN]",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
@@ -331,9 +337,7 @@ pub fn socketpair(
         state.socket_fds.insert(b);
         (a, b)
     };
-    unicorn
-        .mem_write(sv_addr as u64, &a.to_le_bytes())
-        .unwrap();
+    unicorn.mem_write(sv_addr as u64, &a.to_le_bytes()).unwrap();
     unicorn
         .mem_write((sv_addr + 4) as u64, &b.to_le_bytes())
         .unwrap();

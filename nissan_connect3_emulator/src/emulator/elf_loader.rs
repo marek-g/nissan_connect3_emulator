@@ -167,7 +167,8 @@ pub fn load_elf(
     if let Some(interp_path) = binary.interpreter() {
         log::debug!("Load interpreter: {:?}", &interp_path);
 
-        let interp_bin = load_binary(unicorn, &interp_path).map_err(|_| "cannot load interpreter")?;
+        let interp_bin =
+            load_binary(unicorn, &interp_path).map_err(|_| "cannot load interpreter")?;
         let binary = ElfBinary::new(&interp_bin).expect("Got proper ELF file");
 
         let mut interp_loader = ArmElfLoader {

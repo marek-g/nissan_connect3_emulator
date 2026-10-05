@@ -128,9 +128,9 @@ impl MqState {
     }
 
     pub fn has_guest_ready_queue(&self, configured: &str) -> bool {
-        self.queues.values().any(|queue| {
-            queue.guest_open_count > 0 && is_boot_ready_queue(&queue.name, configured)
-        })
+        self.queues
+            .values()
+            .any(|queue| queue.guest_open_count > 0 && is_boot_ready_queue(&queue.name, configured))
     }
 
     /// Open an existing queue as a guest opener, or create one if requested.
@@ -151,7 +151,10 @@ impl MqState {
                 return MqGuestOpen::AlreadyExists;
             }
 
-            let queue = self.queues.get_mut(&id).expect("name_to_id points to a queue");
+            let queue = self
+                .queues
+                .get_mut(&id)
+                .expect("name_to_id points to a queue");
             queue.open_count += 1;
             queue.guest_open_count += 1;
             queue.nonblock |= nonblock;
@@ -179,7 +182,10 @@ impl MqState {
     pub fn rtos_open_or_create(&mut self, name: &str, maxmsg: i64, msgsize: i64) -> u32 {
         let name = canonical_mq_name(name);
         if let Some(&id) = self.name_to_id.get(&name) {
-            let queue = self.queues.get_mut(&id).expect("name_to_id points to a queue");
+            let queue = self
+                .queues
+                .get_mut(&id)
+                .expect("name_to_id points to a queue");
             queue.open_count += 1;
             return id;
         }
@@ -301,10 +307,7 @@ pub fn is_boot_ready_queue(name: &str, configured: &str) -> bool {
 
     matches!(
         name.as_str(),
-        "NOIOSC_CB_HDR_LI_0"
-            | "OSAL_CB_HDR_LI_MAIN"
-            | "TE_TERM_MQ"
-            | "LI_TERM_MQ"
+        "NOIOSC_CB_HDR_LI_0" | "OSAL_CB_HDR_LI_MAIN" | "TE_TERM_MQ" | "LI_TERM_MQ"
     ) || name.starts_with(NOIOSC_CB_HDR_LI_PREFIX)
         || name == configured
 }

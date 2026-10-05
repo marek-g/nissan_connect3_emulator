@@ -19,7 +19,13 @@ const ERROR_HANDLE: u32 = 0x7200c;
 const ERROR_COMMAND: u32 = 0x72011;
 
 pub fn hook_registry_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
-    add_code_stub(unicorn, "LIBOSAL", base_address + REGISTRY_OPEN, "REGISTRY_u32IOOpen", open);
+    add_code_stub(
+        unicorn,
+        "LIBOSAL",
+        base_address + REGISTRY_OPEN,
+        "REGISTRY_u32IOOpen",
+        open,
+    );
     add_code_stub(
         unicorn,
         "LIBOSAL",
@@ -122,7 +128,12 @@ fn create(unicorn: &mut Unicorn<'_, Context>) -> u32 {
             if !write_u32(unicorn, out_addr, handle) {
                 return ERROR_PARAM;
             }
-            log::trace!("REGISTRY_u32IOCreate({}) flags={:#x} -> handle={:#x}", path, flags, handle);
+            log::trace!(
+                "REGISTRY_u32IOCreate({}) flags={:#x} -> handle={:#x}",
+                path,
+                flags,
+                handle
+            );
             SUCCESS
         }
         crate::common::registry::OpenKeyResult::Exists => ERROR_EXISTS,
@@ -171,7 +182,11 @@ fn io_control(unicorn: &mut Unicorn<'_, Context>) -> u32 {
 
 fn query_value(unicorn: &mut Unicorn<'_, Context>, path: &str, flags: u32, buffer: u32) -> u32 {
     if !readable(flags) || buffer == 0 {
-        return if !readable(flags) { ERROR_FLAGS } else { ERROR_PARAM };
+        return if !readable(flags) {
+            ERROR_FLAGS
+        } else {
+            ERROR_PARAM
+        };
     }
 
     let name_addr = match read_u32(unicorn, buffer) {
@@ -214,7 +229,8 @@ fn query_value(unicorn: &mut Unicorn<'_, Context>, path: &str, flags: u32, buffe
             if length <= 3 {
                 return ERROR_LENGTH;
             }
-            if !write_u32(unicorn, out_type_addr, 1) || !write_u32(unicorn, out_buffer_addr, value) {
+            if !write_u32(unicorn, out_type_addr, 1) || !write_u32(unicorn, out_buffer_addr, value)
+            {
                 return ERROR_PARAM;
             }
             SUCCESS
@@ -237,7 +253,11 @@ fn query_value(unicorn: &mut Unicorn<'_, Context>, path: &str, flags: u32, buffe
 
 fn lookup_app_path(unicorn: &mut Unicorn<'_, Context>, path: &str, flags: u32, buffer: u32) -> u32 {
     if !readable(flags) || buffer == 0 {
-        return if !readable(flags) { ERROR_FLAGS } else { ERROR_PARAM };
+        return if !readable(flags) {
+            ERROR_FLAGS
+        } else {
+            ERROR_PARAM
+        };
     }
 
     let app_id_addr = buffer + 0x100;
@@ -268,9 +288,18 @@ fn lookup_app_path(unicorn: &mut Unicorn<'_, Context>, path: &str, flags: u32, b
     SUCCESS
 }
 
-fn lookup_service_path(unicorn: &mut Unicorn<'_, Context>, path: &str, flags: u32, buffer: u32) -> u32 {
+fn lookup_service_path(
+    unicorn: &mut Unicorn<'_, Context>,
+    path: &str,
+    flags: u32,
+    buffer: u32,
+) -> u32 {
     if !readable(flags) || buffer == 0 {
-        return if !readable(flags) { ERROR_FLAGS } else { ERROR_PARAM };
+        return if !readable(flags) {
+            ERROR_FLAGS
+        } else {
+            ERROR_PARAM
+        };
     }
 
     let service_id_addr = buffer + 0x100;
@@ -281,7 +310,9 @@ fn lookup_service_path(unicorn: &mut Unicorn<'_, Context>, path: &str, flags: u3
 
     let service_path = {
         let namespace = unicorn.get_data().namespace.lock().unwrap();
-        namespace.registry.find_key_by_u32_value("SERVICEID", service_id)
+        namespace
+            .registry
+            .find_key_by_u32_value("SERVICEID", service_id)
     };
 
     let service_path = match service_path {
@@ -299,7 +330,9 @@ fn lookup_service_path(unicorn: &mut Unicorn<'_, Context>, path: &str, flags: u3
         None => return ERROR_NOT_FOUND,
     };
 
-    if !write_cstr(unicorn, buffer, 0x100, &service_path) || !write_u32(unicorn, service_id_addr, app_id) {
+    if !write_cstr(unicorn, buffer, 0x100, &service_path)
+        || !write_u32(unicorn, service_id_addr, app_id)
+    {
         return ERROR_PARAM;
     }
     log::debug!(

@@ -111,7 +111,9 @@ fn sigset_bit(signum: u32) -> Option<u64> {
 }
 
 fn lowest_signum(mask: u64) -> Option<u32> {
-    (0..64).find(|bit| mask & (1u64 << *bit) != 0).map(|bit| bit + 1)
+    (0..64)
+        .find(|bit| mask & (1u64 << *bit) != 0)
+        .map(|bit| bit + 1)
 }
 
 fn read_sigset(unicorn: &Unicorn<'_, Context>, addr: u32) -> u64 {
@@ -187,11 +189,11 @@ pub fn rt_sigaction(
                 .unwrap()
                 .signals
                 .actions[index] = SigAction {
-                    handler,
-                    flags,
-                    restorer,
-                    mask,
-                };
+                handler,
+                flags,
+                restorer,
+                mask,
+            };
         }
     } else {
         res = 0xffff_f5e8; // -EINVAL
@@ -256,7 +258,9 @@ fn do_sigreturn_core(unicorn: &mut Unicorn<'_, Context>, frame: u32) -> Result<u
     .iter()
     .enumerate()
     {
-        unicorn.reg_write(*reg as i32, regs[i] as u64).map_err(|_| ())?;
+        unicorn
+            .reg_write(*reg as i32, regs[i] as u64)
+            .map_err(|_| ())?;
     }
     unicorn
         .reg_write(RegisterARM::FP as i32, r11 as u64)
@@ -283,7 +287,13 @@ fn do_sigreturn_core(unicorn: &mut Unicorn<'_, Context>, frame: u32) -> Result<u
         let high = rd(unicorn, UC_SIGMASK + frame + 4).unwrap_or(0) as u64;
         low | (high << 32)
     };
-    unicorn.get_data().sys_calls_state.lock().unwrap().signals.blocked = mask;
+    unicorn
+        .get_data()
+        .sys_calls_state
+        .lock()
+        .unwrap()
+        .signals
+        .blocked = mask;
     log::trace!(
         "rt_sigreturn: restored pc={:#x} sp={:#x} lr={:#x} r0={:#x}",
         pc,
@@ -406,7 +416,13 @@ fn deliver_sigsegv(unicorn: &mut Unicorn<'_, Context>, fault_addr: u32) -> bool 
     wr(unicorn, mc + SC_FAULT_ADDR, fault_addr);
 
     // uc_sigmask (new blocked set)
-    let blocked = unicorn.get_data().sys_calls_state.lock().unwrap().signals.blocked;
+    let blocked = unicorn
+        .get_data()
+        .sys_calls_state
+        .lock()
+        .unwrap()
+        .signals
+        .blocked;
     write_sigset(unicorn, UC_SIGMASK + frame, blocked);
 
     // retcode[]
@@ -419,9 +435,15 @@ fn deliver_sigsegv(unicorn: &mut Unicorn<'_, Context>, fault_addr: u32) -> bool 
     wr(unicorn, RETCODE_OFFSET + 4 + frame, 0);
 
     // install the handler entry: r0 = signal number, sp = frame, pc = handler, lr = retcode
-    unicorn.reg_write(RegisterARM::R0 as i32, SIGSEGV as u64).unwrap();
-    unicorn.reg_write(RegisterARM::SP as i32, frame as u64).unwrap();
-    unicorn.reg_write(RegisterARM::LR as i32, lr as u64).unwrap();
+    unicorn
+        .reg_write(RegisterARM::R0 as i32, SIGSEGV as u64)
+        .unwrap();
+    unicorn
+        .reg_write(RegisterARM::SP as i32, frame as u64)
+        .unwrap();
+    unicorn
+        .reg_write(RegisterARM::LR as i32, lr as u64)
+        .unwrap();
     unicorn
         .reg_write(RegisterARM::CPSR as i32, (cpsr & !PSR_F) as u64)
         .unwrap();
@@ -462,7 +484,7 @@ pub fn rt_sigprocmask(
         let mut state = unicorn.get_data().sys_calls_state.lock().unwrap();
         let old = state.signals.blocked;
         match how {
-            0 => state.signals.blocked = old | mask, // SIG_BLOCK
+            0 => state.signals.blocked = old | mask,  // SIG_BLOCK
             1 => state.signals.blocked = old & !mask, // SIG_UNBLOCK
             2 => state.signals.blocked = mask,        // SIG_SETMASK
             _ => res = 0xffff_f5e8,

@@ -60,13 +60,15 @@ impl Process {
             )),
         };
 
-        let mut unicorn =
-            Unicorn::new_with_data(Arch::ARM, Mode::LITTLE_ENDIAN, context)
-                .map_err(|e| format!("Unicorn error: {:?}", e))?;
+        let mut unicorn = Unicorn::new_with_data(Arch::ARM, Mode::LITTLE_ENDIAN, context)
+            .map_err(|e| format!("Unicorn error: {:?}", e))?;
         unicorn.add_intr_hook(hook_syscall).unwrap();
         // mem-fault hooks (unmapped/prot) deliver SIGSEGV to the guest. They add
         // per-access overhead, so they're opt-in via EMU_MEM_HOOKS.
-        if std::env::var("EMU_MEM_HOOKS").map(|v| v == "1").unwrap_or(false) {
+        if std::env::var("EMU_MEM_HOOKS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
             add_mem_fault_hooks(&mut unicorn);
         }
 

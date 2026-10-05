@@ -12,6 +12,10 @@ use unicorn_engine::{RegisterARM, Unicorn};
 
 static SYNTH_PWR_START_CONF_SENT: AtomicBool = AtomicBool::new(false);
 static SYNTH_PWR_START_CONF_CONTENT: AtomicU32 = AtomicU32::new(0);
+static SYNTH_PWR_STATE_REQ_SENT: AtomicBool = AtomicBool::new(false);
+static SYNTH_PWR_STATE_REQ_CONTENT: AtomicU32 = AtomicU32::new(0);
+static SYNTH_PWR_CVM_SIGNAL_CHANGED_SENT: AtomicBool = AtomicBool::new(false);
+static SYNTH_PWR_CVM_SIGNAL_CHANGED_CONTENT: AtomicU32 = AtomicU32::new(0);
 
 /// Message-queue observation and OSAL service bridge hooks.
 ///
@@ -139,6 +143,7 @@ fn handle_queue_api(
                     words[3],
                     caller
                 );
+                log_osal_message_ref(unicorn, base_address, &format!("post {}", decoded.name), r1);
             } else {
                 let stack_timeout = read_stack_timeout(unicorn, api_name);
                 log::info!(
@@ -168,7 +173,7 @@ fn handle_queue_api(
                     decoded.name
                 );
             } else {
-                let _ = synthesize_ail_power_start_conf(
+                synthesize_ail_power_startup_sequence(
                     unicorn,
                     api_name,
                     &decoded.name,
@@ -366,12 +371,145 @@ fn read_stack_timeout(unicorn: &Unicorn<'_, Context>, api_name: &str) -> u32 {
     }
 }
 
-fn synthesize_ail_power_start_conf(
+fn log_osal_message_ref(
+    unicorn: &Unicorn<'_, Context>,
+    base_address: u32,
+    source: &str,
+    ref_addr: u32,
+) {
+    const MSG_POOL_CONTENT_BASE: u32 = 0x4856_f800;
+    const MSG_POOL_BLOCK_BASE: u32 = 0x4856_f7f4;
+    const MSG_POOL_ENTRY_SIZE: u32 = 12;
+
+    let raw_type = read_u32_or_invalid(unicorn, ref_addr);
+    let raw_handle = read_u32_or_invalid(unicorn, ref_addr + 4);
+    match raw_type & 0xff {
+        1 if raw_handle != 0 && raw_handle < 0xf000_0000 => {
+            log_osal_message_bytes(unicorn, source, raw_type, raw_handle, raw_handle, "direct");
+        }
+        2 => {
+            let block_base = read_u32_or_invalid(unicorn, base_address + (MSG_POOL_BLOCK_BASE - ORIGINAL_BASE));
+            let content_base = read_u32_or_invalid(unicorn, base_address + (MSG_POOL_CONTENT_BASE - ORIGINAL_BASE));
+            let valid_base = |addr: u32| addr != 0 && addr != 0xffff_ffff && addr < 0xf000_0000;
+
+            for (label, base) in [("content", content_base), ("block", block_base)] {
+                if !valid_base(base) {
+                    continue;
+                }
+                let content = base.wrapping_add((raw_handle.wrapping_add(1) * MSG_POOL_ENTRY_SIZE) + 0x18);
+                if content < 0xf000_0000 {
+                    log_osal_message_bytes(unicorn, source, raw_type, raw_handle, content, label);
+                    return;
+                }
+            }
+            log::info!(
+                "[LIBOSAL] {} message ref type={} handle=0x{:x} pool bases content=0x{:x} block=0x{:x}",
+                source,
+                raw_type,
+                raw_handle,
+                content_base,
+                block_base
+            );
+        }
+        _ => {}
+    }
+}
+
+fn log_osal_message_bytes(
+    unicorn: &Unicorn<'_, Context>,
+    source: &str,
+    raw_type: u32,
+    raw_handle: u32,
+    content: u32,
+    base_label: &str,
+) {
+    let Some(data) = read_guest_buffer(unicorn, content, 0x40) else {
+        return;
+    };
+    let printable: String = data
+        .iter()
+        .map(|b| if (0x20..=0x7e).contains(b) { *b as char } else { '.' })
+        .collect();
+    log::info!(
+        "[LIBOSAL] {} message ref type={} handle=0x{:x} content=0x{:x} base={} bytes={} ascii={}",
+        source,
+        raw_type,
+        raw_handle,
+        content,
+        base_label,
+        data.iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" "),
+        printable
+    );
+}
+
+fn synthesize_ail_power_startup_sequence(
     unicorn: &mut Unicorn<'_, Context>,
     api_name: &str,
     name: &str,
     buf: u32,
     stack_timeout: u32,
+) -> bool {
+    for message in [
+        (
+            3u16,
+            0u32,
+            0u32,
+            "PWR_PROXY_START_CONF" as &str,
+            &SYNTH_PWR_START_CONF_SENT as &AtomicBool,
+            &SYNTH_PWR_START_CONF_CONTENT as &AtomicU32,
+        ),
+        (
+            0x10,
+            3,
+            0,
+            "PWR_STATE_CHANGE_REQ",
+            &SYNTH_PWR_STATE_REQ_SENT,
+            &SYNTH_PWR_STATE_REQ_CONTENT,
+        ),
+        (
+            0x50,
+            0,
+            0,
+            "PWR_CVM_SIGNAL_CHANGED",
+            &SYNTH_PWR_CVM_SIGNAL_CHANGED_SENT,
+            &SYNTH_PWR_CVM_SIGNAL_CHANGED_CONTENT,
+        ),
+    ] {
+        if synthesize_ail_power_message(
+            unicorn,
+            api_name,
+            name,
+            buf,
+            stack_timeout,
+            message.0,
+            message.1,
+            message.2,
+            message.3,
+            message.4,
+            message.5,
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn synthesize_ail_power_message(
+    unicorn: &mut Unicorn<'_, Context>,
+    api_name: &str,
+    name: &str,
+    buf: u32,
+    stack_timeout: u32,
+    power_type: u16,
+    power_data1: u32,
+    power_data2: u32,
+    message_name: &str,
+    sent: &AtomicBool,
+    content_slot: &AtomicU32,
 ) -> bool {
     const TARGET_QUEUE: &str = "mbx_265";
     const CONTENT_LEN: u32 = 0x20;
@@ -388,47 +526,61 @@ fn synthesize_ail_power_start_conf(
     if buf == 0 || buf > 0xf000_0000 {
         return false;
     }
-    if SYNTH_PWR_START_CONF_SENT.swap(true, Ordering::Relaxed) {
+
+    if power_type != 3 && !SYNTH_PWR_START_CONF_SENT.load(Ordering::SeqCst) {
+        return false;
+    }
+    if sent
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+        .is_err()
+    {
         return false;
     }
 
-    let mmu_arc = unicorn.get_data().mmu.clone();
-    let content = mmu_arc.lock().unwrap().heap_alloc(
-        unicorn,
-        CONTENT_LEN,
-        Prot::READ | Prot::WRITE,
-        "[synthetic-cca-power-conf]",
-    );
-    if content == 0 {
-        SYNTH_PWR_START_CONF_SENT.store(false, Ordering::Relaxed);
-        return false;
+    let mut content = content_slot.load(Ordering::Relaxed);
+    if content == 0 || content > 0xf000_0000 {
+        let mmu_arc = unicorn.get_data().mmu.clone();
+        content = mmu_arc.lock().unwrap().heap_alloc(
+            unicorn,
+            CONTENT_LEN,
+            Prot::READ | Prot::WRITE,
+            "[synthetic-cca-power-conf]",
+        );
+        if content == 0 {
+            return false;
+        }
+
+        let mut body = [0u8; CONTENT_LEN as usize];
+        body[0x00..0x02].copy_from_slice(&0x0109u16.to_le_bytes());
+        body[0x04..0x08].copy_from_slice(&CONTENT_LEN.to_le_bytes());
+        body[0x08..0x0a].copy_from_slice(&0x0002u16.to_le_bytes());
+        body[0x0b] = 0x40;
+        body[0x0c..0x0e].copy_from_slice(&0x0001u16.to_le_bytes());
+        body[0x14..0x16].copy_from_slice(&power_type.to_le_bytes());
+        body[0x18..0x1c].copy_from_slice(&power_data1.to_le_bytes());
+        body[0x1c..0x20].copy_from_slice(&power_data2.to_le_bytes());
+
+        if unicorn.mem_write(content as u64, &body).is_err() {
+            return false;
+        }
+
+        content_slot.store(content, Ordering::Relaxed);
     }
 
-    let mut body = [0u8; CONTENT_LEN as usize];
-    body[0x00..0x02].copy_from_slice(&0x0109u16.to_le_bytes());
-    body[0x04..0x08].copy_from_slice(&CONTENT_LEN.to_le_bytes());
-    body[0x08..0x0a].copy_from_slice(&0x0002u16.to_le_bytes());
-    body[0x0b] = 0x40;
-    body[0x0c..0x0e].copy_from_slice(&0x0001u16.to_le_bytes());
-    body[0x14..0x16].copy_from_slice(&0x0003u16.to_le_bytes());
-
-    if unicorn.mem_write(content as u64, &body).is_err()
-        || unicorn.mem_write(buf as u64, &1u32.to_le_bytes()).is_err()
+    if unicorn.mem_write(buf as u64, &1u32.to_le_bytes()).is_err()
         || unicorn
             .mem_write((buf + 4) as u64, &content.to_le_bytes())
             .is_err()
     {
-        SYNTH_PWR_START_CONF_SENT.store(false, Ordering::Relaxed);
         return false;
     }
-
-    SYNTH_PWR_START_CONF_CONTENT.store(content, Ordering::Relaxed);
     let thread = unicorn.get_data().inner.thread_id();
     log::info!(
-        "[{}] [LIBOSAL] {}({}) answered with synthetic PWR_PROXY_START_CONF content=0x{:x}",
+        "[{}] [LIBOSAL] {}({}) answered with synthetic {} content=0x{:x}",
         thread,
         api_name,
         name,
+        message_name,
         content
     );
     return_to_caller(unicorn, 8);
@@ -442,15 +594,18 @@ fn suppress_synthetic_message_delete(
 ) {
     let handle = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
     let content = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
-    let synthetic = SYNTH_PWR_START_CONF_CONTENT.load(Ordering::Relaxed);
-    if synthetic == 0 || (handle & 0xff) != 1 || content != synthetic {
+    let synthetic_contents = [
+        SYNTH_PWR_START_CONF_CONTENT.load(Ordering::Relaxed),
+        SYNTH_PWR_STATE_REQ_CONTENT.load(Ordering::Relaxed),
+        SYNTH_PWR_CVM_SIGNAL_CHANGED_CONTENT.load(Ordering::Relaxed),
+    ];
+    if !synthetic_contents.contains(&content) || (handle & 0xff) != 1 {
         return;
     }
 
-    SYNTH_PWR_START_CONF_CONTENT.store(0, Ordering::Relaxed);
     let thread = unicorn.get_data().inner.thread_id();
     log::info!(
-        "0x{:x} [{}] [LIBOSAL] OSAL_s32MessageDelete ignored synthetic PWR_PROXY_START_CONF content=0x{:x}",
+        "0x{:x} [{}] [LIBOSAL] OSAL_s32MessageDelete ignored synthetic power message content=0x{:x}",
         addr - base_address + ORIGINAL_BASE,
         thread,
         content

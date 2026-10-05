@@ -180,10 +180,7 @@ impl MountFileSystem {
                     path = if target.starts_with('/') {
                         target
                     } else {
-                        let parent = absolute_path
-                            .rsplit_once('/')
-                            .map(|(p, _)| p)
-                            .unwrap_or("");
+                        let parent = absolute_path.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
                         format!("{}/{}", parent, target)
                     };
                     continue;
@@ -287,7 +284,6 @@ impl MountFileSystem {
         }
     }
 
-
     pub fn link(&mut self, old_path: &str, new_path: &str) -> Result<(), OpenFileError> {
         if let Some((mount_point, old_file_path)) = self.get_mount_point_from_filepath_mut(old_path)
         {
@@ -351,14 +347,14 @@ impl MountFileSystem {
         let absolute_path = self.path_convert_to_absolute(file_path);
 
         // stat by path - no need (or side effect) of opening the file
-        let mount_and_details = self
-            .resolve_mount(&absolute_path)
-            .and_then(|(mount_point, translated_path)| {
-                mount_point
-                    .file_system
-                    .get_file_details_for_path(&translated_path)
-                    .map(|details| (mount_point.mount_point.clone(), details))
-            });
+        let mount_and_details =
+            self.resolve_mount(&absolute_path)
+                .and_then(|(mount_point, translated_path)| {
+                    mount_point
+                        .file_system
+                        .get_file_details_for_path(&translated_path)
+                        .map(|details| (mount_point.mount_point.clone(), details))
+                });
 
         if let Some((mount_name, file_details)) = mount_and_details {
             let inode = self.get_inode_for_filepath(&mount_name, &absolute_path);
