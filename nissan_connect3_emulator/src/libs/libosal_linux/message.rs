@@ -15,11 +15,23 @@ use unicorn_engine::{RegisterARM, Unicorn};
 /// queue type.
 pub fn hook_message_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     // original base address: 0x484d8000
+    const QUEUE_OPEN: u32 = 0x4850f028 - 0x484d8000;
+    const QUEUE_CREATE: u32 = 0x4850f2e0 - 0x484d8000;
     const QUEUE_WAIT: u32 = 0x4850fe18 - 0x484d8000;
     const QUEUE_POST: u32 = 0x48510650 - 0x484d8000;
     const QUEUE_NOTIFY: u32 = 0x4850e1a8 - 0x484d8000;
     const QUEUE_PRIORITY_WAIT: u32 = 0x4850d8a8 - 0x484d8000;
     const GET_FROM_MQ: u32 = 0x48509c8c - 0x484d8000;
+
+    unicorn
+        .add_code_hook(
+            (base_address + QUEUE_OPEN) as u64,
+            (base_address + QUEUE_OPEN) as u64,
+            move |uc, addr, _| {
+                fallback_open_to_create(uc, addr as u32, base_address, QUEUE_CREATE);
+            },
+        )
+        .unwrap();
 
     for (offset, name) in [
         (QUEUE_WAIT, "OSAL_s32MessageQueueWait"),
@@ -112,6 +124,111 @@ fn handle_queue_api(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address:
                 );
             }
         }
+    }
+}
+
+fn fallback_open_to_create(
+    unicorn: &mut Unicorn<'_, Context>,
+    addr: u32,
+    base_address: u32,
+    create_offset: u32,
+) {
+    const OSAL_CORE_PTR: u32 = 0x90ad_a928;
+    const OSAL_QUEUE_TABLE_OFFSET: u32 = 0x25220;
+    const OSAL_QUEUE_ENTRY_SIZE: u32 = 0x5c;
+    const OSAL_QUEUE_ENTRY_IN_USE_OFFSET: u32 = 0x08;
+    const OSAL_QUEUE_ENTRY_NAME_OFFSET: u32 = 0x38;
+    const OSAL_DEFAULT_MAXMSG: u32 = 100;
+    const OSAL_PRM_MSGSIZE: u32 = 0x70;
+
+    let name_ptr = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+    let flags = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+    let handle_ptr = unicorn.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+
+    let name = read_cstr(unicorn, name_ptr, 0x20);
+    if name != "PRM_MSGQUEUE" {
+        return;
+    }
+    if handle_ptr == 0 || handle_ptr > 0xf000_0000 || flags > 4 {
+        return;
+    }
+
+    if osal_queue_exists(
+        unicorn,
+        &name,
+        OSAL_CORE_PTR,
+        OSAL_QUEUE_TABLE_OFFSET,
+        OSAL_QUEUE_ENTRY_SIZE,
+        OSAL_QUEUE_ENTRY_IN_USE_OFFSET,
+        OSAL_QUEUE_ENTRY_NAME_OFFSET,
+    ) {
+        return;
+    }
+
+    let thread = unicorn.get_data().inner.thread_id();
+    let sp = unicorn.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+    if sp == 0
+        || sp > 0xf000_0000
+        || unicorn
+            .mem_write(sp as u64, &handle_ptr.to_le_bytes())
+            .is_err()
+    {
+        return;
+    }
+
+    log::info!(
+        "0x{:x} [{}] [LIBOSAL] OSAL_s32MessageQueueOpen({}) creates missing queue",
+        addr - base_address + 0x484d8000,
+        thread,
+        name
+    );
+
+    // OSAL_s32MessageQueueCreate(char *name, uint maxmsg, uint msgsize, int type, handle *out)
+    unicorn
+        .reg_write(RegisterARM::R1, OSAL_DEFAULT_MAXMSG as u64)
+        .unwrap();
+    unicorn
+        .reg_write(RegisterARM::R2, OSAL_PRM_MSGSIZE as u64)
+        .unwrap();
+    unicorn.reg_write(RegisterARM::R3, flags as u64).unwrap();
+    unicorn
+        .reg_write(RegisterARM::PC, (base_address + create_offset) as u64)
+        .unwrap();
+}
+
+fn osal_queue_exists(
+    unicorn: &Unicorn<'_, Context>,
+    name: &str,
+    core_ptr_addr: u32,
+    table_offset: u32,
+    entry_size: u32,
+    in_use_offset: u32,
+    name_offset: u32,
+) -> bool {
+    let core = read_u32_or_invalid(unicorn, core_ptr_addr);
+    if core == 0 || core > 0xf000_0000 {
+        return false;
+    }
+
+    let table = core.wrapping_add(table_offset);
+    for index in 0..0x100u32 {
+        let entry = table.wrapping_add(index * entry_size);
+        if read_u8_or_invalid(unicorn, entry + in_use_offset) != 1 {
+            continue;
+        }
+        if read_cstr(unicorn, entry + name_offset, 0x20) == name {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn read_u8_or_invalid(unicorn: &Unicorn<'_, Context>, addr: u32) -> u32 {
+    let mut byte = [0u8; 1];
+    match unicorn.mem_read(addr as u64, &mut byte) {
+        Ok(()) => byte[0] as u32,
+        Err(_) => 0xff,
     }
 }
 
@@ -266,7 +383,10 @@ struct DecodedQueueHandle {
 }
 
 fn decode_queue_handle(unicorn: &Unicorn<'_, Context>, handle: u32) -> DecodedQueueHandle {
-    let info_addr = read_u32_or_invalid(unicorn, handle + 0xc);
+    let info_addr = handle
+        .checked_add(0xc)
+        .map(|addr| read_u32_or_invalid(unicorn, addr))
+        .unwrap_or(0xffff_ffff);
     if info_addr == 0 || info_addr > 0xf000_0000 {
         return DecodedQueueHandle {
             info: info_addr,

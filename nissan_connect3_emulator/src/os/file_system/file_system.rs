@@ -68,6 +68,10 @@ pub trait FileSystem {
 
     fn link(&mut self, old_path: &str, new_path: &str) -> Result<(), OpenFileError>;
 
+    fn symlink(&mut self, _target: &str, _link_path: &str) -> Result<(), OpenFileError> {
+        Err(OpenFileError::FileSystemNotMounted)
+    }
+
     fn unlink(&mut self, file_path: &str) -> Result<(), OpenFileError>;
 
     fn get_file_details(&mut self, fd: i32) -> Option<FileDetails>;

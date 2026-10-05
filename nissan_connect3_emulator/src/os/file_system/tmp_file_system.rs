@@ -101,9 +101,9 @@ impl FileSystem for TmpFileSystem {
         let mut folders = HashSet::new();
         for key in self.files.keys() {
             if key.starts_with(&dir_path) {
-                let folder = &key[dir_path.len()..];
+                let folder = key[dir_path.len()..].trim_start_matches('/');
                 if folder.len() > 0 {
-                    let folder = folder.split("/").next().unwrap();
+                    let folder = folder.split('/').next().unwrap_or(folder);
                     folders.insert(folder);
                 }
             }
@@ -189,6 +189,29 @@ impl FileSystem for TmpFileSystem {
         } else {
             Err(OpenFileError::NoSuchFileOrDirectory)
         }
+    }
+
+    fn symlink(&mut self, target: &str, link_path: &str) -> Result<(), OpenFileError> {
+        if self.files.contains_key(link_path) {
+            return Err(OpenFileError::FileExists);
+        }
+        self.files.insert(
+            link_path.to_string(),
+            Arc::new(Mutex::new(TmpFsFileData {
+                file_type: FileType::Link,
+                data: target.as_bytes().to_vec(),
+            })),
+        );
+        Ok(())
+    }
+
+    fn read_link(&mut self, file_path: &str) -> Option<String> {
+        let file_data = self.files.get(file_path)?;
+        let data = file_data.lock().unwrap();
+        if data.file_type != FileType::Link {
+            return None;
+        }
+        String::from_utf8(data.data.clone()).ok()
     }
 
     fn unlink(&mut self, file_path: &str) -> Result<(), OpenFileError> {

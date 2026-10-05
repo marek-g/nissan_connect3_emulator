@@ -50,7 +50,12 @@ impl MountPoint {
             Ok(global_path.to_string())
         } else {
             let global_path = strip_trailing_slash(global_path);
-            Ok(global_path[self.mount_point.len()..].to_string())
+            let translated = &global_path[self.mount_point.len()..];
+            if translated.is_empty() {
+                Ok("/".to_string())
+            } else {
+                Ok(translated.to_string())
+            }
         }
     }
 }
@@ -291,6 +296,14 @@ impl MountFileSystem {
             } else {
                 Err(OpenFileError::FileSystemNotMounted)
             }
+        } else {
+            Err(OpenFileError::FileSystemNotMounted)
+        }
+    }
+
+    pub fn symlink(&mut self, target: &str, link_path: &str) -> Result<(), OpenFileError> {
+        if let Some((mount_point, file_path)) = self.get_mount_point_from_filepath_mut(link_path) {
+            mount_point.file_system.symlink(target, &file_path)
         } else {
             Err(OpenFileError::FileSystemNotMounted)
         }

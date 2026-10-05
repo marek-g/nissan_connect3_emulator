@@ -828,7 +828,7 @@ pub fn symlink(unicorn: &mut Unicorn<'_, Context>, old_path: u32, new_path: u32)
         .file_system
         .lock()
         .unwrap()
-        .link(&old_path, &new_path)
+        .symlink(&old_path, &new_path)
     {
         Ok(_) => 0u32,
         Err(err) => err.to_syscall_error(),
