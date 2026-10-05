@@ -1,5 +1,8 @@
 use crate::common::osal_queues::OsalQueueService;
 use crate::emulator::context::Context;
+
+const ORIGINAL_BASE: u32 = 0x484d_8000;
+const OSAL_CORE_GLOBAL: u32 = 0x4856_79e0;
 use crate::emulator::thread::{BlockReason, ThreadStatus};
 use crate::emulator::utils::pack_u32;
 use std::time::{Duration, Instant};
@@ -22,6 +25,7 @@ pub fn hook_message_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     const QUEUE_NOTIFY: u32 = 0x4850e1a8 - 0x484d8000;
     const QUEUE_PRIORITY_WAIT: u32 = 0x4850d8a8 - 0x484d8000;
     const GET_FROM_MQ: u32 = 0x48509c8c - 0x484d8000;
+    const CHECK_FOR_IOS_QUEUE: u32 = 0x48509744 - 0x484d8000;
 
     unicorn
         .add_code_hook(
@@ -29,6 +33,16 @@ pub fn hook_message_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
             (base_address + QUEUE_OPEN) as u64,
             move |uc, addr, _| {
                 fallback_open_to_create(uc, addr as u32, base_address, QUEUE_CREATE);
+            },
+        )
+        .unwrap();
+
+    unicorn
+        .add_code_hook(
+            (base_address + CHECK_FOR_IOS_QUEUE) as u64,
+            (base_address + CHECK_FOR_IOS_QUEUE) as u64,
+            move |uc, addr, _| {
+                force_non_iosc_queue(uc, addr as u32, base_address);
             },
         )
         .unwrap();
@@ -56,19 +70,28 @@ fn handle_queue_api(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address:
     let r1 = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
     let r2 = unicorn.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
     let r3 = unicorn.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+    let lr = unicorn.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+    let caller = {
+        let mmu = unicorn.get_data().mmu.lock().unwrap();
+        match mmu.executable_location(lr) {
+            Some((library, offset)) => format!("{}+0x{:x}", library, offset),
+            None => format!("0x{:x}", lr),
+        }
+    };
 
     match api_name {
         "u32GetFromMessageQueue" => {
             let message_type = read_u32_or_invalid(unicorn, r1);
             log::info!(
-                "0x{:x} [{}] [LIBOSAL] {}(iosc_handle=0x{:x}, msg=0x{:x}, msg_type=0x{:x}, timeout=0x{:x})",
+                "0x{:x} [{}] [LIBOSAL] {}(iosc_handle=0x{:x}, msg=0x{:x}, msg_type=0x{:x}, timeout=0x{:x}, caller={})",
                 addr - base_address + 0x484d8000,
                 thread,
                 api_name,
                 r0,
                 r1,
                 message_type,
-                r2
+                r2,
+                caller
             );
         }
         _ => {
@@ -81,7 +104,7 @@ fn handle_queue_api(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address:
                     read_u32_or_invalid(unicorn, r1 + 12),
                 ];
                 log::info!(
-                    "0x{:x} [{}] [LIBOSAL] {}(handle=0x{:x}, info=0x{:x}, type={}, name={}, msg=0x{:x}, len=0x{:x}, data=[{:x}, {:x}, {:x}, {:x}])",
+                    "0x{:x} [{}] [LIBOSAL] {}(handle=0x{:x}, info=0x{:x}, type={}, name={}, msg=0x{:x}, len=0x{:x}, data=[{:x}, {:x}, {:x}, {:x}], caller={})",
                     addr - base_address + 0x484d8000,
                     thread,
                     api_name,
@@ -94,12 +117,13 @@ fn handle_queue_api(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address:
                     words[0],
                     words[1],
                     words[2],
-                    words[3]
+                    words[3],
+                    caller
                 );
             } else {
                 let stack_timeout = read_stack_timeout(unicorn, api_name);
                 log::info!(
-                    "0x{:x} [{}] [LIBOSAL] {}(handle=0x{:x}, info=0x{:x}, type={}, name={}, buf=0x{:x}, size=0x{:x}, timeout=0x{:x})",
+                    "0x{:x} [{}] [LIBOSAL] {}(handle=0x{:x}, info=0x{:x}, type={}, name={}, buf=0x{:x}, size=0x{:x}, timeout=0x{:x}, caller={})",
                     addr - base_address + 0x484d8000,
                     thread,
                     api_name,
@@ -109,7 +133,8 @@ fn handle_queue_api(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address:
                     decoded.name,
                     r1,
                     r2,
-                    stack_timeout
+                    stack_timeout,
+                    caller
                 );
             }
 
@@ -133,22 +158,38 @@ fn fallback_open_to_create(
     base_address: u32,
     create_offset: u32,
 ) {
-    const OSAL_CORE_PTR: u32 = 0x90ad_a928;
     const OSAL_QUEUE_TABLE_OFFSET: u32 = 0x25220;
     const OSAL_QUEUE_ENTRY_SIZE: u32 = 0x5c;
     const OSAL_QUEUE_ENTRY_IN_USE_OFFSET: u32 = 0x08;
     const OSAL_QUEUE_ENTRY_NAME_OFFSET: u32 = 0x38;
-    const OSAL_DEFAULT_MAXMSG: u32 = 100;
-    const OSAL_PRM_MSGSIZE: u32 = 0x70;
 
+    let core_global = base_address + (OSAL_CORE_GLOBAL - ORIGINAL_BASE);
     let name_ptr = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
     let flags = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
     let handle_ptr = unicorn.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
 
     let name = read_cstr(unicorn, name_ptr, 0x20);
-    if name != "PRM_MSGQUEUE" {
+    let thread = unicorn.get_data().inner.thread_id();
+    let lr = unicorn.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+    let caller = {
+        let mmu = unicorn.get_data().mmu.lock().unwrap();
+        match mmu.executable_location(lr) {
+            Some((library, offset)) => format!("{}+0x{:x}", library, offset),
+            None => format!("0x{:x}", lr),
+        }
+    };
+    log::info!(
+        "0x{:x} [{}] [LIBOSAL] OSAL_s32MessageQueueOpen(name={}, flags={:#x}, out=0x{:x}, caller={})",
+        addr - base_address + 0x484d8000,
+        thread,
+        name,
+        flags,
+        handle_ptr,
+        caller
+    );
+    let Some((max_msg, msg_size)) = fallback_create_params(&name) else {
         return;
-    }
+    };
     if handle_ptr == 0 || handle_ptr > 0xf000_0000 || flags > 4 {
         return;
     }
@@ -156,7 +197,7 @@ fn fallback_open_to_create(
     if osal_queue_exists(
         unicorn,
         &name,
-        OSAL_CORE_PTR,
+        core_global,
         OSAL_QUEUE_TABLE_OFFSET,
         OSAL_QUEUE_ENTRY_SIZE,
         OSAL_QUEUE_ENTRY_IN_USE_OFFSET,
@@ -165,7 +206,6 @@ fn fallback_open_to_create(
         return;
     }
 
-    let thread = unicorn.get_data().inner.thread_id();
     let sp = unicorn.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
     if sp == 0
         || sp > 0xf000_0000
@@ -177,18 +217,20 @@ fn fallback_open_to_create(
     }
 
     log::info!(
-        "0x{:x} [{}] [LIBOSAL] OSAL_s32MessageQueueOpen({}) creates missing queue",
+        "0x{:x} [{}] [LIBOSAL] OSAL_s32MessageQueueOpen({}) creates missing queue max={} size={}",
         addr - base_address + 0x484d8000,
         thread,
-        name
+        name,
+        max_msg,
+        msg_size
     );
 
     // OSAL_s32MessageQueueCreate(char *name, uint maxmsg, uint msgsize, int type, handle *out)
     unicorn
-        .reg_write(RegisterARM::R1, OSAL_DEFAULT_MAXMSG as u64)
+        .reg_write(RegisterARM::R1, max_msg as u64)
         .unwrap();
     unicorn
-        .reg_write(RegisterARM::R2, OSAL_PRM_MSGSIZE as u64)
+        .reg_write(RegisterARM::R2, msg_size as u64)
         .unwrap();
     unicorn.reg_write(RegisterARM::R3, flags as u64).unwrap();
     unicorn
@@ -196,19 +238,61 @@ fn fallback_open_to_create(
         .unwrap();
 }
 
+fn fallback_create_params(name: &str) -> Option<(u32, u32)> {
+    if name == "PRM_MSGQUEUE" {
+        return Some((100, 0x70));
+    }
+
+    if let Some(id) = name.strip_prefix("mbx_") {
+        let id = id.parse::<u32>().ok()?;
+        return Some(if id == 265 { (800, 8) } else { (120, 8) });
+    }
+
+    None
+}
+
+fn force_non_iosc_queue(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address: u32) {
+    let name_ptr = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+    if name_ptr == 0 || name_ptr > 0xf000_0000 {
+        return;
+    }
+
+    let name = read_cstr(unicorn, name_ptr, 0x20);
+    if !name.starts_with("mbx_") {
+        return;
+    }
+
+    let thread = unicorn.get_data().inner.thread_id();
+    let lr = unicorn.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+    let caller = {
+        let mmu = unicorn.get_data().mmu.lock().unwrap();
+        match mmu.executable_location(lr) {
+            Some((library, offset)) => format!("{}+0x{:x}", library, offset),
+            None => format!("0x{:x}", lr),
+        }
+    };
+    log::info!(
+        "0x{:x} [{}] [LIBOSAL] s32CheckForIOSCQueue({}) forced non-IOSC caller={}",
+        addr - base_address + 0x484d8000,
+        thread,
+        name,
+        caller
+    );
+    return_to_caller(unicorn, 0xffff_ffff);
+}
+
 fn osal_queue_exists(
     unicorn: &Unicorn<'_, Context>,
     name: &str,
-    core_ptr_addr: u32,
+    core_global: u32,
     table_offset: u32,
     entry_size: u32,
     in_use_offset: u32,
     name_offset: u32,
 ) -> bool {
-    let core = read_u32_or_invalid(unicorn, core_ptr_addr);
-    if core == 0 || core > 0xf000_0000 {
+    let Some(core) = osal_core_base(unicorn, core_global) else {
         return false;
-    }
+    };
 
     let table = core.wrapping_add(table_offset);
     for index in 0..0x100u32 {
@@ -222,6 +306,20 @@ fn osal_queue_exists(
     }
 
     false
+}
+
+fn osal_core_base(unicorn: &Unicorn<'_, Context>, core_global: u32) -> Option<u32> {
+    let core_struct = read_u32_or_invalid(unicorn, core_global);
+    if core_struct == 0 || core_struct > 0xf000_0000 {
+        return None;
+    }
+
+    let core = read_u32_or_invalid(unicorn, core_struct);
+    if core == 0 || core > 0xf000_0000 {
+        return None;
+    }
+
+    Some(core)
 }
 
 fn read_u8_or_invalid(unicorn: &Unicorn<'_, Context>, addr: u32) -> u32 {
