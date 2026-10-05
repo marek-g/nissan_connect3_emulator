@@ -104,10 +104,20 @@ pub fn close(unicorn: &mut Unicorn<'_, Context>, fd: u32) -> u32 {
         return crate::os::dev::iosc::close_iosc(unicorn, fd);
     }
 
-    {
+    let is_socket_fd = {
         let state = &mut unicorn.get_data().inner.sys_calls_state.lock().unwrap();
         state.get_dents_list.remove(&fd);
         state.inotify_fds.remove(&fd);
+        state.socket_fds.remove(&fd)
+    };
+    if is_socket_fd {
+        log::trace!(
+            "{:#x}: [{}] [SYSCALL] close => {:#x}",
+            unicorn.reg_read(RegisterARM::PC).unwrap(),
+            unicorn.get_data().inner.thread_id(),
+            0u32
+        );
+        return 0u32;
     }
 
     let res = if let Ok(_) = unicorn

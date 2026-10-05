@@ -15,6 +15,10 @@ pub struct SysCallsState {
     // descriptors returned by inotify_init(); reads on them block instead of EOFing
     pub inotify_fds: HashSet<u32>,
 
+    // descriptors returned by socket(); currently host-less emulated sockets
+    pub socket_fds: HashSet<u32>,
+    pub next_socket_fd: u32,
+
     // signal dispositions + blocked mask (rt_sigaction / rt_sigreturn / SIGSEGV delivery)
     pub signals: SignalState,
 }
@@ -25,6 +29,8 @@ impl SysCallsState {
             get_dents_list: HashMap::new(),
             futex_waiters: HashMap::new(),
             inotify_fds: HashSet::new(),
+            socket_fds: HashSet::new(),
+            next_socket_fd: 0x1000,
             signals: SignalState::new(),
         }
     }

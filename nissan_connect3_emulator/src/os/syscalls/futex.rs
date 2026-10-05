@@ -67,9 +67,10 @@ pub fn futex(
                 // wait - block the current guest thread until woken by FUTEX_WAKE
                 // or by the timeout (whichever comes first)
                 log::trace!(
-                    "{:#x}: [{}] [SYSCALL] futex - wait",
+                    "{:#x}: [{}] [SYSCALL] futex - wait (caller={:#x})",
                     unicorn.reg_read(RegisterARM::PC).unwrap(),
-                    unicorn.get_data().thread_id()
+                    unicorn.get_data().thread_id(),
+                    unicorn.reg_read(RegisterARM::R14).unwrap(),
                 );
 
                 let deadline = read_timeout_deadline(unicorn, timeout);

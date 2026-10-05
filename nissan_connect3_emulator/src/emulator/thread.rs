@@ -103,6 +103,8 @@ pub enum BlockReason {
     IoscSemaphore { id: u32, deadline: Option<Instant> },
     /// waiting in read() on an emulated inotify descriptor for the first event
     InotifyRead { fd: u32, deadline: Option<Instant> },
+    /// waiting in recvmsg() on an emulated socket with no host backend yet
+    SocketRead { fd: u32, deadline: Option<Instant> },
     /// waiting in rt_sigtimedwait for one of `set` signals to be delivered
     SignalWait { set: u64, deadline: Option<Instant> },
 }

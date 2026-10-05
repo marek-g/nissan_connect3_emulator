@@ -301,6 +301,11 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
                     set_runnable(unicorn, tid, Some(-11i32 as u32)); // -EAGAIN
                 }
             }
+            BlockReason::SocketRead { deadline, .. } => {
+                if deadline.map(|d| d <= now).unwrap_or(false) {
+                    set_runnable(unicorn, tid, Some(-110i32 as u32)); // -ETIMEDOUT
+                }
+            }
             BlockReason::SignalWait { .. } => {
                 crate::os::syscalls::signal::finish_signal_wait(unicorn, tid, now);
             }
@@ -347,6 +352,7 @@ fn park_duration(unicorn: &Unicorn<'_, Context>) -> Duration {
             | BlockReason::IoscEvent { deadline, .. }
             | BlockReason::IoscSemaphore { deadline, .. }
             | BlockReason::InotifyRead { deadline, .. }
+            | BlockReason::SocketRead { deadline, .. }
             | BlockReason::SignalWait { deadline, .. },
         ) => *deadline,
         _ => None,
