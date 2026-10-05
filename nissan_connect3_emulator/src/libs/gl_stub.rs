@@ -1,343 +1,209 @@
 use crate::emulator::context::Context;
-use crate::os::code_stub::{add_code_stub, CodeStubHandler};
-use std::sync::atomic::{AtomicU32, Ordering};
-use unicorn_engine::{RegisterARM, Unicorn};
+use crate::gpu;
+use crate::os::code_stub::{add_code_stub, current_stub_name};
+use unicorn_engine::Unicorn;
 
-static NEXT_OBJECT_ID: AtomicU32 = AtomicU32::new(0x1001);
-static NEXT_ATTR_LOCATION: AtomicU32 = AtomicU32::new(0);
-static NEXT_UNIFORM_LOCATION: AtomicU32 = AtomicU32::new(1);
-
-fn reg(unicorn: &mut Unicorn<'_, Context>, register: RegisterARM) -> u32 {
-    unicorn.reg_read(register).unwrap_or(0) as u32
+fn egl_handler(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+    gpu::egl_api(unicorn, current_stub_name())
 }
 
-fn read_u32(unicorn: &mut Unicorn<'_, Context>, address: u32) -> u32 {
-    if address == 0 {
-        return 0;
-    }
-    let mut buf = [0u8; 4];
-    match unicorn.mem_read(address as u64, &mut buf) {
-        Ok(()) => u32::from_le_bytes(buf),
-        Err(_) => 0,
-    }
-}
-
-fn write_u32(unicorn: &mut Unicorn<'_, Context>, address: u32, value: u32) {
-    if address != 0 {
-        let _ = unicorn.mem_write(address as u64, &value.to_le_bytes());
-    }
-}
-
-fn next_id() -> u32 {
-    let id = NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed);
-    if id == 0 {
-        NEXT_OBJECT_ID.fetch_add(1, Ordering::Relaxed)
-    } else {
-        id
-    }
-}
-
-fn stub_zero(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
-    0
-}
-
-fn stub_one(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
-    1
-}
-
-fn stub_object(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
-    next_id()
-}
-
-fn stub_attr_location(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
-    NEXT_ATTR_LOCATION.fetch_add(1, Ordering::Relaxed) & 0x0f
-}
-
-fn stub_uniform_location(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
-    NEXT_UNIFORM_LOCATION.fetch_add(1, Ordering::Relaxed) & 0x0f
-}
-
-fn stub_gen_ids(unicorn: &mut Unicorn<'_, Context>) -> u32 {
-    let count = reg(unicorn, RegisterARM::R0).min(1024);
-    let out = reg(unicorn, RegisterARM::R1);
-    for i in 0..count {
-        write_u32(unicorn, out + i * 4, next_id());
-    }
-    0
-}
-
-fn stub_get_status(unicorn: &mut Unicorn<'_, Context>) -> u32 {
-    let pname = reg(unicorn, RegisterARM::R1);
-    let out = reg(unicorn, RegisterARM::R2);
-    let value = match pname {
-        0x8b84 => 0,
-        _ => 1,
-    };
-    write_u32(unicorn, out, value);
-    0
-}
-
-fn stub_get_integerv(unicorn: &mut Unicorn<'_, Context>) -> u32 {
-    let pname = reg(unicorn, RegisterARM::R0);
-    let out = reg(unicorn, RegisterARM::R1);
-    let value = match pname {
-        0x0d33 | 0x84e8 | 0x851c | 0x8ca6 => 4096,
-        _ => 16,
-    };
-    write_u32(unicorn, out, value);
-    0
-}
-
-fn stub_framebuffer_complete(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
-    0x8cd5
-}
-
-fn egl_initialize(unicorn: &mut Unicorn<'_, Context>) -> u32 {
-    let major = reg(unicorn, RegisterARM::R1);
-    let minor = reg(unicorn, RegisterARM::R2);
-    write_u32(unicorn, major, 1);
-    write_u32(unicorn, minor, 4);
-    1
-}
-
-fn egl_choose_config(unicorn: &mut Unicorn<'_, Context>) -> u32 {
-    let configs = reg(unicorn, RegisterARM::R2);
-    let config_size = reg(unicorn, RegisterARM::R3);
-    let sp = reg(unicorn, RegisterARM::SP);
-    let num_config = read_u32(unicorn, sp);
-
-    if configs != 0 && config_size != 0 {
-        write_u32(unicorn, configs, 1);
-    }
-    write_u32(unicorn, num_config, 1);
-    1
-}
-
-fn add_stub(
-    unicorn: &mut Unicorn<'_, Context>,
-    lib: &'static str,
-    base_address: u32,
-    offset: u32,
-    name: &'static str,
-    handler: CodeStubHandler,
-) {
-    add_code_stub(unicorn, lib, base_address + offset, name, handler);
+fn gl_handler(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+    gpu::gl_api(unicorn, current_stub_name())
 }
 
 pub fn libegl_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
-    let lib = "/usr/lib/libEGL.so";
-    let one: [(u32, &str); 21] = [
-        (0x176c, "eglReleaseThread"),
-        (0x1770, "eglWaitClient"),
-        (0x1774, "eglQueryAPI"),
-        (0x1778, "eglBindAPI"),
-        (0x1780, "eglReleaseTexImage"),
-        (0x1784, "eglBindTexImage"),
-        (0x1788, "eglSurfaceAttrib"),
-        (0x178c, "eglSwapInterval"),
-        (0x1790, "eglCopyBuffers"),
-        (0x1794, "eglSwapBuffers"),
-        (0x1798, "eglWaitNative"),
-        (0x179c, "eglWaitGL"),
-        (0x17a0, "eglQueryContext"),
-        (0x17b0, "eglMakeCurrent"),
-        (0x17b4, "eglDestroyContext"),
-        (0x17bc, "eglQuerySurface"),
-        (0x17c0, "eglDestroySurface"),
-        (0x17d0, "eglGetConfigAttrib"),
-        (0x17d8, "eglGetConfigs"),
-        (0x17e4, "eglTerminate"),
-        (0x17f4, "EGLCloseWindow"),
+    const LIB: &str = "/usr/lib/libEGL.so";
+    let table = [
+        (0x00001778, "eglBindAPI"),
+        (0x00001784, "eglBindTexImage"),
+        (0x000017d4, "eglChooseConfig"),
+        (0x000017f4, "EGLCloseWindow"),
+        (0x00001790, "eglCopyBuffers"),
+        (0x000017b8, "eglCreateContext"),
+        (0x0000177c, "eglCreatePbufferFromClientBuffer"),
+        (0x000017c4, "eglCreatePbufferSurface"),
+        (0x000017c8, "eglCreatePixmapSurface"),
+        (0x000017cc, "eglCreateWindowSurface"),
+        (0x000017b4, "eglDestroyContext"),
+        (0x000017c0, "eglDestroySurface"),
+        (0x000017d0, "eglGetConfigAttrib"),
+        (0x000017d8, "eglGetConfigs"),
+        (0x000017ac, "eglGetCurrentContext"),
+        (0x000017a4, "eglGetCurrentDisplay"),
+        (0x000017a8, "eglGetCurrentSurface"),
+        (0x000017ec, "eglGetDisplay"),
+        (0x000017f0, "eglGetError"),
+        (0x000017dc, "eglGetProcAddress"),
+        (0x000017e8, "eglInitialize"),
+        (0x000017b0, "eglMakeCurrent"),
+        (0x00001774, "eglQueryAPI"),
+        (0x000017a0, "eglQueryContext"),
+        (0x000017e0, "eglQueryString"),
+        (0x000017bc, "eglQuerySurface"),
+        (0x00001780, "eglReleaseTexImage"),
+        (0x0000176c, "eglReleaseThread"),
+        (0x00001788, "eglSurfaceAttrib"),
+        (0x00001794, "eglSwapBuffers"),
+        (0x0000178c, "eglSwapInterval"),
+        (0x000017e4, "eglTerminate"),
+        (0x00001770, "eglWaitClient"),
+        (0x0000179c, "eglWaitGL"),
+        (0x00001798, "eglWaitNative"),
     ];
-    for (offset, name) in one {
-        add_stub(unicorn, lib, base_address, offset, name, stub_one);
-    }
 
-    let object: [(u32, &str); 5] = [
-        (
-            0x177c,
-            "eglCreatePbufferFromClientBuffer",
-        ),
-        (0x17ac, "eglGetCurrentContext"),
-        (0x17b8, "eglCreateContext"),
-        (0x17c4, "eglCreatePbufferSurface"),
-        (0x17cc, "eglCreateWindowSurface"),
-    ];
-    for (offset, name) in object {
-        add_stub(unicorn, lib, base_address, offset, name, stub_object);
+    for (offset, name) in table {
+        add_code_stub(unicorn, LIB, base_address + offset, name, egl_handler);
     }
-
-    let display: [(u32, &str); 2] = [
-        (0x17a4, "eglGetCurrentDisplay"),
-        (0x17ec, "eglGetDisplay"),
-    ];
-    for (offset, name) in display {
-        add_stub(unicorn, lib, base_address, offset, name, stub_object);
-    }
-
-    add_stub(
-        unicorn,
-        lib,
-        base_address,
-        0x17a8,
-        "eglGetCurrentSurface",
-        stub_object,
-    );
-    add_stub(
-        unicorn,
-        lib,
-        base_address,
-        0x17dc,
-        "eglGetProcAddress",
-        stub_zero,
-    );
-    add_stub(
-        unicorn,
-        lib,
-        base_address,
-        0x17e0,
-        "eglQueryString",
-        stub_zero,
-    );
-    add_stub(
-        unicorn,
-        lib,
-        base_address,
-        0x17f0,
-        "eglGetError",
-        stub_zero,
-    );
-    add_stub(
-        unicorn,
-        lib,
-        base_address,
-        0x17e8,
-        "eglInitialize",
-        egl_initialize,
-    );
-    add_stub(
-        unicorn,
-        lib,
-        base_address,
-        0x17d4,
-        "eglChooseConfig",
-        egl_choose_config,
-    );
 }
 
 pub fn libgles2_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
-    let lib = "/usr/lib/libGLESv2.so";
-
-    let zero: [(u32, &str); 2] = [
-        (0x179a8, "glGetError"),
-        (0x17fa0, "glGetString"),
+    const LIB: &str = "/usr/lib/libGLESv2.so";
+    let table = [
+        (0x00028f28, "glActiveTexture"),
+        (0x000218dc, "glAttachShader"),
+        (0x00024fe8, "glBindAttribLocation"),
+        (0x0000b9bc, "glBindBuffer"),
+        (0x00015a64, "glBindFramebuffer"),
+        (0x00015eb4, "glBindRenderbuffer"),
+        (0x0002d804, "glBindTexture"),
+        (0x000274f8, "glBlendColor"),
+        (0x00026f74, "glBlendEquation"),
+        (0x00026e5c, "glBlendEquationSeparate"),
+        (0x00026d78, "glBlendFunc"),
+        (0x00026de4, "glBlendFuncSeparate"),
+        (0x0000b420, "glBufferData"),
+        (0x0000b2b0, "glBufferSubData"),
+        (0x00017840, "glCheckFramebufferStatus"),
+        (0x0000c6f8, "glClear"),
+        (0x0000bcbc, "glClearColor"),
+        (0x0000bc5c, "glClearDepthf"),
+        (0x0000bbf4, "glClearStencil"),
+        (0x0002604c, "glColorMask"),
+        (0x000244f0, "glCompileShader"),
+        (0x0002c89c, "glCompressedTexImage2D"),
+        (0x0002a8f8, "glCompressedTexSubImage2D"),
+        (0x0002bb90, "glCopyTexImage2D"),
+        (0x00029120, "glCopyTexSubImage2D"),
+        (0x00024ed8, "glCreateProgram"),
+        (0x00024dac, "glCreateShader"),
+        (0x00026ac4, "glCullFace"),
+        (0x0000b76c, "glDeleteBuffers"),
+        (0x0001593c, "glDeleteFramebuffers"),
+        (0x0002173c, "glDeleteProgram"),
+        (0x00015434, "glDeleteRenderbuffers"),
+        (0x000216a8, "glDeleteShader"),
+        (0x0002d6a0, "glDeleteTextures"),
+        (0x00026a3c, "glDepthFunc"),
+        (0x00025fc8, "glDepthMask"),
+        (0x00027498, "glDepthRangef"),
+        (0x000217d0, "glDetachShader"),
+        (0x000268bc, "glDisable"),
+        (0x0003db5c, "glDisableVertexAttribArray"),
+        (0x00010770, "glDrawArrays"),
+        (0x00010c4c, "glDrawElements"),
+        (0x00026740, "glEnable"),
+        (0x0003dbf0, "glEnableVertexAttribArray"),
+        (0x0001c894, "glFinish"),
+        (0x0001c7f4, "glFlush"),
+        (0x00014e30, "glFramebufferRenderbuffer"),
+        (0x000152d8, "glFramebufferTexture2D"),
+        (0x000266c0, "glFrontFace"),
+        (0x0000b6ac, "glGenBuffers"),
+        (0x000148bc, "glGenerateMipmap"),
+        (0x00014bb4, "glGenFramebuffers"),
+        (0x00014c44, "glGenRenderbuffers"),
+        (0x0002d45c, "glGenTextures"),
+        (0x00024c78, "glGetActiveAttrib"),
+        (0x00037064, "glGetActiveUniform"),
+        (0x00018a28, "glGetAttachedShaders"),
+        (0x00018aec, "glGetAttribLocation"),
+        (0x0001a6a0, "glGetBooleanv"),
+        (0x000181ac, "glGetBufferParameteriv"),
+        (0x000179a8, "glGetError"),
+        (0x0001a63c, "glGetFloatv"),
+        (0x000144bc, "glGetFramebufferAttachmentParameteriv"),
+        (0x0001a5d8, "glGetIntegerv"),
+        (0x000190c8, "glGetProgramInfoLog"),
+        (0x000191c4, "glGetProgramiv"),
+        (0x00014714, "glGetRenderbufferParameteriv"),
+        (0x00018fcc, "glGetShaderInfoLog"),
+        (0x00018dbc, "glGetShaderiv"),
+        (0x00017a0c, "glGetShaderPrecisionFormat"),
+        (0x00018efc, "glGetShaderSource"),
+        (0x00017fa0, "glGetString"),
+        (0x00018938, "glGetTexParameterfv"),
+        (0x000189b0, "glGetTexParameteriv"),
+        (0x00018cf8, "glGetUniformfv"),
+        (0x00018bf8, "glGetUniformiv"),
+        (0x00036ea4, "glGetUniformLocation"),
+        (0x00017d7c, "glGetVertexAttribfv"),
+        (0x0001850c, "glGetVertexAttribiv"),
+        (0x00017cdc, "glGetVertexAttribPointerv"),
+        (0x0001c758, "glHint"),
+        (0x00018480, "glIsBuffer"),
+        (0x00017c84, "glIsEnabled"),
+        (0x00014a9c, "glIsFramebuffer"),
+        (0x000183ec, "glIsProgram"),
+        (0x00014b28, "glIsRenderbuffer"),
+        (0x00018354, "glIsShader"),
+        (0x000182c8, "glIsTexture"),
+        (0x00027338, "glLineWidth"),
+        (0x00023578, "glLinkProgram"),
+        (0x0001dd58, "glPixelStorei"),
+        (0x00025f30, "glPolygonOffset"),
+        (0x0001e0cc, "glReadPixels"),
+        (0x00024044, "glReleaseShaderCompiler"),
+        (0x00016660, "glRenderbufferStorage"),
+        (0x000272cc, "glSampleCoverage"),
+        (0x0001e5e0, "glScissor"),
+        (0x00023a90, "glShaderBinary"),
+        (0x00023c10, "glShaderSource"),
+        (0x00027254, "glStencilFunc"),
+        (0x000271dc, "glStencilFuncSeparate"),
+        (0x00026660, "glStencilMask"),
+        (0x00026600, "glStencilMaskSeparate"),
+        (0x000264b8, "glStencilOp"),
+        (0x00026444, "glStencilOpSeparate"),
+        (0x0002cbc0, "glTexImage2D"),
+        (0x0002dd24, "glTexParameterf"),
+        (0x0002dc24, "glTexParameterfv"),
+        (0x0002dda0, "glTexParameteri"),
+        (0x0002dca4, "glTexParameteriv"),
+        (0x0002ab4c, "glTexSubImage2D"),
+        (0x0003690c, "glUniform1f"),
+        (0x00035f1c, "glUniform1fv"),
+        (0x00036d4c, "glUniform1i"),
+        (0x00036418, "glUniform1iv"),
+        (0x000367fc, "glUniform2f"),
+        (0x00035ddc, "glUniform2fv"),
+        (0x00036c40, "glUniform2i"),
+        (0x000362dc, "glUniform2iv"),
+        (0x000366e8, "glUniform3f"),
+        (0x00035c9c, "glUniform3fv"),
+        (0x00036b28, "glUniform3i"),
+        (0x0003619c, "glUniform3iv"),
+        (0x000365c8, "glUniform4f"),
+        (0x00035b5c, "glUniform4fv"),
+        (0x00036a08, "glUniform4i"),
+        (0x0003605c, "glUniform4iv"),
+        (0x00035a14, "glUniformMatrix2fv"),
+        (0x000358cc, "glUniformMatrix3fv"),
+        (0x00035784, "glUniformMatrix4fv"),
+        (0x00021650, "glUseProgram"),
+        (0x00021aa4, "glValidateProgram"),
+        (0x0003dac8, "glVertexAttrib1f"),
+        (0x0003d86c, "glVertexAttrib1fv"),
+        (0x0003da30, "glVertexAttrib2f"),
+        (0x0003d7d0, "glVertexAttrib2fv"),
+        (0x0003d99c, "glVertexAttrib3f"),
+        (0x0003d738, "glVertexAttrib3fv"),
+        (0x0003d904, "glVertexAttrib4f"),
+        (0x0003d69c, "glVertexAttrib4fv"),
+        (0x0003dc84, "glVertexAttribPointer"),
+        (0x000260f0, "glViewport"),
     ];
-    for (offset, name) in zero {
-        add_stub(unicorn, lib, base_address, offset, name, stub_zero);
-    }
 
-    let ids: [(u32, &str); 4] = [
-        (0x2d45c, "glGenTextures"),
-        (0x14bb4, "glGenFramebuffers"),
-        (0x14c44, "glGenRenderbuffers"),
-        (0x0b6ac, "glGenBuffers"),
-    ];
-    for (offset, name) in ids {
-        add_stub(unicorn, lib, base_address, offset, name, stub_gen_ids);
-    }
-
-    let object: [(u32, &str); 2] = [
-        (0x24dac, "glCreateShader"),
-        (0x24ed8, "glCreateProgram"),
-    ];
-    for (offset, name) in object {
-        add_stub(unicorn, lib, base_address, offset, name, stub_object);
-    }
-
-    let status: [(u32, &str); 4] = [
-        (0x18dbc, "glGetShaderiv"),
-        (0x191c4, "glGetProgramiv"),
-        (0x1a6a0, "glGetBooleanv"),
-        (0x1a63c, "glGetFloatv"),
-    ];
-    for (offset, name) in status {
-        add_stub(unicorn, lib, base_address, offset, name, stub_get_status);
-    }
-
-    add_stub(
-        unicorn,
-        lib,
-        base_address,
-        0x1a5d8,
-        "glGetIntegerv",
-        stub_get_integerv,
-    );
-    add_stub(
-        unicorn,
-        lib,
-        base_address,
-        0x17840,
-        "glCheckFramebufferStatus",
-        stub_framebuffer_complete,
-    );
-    add_stub(
-        unicorn,
-        lib,
-        base_address,
-        0x18aec,
-        "glGetAttribLocation",
-        stub_attr_location,
-    );
-    add_stub(
-        unicorn,
-        lib,
-        base_address,
-        0x36ea4,
-        "glGetUniformLocation",
-        stub_uniform_location,
-    );
-
-    let void: [(u32, &str); 38] = [
-        (0x218dc, "glAttachShader"),
-        (0x26f74, "glBlendEquation"),
-        (0x26d78, "glBlendFunc"),
-        (0x26de4, "glBlendFuncSeparate"),
-        (0x21650, "glUseProgram"),
-        (0x0c6f8, "glClear"),
-        (0x0bcbc, "glClearColor"),
-        (0x2173c, "glDeleteProgram"),
-        (0x216a8, "glDeleteShader"),
-        (0x2d6a0, "glDeleteTextures"),
-        (0x1593c, "glDeleteFramebuffers"),
-        (0x268bc, "glDisable"),
-        (0x3db5c, "glDisableVertexAttribArray"),
-        (0x10770, "glDrawArrays"),
-        (0x26740, "glEnable"),
-        (0x3dbf0, "glEnableVertexAttribArray"),
-        (0x1c894, "glFinish"),
-        (0x152d8, "glFramebufferTexture2D"),
-        (0x15a64, "glBindFramebuffer"),
-        (0x15eb4, "glBindRenderbuffer"),
-        (0x16660, "glRenderbufferStorage"),
-        (0x2d804, "glBindTexture"),
-        (0x0b9bc, "glBindBuffer"),
-        (0x0b420, "glBufferData"),
-        (0x2dda0, "glTexParameteri"),
-        (0x2cbc0, "glTexImage2D"),
-        (0x23578, "glLinkProgram"),
-        (0x23a90, "glShaderBinary"),
-        (0x23c10, "glShaderSource"),
-        (0x244f0, "glCompileShader"),
-        (0x1e0cc, "glReadPixels"),
-        (0x1e5e0, "glScissor"),
-        (0x3dc84, "glVertexAttribPointer"),
-        (0x36d4c, "glUniform1i"),
-        (0x365c8, "glUniform4f"),
-        (0x367fc, "glUniform2f"),
-        (0x366e8, "glUniform3f"),
-        (0x28f28, "glActiveTexture"),
-    ];
-    for (offset, name) in void {
-        add_stub(unicorn, lib, base_address, offset, name, stub_zero);
+    for (offset, name) in table {
+        add_code_stub(unicorn, LIB, base_address + offset, name, gl_handler);
     }
 }

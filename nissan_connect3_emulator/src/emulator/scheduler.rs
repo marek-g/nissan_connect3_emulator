@@ -188,6 +188,9 @@ pub fn run_process_loop(
     wake: &Wake,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     loop {
+        crate::gpu::tick();
+        crate::libs::prochmi::tick(unicorn);
+
         // re-evaluate blocked guest threads: complete the ones whose IPC object is
         // now ready or whose deadline passed (memory work happens here, in this
         // process' own VM, so cross-process delivery never touches foreign memory)

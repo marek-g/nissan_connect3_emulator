@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 mod common;
 mod emulator;
+mod gpu;
 mod libs;
 mod os;
 mod rtos;

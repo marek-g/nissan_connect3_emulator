@@ -31,6 +31,26 @@ fn log_event_call(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address: u
     let r3 = r(unicorn, RegisterARM::R3);
     let thread = unicorn.get_data().inner.thread_id();
 
+    if matches!(name, "OSAL_s32EventPost" | "OSAL_s32EventWait") {
+        let event_name = read_string(unicorn, r0.wrapping_add(0x18));
+        if event_name == "HMI_FW_LOOP" {
+            crate::libs::prochmi::note_hmi_event_object(r0);
+            if name == "OSAL_s32EventWait" && crate::libs::prochmi::should_force_hmi_event(unicorn, r1) {
+                let bits_addr = r0.wrapping_add(0x14);
+                let bits = read_u32(unicorn, bits_addr);
+                let forced = bits | r1;
+                let mut buf = forced.to_le_bytes();
+                if unicorn.mem_write(bits_addr as u64, &mut buf).is_ok() {
+                    log::info!(
+                        "PROCHMI: pre-armed HMI_FW_LOOP event bits 0x{:08x} -> 0x{:08x}",
+                        bits,
+                        forced
+                    );
+                }
+            }
+        }
+    }
+
     let details = match name {
         "OSAL_s32EventCreate" | "OSAL_s32EventOpen" => {
             format!("name={} out={:#x}", read_name(unicorn, r0), r1)

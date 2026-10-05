@@ -28,7 +28,9 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
             stub.lib,
             stub.name
         );
+        crate::os::code_stub::set_current_stub_name(stub.name);
         let res = (stub.handler)(unicorn);
+        crate::os::code_stub::set_current_stub_name("");
         log::trace!(
             "{:#x}: [{}] [{} HOOK] {}() => {}",
             pc,

@@ -5,6 +5,7 @@ const ORIGINAL_BASE: u32 = 0x484d_8000;
 const OSAL_CORE_GLOBAL: u32 = 0x4856_79e0;
 use crate::emulator::thread::{BlockReason, ThreadStatus};
 use crate::emulator::utils::pack_u32;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use unicorn_engine::unicorn_const::Prot;
@@ -16,6 +17,10 @@ static SYNTH_PWR_STATE_REQ_SENT: AtomicBool = AtomicBool::new(false);
 static SYNTH_PWR_STATE_REQ_CONTENT: AtomicU32 = AtomicU32::new(0);
 static SYNTH_PWR_CVM_SIGNAL_CHANGED_SENT: AtomicBool = AtomicBool::new(false);
 static SYNTH_PWR_CVM_SIGNAL_CHANGED_CONTENT: AtomicU32 = AtomicU32::new(0);
+
+thread_local! {
+    static SYNTH_PWR_PERIODIC_NEXT: Cell<Option<Instant>> = const { Cell::new(None) };
+}
 
 /// Message-queue observation and OSAL service bridge hooks.
 ///
@@ -495,6 +500,13 @@ fn synthesize_ail_power_startup_sequence(
         }
     }
 
+    if SYNTH_PWR_START_CONF_SENT.load(Ordering::SeqCst)
+        && SYNTH_PWR_STATE_REQ_SENT.load(Ordering::SeqCst)
+        && SYNTH_PWR_CVM_SIGNAL_CHANGED_SENT.load(Ordering::SeqCst)
+    {
+        return synthesize_periodic_ail_power_state_req(unicorn, buf);
+    }
+
     false
 }
 
@@ -583,6 +595,80 @@ fn synthesize_ail_power_message(
         message_name,
         content
     );
+    return_to_caller(unicorn, 8);
+    true
+}
+
+fn synthesize_periodic_ail_power_state_req(
+    unicorn: &mut Unicorn<'_, Context>,
+    buf: u32,
+) -> bool {
+    const CONTENT_LEN: u32 = 0x20;
+    const TARGET_QUEUE: &str = "mbx_265";
+
+    if buf == 0 || buf > 0xf000_0000 {
+        return false;
+    }
+
+    let now = Instant::now();
+    let ready = SYNTH_PWR_PERIODIC_NEXT.with(|cell| match cell.get() {
+        None => {
+            cell.set(Some(now + Duration::from_millis(500)));
+            false
+        }
+        Some(next) => now >= next,
+    });
+    if !ready {
+        return false;
+    }
+
+    let mut content = SYNTH_PWR_STATE_REQ_CONTENT.load(Ordering::Relaxed);
+    if content == 0 || content > 0xf000_0000 {
+        let mmu_arc = unicorn.get_data().mmu.clone();
+        content = mmu_arc.lock().unwrap().heap_alloc(
+            unicorn,
+            CONTENT_LEN,
+            Prot::READ | Prot::WRITE,
+            "[synthetic-cca-power-state-req]",
+        );
+        if content == 0 {
+            return false;
+        }
+
+        let mut body = [0_u8; CONTENT_LEN as usize];
+        body[0x00..0x02].copy_from_slice(&0x0109u16.to_le_bytes());
+        body[0x04..0x08].copy_from_slice(&CONTENT_LEN.to_le_bytes());
+        body[0x08..0x0a].copy_from_slice(&0x0002u16.to_le_bytes());
+        body[0x0b] = 0x40;
+        body[0x0c..0x0e].copy_from_slice(&0x0001u16.to_le_bytes());
+        body[0x14..0x16].copy_from_slice(&0x10u16.to_le_bytes());
+        body[0x18..0x1c].copy_from_slice(&3u32.to_le_bytes());
+        body[0x1c..0x20].copy_from_slice(&0u32.to_le_bytes());
+
+        if unicorn.mem_write(content as u64, &body).is_err() {
+            return false;
+        }
+        SYNTH_PWR_STATE_REQ_CONTENT.store(content, Ordering::Relaxed);
+    }
+
+    crate::libs::prochmi::force_hmi_gui_state(unicorn);
+
+    if unicorn.mem_write(buf as u64, &1u32.to_le_bytes()).is_err()
+        || unicorn
+            .mem_write((buf + 4) as u64, &content.to_le_bytes())
+            .is_err()
+    {
+        return false;
+    }
+
+    let thread = unicorn.get_data().inner.thread_id();
+    log::info!(
+        "[{}] [LIBOSAL] OSAL_s32MessageQueueWait({}) answered with periodic synthetic PWR_STATE_CHANGE_REQ content=0x{:x}",
+        thread,
+        TARGET_QUEUE,
+        content
+    );
+    SYNTH_PWR_PERIODIC_NEXT.with(|cell| cell.set(Some(now + Duration::from_millis(1000))));
     return_to_caller(unicorn, 8);
     true
 }
