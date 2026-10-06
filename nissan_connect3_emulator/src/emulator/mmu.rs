@@ -12,6 +12,7 @@ pub struct MmuRegion {
     pub memory_perms: Prot,
     pub description: String,
     pub filepath: String,
+    pub shared_key: Option<String>,
 }
 
 impl std::fmt::Display for MmuRegion {
@@ -39,8 +40,10 @@ impl std::fmt::Display for MmuRegion {
             },
             self.description,
             self.filepath
-        )
-        .unwrap();
+        );
+        if let Some(shared_key) = &self.shared_key {
+            write!(f, " shm={}", shared_key);
+        }
         Ok(())
     }
 }
@@ -88,6 +91,7 @@ impl Mmu {
             memory_perms: perms,
             description: desc.clone(),
             filepath: filepath.to_owned(),
+            shared_key: None,
         });
 
         log::debug!(
@@ -113,6 +117,7 @@ impl Mmu {
         perms: Prot,
         description: &str,
         filepath: &str,
+        shared_key: Option<&str>,
         host_ptr: *mut c_void,
     ) {
         self.remove_internal(unicorn, address, size);
@@ -134,6 +139,7 @@ impl Mmu {
             memory_perms: perms,
             description: desc.clone(),
             filepath: filepath.to_owned(),
+            shared_key: shared_key.map(str::to_owned),
         });
 
         log::debug!(
@@ -155,12 +161,15 @@ impl Mmu {
     /// memory (which has no cross-process identity).
     pub fn shared_futex_key(&self, addr: u32) -> Option<(String, u32)> {
         self.regions.iter().find_map(|r| {
-            if addr >= r.memory_start && addr <= r.memory_end && r.filepath.starts_with("/dev/shm/")
-            {
-                Some((r.filepath.clone(), addr - r.memory_start))
-            } else {
-                None
+            if addr >= r.memory_start && addr <= r.memory_end {
+                if let Some(shared_key) = &r.shared_key {
+                    return Some((shared_key.clone(), addr - r.memory_start));
+                }
+                if r.filepath.starts_with("/dev/shm/") {
+                    return Some((r.filepath.clone(), addr - r.memory_start));
+                }
             }
+            None
         })
     }
 
@@ -259,6 +268,7 @@ impl Mmu {
         size: u32,
         perms: Prot,
         filepath: &str,
+        shared_key: Option<&str>,
         host_ptr: *mut c_void,
     ) -> u32 {
         let heap_addr = self.heap_mem_end;
@@ -271,6 +281,7 @@ impl Mmu {
             perms,
             "[heap (shared)]",
             filepath,
+            shared_key,
             host_ptr,
         );
 
@@ -307,6 +318,7 @@ impl Mmu {
         size: u32,
         perms: Prot,
         filepath: &str,
+        shared_key: Option<&str>,
         host_ptr: *mut c_void,
     ) -> u32 {
         let size = mem_align_up(size, None);
@@ -319,6 +331,7 @@ impl Mmu {
                 perms,
                 "[heap (shared hint)]",
                 filepath,
+                shared_key,
                 host_ptr,
             );
             if hint + size > self.heap_mem_end {
@@ -327,7 +340,7 @@ impl Mmu {
             return hint;
         }
 
-        self.heap_alloc_shared(unicorn, size, perms, filepath, host_ptr)
+        self.heap_alloc_shared(unicorn, size, perms, filepath, shared_key, host_ptr)
     }
 
     pub fn is_free(&self, address: u32, size: u32) -> bool {
@@ -417,6 +430,7 @@ impl Mmu {
                 memory_perms: item.memory_perms,
                 description: item.description.clone(),
                 filepath: item.filepath.clone(),
+                shared_key: item.shared_key.clone(),
             });
 
             // right part
@@ -432,6 +446,7 @@ impl Mmu {
                 memory_perms: item.memory_perms,
                 description: item.description.clone(),
                 filepath: item.filepath.clone(),
+                shared_key: item.shared_key.clone(),
             });
         }
     }

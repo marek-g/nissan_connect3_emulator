@@ -164,12 +164,19 @@ fn mmapx(
     // of the file maps zero-filled pages instead of failing)
     let mut buf = Vec::new();
     let mut filepath = String::new();
+    let mut shm_key = None;
     if fd != 0xFFFFFFFFu32 {
         let file_system = &mut unicorn.get_data().inner.file_system.clone();
         let mut fs = file_system.lock().unwrap();
 
         if let Some(fileinfo) = fs.get_file_info(fd as i32) {
             filepath = fileinfo.file_path.clone();
+
+            if filepath.starts_with("/dev/shm/") {
+                shm_key = fs
+                    .get_shared_identity(fd as i32)
+                    .map(|identity| format!("/dev/shm#file:{:#x}", identity));
+            }
 
             let file_pos = match fs.stream_position(fd as i32) {
                 Ok(pos) => pos,
@@ -198,9 +205,10 @@ fn mmapx(
     // of the same file see coherent memory - what shm_open/sem_open rely on.
     // This bypasses the private copy path (mem_map + mem_write) below.
     if filepath.starts_with("/dev/shm/") {
+        let shm_path = shm_key.as_deref().unwrap_or(filepath.as_str());
         let host_buf = {
             let mut ns = unicorn.get_data().inner.namespace.lock().unwrap();
-            ns.shm.get_or_create(&filepath, length as usize, &buf)
+            ns.shm.get_or_create(shm_path, length as usize, &buf)
         };
         // never map more host bytes than the buffer holds (sizes normally match;
         // this guards a larger re-mapping of an already-created buffer)
@@ -221,18 +229,36 @@ fn mmapx(
             mmu_arc
                 .lock()
                 .unwrap()
-                .map_shared(unicorn, addr, map_len, perms, "[shm]", &filepath, host_ptr);
+                .map_shared(
+                    unicorn,
+                    addr,
+                    map_len,
+                    perms,
+                    "[shm]",
+                    &filepath,
+                    shm_key.as_deref(),
+                    host_ptr,
+                );
             addr
         } else if addr != 0 {
-            mmu_arc
-                .lock()
-                .unwrap()
-                .heap_alloc_shared_hint(unicorn, addr, map_len, perms, &filepath, host_ptr)
+            mmu_arc.lock().unwrap().heap_alloc_shared_hint(
+                unicorn,
+                addr,
+                map_len,
+                perms,
+                &filepath,
+                shm_key.as_deref(),
+                host_ptr,
+            )
         } else {
-            mmu_arc
-                .lock()
-                .unwrap()
-                .heap_alloc_shared(unicorn, map_len, perms, &filepath, host_ptr)
+            mmu_arc.lock().unwrap().heap_alloc_shared(
+                unicorn,
+                map_len,
+                perms,
+                &filepath,
+                shm_key.as_deref(),
+                host_ptr,
+            )
         };
     }
 

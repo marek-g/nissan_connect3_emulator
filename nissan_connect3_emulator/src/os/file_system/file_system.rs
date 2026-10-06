@@ -79,6 +79,12 @@ pub trait FileSystem {
     /// Get file details for a path without opening the file (stat/lstat).
     fn get_file_details_for_path(&mut self, file_path: &str) -> Option<FileDetails>;
 
+    /// Stable identity for an open file, used to make hard-linked `/dev/shm`
+    /// objects alias across process address spaces. Default is no identity.
+    fn shared_identity(&mut self, _fd: i32) -> Option<u64> {
+        None
+    }
+
     fn is_open(&self, fd: i32) -> bool;
 
     fn get_length(&mut self, fd: i32) -> u64;

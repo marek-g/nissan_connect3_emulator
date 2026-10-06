@@ -261,6 +261,7 @@ fn shared_malloc(unicorn: &mut Unicorn<'_, Context>, addr: u32) -> u32 {
             map_size,
             Prot::READ | Prot::WRITE,
             &format!("/dev/iosc/shared/{:08x}", id),
+            Some(&format!("iosc:{:08x}", id)),
             host_ptr,
         );
         base

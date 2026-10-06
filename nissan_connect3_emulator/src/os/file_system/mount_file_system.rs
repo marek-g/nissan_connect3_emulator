@@ -408,6 +408,11 @@ impl MountFileSystem {
         }
     }
 
+    pub fn get_shared_identity(&mut self, fd: i32) -> Option<u64> {
+        self.get_mount_point_mut(fd)
+            .and_then(|mount_point| mount_point.file_system.shared_identity(fd))
+    }
+
     pub fn read(&mut self, fd: i32, content: &mut [u8]) -> Result<u64, ()> {
         if let Some(mount_point) = self.get_mount_point_mut(fd) {
             mount_point.file_system.read(fd, content)

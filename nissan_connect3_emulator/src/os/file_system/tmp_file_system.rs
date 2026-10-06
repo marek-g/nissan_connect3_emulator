@@ -4,7 +4,10 @@ use crate::os::file_system::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use unicorn_engine::Unicorn;
 
 ///
@@ -17,7 +20,14 @@ pub struct TmpFileSystem {
     opened_files: HashMap<i32, TmpFsOpenedFileData>,
 }
 
+static NEXT_TMP_FILE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn new_tmp_file_id() -> u64 {
+    NEXT_TMP_FILE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 struct TmpFsFileData {
+    pub file_id: u64,
     pub file_type: FileType,
     pub data: Vec<u8>,
 }
@@ -41,7 +51,11 @@ impl TmpFileSystem {
     pub fn insert_entry(&mut self, path: &str, file_type: FileType, data: Vec<u8>) {
         self.files.insert(
             path.to_string(),
-            Arc::new(Mutex::new(TmpFsFileData { file_type, data })),
+            Arc::new(Mutex::new(TmpFsFileData {
+                file_id: new_tmp_file_id(),
+                file_type,
+                data,
+            })),
         );
     }
 }
@@ -131,6 +145,7 @@ impl FileSystem for TmpFileSystem {
                 self.files.insert(
                     file_path.to_string(),
                     Arc::new(Mutex::new(TmpFsFileData {
+                        file_id: new_tmp_file_id(),
                         file_type: FileType::File,
                         data: vec![],
                     })),
@@ -202,6 +217,7 @@ impl FileSystem for TmpFileSystem {
         self.files.insert(
             link_path.to_string(),
             Arc::new(Mutex::new(TmpFsFileData {
+                file_id: new_tmp_file_id(),
                 file_type: FileType::Link,
                 data: target.as_bytes().to_vec(),
             })),
@@ -367,6 +383,12 @@ impl FileSystem for TmpFileSystem {
         } else {
             Err(())
         }
+    }
+
+    fn shared_identity(&mut self, fd: i32) -> Option<u64> {
+        self.opened_files
+            .get(&fd)
+            .map(|file| file.file_data.lock().unwrap().file_id)
     }
 
     fn ioctl(
