@@ -57,9 +57,8 @@ pub struct MqQueue {
     /// number of successful guest `mq_open` calls; used to distinguish a queue
     /// only pre-created by the RTOS simulator from one actually opened by Linux
     pub guest_open_count: u32,
-    /// sorted by ascending priority (index 0 = lowest); pop from the back for
-    /// the highest priority, FIFO within equal priorities (msg_insert in
-    /// ipc/mqueue.c)
+    /// sorted by ascending priority (index 0 = lowest); pop the highest priority,
+    /// FIFO within equal priorities
     pub messages: Vec<MqMessage>,
     pub open_count: u32,
     pub unlinked: bool,
@@ -260,7 +259,16 @@ impl MqState {
     }
 
     pub fn pop_message(&mut self, queue_id: u32) -> Option<MqMessage> {
-        self.queues.get_mut(&queue_id)?.messages.pop()
+        let index = self
+            .queues
+            .get(&queue_id)
+            .and_then(|queue| best_message_index(&queue.messages))?;
+        Some(self.queues.get_mut(&queue_id)?.messages.remove(index))
+    }
+
+    pub fn peek_message(&self, queue_id: u32) -> Option<&MqMessage> {
+        let queue = self.queues.get(&queue_id)?;
+        queue.messages.get(best_message_index(&queue.messages)?)
     }
 
     pub fn has_free_slot(&self, queue_id: u32) -> bool {
@@ -310,6 +318,13 @@ pub fn is_boot_ready_queue(name: &str, configured: &str) -> bool {
         "NOIOSC_CB_HDR_LI_0" | "OSAL_CB_HDR_LI_MAIN" | "TE_TERM_MQ" | "LI_TERM_MQ"
     ) || name.starts_with(NOIOSC_CB_HDR_LI_PREFIX)
         || name == configured
+}
+
+fn best_message_index(messages: &[MqMessage]) -> Option<usize> {
+    let priority = messages.iter().map(|message| message.priority).max()?;
+    messages
+        .iter()
+        .position(|message| message.priority == priority)
 }
 
 /// insert a message keeping the kernel's priority ordering (ipc/mqueue.c

@@ -230,9 +230,7 @@ impl OsalQueueService {
         max_len: usize,
     ) -> Option<OsalMessage> {
         let fits = mq
-            .queues
-            .get(&queue_id)
-            .and_then(|queue| queue.messages.last())
+            .peek_message(queue_id)
             .map(|message| message.data.len() <= max_len)
             .unwrap_or(false);
         if !fits {
