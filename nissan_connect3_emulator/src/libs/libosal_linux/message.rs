@@ -1,8 +1,14 @@
-use crate::common::osal_queues::OsalQueueService;
+use crate::common::osal_queues::{
+    callback_message_command, OsalQueueService, OSAL_CB_HDR_LI_MAIN, OSAL_START_PROC_COMMAND,
+};
 use crate::emulator::context::Context;
 
 const ORIGINAL_BASE: u32 = 0x484d_8000;
 const OSAL_CORE_GLOBAL: u32 = 0x4856_79e0;
+const V_START_PROC: u32 = 0x4851_caec - ORIGINAL_BASE;
+const START_PROC_OPTION: u32 = 3;
+const START_PROC_BUFFER_SIZE: u32 = 0x100;
+const GUEST_CALL_STUB_SIZE: u32 = 4;
 use crate::emulator::thread::{BlockReason, ThreadStatus};
 use crate::emulator::utils::pack_u32;
 use std::cell::Cell;
@@ -168,8 +174,16 @@ fn handle_queue_api(
             }
 
             let stack_timeout = read_stack_timeout(unicorn, api_name);
-            if bridge_guest_osal_queue(unicorn, api_name, &decoded.name, r1, r2, r3, stack_timeout)
-            {
+            if bridge_guest_osal_queue(
+                unicorn,
+                api_name,
+                base_address,
+                &decoded.name,
+                r1,
+                r2,
+                r3,
+                stack_timeout,
+            ) {
                 log::info!(
                     "0x{:x} [{}] [LIBOSAL-OSAL-SERVICE] {} handled name={}",
                     addr - base_address + 0x484d8000,
@@ -702,6 +716,7 @@ fn suppress_synthetic_message_delete(
 fn bridge_guest_osal_queue(
     unicorn: &mut Unicorn<'_, Context>,
     api_name: &str,
+    base_address: u32,
     name: &str,
     msg_ptr: u32,
     msg_len: u32,
@@ -750,6 +765,22 @@ fn bridge_guest_osal_queue(
             };
 
             if let Some(message) = message {
+                if name == OSAL_CB_HDR_LI_MAIN
+                    && callback_message_command(&message.data) == Some(OSAL_START_PROC_COMMAND)
+                {
+                    if let Some(path) = start_proc_path_from_callback(&message.data) {
+                        if deliver_start_proc_callback(
+                            unicorn,
+                            base_address,
+                            name,
+                            path,
+                            message.data.len() as u32,
+                        ) {
+                            return true;
+                        }
+                    }
+                }
+
                 if !message.data.is_empty()
                     && unicorn.mem_write(msg_ptr as u64, &message.data).is_err()
                 {
@@ -784,6 +815,154 @@ fn bridge_guest_osal_queue(
         }
         _ => false,
     }
+}
+
+fn start_proc_path_from_callback(data: &[u8]) -> Option<&str> {
+    let path_bytes = data.get(3..)?;
+    let path_bytes = match path_bytes.iter().position(|b| *b == 0) {
+        Some(end) => &path_bytes[..end],
+        None => path_bytes,
+    };
+    if path_bytes.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(path_bytes).ok()
+}
+
+fn deliver_start_proc_callback(
+    unicorn: &mut Unicorn<'_, Context>,
+    base_address: u32,
+    queue_name: &str,
+    path: &str,
+    return_value: u32,
+) -> bool {
+    if path.len() >= START_PROC_BUFFER_SIZE as usize {
+        log::warn!(
+            "[LIBOSAL] start-proc path is too long for synthesized OSAL callback delivery: {}",
+            path
+        );
+        return false;
+    }
+
+    let Some(path_ptr) = allocate_guest_cstr(unicorn, path) else {
+        log::warn!(
+            "[LIBOSAL] failed to allocate guest path buffer for start-proc callback path={}",
+            path
+        );
+        return false;
+    };
+    let Some(stub) = allocate_guest_call_stub(unicorn) else {
+        log::warn!(
+            "[LIBOSAL] failed to allocate ARM pop{{r0-r3,lr,pc}} stub for start-proc callback path={}",
+            path
+        );
+        return false;
+    };
+
+    let sp = unicorn.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+    let lr = unicorn.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+    if sp < 0x1000 || lr == 0 || lr > 0xf000_0000 {
+        log::warn!(
+            "[LIBOSAL] refusing synthesized start-proc callback from SP={:#x} LR={:#x}",
+            sp,
+            lr
+        );
+        return false;
+    }
+
+    let new_sp = sp.wrapping_sub(24);
+    let stack = [return_value, 0, 0, 0, lr, lr];
+    if !stack
+        .iter()
+        .enumerate()
+        .all(|(index, value)| write_u32(unicorn, new_sp + (index as u32 * 4), *value))
+    {
+        log::warn!(
+            "[LIBOSAL] failed to prepare guest stack for start-proc callback at SP={:#x}",
+            new_sp
+        );
+        return false;
+    }
+
+    unicorn
+        .reg_write(RegisterARM::SP, new_sp as u64)
+        .unwrap_or_default();
+    for (register, value) in [
+        (RegisterARM::R0, path_ptr),
+        (RegisterARM::R1, START_PROC_OPTION),
+        (RegisterARM::R2, 0),
+        (RegisterARM::R3, 0),
+        (RegisterARM::LR, stub),
+        (RegisterARM::PC, base_address + V_START_PROC),
+    ] {
+        if unicorn.reg_write(register, value as u64).is_err() {
+            log::warn!("[LIBOSAL] failed to set registers for synthesized start-proc callback");
+            return false;
+        }
+    }
+
+    let thread = unicorn.get_data().inner.thread_id();
+    log::info!(
+        "[{}] [LIBOSAL] {} delivered start-proc callback path={} via vStartProc(path, {})",
+        thread,
+        queue_name,
+        path,
+        START_PROC_OPTION
+    );
+    true
+}
+
+fn allocate_guest_cstr(unicorn: &mut Unicorn<'_, Context>, value: &str) -> Option<u32> {
+    let bytes = value.as_bytes();
+    if bytes.len() + 1 > START_PROC_BUFFER_SIZE as usize {
+        return None;
+    }
+
+    let mmu_arc = {
+        let data = unicorn.get_data();
+        data.mmu.clone()
+    };
+    let addr = mmu_arc.lock().unwrap().heap_alloc(
+        unicorn,
+        START_PROC_BUFFER_SIZE,
+        Prot::READ | Prot::WRITE,
+        "[libosal-start-proc-path]",
+    );
+    if addr == 0 {
+        return None;
+    }
+
+    let mut buf = vec![0u8; START_PROC_BUFFER_SIZE as usize];
+    buf[..bytes.len()].copy_from_slice(bytes);
+    unicorn.mem_write(addr as u64, &buf).ok()?;
+    Some(addr)
+}
+
+fn allocate_guest_call_stub(unicorn: &mut Unicorn<'_, Context>) -> Option<u32> {
+    let mmu_arc = {
+        let data = unicorn.get_data();
+        data.mmu.clone()
+    };
+    let addr = mmu_arc.lock().unwrap().heap_alloc(
+        unicorn,
+        GUEST_CALL_STUB_SIZE,
+        Prot::READ | Prot::WRITE | Prot::EXEC,
+        "[libosal-start-proc-stub]",
+    );
+    if addr == 0 {
+        return None;
+    }
+
+    unicorn
+        .mem_write(addr as u64, &[0x0f, 0xc0, 0xbd, 0xe8])
+        .ok()?;
+    Some(addr)
+}
+
+fn write_u32(unicorn: &mut Unicorn<'_, Context>, address: u32, value: u32) -> bool {
+    unicorn
+        .mem_write(address as u64, &value.to_le_bytes())
+        .is_ok()
 }
 
 fn read_guest_buffer(unicorn: &Unicorn<'_, Context>, addr: u32, len: usize) -> Option<Vec<u8>> {

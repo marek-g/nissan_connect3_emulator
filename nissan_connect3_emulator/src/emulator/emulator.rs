@@ -132,8 +132,17 @@ impl Emulator {
             .unwrap_or_default();
         process_launcher::install(factory.clone(), handles.clone(), default_envs);
 
+        let rtos_startup_messages = if rtos_config.queue_boot_enabled() {
+            rtos_config.startup_messages()
+        } else {
+            Default::default()
+        };
+
         if rtos_config.is_enabled() {
-            rtos::RtosQueueInteraction::bootstrap(&factory.namespace());
+            rtos::RtosQueueInteraction::bootstrap_with_startup_messages(
+                &factory.namespace(),
+                rtos_startup_messages,
+            );
         }
 
         for spec in specs {
@@ -142,16 +151,10 @@ impl Emulator {
         }
 
         let rtos_queues = if rtos_config.is_enabled() {
-            let startup_messages = if rtos_config.queue_boot_enabled() {
-                rtos_config.startup_messages()
-            } else {
-                Default::default()
-            };
-
             Some(rtos::RtosQueueInteraction::start_with_startup_messages(
                 factory.namespace(),
                 rtos_config.interaction_config(),
-                startup_messages,
+                Default::default(),
             ))
         } else {
             None

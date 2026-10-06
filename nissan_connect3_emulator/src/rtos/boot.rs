@@ -1,4 +1,4 @@
-use crate::common::queues::{self, LI_TERM_MQ};
+use crate::common::queues;
 use crate::emulator::emulator::{ProcessFactory, ProcessHandle, ProcessSpec};
 use crate::rtos::interaction::{
     RtosInteractionConfig, RtosQueueMessageFormat, RtosStartupQueueMessage,
@@ -79,10 +79,10 @@ impl Default for RtosBootConfig {
             commands: vec![StartProcessCommand::start_proc(
                 "/opt/bosch/processes/prochmi_out.out",
             )],
-            start_queue: LI_TERM_MQ.to_string(),
-            queue_boot: false,
-            start_message_format: RtosQueueMessageFormat::Terminal,
-            direct_spawn: true,
+            start_queue: queues::OSAL_CB_HDR_LI_MAIN.to_string(),
+            queue_boot: true,
+            start_message_format: RtosQueueMessageFormat::Callback,
+            direct_spawn: false,
             ready_queue: DEFAULT_READY_QUEUE.to_string(),
             ready_timeout: Duration::from_secs(30),
             initial_delay: Duration::ZERO,
@@ -101,7 +101,7 @@ impl RtosBootConfig {
 
         cfg.enabled = match std::env::var("EMU_RTOS") {
             Ok(value) => !matches!(value.as_str(), "0" | "off" | "false" | "FALSE"),
-            Err(_) => std::env::var_os("EMU_PROCESSES").is_none(),
+            Err(_) => true,
         };
 
         if let Ok(value) = std::env::var("EMU_RTOS_START") {

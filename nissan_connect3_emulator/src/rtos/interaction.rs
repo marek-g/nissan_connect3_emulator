@@ -9,9 +9,10 @@
 //! * `FUN_80153a54` creates `OSAL_CB_HDR_LI_MAIN` and `OSAL_CB_HDR_TE`, then
 //!   consumes `OSAL_CB_HDR_TE` and ignores callback-header types other than 7.
 //!
-//! Optional startup queue messages are kept as opt-in diagnostics only; the
-//! mapped RTOS terminal task itself does not send `0x1a` start-process messages
-//! after the terminal handshake.
+//! Startup queue messages are enabled by default and pre-queued before Linux process
+//! spawn so waiting guest processes can consume them. The mapped RTOS terminal task
+//! itself does not send `0x1a`; the emulator uses the Linux OSAL callback layout as the
+//! bridge command.
 
 use crate::common::osal_queues::{
     callback_message_command, make_callback_command_message, make_terminal_command_message,
@@ -130,7 +131,10 @@ pub struct RtosQueueInteraction {
 }
 
 impl RtosQueueInteraction {
-    pub fn bootstrap(namespace: &Arc<Mutex<SystemNamespace>>) {
+    pub fn bootstrap_with_startup_messages(
+        namespace: &Arc<Mutex<SystemNamespace>>,
+        startup_messages: VecDeque<RtosStartupQueueMessage>,
+    ) {
         let mut namespace = namespace.lock().unwrap();
 
         let ready_posted = OsalQueueService::rtos_terminal_bootstrap(&mut namespace.mq);
@@ -142,6 +146,17 @@ impl RtosQueueInteraction {
         }
 
         OsalQueueService::rtos_callback_bootstrap(&mut namespace.mq);
+
+        if !startup_messages.is_empty() {
+            log::info!(
+                "RTOS startup queued {} pre-spawn start-process message(s)",
+                startup_messages.len()
+            );
+            for message in startup_messages {
+                post_startup_message_locked(&mut namespace, &message);
+            }
+        }
+
         namespace.notify_waiters();
     }
 

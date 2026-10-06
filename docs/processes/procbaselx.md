@@ -95,6 +95,12 @@ launches one when it *receives* a 0x1a command carrying the target binary name (
 `prochmi_out.out`). `OSAL_ProcessSpawn` is never invoked in a bare single-process run,
 which is why no child is spawned by itself.
 
+Current emulator behavior: the default RTOS backend pre-queues a Linux OSAL callback
+command `[0, 0, 0x1a, path..., 0]` on `OSAL_CB_HDR_LI_MAIN`. The libosal message bridge
+delivers that queued command to the guest by invoking `vStartProc(path, 3)`, which then
+calls `OSAL_ProcessSpawn`. The existing `OSAL_ProcessSpawn` interception launches `.out`
+binaries as separate emulator processes.
+
 Supporting process-table APIs also exist: `s32ProcessTableCreate`,
 `tProcessTableGetFreeIndex`, `vAddProcessEntry`, `OSAL_s32ProcessControlBlock`,
 `OSAL_s32ProcessJoin`, `OSAL_s32ProcessDelete`, `vOnProcessDetach`,
@@ -109,6 +115,7 @@ Supporting process-table APIs also exist: `s32ProcessTableCreate`,
   **separate process alongside** procbaselx via the multi-process runner
   (`Emulator::run_processes` / `ProcessSpec`), sharing the namespace so IPC (message
   queues / IOSC) between them works.
-- Alternatively, one could inject a 0x1a "start process" command into procbaselx's
-  system-callback queue — but that still requires `fork`/`execve`, so it is not viable
-  without those syscalls.
+- Alternatively, inject a 0x1a "start process" command into procbaselx's system-callback
+  queue and intercept `OSAL_ProcessSpawn`. This is now the default bring-up path: the
+  RTOS backend queues the command, libosal delivery calls `vStartProc`, and the host
+  launcher starts the requested guest binary without implementing guest `fork`/`execve`.

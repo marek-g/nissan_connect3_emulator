@@ -438,7 +438,8 @@ The repository now contains a minimal host-side RTOS boot backend in
 Current behavior:
 
 - `Emulator::run_processes` starts the configured initial Linux processes.
-- The default process set is now `procbaselx_out.out` only.
+- The RTOS backend is enabled by default, including when `EMU_PROCESSES` is set; set
+  `EMU_RTOS=0|off|false` to disable it.
 - `RtosQueueInteraction` mirrors the RTOS queue tasks mapped from `triton_mid_raw.bin`:
   - the terminal task path (`FUN_8013f2b0`) creates `TE_TERM_MQ` and `LI_TERM_MQ`
     (`maxmsg=10`, `msgsize=0x50`), posts the initial ready word `0x0e` to
@@ -447,20 +448,24 @@ Current behavior:
     (`maxmsg=0xf0`) and `OSAL_CB_HDR_TE` (`maxmsg=0x78`), both with `msgsize=0x50`,
     consumes callback headers from `OSAL_CB_HDR_TE`, and only type `7` would dispatch
     the RTOS callback table;
-  - optional startup queue messages can be enabled for diagnostics, but they are not
-    the mapped RTOS terminal task flow.
-- `RtosBootService` keeps direct host-side spawn as the default emulator boot fallback.
+  - startup start-process messages are queued before initial Linux processes spawn so
+    waiting processes can consume them immediately.
+- The default RTOS start-process path is queue-driven: it posts the Linux OSAL callback
+  command `[0, 0, 0x1a, path..., 0]` to `OSAL_CB_HDR_LI_MAIN`.
+- The libosal guest bridge intercepts an intercepted `OSAL_s32MessageQueueWait` for
+  `OSAL_CB_HDR_LI_MAIN`; when it sees command `0x1a`, it allocates the guest path buffer
+  and invokes the real OSAL helper `vStartProc(path, 3)` inside the waiting process.
+- `OSAL_ProcessSpawn` interception then launches `.out` targets through the emulator's
+  multi-process runner; the guest observes the normal `Start Process succeeded` trace.
+- Direct host-side spawn is disabled by default and kept only as an explicit fallback.
 - Default dynamically started target: `/opt/bosch/processes/prochmi_out.out`.
 - Environment knobs:
-  - `EMU_RTOS=1` or `EMU_RTOS=off` enables/disables the RTOS backend;
-  - when `EMU_PROCESSES` is set, the RTOS service is disabled unless explicitly enabled;
+  - `EMU_RTOS=1|off` enables/disables the RTOS backend; it is enabled by default;
   - `EMU_RTOS_START=path1:path2` selects start-process targets;
   - `EMU_RTOS_START_QUEUE=NAME` selects the RTOS-to-Linux queue for startup commands;
   - `EMU_RTOS_START_MESSAGE_FORMAT=terminal|callback` selects the startup message layout;
-  - `EMU_RTOS_QUEUE_BOOT=1` optionally enables the non-mapped queue startup message
-    path for diagnostics; it is disabled by default because the mapped RTOS terminal
-    task does not send `0x1a`;
-  - `EMU_RTOS_DIRECT_SPAWN=0` disables the direct host-side spawn fallback;
+  - `EMU_RTOS_QUEUE_BOOT=0` disables the queue-driven start-process path;
+  - `EMU_RTOS_DIRECT_SPAWN=1` re-enables the direct host-side spawn fallback;
   - `EMU_RTOS_WAIT_TE_READY=1|off` controls whether startup queue messages wait for the
     Linux terminal-ready message, with `EMU_RTOS_TE_READY_TIMEOUT_MS=N` as a safety timeout;
   - `EMU_RTOS_TERMINAL_ACK=1` posts an optional RTOS terminal-ready ack after Linux
@@ -470,8 +475,9 @@ Current behavior:
   - `EMU_RTOS_READY_TIMEOUT_MS=N` and `EMU_RTOS_START_DELAY_MS=N` tune fallback timing.
 
 This is intentionally a boot-controller backend, not a full RTOS guest. It now performs
-RTOS-side queue traffic, but the exact start-process producer/command semantics are not
-fully mapped yet. The direct spawn path remains only as a fallback for GUI bring-up.
+RTOS-side queue traffic and reaches `vStartProc`/`OSAL_ProcessSpawn`, but the exact
+RTOS start-process producer still uses the Linux callback command layout as an emulator
+bridge rather than a fully decoded RTOS callback-header table dispatch.
 
 ## Relation to `procbaselx`
 
