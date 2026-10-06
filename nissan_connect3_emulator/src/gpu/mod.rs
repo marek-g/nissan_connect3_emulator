@@ -14,6 +14,9 @@ const EGL_VENDOR: u32 = 0x3053;
 const EGL_VERSION: u32 = 0x3054;
 const EGL_EXTENSIONS: u32 = 0x3055;
 const EGL_CLIENT_APIS: u32 = 0x308d;
+const EGL_OPENGL_ES_API: u32 = 0x30a0;
+const EGL_OPENVG_API: u32 = 0x30a1;
+const EGL_OPENGL_API: u32 = 0x30a2;
 const MAX_TEXTURE_DIM: i32 = 4096;
 const MAX_TEXTURE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -24,7 +27,7 @@ thread_local! {
     static PENDING_GL_ERROR: Cell<bool> = const { Cell::new(false) };
     static BACKEND_INIT_FAILED: Cell<bool> = const { Cell::new(false) };
     static API_LOG_COUNT: Cell<u32> = const { Cell::new(0) };
-    static FRAME_DUMP_COUNT: Cell<u32> = const { Cell::new(0) };
+    static EGL_CURRENT_API: Cell<u32> = const { Cell::new(EGL_OPENGL_ES_API) };
 }
 
 struct Backend {
@@ -323,57 +326,6 @@ fn force_gl_error() {
     clear_host_gl_errors();
 }
 
-fn dump_frame(backend: &mut Backend) {
-    let count = FRAME_DUMP_COUNT.with(|c| {
-        let v = c.get();
-        c.set(v + 1);
-        v
-    });
-    if count >= 10 {
-        return;
-    }
-
-    let (width, height) = backend.window.size();
-    if width == 0 || height == 0 {
-        return;
-    }
-
-    let area = (width as usize) * (height as usize) * 3;
-    let mut pixels = vec![0u8; area];
-    unsafe {
-        gl::ReadPixels(
-            0,
-            0,
-            width as i32,
-            height as i32,
-            gl::RGB,
-            gl::UNSIGNED_BYTE,
-            pixels.as_mut_ptr() as *mut core::ffi::c_void,
-        );
-    }
-
-    let non_zero = pixels.iter().any(|&b| b != 0);
-    let path = format!("/tmp/opencode/hmi_frame_{:03}.ppm", count + 1);
-    let _ = std::fs::File::create(&path).and_then(|mut file| {
-        use std::io::Write;
-        write!(file, "P6\n{} {}\n255\n", width, height)?;
-        for y in (0..height).rev() {
-            let start = y as usize * width as usize * 3;
-            let end = start + width as usize * 3;
-            file.write_all(&pixels[start..end])?;
-        }
-        Ok(())
-    });
-    log::info!(
-        "GPU: dumped frame {} {}x{} non_zero={} to {}",
-        count + 1,
-        width,
-        height,
-        non_zero,
-        path
-    );
-}
-
 fn log_api(unicorn: &mut Unicorn<'_, Context>, prefix: &str, name: &str) {
     let count = API_LOG_COUNT.with(|count| {
         let old = count.get();
@@ -404,8 +356,29 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             write_u32(unicorn, minor, 4);
             return 1;
         }
-        "eglBindAPI"
-        | "eglMakeCurrent"
+        "eglBindAPI" => {
+            let api = ureg(unicorn, RegisterARM::R0);
+            if matches!(api, EGL_OPENGL_ES_API | EGL_OPENVG_API | EGL_OPENGL_API) {
+                EGL_CURRENT_API.with(|slot| slot.set(api));
+            }
+            return 1;
+        }
+        "eglQueryAPI" => {
+            return EGL_CURRENT_API.get();
+        }
+        "eglQuerySurface" => {
+            let attr = ureg(unicorn, RegisterARM::R2);
+            let out = ureg(unicorn, RegisterARM::R3);
+            let value = match attr {
+                0x3057 | 0x305d => 800,
+                0x3056 | 0x305e => 480,
+                0x305f => 0,
+                _ => 1,
+            };
+            write_u32(unicorn, out, value);
+            return 1;
+        }
+        "eglMakeCurrent"
         | "eglDestroyContext"
         | "eglDestroySurface"
         | "eglTerminate"
@@ -418,9 +391,7 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
         | "eglSurfaceAttrib"
         | "eglSwapInterval"
         | "eglCopyBuffers"
-        | "eglQueryAPI"
         | "eglQueryContext"
-        | "eglQuerySurface"
         | "eglGetConfigAttrib"
         | "eglGetConfigs"
         | "eglCreatePbufferFromClientBuffer"
@@ -432,7 +403,6 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
                 unsafe {
                     gl::Finish();
                 }
-                dump_frame(backend);
                 let _ = backend.window.gl_swap_window();
                 while let Some(event) = backend.events.poll_event() {
                     if let Event::Quit { .. } = event {
@@ -780,7 +750,10 @@ pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             "glGetString" => {
                 let name = ureg(unicorn, RegisterARM::R0);
                 let ptr = gl::GetString(name);
-                let text = host_cstr_to_string(ptr as *const _);
+                let mut text = host_cstr_to_string(ptr as *const _);
+                if name == gl::EXTENSIONS {
+                    text = suppress_unstubbed_gl_extensions(&text);
+                }
                 return alloc_write_guest_cstr(unicorn, &text);
             }
             "glGetUniformLocation" => {
@@ -1171,6 +1144,14 @@ fn gl_fallback(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
         "glGetUniformLocation" => 1,
         _ => 0,
     }
+}
+
+fn suppress_unstubbed_gl_extensions(extensions: &str) -> String {
+    extensions
+        .split_ascii_whitespace()
+        .filter(|ext| !ext.contains("multi_draw_arrays"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn patch_vertex_shader_position_w(source: &str) -> String {
