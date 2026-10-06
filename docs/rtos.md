@@ -458,7 +458,9 @@ Current behavior:
 - `OSAL_ProcessSpawn` interception then launches `.out` targets through the emulator's
   multi-process runner; the guest observes the normal `Start Process succeeded` trace.
 - Direct host-side spawn is disabled by default and kept only as an explicit fallback.
-- Default dynamically started target: `/opt/bosch/processes/prochmi_out.out`.
+- Default dynamically started targets:
+  - `/opt/bosch/processes/prochmi_out.out`
+  - `/opt/bosch/processes/procmapengine.out`
 - Environment knobs:
   - `EMU_RTOS=1|off` enables/disables the RTOS backend; it is enabled by default;
   - `EMU_RTOS_START=path1:path2` selects start-process targets;

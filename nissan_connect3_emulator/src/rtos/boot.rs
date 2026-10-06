@@ -76,9 +76,10 @@ impl Default for RtosBootConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            commands: vec![StartProcessCommand::start_proc(
-                "/opt/bosch/processes/prochmi_out.out",
-            )],
+            commands: vec![
+                StartProcessCommand::start_proc("/opt/bosch/processes/prochmi_out.out"),
+                StartProcessCommand::start_proc("/opt/bosch/processes/procmapengine.out"),
+            ],
             start_queue: queues::OSAL_CB_HDR_LI_MAIN.to_string(),
             queue_boot: true,
             start_message_format: RtosQueueMessageFormat::Callback,
