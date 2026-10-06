@@ -4,6 +4,7 @@ pub mod memory_map;
 pub mod mmu;
 pub mod print;
 pub mod process;
+pub mod process_launcher;
 pub mod scheduler;
 pub mod thread;
 pub mod users;

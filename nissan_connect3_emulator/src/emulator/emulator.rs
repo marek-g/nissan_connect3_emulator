@@ -1,4 +1,5 @@
 use crate::emulator::process::Process;
+use crate::emulator::process_launcher;
 use crate::emulator::scheduler;
 use crate::emulator::thread::Wake;
 use crate::os::file_system::MountFileSystem;
@@ -125,6 +126,11 @@ impl Emulator {
         );
         let rtos_config = rtos::RtosBootConfig::from_env_with_default_envs(&specs);
         let handles = Arc::new(Mutex::new(Vec::with_capacity(specs.len())));
+        let default_envs = specs
+            .first()
+            .map(|spec| spec.program_envs.clone())
+            .unwrap_or_default();
+        process_launcher::install(factory.clone(), handles.clone(), default_envs);
 
         if rtos_config.is_enabled() {
             rtos::RtosQueueInteraction::bootstrap(&factory.namespace());

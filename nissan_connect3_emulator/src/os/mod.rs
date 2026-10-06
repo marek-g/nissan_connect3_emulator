@@ -9,6 +9,7 @@ pub use crate::libs::libosal_linux::libosal_add_code_hooks;
 use crate::libs::gl_stub::{libegl_add_code_hooks, libgles2_add_code_hooks};
 use crate::libs::libsvg_resource::libsvg_resource_add_code_hooks;
 use crate::libs::libtrace::libtrace_add_code_hooks;
+use crate::libs::procmapengine::procmapengine_add_code_hooks;
 use crate::libs::prochmi::prochmi_add_code_hooks;
 pub use syscalls::hook_syscall::hook_syscall;
 pub use syscalls::sys_calls_state::SysCallsState;
@@ -31,6 +32,9 @@ pub fn add_library_hook(unicorn: &mut Unicorn<'_, Context>, library: &str, base_
         "/usr/lib/libGLESv2.so" => libgles2_add_code_hooks(unicorn, base_address),
         "/usr/lib/libsvg-resource.so" => libsvg_resource_add_code_hooks(unicorn, base_address),
         "/opt/bosch/processes/prochmi_out.out" => prochmi_add_code_hooks(unicorn, base_address),
+        "/opt/bosch/processes/procmapengine.out" => {
+            procmapengine_add_code_hooks(unicorn, base_address)
+        }
         _ => return,
     }
 

@@ -125,6 +125,7 @@ impl Registry {
         }
 
         registry.load_referenced_process_registries(&dir);
+        registry.load_display_process_registries(&dir);
         registry.load_compatibility_entries();
         registry.mark_process_started("LBASE");
         registry
@@ -202,6 +203,47 @@ impl Registry {
                 Ok(entries) => loaded += entries,
                 Err(error) => log::debug!(
                     "registry: referenced file {} unavailable: {}",
+                    path.display(),
+                    error
+                ),
+            }
+        }
+
+        loaded
+    }
+
+    pub fn load_display_process_registries(&mut self, dir: &Path) -> usize {
+        let display = display_registry_id();
+        let path = format!(
+            "/dev/registry/LOCAL_MACHINE/SOFTWARE/BLAUPUNKT/PROCESS/CONFIG/REGISTRY/DISPLAY/{}",
+            display
+        );
+        let files: Vec<String> = self
+            .values(&path)
+            .into_iter()
+            .filter_map(|(_, value)| match value {
+                RegistryValue::String(file) => Some(file),
+                RegistryValue::U32(_) => None,
+            })
+            .collect();
+
+        let mut loaded = 0;
+        for file in files {
+            let file = file.trim();
+            if file.is_empty() || !file.to_ascii_lowercase().ends_with(".reg") {
+                continue;
+            }
+
+            let path = if Path::new(file).is_absolute() {
+                PathBuf::from(file)
+            } else {
+                dir.join(file)
+            };
+
+            match self.load_file(&path) {
+                Ok(entries) => loaded += entries,
+                Err(error) => log::debug!(
+                    "registry: display file {} unavailable: {}",
                     path.display(),
                     error
                 ),
@@ -413,6 +455,14 @@ pub fn default_registry_files(dir: &Path) -> Vec<PathBuf> {
         .iter()
         .map(|file| dir.join(file))
         .collect()
+}
+
+pub fn display_registry_id() -> String {
+    env::var("EMU_REGISTRY_DISPLAY_ID")
+        .ok()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| "000".to_string())
 }
 
 pub fn default_registry_compat_file() -> PathBuf {

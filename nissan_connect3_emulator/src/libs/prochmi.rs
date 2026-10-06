@@ -2,6 +2,7 @@ use crate::emulator::context::Context;
 use crate::emulator::thread::{BlockReason, ThreadStatus};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::{RegisterARM, Unicorn};
@@ -17,16 +18,26 @@ const CL_GUI_MAINLOOP: u32 = 0x0133_be70 - ORIGINAL_BASE;
 const CL_GUI_CHECK_MSGBOX: u32 = 0x0133_bcf4 - ORIGINAL_BASE;
 const GUI_LUA_LOAD_SCRIPTS: u32 = 0x0136_9350 - ORIGINAL_BASE;
 const GUI_LUA_DOFILE: u32 = 0x0136_9228 - ORIGINAL_BASE;
+const GUI_LUA_PREPARE_CALL: u32 = 0x0136_8c5c - ORIGINAL_BASE;
 const GUI_STATEMACHINE_CREATE: u32 = 0x0137_31ac - ORIGINAL_BASE;
 const GUI_TOUCH_START: u32 = 0x0134_aef0 - ORIGINAL_BASE;
 const GUI_DM_S_INITIALIZE: u32 = 0x0133_df68 - ORIGINAL_BASE;
 const GUI_STATE_ADD_TRANSITION: u32 = 0x013a_7d14 - ORIGINAL_BASE;
+const GUI_STATEMACHINE_ON_MESSAGE: u32 = 0x0137_17a8 - ORIGINAL_BASE;
+const GUI_STATEMACHINE_PERFORM_TRANSITION: u32 = 0x0137_1390 - ORIGINAL_BASE;
+const GUI_STATEMACHINE_DO_TRANSITION: u32 = 0x0137_1170 - ORIGINAL_BASE;
 const GUI_UTIL_QUEUE_READER_C1: u32 = 0x0134_c260 - ORIGINAL_BASE;
 const GUI_UTIL_QUEUE_READER_C2: u32 = 0x0134_c204 - ORIGINAL_BASE;
 const GUI_UTIL_QUEUE_READER_BEGIN: u32 = 0x0134_c534 - ORIGINAL_BASE;
 const GUI_MSGBOX_READER_C1_LR: u32 = 0x0236_8bac - ORIGINAL_BASE;
 const GUI_MSGBOX_BEGIN_CALL_LR: u32 = 0x0133_bd64 - ORIGINAL_BASE;
 const GUI_MSG_ON_MESSAGE: u32 = 0x0136_52d4 - ORIGINAL_BASE;
+const GUI_MSG_EVENT_NAME_RETURN: u32 = 0x0136_5408 - ORIGINAL_BASE;
+const GUI_MSG_FIRE_INTERNAL_EVENT: u32 = 0x0136_5868 - ORIGINAL_BASE;
+const HSI_CM_BASE_SEND_SYSTEM_EVENT: u32 = 0x0180_a8bc - ORIGINAL_BASE;
+const CL_HMI_MNGR_PERFORM_NEW_APP_STATE: u32 = 0x0134_e92c - ORIGINAL_BASE;
+const CL_HSI_CM_STARTUP_UPDATE_STATUS: u32 = 0x0184_bf7c - ORIGINAL_BASE;
+const CL_HSI_CM_STARTUP_CHECK_STATUS: u32 = 0x0184_bdd0 - ORIGINAL_BASE;
 const SVG_INIT_RESOURCE: u32 = 0x00fb_6ad0 - ORIGINAL_BASE;
 const SVG_CREATE_SURFACE: u32 = 0x00fb_7058 - ORIGINAL_BASE;
 const SVG_CREATE_LAYER_CONTEXT: u32 = 0x00fb_68e4 - ORIGINAL_BASE;
@@ -46,6 +57,30 @@ const CL_GUI_PENDING_POWER_STATE: u32 = 0x1c;
 const CL_GUI_STARTED: u32 = 0x20;
 const OSAL_EVENT_BITS: u32 = 0x14;
 const HMI_FW_LOOP_EVENT_BIT: u32 = 0x4;
+const GUI_STATE_SM_CURRENT_LEAF: u32 = 8;
+const GUI_STATE_SM_PENDING_TRANSITION: u32 = 0xc;
+const GUI_STATE_STATE_ID: u32 = 0x10;
+const GUI_MESSAGE_EVENT_ID: u32 = 0xc;
+const GUI_TRANSITION_EVENT_ID: u32 = 8;
+const GUI_TRANSITION_SOURCE_STATE: u32 = 0xa;
+const GUI_TRANSITION_TARGET_STATE: u32 = 0xc;
+const GUI_TRANSITION_TYPE: u32 = 0xe;
+const SYSDLG_NAV_STARTING_UP_STATE: u32 = 0x1e5;
+const SYSDLG_NAV_STARTING_UP_TRANSITION: u32 = 0x1977;
+
+const CL_HSI_CM_MANAGER_PHSI_BASE_GET: u32 = 0x0182_79f4 - ORIGINAL_BASE;
+const HSI_CM_STARTUP_BEXECUTE_MESSAGE: u32 = 0x0184_b958 - ORIGINAL_BASE;
+const HSI_FACTORY_CREATE_POST_ASSIGN: u32 = 0x0185_1edc - ORIGINAL_BASE;
+const CL_HMI_MNGR_CMMNGR_OFFSET: u32 = 0x640;
+const CL_HMI_MNGR_EVENT_ADAPTER_OFFSET: u32 = 0x610;
+const HSI_CM_BASE_EVENT_ENGINE: u32 = 0x30;
+const HSI_CM_STARTUP_ID: u32 = 2;
+const HSI_CM_MANAGER_COMPONENT_ARRAY_OFFSET: u32 = 4;
+const HSI_POWER_STATE_MESSAGE: u32 = 0x2715;
+const HSI_POWER_STATE_DEFAULT: u32 = 0x12;
+const HSI_POWER_STATE_PENDING_CREATE: u32 = 1;
+const HSI_POWER_STATE_PENDING_SEND: u32 = 2;
+const GUEST_CALL_STUB_SIZE: u32 = 4;
 
 static PROCHMI_BASE: AtomicU32 = AtomicU32::new(0);
 static HMI_MNGR_POINTER: AtomicU32 = AtomicU32::new(0);
@@ -63,9 +98,114 @@ static HMI_MNGR_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
 static SVG_FAKE_HANDLE: AtomicU32 = AtomicU32::new(0);
 static SVG_BYPASS_LOGGED: AtomicBool = AtomicBool::new(false);
 static GUI_INTERNAL_POST_PENDING: AtomicU32 = AtomicU32::new(0);
+static NAV_STATE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static LUA_CALL_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static GUI_EVENT_NAME_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static GUI_FIRE_EVENT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static HSI_CM_EVENT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static CL_HMI_MNGR_APP_STATE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static HSI_POWER_STATE_PENDING: AtomicU32 = AtomicU32::new(0);
+static HSI_CM_STARTUP_COMPONENT: AtomicU32 = AtomicU32::new(0);
+static PROCHMI_GUEST_CALL_STUB: AtomicU32 = AtomicU32::new(0);
+static HSI_POWER_STATE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 const GUI_INTERNAL_EVENT_COUNT: u32 = 3;
 const GUI_INTERNAL_EVENTS: [u32; 3] = [0x8d, 0x8e, 0x8f];
+
+const NAV_STATE_TRACE_LIMIT: u32 = 128;
+
+fn nav_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("EMU_PROCHMI_NAV_TRACE").is_some())
+}
+
+fn prochmi_internal_events_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("EMU_PROCHMI_NO_FAKE_INTERNAL_EVENTS").is_none())
+}
+
+fn lua_call_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("EMU_PROCHMI_LUA_TRACE").is_some())
+}
+
+fn lua_call_trace_allowed() -> bool {
+    if !lua_call_trace_enabled() {
+        return false;
+    }
+    LUA_CALL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < NAV_STATE_TRACE_LIMIT
+}
+
+fn gui_event_name_trace_allowed() -> bool {
+    if std::env::var_os("EMU_PROCHMI_GUI_EVENT_TRACE").is_none() {
+        return false;
+    }
+    GUI_EVENT_NAME_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < NAV_STATE_TRACE_LIMIT
+}
+
+fn gui_fire_event_trace_allowed() -> bool {
+    if std::env::var_os("EMU_PROCHMI_GUI_FIRE_TRACE").is_none() {
+        return false;
+    }
+    GUI_FIRE_EVENT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < NAV_STATE_TRACE_LIMIT
+}
+
+fn hsi_cm_event_trace_allowed() -> bool {
+    if std::env::var_os("EMU_PROCHMI_CM_EVENT_TRACE").is_none() {
+        return false;
+    }
+    HSI_CM_EVENT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < NAV_STATE_TRACE_LIMIT
+}
+
+fn hmi_app_state_trace_allowed() -> bool {
+    if std::env::var_os("EMU_PROCHMI_HMI_STATE_TRACE").is_none() {
+        return false;
+    }
+    CL_HMI_MNGR_APP_STATE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < NAV_STATE_TRACE_LIMIT
+}
+
+fn hsi_power_state_stub() -> Option<u32> {
+    static ENABLED: OnceLock<Option<u32>> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if std::env::var_os("EMU_PROCHMI_NO_HSI_POWER_STATE_EMULATION").is_some() {
+            return None;
+        }
+        let requested = std::env::var("EMU_PROCHMI_EMULATE_HSI_POWER_STATE").ok();
+        if requested.is_none() {
+            return None;
+        }
+        let value = requested.unwrap();
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("1") || value.eq_ignore_ascii_case("true") {
+            return Some(HSI_POWER_STATE_DEFAULT);
+        }
+        let text = value
+            .strip_prefix("0x")
+            .or_else(|| value.strip_prefix("0X"))
+            .unwrap_or(value);
+        if text.is_empty() {
+            return Some(HSI_POWER_STATE_DEFAULT);
+        }
+        if value.starts_with("0x") || value.starts_with("0X") {
+            return u32::from_str_radix(text, 16).ok();
+        }
+        text.parse::<u32>().ok()
+    })
+}
+
+fn hsi_power_state_trace_allowed() -> bool {
+    if hsi_power_state_stub().is_none() {
+        return false;
+    }
+    HSI_POWER_STATE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < NAV_STATE_TRACE_LIMIT
+}
+
+fn nav_trace_allowed() -> bool {
+    if !nav_trace_enabled() {
+        return false;
+    }
+    NAV_STATE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < NAV_STATE_TRACE_LIMIT
+}
 
 thread_local! {
     static PROCHMI_TICK_NEXT: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -164,9 +304,31 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         })
         .unwrap();
 
+    let lua_prepare_call = base_address + GUI_LUA_PREPARE_CALL;
+    unicorn
+        .add_code_hook(lua_prepare_call as u64, lua_prepare_call as u64, |uc, _, _| {
+            if !lua_call_trace_allowed() {
+                return;
+            }
+            let module = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let function = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let module_name = read_cstr(uc, module, 96);
+            let function_name = read_cstr(uc, function, 128);
+            log::info!(
+                "PROCHMI: GUI_LUA_Interface::prepareCall module={} function={}",
+                module_name,
+                function_name
+            );
+        })
+        .unwrap();
+
     let gui_mainloop = base_address + CL_GUI_MAINLOOP;
     unicorn
-        .add_code_hook(gui_mainloop as u64, gui_mainloop as u64, |uc, _, _| {
+        .add_code_hook(gui_mainloop as u64, gui_mainloop as u64, |uc, address, _| {
+            if maybe_inject_hsi_power_state(uc, address as u32) {
+                return;
+            }
+
             let gui = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             if gui != 0 {
                 GUI_ENGINE_ADDRESS.store(gui, Ordering::Relaxed);
@@ -239,6 +401,338 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         })
         .unwrap();
 
+    let hmi_perform_new_app_state = base_address + CL_HMI_MNGR_PERFORM_NEW_APP_STATE;
+    unicorn
+        .add_code_hook(
+            hmi_perform_new_app_state as u64,
+            hmi_perform_new_app_state as u64,
+            |uc, _, _| {
+                if !hmi_app_state_trace_allowed() {
+                    return;
+                }
+                let obj = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let caller = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                let state = if obj != 0 {
+                    read_u8(uc, obj + 0x670)
+                } else {
+                    0
+                };
+                let pending = if obj != 0 {
+                    read_u8(uc, obj + 0x671)
+                } else {
+                    0
+                };
+                log::info!(
+                    "PROCHMI: clHMIMngr::vPerformNewAppState obj={:#x} state={} pending={} caller={:#x}",
+                    obj,
+                    state,
+                    pending,
+                    caller
+                );
+            },
+        )
+        .unwrap();
+
+    let hsi_send_system_event = base_address + HSI_CM_BASE_SEND_SYSTEM_EVENT;
+    unicorn
+        .add_code_hook(hsi_send_system_event as u64, hsi_send_system_event as u64, |uc, _, _| {
+            if !hsi_cm_event_trace_allowed() {
+                return;
+            }
+            let obj = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let event = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let caller = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            let event_engine = if obj != 0 {
+                read_u32(uc, obj + 0x30)
+            } else {
+                0
+            };
+            log::info!(
+                "PROCHMI: clHSI_CMBase::vSendSystemEvent obj={:#x} event={:#x} engine={:#x} caller={:#x}",
+                obj,
+                event,
+                event_engine,
+                caller
+            );
+        })
+        .unwrap();
+
+    let cm_startup_update_status = base_address + CL_HSI_CM_STARTUP_UPDATE_STATUS;
+    unicorn
+        .add_code_hook(
+            cm_startup_update_status as u64,
+            cm_startup_update_status as u64,
+            |uc, _, _| {
+                if !hsi_cm_event_trace_allowed() {
+                    return;
+                }
+                let obj = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let caller = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                let msg = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let id = if msg != 0 { read_u32(uc, msg) } else { 0 };
+                let field1 = if msg != 0 { read_u32(uc, msg + 4) } else { 0 };
+                let status = if msg != 0 { read_u32(uc, msg + 8) } else { 0 };
+                log::info!(
+                    "PROCHMI: clHSI_CMStartup::vUpdateStatus obj={:#x} id={:#x} field1={:#x} status={:#x} caller={:#x}",
+                    obj,
+                    id,
+                    field1,
+                    status,
+                    caller
+                );
+            },
+        )
+        .unwrap();
+
+    let cm_startup_check_status = base_address + CL_HSI_CM_STARTUP_CHECK_STATUS;
+    unicorn
+        .add_code_hook(
+            cm_startup_check_status as u64,
+            cm_startup_check_status as u64,
+            |uc, _, _| {
+                if !hsi_cm_event_trace_allowed() {
+                    return;
+                }
+                let obj = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let service_id = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let caller = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                let begin = if obj != 0 { read_u32(uc, obj + 0x70) } else { 0 };
+                let end = if obj != 0 { read_u32(uc, obj + 0x74) } else { 0 };
+                let count = if end > begin { (end - begin) / 4 } else { 0 };
+                log::info!(
+                    "PROCHMI: clHSI_CMStartup::bCheckStatus obj={:#x} service={:#x} groups={} begin={:#x} end={:#x} caller={:#x}",
+                    obj,
+                    service_id,
+                    count,
+                    begin,
+                    end,
+                    caller
+                );
+            },
+        )
+        .unwrap();
+
+    let gui_msg_event_name = base_address + GUI_MSG_EVENT_NAME_RETURN;
+    unicorn
+        .add_code_hook(gui_msg_event_name as u64, gui_msg_event_name as u64, |uc, _, _| {
+            if !gui_event_name_trace_allowed() {
+                return;
+            }
+            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+            let event = if sp != 0 {
+                read_u16(uc, sp + 0x4c)
+            } else {
+                0
+            };
+            let name_ptr = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let name = read_cstr(uc, name_ptr, 160);
+            log::info!(
+                "PROCHMI: GUI_Messaging event id={:#x} name={} name_ptr={:#x}",
+                event,
+                name,
+                name_ptr
+            );
+        })
+        .unwrap();
+
+    let gui_fire_internal_event = base_address + GUI_MSG_FIRE_INTERNAL_EVENT;
+    unicorn
+        .add_code_hook(
+            gui_fire_internal_event as u64,
+            gui_fire_internal_event as u64,
+            |uc, _, _| {
+                if !gui_fire_event_trace_allowed() {
+                    return;
+                }
+                let receiver = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let target = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let caller = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                let event = if message != 0 {
+                    read_u16(uc, message + GUI_MESSAGE_EVENT_ID)
+                } else {
+                    0
+                };
+                let m4 = read_u32(uc, message + 4);
+                let m8 = read_u32(uc, message + 8);
+                log::info!(
+                    "PROCHMI: GUI_Messaging::vFireInternalEvent receiver={:#x} msg={:#x} target={:#x} event={:#x} caller={:#x} [0x{:08x},0x{:08x}]",
+                    receiver,
+                    message,
+                    target,
+                    event,
+                    caller,
+                    m4,
+                    m8
+                );
+            },
+        )
+        .unwrap();
+
+    let hsi_factory_post_assign = base_address + HSI_FACTORY_CREATE_POST_ASSIGN;
+    unicorn
+        .add_code_hook(
+            hsi_factory_post_assign as u64,
+            hsi_factory_post_assign as u64,
+            |uc, _, _| {
+                let object = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                let component_id = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                let factory = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                if component_id != HSI_CM_STARTUP_ID || object == 0 {
+                    return;
+                }
+
+                HSI_CM_STARTUP_COMPONENT.store(object, Ordering::Relaxed);
+                let hmi = HMI_MNGR_POINTER.load(Ordering::Relaxed);
+                if hmi != 0 && read_u32(uc, object + HSI_CM_BASE_EVENT_ENGINE) == 0 {
+                    if write_u32(uc, object + HSI_CM_BASE_EVENT_ENGINE, hmi + CL_HMI_MNGR_EVENT_ADAPTER_OFFSET)
+                        && hsi_power_state_trace_allowed()
+                    {
+                        log::info!(
+                            "PROCHMI: HSI startup event-engine {:#x} -> {:#x}",
+                            object,
+                            hmi + CL_HMI_MNGR_EVENT_ADAPTER_OFFSET
+                        );
+                    }
+                }
+
+                if hsi_power_state_trace_allowed() {
+                    log::info!(
+                        "PROCHMI: clHSI_CMStartup created obj={:#x} factory={:#x} pending={}",
+                        object,
+                        factory,
+                        HSI_POWER_STATE_PENDING.load(Ordering::Relaxed)
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    let state_on_message = base_address + GUI_STATEMACHINE_ON_MESSAGE;
+    unicorn
+        .add_code_hook(state_on_message as u64, state_on_message as u64, |uc, _, _| {
+            if !nav_trace_enabled() {
+                return;
+            }
+            let sm = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let caller = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            let leaf = if sm != 0 {
+                read_u32(uc, sm + GUI_STATE_SM_CURRENT_LEAF)
+            } else {
+                0
+            };
+            let state_id = if leaf != 0 {
+                read_u16(uc, leaf + GUI_STATE_STATE_ID)
+            } else {
+                0
+            };
+            if state_id != SYSDLG_NAV_STARTING_UP_STATE {
+                return;
+            }
+            let event = if message != 0 {
+                read_u16(uc, message + GUI_MESSAGE_EVENT_ID)
+            } else {
+                0
+            };
+            let m0 = read_u32(uc, message);
+            let m4 = read_u32(uc, message + 4);
+            let m8 = read_u32(uc, message + 8);
+            let m10 = read_u32(uc, message + 0x10);
+            if nav_trace_allowed() {
+                log::info!(
+                    "PROCHMI: nav startup bOnMessage sm={:#x} leaf={:#x} event={:#x} msg={:#x} caller={:#x} [0x{:08x},0x{:08x},0x{:08x},0x{:08x}]",
+                    sm,
+                    leaf,
+                    event,
+                    message,
+                    caller,
+                    m0,
+                    m4,
+                    m8,
+                    m10
+                );
+            }
+        })
+        .unwrap();
+
+    let state_perform_transition = base_address + GUI_STATEMACHINE_PERFORM_TRANSITION;
+    unicorn
+        .add_code_hook(
+            state_perform_transition as u64,
+            state_perform_transition as u64,
+            |uc, _, _| {
+                if !nav_trace_enabled() {
+                    return;
+                }
+                let sm = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let leaf = if sm != 0 {
+                    read_u32(uc, sm + GUI_STATE_SM_CURRENT_LEAF)
+                } else {
+                    0
+                };
+                let state_id = if leaf != 0 {
+                    read_u16(uc, leaf + GUI_STATE_STATE_ID)
+                } else {
+                    0
+                };
+                let transition = read_u32(uc, sm + GUI_STATE_SM_PENDING_TRANSITION);
+                if transition == 0 {
+                    return;
+                }
+                let event = read_u16(uc, transition + GUI_TRANSITION_EVENT_ID);
+                let source = read_u16(uc, transition + GUI_TRANSITION_SOURCE_STATE);
+                let target = read_u16(uc, transition + GUI_TRANSITION_TARGET_STATE);
+                let kind = read_u16(uc, transition + GUI_TRANSITION_TYPE);
+                if nav_trace_allowed() {
+                    log::info!(
+                        "PROCHMI: GUI_StateMachine performTransition sm={:#x} leaf={:#x} state={:#x} trans={:#x} event={:#x} src={:#x} tgt={:#x} kind={:#x}",
+                        sm,
+                        leaf,
+                        state_id,
+                        transition,
+                        event,
+                        source,
+                        target,
+                        kind
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    let state_do_transition = base_address + GUI_STATEMACHINE_DO_TRANSITION;
+    unicorn
+        .add_code_hook(state_do_transition as u64, state_do_transition as u64, |uc, _, _| {
+            if !nav_trace_enabled() {
+                return;
+            }
+            let sm = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let transition = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
+            let leaf = if sm != 0 {
+                read_u32(uc, sm + GUI_STATE_SM_CURRENT_LEAF)
+            } else {
+                0
+            };
+            let state_id = if leaf != 0 {
+                read_u16(uc, leaf + GUI_STATE_STATE_ID)
+            } else {
+                0
+            };
+            if state_id != SYSDLG_NAV_STARTING_UP_STATE && transition != SYSDLG_NAV_STARTING_UP_TRANSITION {
+                return;
+            }
+            if nav_trace_allowed() {
+                log::info!(
+                    "PROCHMI: nav startup doTransition sm={:#x} leaf={:#x} transition_id={:#x}",
+                    sm,
+                    leaf,
+                    transition
+                );
+            }
+        })
+        .unwrap();
+
     let state_add_transition = base_address + GUI_STATE_ADD_TRANSITION;
     unicorn
         .add_code_hook(
@@ -247,8 +741,39 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
             |uc, _, _| {
                 let state = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let transition = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
-                if state != 0 && read_u16(uc, state + 0x10) == 0x1e5 && transition == 0x1977 {
-                    GUI_INTERNAL_POST_PENDING.store(1, Ordering::Relaxed);
+                let state_id = if state != 0 {
+                    read_u16(uc, state + GUI_STATE_STATE_ID)
+                } else {
+                    0
+                };
+                if state_id == SYSDLG_NAV_STARTING_UP_STATE {
+                    log::debug!(
+                        "PROCHMI: GUI_State::vAddTransition state={:#x} transition={:#x}",
+                        state,
+                        transition
+                    );
+                }
+                if state_id == SYSDLG_NAV_STARTING_UP_STATE && transition == SYSDLG_NAV_STARTING_UP_TRANSITION {
+                    if let Some(power_state) = hsi_power_state_stub() {
+                        HSI_POWER_STATE_PENDING.store(HSI_POWER_STATE_PENDING_CREATE, Ordering::Relaxed);
+                        if nav_trace_allowed() || hsi_power_state_trace_allowed() {
+                            log::info!(
+                                "PROCHMI: armed HSI power-state emulation state={:#x} transition={:#x} hsi_state={:#x}",
+                                state,
+                                transition,
+                                power_state
+                            );
+                        }
+                    } else if prochmi_internal_events_enabled() {
+                        GUI_INTERNAL_POST_PENDING.store(1, Ordering::Relaxed);
+                        if nav_trace_allowed() {
+                            log::info!(
+                                "PROCHMI: armed startup-nav internal events at state={:#x} transition={:#x}",
+                                state,
+                                transition
+                            );
+                        }
+                    }
                 }
             },
         )
@@ -390,6 +915,10 @@ fn post_gui_message_queue(
 }
 
 fn post_gui_internal_events(unicorn: &mut Unicorn<'_, Context>) {
+    if !prochmi_internal_events_enabled() {
+        return;
+    }
+
     let messaging = GUI_MESSAGING_POINTER.load(Ordering::Relaxed);
     if messaging == 0 {
         return;
@@ -534,14 +1063,19 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
     {
         let mut threads = unicorn.get_data().threads.lock().unwrap();
         if let Some(thread) = threads.iter_mut().find(|t| t.id == tid) {
-            if matches!(
-                thread.status,
+            match thread.status {
                 ThreadStatus::Blocked(BlockReason::FutexWait { .. })
-                    | ThreadStatus::Blocked(BlockReason::FutexWaitShared { .. })
-            ) {
-                thread.status = ThreadStatus::Runnable;
-                thread.pending_result = Some(0);
-                woke = true;
+                | ThreadStatus::Blocked(BlockReason::FutexWaitShared { .. }) => {
+                    thread.status = ThreadStatus::Runnable;
+                    thread.pending_result = Some(0);
+                    woke = true;
+                }
+                ThreadStatus::Blocked(BlockReason::SleepUntil(_)) => {
+                    thread.status = ThreadStatus::Runnable;
+                    thread.pending_result = None;
+                    woke = true;
+                }
+                _ => {}
             }
         }
     }
@@ -549,6 +1083,183 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
     if woke && !HMI_EVENT_WAKE_LOGGED.swap(true, Ordering::Relaxed) {
         log::info!("PROCHMI: forced HMI_MAIN event wake for HMI_FW_LOOP");
     }
+}
+
+fn ensure_guest_call_stub(unicorn: &mut Unicorn<'_, Context>) -> Option<u32> {
+    let current = PROCHMI_GUEST_CALL_STUB.load(Ordering::Relaxed);
+    if current != 0 {
+        return Some(current);
+    }
+
+    let mmu_arc = {
+        let data = unicorn.get_data();
+        data.mmu.clone()
+    };
+    let addr = mmu_arc
+        .lock()
+        .unwrap()
+        .heap_alloc(
+            unicorn,
+            GUEST_CALL_STUB_SIZE,
+            Prot::READ | Prot::WRITE | Prot::EXEC,
+            "[prochmi-call-stub]",
+        );
+    if addr == 0 || unicorn.mem_write(addr as u64, &[0x0f, 0xc0, 0xbd, 0xe8]).is_err() {
+        log::warn!("PROCHMI: failed to allocate ARM pop{{r0-r3,lr,pc}} guest-call stub");
+        return None;
+    }
+
+    PROCHMI_GUEST_CALL_STUB.store(addr, Ordering::Relaxed);
+    log::info!("PROCHMI: allocated guest-call stub at {:#x}", addr);
+    Some(addr)
+}
+
+fn call_guest_function(
+    unicorn: &mut Unicorn<'_, Context>,
+    original_pc: u32,
+    function: u32,
+    args: [u32; 4],
+) -> bool {
+    if original_pc == 0 || function == 0 {
+        return false;
+    }
+
+    let Some(stub) = ensure_guest_call_stub(unicorn) else {
+        return false;
+    };
+
+    let r0 = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+    let r1 = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+    let r2 = unicorn.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+    let r3 = unicorn.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+    let lr = unicorn.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+    let sp = unicorn.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+    if sp < 0x1000 {
+        log::warn!("PROCHMI: refusing guest call from invalid SP {:#x}", sp);
+        return false;
+    }
+
+    let new_sp = sp.wrapping_sub(24);
+    let saved = [r0, r1, r2, r3, lr, original_pc];
+    if !saved
+        .iter()
+        .enumerate()
+        .all(|(index, value)| write_u32(unicorn, new_sp + (index as u32 * 4), *value))
+    {
+        log::warn!(
+            "PROCHMI: failed to save caller state at {:#x} before guest call {:#x}",
+            new_sp,
+            function
+        );
+        return false;
+    }
+
+    unicorn
+        .reg_write(RegisterARM::R13, new_sp as u64)
+        .unwrap_or_default();
+    for (register, value) in [
+        (RegisterARM::R0, args[0]),
+        (RegisterARM::R1, args[1]),
+        (RegisterARM::R2, args[2]),
+        (RegisterARM::R3, args[3]),
+        (RegisterARM::R14, stub),
+        (RegisterARM::PC, function),
+    ] {
+        let _ = unicorn.reg_write(register, value as u64);
+    }
+
+    true
+}
+
+fn maybe_inject_hsi_power_state(unicorn: &mut Unicorn<'_, Context>, original_pc: u32) -> bool {
+    let Some(power_state) = hsi_power_state_stub() else {
+        return false;
+    };
+    let phase = HSI_POWER_STATE_PENDING.load(Ordering::Relaxed);
+    if phase == 0 {
+        return false;
+    }
+
+    let base = PROCHMI_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return false;
+    }
+
+    let hmi = HMI_MNGR_POINTER.load(Ordering::Relaxed);
+    if hmi == 0 {
+        if hsi_power_state_trace_allowed() {
+            log::warn!("PROCHMI: HSI power-state emulation waiting for clHMIMngr pointer");
+        }
+        return false;
+    }
+
+    let manager = hmi + CL_HMI_MNGR_CMMNGR_OFFSET;
+    let factory = read_u32(unicorn, manager + HSI_CM_MANAGER_COMPONENT_ARRAY_OFFSET);
+    if factory == 0 {
+        if hsi_power_state_trace_allowed() {
+            log::warn!("PROCHMI: HSI power-state emulation waiting for HSI factory at {:#x}", manager + 4);
+        }
+        return false;
+    }
+
+    let mut component = HSI_CM_STARTUP_COMPONENT.load(Ordering::Relaxed);
+    if component == 0 {
+        let array_slot =
+            factory + HSI_CM_MANAGER_COMPONENT_ARRAY_OFFSET + (HSI_CM_STARTUP_ID * 4);
+        component = read_u32(unicorn, array_slot);
+        if component != 0 {
+            HSI_CM_STARTUP_COMPONENT.store(component, Ordering::Relaxed);
+        }
+    }
+
+    if component == 0 {
+        if phase == HSI_POWER_STATE_PENDING_CREATE {
+            let function = base + CL_HSI_CM_MANAGER_PHSI_BASE_GET;
+            if call_guest_function(unicorn, original_pc, function, [manager, HSI_CM_STARTUP_ID, 0, 0]) {
+                HSI_POWER_STATE_PENDING.store(HSI_POWER_STATE_PENDING_SEND, Ordering::Relaxed);
+                log::info!(
+                    "PROCHMI: created HSI startup component via clHSI_CMMngr::pHSI_BaseGet manager={:#x} id={}",
+                    manager,
+                    HSI_CM_STARTUP_ID
+                );
+                return true;
+            }
+
+            HSI_POWER_STATE_PENDING.store(0, Ordering::Relaxed);
+            log::warn!("PROCHMI: failed to call clHSI_CMMngr::pHSI_BaseGet for HSI startup component");
+            return false;
+        }
+
+        HSI_POWER_STATE_PENDING.store(0, Ordering::Relaxed);
+        log::warn!("PROCHMI: HSI startup component was not created by pHSI_BaseGet");
+        return false;
+    }
+
+    let adapter = hmi + CL_HMI_MNGR_EVENT_ADAPTER_OFFSET;
+    if read_u32(unicorn, component + HSI_CM_BASE_EVENT_ENGINE) == 0 {
+        let _ = write_u32(unicorn, component + HSI_CM_BASE_EVENT_ENGINE, adapter);
+    }
+
+    let function = base + HSI_CM_STARTUP_BEXECUTE_MESSAGE;
+    if call_guest_function(
+        unicorn,
+        original_pc,
+        function,
+        [component, HSI_POWER_STATE_MESSAGE, power_state, 0],
+    ) {
+        HSI_POWER_STATE_PENDING.store(0, Ordering::Relaxed);
+        log::info!(
+            "PROCHMI: simulated HSI power-state message obj={:#x} msg={:#x} hsi_state={:#x}",
+            component,
+            HSI_POWER_STATE_MESSAGE,
+            power_state
+        );
+        return true;
+    }
+
+    HSI_POWER_STATE_PENDING.store(0, Ordering::Relaxed);
+    log::warn!("PROCHMI: failed to call clHSI_CMStartup::bExecuteMessage for HSI power-state");
+    false
 }
 
 fn svg_fake_handle(unicorn: &mut Unicorn<'_, Context>) -> u32 {
