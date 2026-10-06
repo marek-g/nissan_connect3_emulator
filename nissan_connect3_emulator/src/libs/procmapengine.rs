@@ -6,6 +6,7 @@ use unicorn_engine::{RegisterARM, Unicorn};
 const ORIGINAL_BASE: u32 = 0x0000_8000;
 const AIL_VSTART_APP_ENTRY: u32 = 0x0065_d664 - ORIGINAL_BASE;
 const APP_NEW_STATE: u32 = 0x0039_0064 - ORIGINAL_BASE;
+const CREATE_DEFAULT_VIEW_FLAG: u32 = 0x0071_5519 - ORIGINAL_BASE;
 const GUEST_CALL_STUB_SIZE: u32 = 4;
 const ACTIVE_APP_STATE: u32 = 3;
 
@@ -42,6 +43,23 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                 log::warn!("PROCMAPENGINE: vStartAppEntry called with null app object");
                 APP_STATE_STARTED.store(false, Ordering::Relaxed);
                 return;
+            }
+
+            if !std::env::var_os("EMU_PROCMAPENGINE_CREATE_DEFAULT_VIEW")
+                .is_some_and(|value| value != "0" && !value.is_empty())
+            {
+                let flag = base_address + CREATE_DEFAULT_VIEW_FLAG;
+                if uc.mem_write(flag as u64, &[0u8]).is_ok() {
+                    log::info!(
+                        "PROCMAPENGINE: cleared g_bCreateDefaultView at {:#x} before forced active state",
+                        flag
+                    );
+                } else {
+                    log::warn!(
+                        "PROCMAPENGINE: failed to clear g_bCreateDefaultView at {:#x}",
+                        flag
+                    );
+                }
             }
 
             if call_guest_function(uc, hook_addr, state_function, [this, 0, ACTIVE_APP_STATE, 0]) {
