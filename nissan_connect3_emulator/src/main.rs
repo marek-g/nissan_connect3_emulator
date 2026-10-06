@@ -186,7 +186,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
             .filter(|s| !s.is_empty())
             .map(|p| ProcessSpec::new(p).envs(envs.clone()))
             .collect(),
-        Err(_) => vec![ProcessSpec::new("/opt/bosch/processes/procbaselx_out.out").envs(envs)],
+        Err(_) => vec![ProcessSpec::new("/opt/bosch/processes/prochmi_out").envs(envs)],
     };
     emulator.run_processes(specs)?;
 
