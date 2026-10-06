@@ -14,23 +14,26 @@ const CL_HMI_MNGR_B_EXECUTE: u32 = 0x0134_ec88 - ORIGINAL_BASE;
 const CL_GUI_WIDGET_S_INITIALIZE: u32 = 0x0133_cc6c - ORIGINAL_BASE;
 const CL_GUI_WIDGET_B_EXECUTE: u32 = 0x0133_c134 - ORIGINAL_BASE;
 const CL_GUI_MAINLOOP: u32 = 0x0133_be70 - ORIGINAL_BASE;
+const CL_GUI_CHECK_MSGBOX: u32 = 0x0133_bcf4 - ORIGINAL_BASE;
 const GUI_LUA_LOAD_SCRIPTS: u32 = 0x0136_9350 - ORIGINAL_BASE;
 const GUI_LUA_DOFILE: u32 = 0x0136_9228 - ORIGINAL_BASE;
 const GUI_STATEMACHINE_CREATE: u32 = 0x0137_31ac - ORIGINAL_BASE;
 const GUI_TOUCH_START: u32 = 0x0134_aef0 - ORIGINAL_BASE;
 const GUI_DM_S_INITIALIZE: u32 = 0x0133_df68 - ORIGINAL_BASE;
-const GUI_DM_IS_DIRTY: u32 = 0x0133_d8ac - ORIGINAL_BASE;
-const GUI_DM_IS_VIEW_DIRTY: u32 = 0x0133_d758 - ORIGINAL_BASE;
-const GUI_MENU_GET_VIEW: u32 = 0x0136_42c8 - ORIGINAL_BASE;
-const GUI_WIDGET_CALL_DRAW: u32 = 0x0137_af7c - ORIGINAL_BASE;
-const GUI_DM_UPDATE: u32 = 0x0133_d99c - ORIGINAL_BASE;
+const GUI_STATE_ADD_TRANSITION: u32 = 0x013a_7d14 - ORIGINAL_BASE;
+const GUI_UTIL_QUEUE_READER_C1: u32 = 0x0134_c260 - ORIGINAL_BASE;
+const GUI_UTIL_QUEUE_READER_C2: u32 = 0x0134_c204 - ORIGINAL_BASE;
+const GUI_UTIL_QUEUE_READER_BEGIN: u32 = 0x0134_c534 - ORIGINAL_BASE;
+const GUI_MSGBOX_READER_C1_LR: u32 = 0x0236_8bac - ORIGINAL_BASE;
+const GUI_MSGBOX_BEGIN_CALL_LR: u32 = 0x0133_bd64 - ORIGINAL_BASE;
+const GUI_MSG_ON_MESSAGE: u32 = 0x0136_52d4 - ORIGINAL_BASE;
 const SVG_INIT_RESOURCE: u32 = 0x00fb_6ad0 - ORIGINAL_BASE;
 const SVG_CREATE_SURFACE: u32 = 0x00fb_7058 - ORIGINAL_BASE;
 const SVG_CREATE_LAYER_CONTEXT: u32 = 0x00fb_68e4 - ORIGINAL_BASE;
 const CL_LUA_DEBUGGER_S_INITIALIZE: u32 = 0x0133_ae10 - ORIGINAL_BASE;
 const GUI_DISPLAY_WIDTH: u32 = 800;
 const GUI_DISPLAY_HEIGHT: u32 = 480;
-const TRAMPOLINE_SIZE: usize = 36;
+const TRAMPOLINE_SIZE: usize = 44;
 
 const CL_HMI_MNGR_C1: u32 = 0x0134_f364 - ORIGINAL_BASE;
 const CL_HMI_MNGR_C2: u32 = 0x0134_f5a8 - ORIGINAL_BASE;
@@ -39,16 +42,19 @@ const CL_GUI_WIDGET_C2: u32 = 0x0133_ccd0 - ORIGINAL_BASE;
 const HMI_MAIN_ENTRY: u32 = 0x00fc_8c48 - ORIGINAL_BASE;
 const CL_HMI_MNGR_STATE: u32 = 0x670;
 const CL_HMI_MNGR_PENDING_STATE: u32 = 0x671;
-const CL_GUI_PREV_APP_STATE: u32 = 0x18;
 const CL_GUI_PENDING_POWER_STATE: u32 = 0x1c;
 const CL_GUI_STARTED: u32 = 0x20;
-const GUI_DM_DIRTY: u32 = 0x3c;
 const OSAL_EVENT_BITS: u32 = 0x14;
 const HMI_FW_LOOP_EVENT_BIT: u32 = 0x4;
 
 static PROCHMI_BASE: AtomicU32 = AtomicU32::new(0);
 static HMI_MNGR_POINTER: AtomicU32 = AtomicU32::new(0);
 static HMI_GUI_POINTER: AtomicU32 = AtomicU32::new(0);
+static GUI_MESSAGING_POINTER: AtomicU32 = AtomicU32::new(0);
+static GUI_INTERNAL_EVENT_SENT_COUNT: AtomicU32 = AtomicU32::new(0);
+static GUI_UTIL_STARTUP_STATUS_POSTED: AtomicU32 = AtomicU32::new(0);
+static GUI_UTIL_MSGBOX_QUEUE: AtomicU32 = AtomicU32::new(0);
+static GUI_ENGINE_ADDRESS: AtomicU32 = AtomicU32::new(0);
 static HMI_EVENT_OBJECT: AtomicU32 = AtomicU32::new(0);
 static HMI_MAIN_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static HMI_GUI_FORCE_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -56,13 +62,15 @@ static HMI_EVENT_WAKE_LOGGED: AtomicBool = AtomicBool::new(false);
 static HMI_MNGR_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
 static SVG_FAKE_HANDLE: AtomicU32 = AtomicU32::new(0);
 static SVG_BYPASS_LOGGED: AtomicBool = AtomicBool::new(false);
-static GUI_DISPLAY_MANAGER_POINTER: AtomicU32 = AtomicU32::new(0);
-static GUI_DISPLAY_DIRTY_COUNT: AtomicU32 = AtomicU32::new(0);
-static GUI_VIEW_DIRTY_FORCE_COUNT: AtomicU32 = AtomicU32::new(0);
-static GUI_LAST_VIEW: AtomicU32 = AtomicU32::new(0);
+static GUI_INTERNAL_POST_PENDING: AtomicU32 = AtomicU32::new(0);
+
+const GUI_INTERNAL_EVENT_COUNT: u32 = 3;
+const GUI_INTERNAL_EVENTS: [u32; 3] = [0x8d, 0x8e, 0x8f];
 
 thread_local! {
     static PROCHMI_TICK_NEXT: Cell<Option<Instant>> = const { Cell::new(None) };
+    static PROCHMI_GUI_INTERNAL_NEXT: Cell<Option<Instant>> = const { Cell::new(None) };
+    static PROCHMI_DISPLAY_MODE_NEXT: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
@@ -94,11 +102,20 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     }
 
     for (offset, name) in [
-        (CL_LUA_DEBUGGER_S_INITIALIZE, "clLuaDebugger::s_initialize trampoline"),
+        (
+            CL_LUA_DEBUGGER_S_INITIALIZE,
+            "clLuaDebugger::s_initialize trampoline",
+        ),
         (CL_HMI_MNGR_S_INITIALIZE, "clHMIMngr::s_initialize"),
-        (CL_GUI_WIDGET_S_INITIALIZE, "clGUIWidgetEngine::s_initialize"),
+        (
+            CL_GUI_WIDGET_S_INITIALIZE,
+            "clGUIWidgetEngine::s_initialize",
+        ),
         (GUI_LUA_LOAD_SCRIPTS, "GUI_LUA_Interface::loadScripts"),
-        (GUI_STATEMACHINE_CREATE, "GUI_StateMachineFactory::s_vCreateStateMachines"),
+        (
+            GUI_STATEMACHINE_CREATE,
+            "GUI_StateMachineFactory::s_vCreateStateMachines",
+        ),
         (GUI_TOUCH_START, "GUI_TouchAdapter_vStart"),
     ] {
         let addr = base_address + offset;
@@ -137,11 +154,7 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
             let lua = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let path = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let path_str = read_cstr(uc, path, 128);
-            let lua_state = if lua >= 4 {
-                read_u32(uc, lua + 4)
-            } else {
-                0
-            };
+            let lua_state = if lua >= 4 { read_u32(uc, lua + 4) } else { 0 };
             log::info!(
                 "PROCHMI: GUI_LUA_Interface::doFile lua={:#x} state={:#x} path={}",
                 lua,
@@ -155,10 +168,10 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     unicorn
         .add_code_hook(gui_mainloop as u64, gui_mainloop as u64, |uc, _, _| {
             let gui = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
-            let mode = read_u8(uc, gui + 0x3d);
-            if mode != 0 {
-                write_u8(uc, gui + 0x3d, 0);
+            if gui != 0 {
+                GUI_ENGINE_ADDRESS.store(gui, Ordering::Relaxed);
             }
+            let mode = read_u8(uc, gui + 0x3d);
             log::info!(
                 "PROCHMI: clGUIWidgetEngine::bGUIMainloop this={:#x} display_mode={}",
                 gui,
@@ -167,95 +180,78 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         })
         .unwrap();
 
-    let dm_is_dirty = base_address + GUI_DM_IS_DIRTY;
+    let check_msgbox = base_address + CL_GUI_CHECK_MSGBOX;
     unicorn
-        .add_code_hook(dm_is_dirty as u64, dm_is_dirty as u64, |uc, _, _| {
-            let dm = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
-            GUI_DISPLAY_MANAGER_POINTER.store(dm, Ordering::Relaxed);
-            let forced = GUI_DISPLAY_DIRTY_COUNT.fetch_add(1, Ordering::Relaxed);
-            if dm != 0 && forced < 20 {
-                write_u8(uc, dm + GUI_DM_DIRTY, 1);
+        .add_code_hook(check_msgbox as u64, check_msgbox as u64, |uc, _, _| {
+            if GUI_UTIL_STARTUP_STATUS_POSTED.load(Ordering::Relaxed) == 0
+                && post_gui_util_startup_anim_status(uc, 1)
+            {
+                GUI_UTIL_STARTUP_STATUS_POSTED.store(1, Ordering::Relaxed);
                 log::info!(
-                    "PROCHMI: forcing GUI_DM_DisplayManager dirty {} at {:#x}+{:#x}",
-                    forced + 1,
-                    dm,
-                    GUI_DM_DIRTY
+                    "PROCHMI: injected startup animation status before GUI message box poll"
                 );
             }
         })
         .unwrap();
 
-    let menu_get_view = base_address + GUI_MENU_GET_VIEW;
-    unicorn
-        .add_code_hook(menu_get_view as u64, menu_get_view as u64, |uc, _, _| {
-            log::info!(
-                "PROCHMI: GUI_MenuManager::pGetView menu={:#x} index={}",
-                uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
-                uc.reg_read(RegisterARM::R1).unwrap_or(0) as i32
-            );
-        })
-        .unwrap();
-
-    let dm_is_view_dirty = base_address + GUI_DM_IS_VIEW_DIRTY;
-    unicorn
-        .add_code_hook(dm_is_view_dirty as u64, dm_is_view_dirty as u64, |uc, _, _| {
-            let view = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
-            let view_layer = if view == 0 { 0 } else { read_u32(uc, view + 0x40) };
-            GUI_LAST_VIEW.store(view_layer, Ordering::Relaxed);
-            let forced = GUI_VIEW_DIRTY_FORCE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if view != 0 && forced < 20 {
-                log::info!(
-                    "PROCHMI: forcing GUI_DM_DisplayManager::isViewDirty view={:#x}",
-                    view
-                );
-                uc.reg_write(RegisterARM::R0, 1).unwrap();
-                uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap())
-                    .unwrap();
-            } else if forced < 40 {
-                log::info!(
-                    "PROCHMI: GUI_DM_DisplayManager::isViewDirty view={:#x}",
-                    view
-                );
-            }
-        })
-        .unwrap();
-
-    let dm_update = base_address + GUI_DM_UPDATE;
-    unicorn
-        .add_code_hook(dm_update as u64, dm_update as u64, |uc, _, _| {
-            let dm = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
-            log::info!(
-                "PROCHMI: GUI_DM_DisplayManager::update this={:#x} eam={:#x} view0x40={:#x}",
-                dm,
-                if dm == 0 {
-                    0
-                } else {
-                    read_u32(uc, dm)
-                },
-                GUI_LAST_VIEW.load(Ordering::Relaxed)
-            );
-        })
-        .unwrap();
-
-    let widget_call_draw = base_address + GUI_WIDGET_CALL_DRAW;
-    unicorn
-        .add_code_hook(widget_call_draw as u64, widget_call_draw as u64, |uc, _, _| {
-            let widget = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
-            log::info!(
-                "PROCHMI: GUI_Widget::callDraw widget={:#x} vtable={:#x} drawctx={:#x}",
-                widget,
-                if widget == 0 {
-                    0
-                } else {
-                    read_u32(uc, widget)
-                },
-                if widget == 0 {
-                    0
-                } else {
-                    read_u32(uc, widget + 0x40)
+    for offset in [
+        GUI_UTIL_QUEUE_READER_C1,
+        GUI_UTIL_QUEUE_READER_C2,
+        GUI_UTIL_QUEUE_READER_BEGIN,
+    ] {
+        let addr = base_address + offset;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                if GUI_UTIL_MSGBOX_QUEUE.load(Ordering::Relaxed) != 0 {
+                    return;
                 }
-            );
+                let reader = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let mut queue = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                if queue == 0 && offset == GUI_UTIL_QUEUE_READER_BEGIN && reader != 0 {
+                    queue = read_u32(uc, reader + 4);
+                }
+                let captured = (offset == GUI_UTIL_QUEUE_READER_C1
+                    && lr == base_address + GUI_MSGBOX_READER_C1_LR)
+                    || (offset == GUI_UTIL_QUEUE_READER_BEGIN
+                        && lr == base_address + GUI_MSGBOX_BEGIN_CALL_LR);
+                if queue != 0 && captured {
+                    GUI_UTIL_MSGBOX_QUEUE.store(queue, Ordering::Relaxed);
+                    log::info!("PROCHMI: captured GUI_UTIL message box queue={:#x}", queue);
+                }
+            })
+            .unwrap();
+    }
+
+    let msg_on_message = base_address + GUI_MSG_ON_MESSAGE;
+    unicorn
+        .add_code_hook(msg_on_message as u64, msg_on_message as u64, |uc, _, _| {
+            let messaging = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            if messaging != 0 {
+                GUI_MESSAGING_POINTER.store(messaging, Ordering::Relaxed);
+            }
+            if GUI_INTERNAL_POST_PENDING.load(Ordering::Relaxed) != 0
+                && messaging != 0
+                && GUI_INTERNAL_EVENT_SENT_COUNT.load(Ordering::Relaxed) < GUI_INTERNAL_EVENT_COUNT
+            {
+                post_gui_internal_events(uc);
+            }
         })
+        .unwrap();
+
+    let state_add_transition = base_address + GUI_STATE_ADD_TRANSITION;
+    unicorn
+        .add_code_hook(
+            state_add_transition as u64,
+            state_add_transition as u64,
+            |uc, _, _| {
+                let state = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let transition = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
+                if state != 0 && read_u16(uc, state + 0x10) == 0x1e5 && transition == 0x1977 {
+                    GUI_INTERNAL_POST_PENDING.store(1, Ordering::Relaxed);
+                }
+            },
+        )
         .unwrap();
 
     for (offset, store) in [
@@ -276,21 +272,6 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
 
                 if store == "hmi_mngr" {
                     force_hmi_gui_state(uc);
-                    log::info!(
-                        "PROCHMI: clHMIMngr::bExecute this={:#x} state={} pending={} gui={:#x}",
-                        ptr,
-                        read_u8(uc, ptr + CL_HMI_MNGR_STATE),
-                        read_u8(uc, ptr + CL_HMI_MNGR_PENDING_STATE),
-                        HMI_GUI_POINTER.load(Ordering::Relaxed)
-                    );
-                } else {
-                    log::info!(
-                        "PROCHMI: clGUIWidgetEngine::bExecute this={:#x} previous={} pending=0x{:08x} started={}",
-                        ptr,
-                        read_u8(uc, ptr + 0x18),
-                        read_u32(uc, ptr + CL_GUI_PENDING_POWER_STATE),
-                        read_u8(uc, ptr + CL_GUI_STARTED)
-                    );
                 }
             })
             .unwrap();
@@ -380,8 +361,144 @@ pub fn force_hmi_gui_state(unicorn: &mut Unicorn<'_, Context>) -> bool {
     true
 }
 
+fn post_gui_message_queue(
+    unicorn: &mut Unicorn<'_, Context>,
+    queue: u32,
+    receiver: u32,
+    event_index: u32,
+) -> bool {
+    let head = read_u32(unicorn, queue + 8);
+    let tail = read_u32(unicorn, queue + 0xc);
+    let capacity = read_u32(unicorn, queue + 4);
+    let entries = read_u32(unicorn, queue);
+    if queue == 0 || entries == 0 || capacity == 0 {
+        return false;
+    }
+
+    let next = if tail + 1 == capacity { 0 } else { tail + 1 };
+    if next == head {
+        return false;
+    }
+
+    let entry = entries + tail * 0x10;
+    let _ = write_u32(unicorn, entry, receiver);
+    let _ = write_u32(unicorn, entry + 4, 0);
+    let _ = write_u32(unicorn, entry + 8, 0);
+    let _ = write_u32(unicorn, entry + 0xc, event_index);
+    let _ = write_u32(unicorn, queue + 0xc, next);
+    true
+}
+
+fn post_gui_internal_events(unicorn: &mut Unicorn<'_, Context>) {
+    let messaging = GUI_MESSAGING_POINTER.load(Ordering::Relaxed);
+    if messaging == 0 {
+        return;
+    }
+
+    let sent = GUI_INTERNAL_EVENT_SENT_COUNT.load(Ordering::Relaxed) as usize;
+    if sent >= GUI_INTERNAL_EVENT_COUNT as usize {
+        return;
+    }
+
+    let event_index = GUI_INTERNAL_EVENTS[sent];
+    let queue = read_u32(unicorn, messaging + 4);
+    if post_gui_message_queue(unicorn, queue, messaging, event_index) {
+        let count = GUI_INTERNAL_EVENT_SENT_COUNT.fetch_add(1, Ordering::Relaxed);
+        log::info!(
+            "PROCHMI: posted GUI message event={:#x} queue={:#x} count={}",
+            event_index,
+            queue,
+            count + 1
+        );
+    }
+}
+
+fn post_gui_util_startup_anim_status(unicorn: &mut Unicorn<'_, Context>, status: u32) -> bool {
+    let queue = GUI_UTIL_MSGBOX_QUEUE.load(Ordering::Relaxed);
+    if queue == 0 {
+        return false;
+    }
+
+    let buffer = read_u32(unicorn, queue + 4);
+    let read = read_u32(unicorn, queue + 8);
+    let write = read_u32(unicorn, queue + 0xc);
+    let wrap = read_u32(unicorn, queue + 0x10);
+    let max = read_u32(unicorn, queue + 0x14);
+    const MSG_SIZE: u32 = 12;
+
+    if buffer == 0 || max < MSG_SIZE {
+        log::info!(
+            "PROCHMI: GUI_UTIL startup animation queue not ready queue={:#x} buffer={:#x} read={} write={} wrap={} max={}",
+            queue,
+            buffer,
+            read,
+            write,
+            wrap,
+            max
+        );
+        return false;
+    }
+
+    let mut offset = write;
+    if max.saturating_sub(offset) < MSG_SIZE {
+        if offset < read || read <= MSG_SIZE {
+            log::info!(
+                "PROCHMI: GUI_UTIL startup animation queue has no room queue={:#x} read={} write={} wrap={} max={}",
+                queue,
+                read,
+                write,
+                wrap,
+                max
+            );
+            return false;
+        }
+        let _ = write_u32(unicorn, queue + 0x10, offset);
+        offset = 0;
+    }
+
+    if max.saturating_sub(offset) < MSG_SIZE {
+        return false;
+    }
+
+    let next = offset + MSG_SIZE;
+    let _ = write_u32(unicorn, buffer + offset, next);
+    let _ = write_u32(unicorn, buffer + offset + 4, 6);
+    let _ = write_u32(unicorn, buffer + offset + 8, status);
+    let callback = read_u32(unicorn, queue + 0x30);
+    let context = read_u32(unicorn, queue + 0x34);
+    let _ = write_u32(unicorn, queue + 0xc, next);
+
+    log::info!(
+        "PROCHMI: posted GUI_UTIL startup animation status queue={:#x} buffer={:#x} read={} write={} next={} status={} callback={:#x} context={:#x}",
+        queue,
+        buffer,
+        read,
+        write,
+        next,
+        status,
+        callback,
+        context
+    );
+    true
+}
+
 pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
     let now = Instant::now();
+    if GUI_INTERNAL_POST_PENDING.load(Ordering::Relaxed) != 0
+        && GUI_MESSAGING_POINTER.load(Ordering::Relaxed) != 0
+        && GUI_INTERNAL_EVENT_SENT_COUNT.load(Ordering::Relaxed) < GUI_INTERNAL_EVENT_COUNT
+    {
+        post_gui_internal_events(unicorn);
+    }
+
+    if GUI_ENGINE_ADDRESS.load(Ordering::Relaxed) != 0
+        && GUI_UTIL_STARTUP_STATUS_POSTED.load(Ordering::Relaxed) < 1
+    {
+        if post_gui_util_startup_anim_status(unicorn, 1) {
+            GUI_UTIL_STARTUP_STATUS_POSTED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     let ready = PROCHMI_TICK_NEXT.with(|cell| match cell.get() {
         None => {
             cell.set(Some(now + Duration::from_millis(100)));
@@ -444,12 +561,11 @@ fn svg_fake_handle(unicorn: &mut Unicorn<'_, Context>) -> u32 {
         let data = unicorn.get_data();
         data.mmu.clone()
     };
-    let fake = mmu_arc.lock().unwrap().heap_alloc(
-        unicorn,
-        0x1000,
-        Prot::READ | Prot::WRITE,
-        "[svg-fake]",
-    );
+    let fake =
+        mmu_arc
+            .lock()
+            .unwrap()
+            .heap_alloc(unicorn, 0x1000, Prot::READ | Prot::WRITE, "[svg-fake]");
     SVG_FAKE_HANDLE.store(fake, Ordering::Relaxed);
     log::info!("PROCHMI: allocated SVG fake resource surface {:#x}", fake);
     fake
@@ -468,19 +584,14 @@ fn install_hmi_mngr_initialize_before_v_start_thread(
     trampoline_bytes.extend_from_slice(&[0x11, 0x40, 0x2d, 0xe9]); // push {r0, r4, lr}
     trampoline_bytes.extend_from_slice(&arm_bl(lua_initialize + 4, hmi_initialize));
     trampoline_bytes.extend_from_slice(&arm_bl(lua_initialize + 8, gui_initialize));
-    trampoline_bytes.extend_from_slice(&arm_bl(
-        lua_initialize + 20,
-        display_initialize,
-    ));
+    trampoline_bytes.extend_from_slice(&[0xc8, 0x00, 0xa0, 0xe3]); // mov r0, #200
+    trampoline_bytes.extend_from_slice(&[0x00, 0x01, 0xa0, 0xe1]); // mov r0, r0, lsl #2
+    trampoline_bytes.extend_from_slice(&[0xf0, 0x10, 0xa0, 0xe3]); // mov r1, #240
+    trampoline_bytes.extend_from_slice(&[0x81, 0x10, 0xa0, 0xe1]); // mov r1, r1, lsl #1
+    trampoline_bytes.extend_from_slice(&arm_bl(lua_initialize + 28, display_initialize));
     trampoline_bytes.extend_from_slice(&[0x11, 0x40, 0xbd, 0xe8]); // pop {r0, r4, lr}
     trampoline_bytes.extend_from_slice(&[0x00, 0x00, 0xa0, 0xe3]); // mov r0, #0
     trampoline_bytes.extend_from_slice(&[0x1e, 0xff, 0x2f, 0xe1]); // bx lr
-    trampoline_bytes.splice(
-        12..12,
-        [0x20, 0x00, 0x03, 0xe3]
-            .into_iter()
-            .chain([0xe0, 0x00, 0x01, 0xe3]),
-    );
 
     assert_eq!(trampoline_bytes.len(), TRAMPOLINE_SIZE);
     unicorn
@@ -517,10 +628,6 @@ fn arm_bl(from: u32, to: u32) -> [u8; 4] {
     arm_branch(from, to, 0xeb00_0000)
 }
 
-fn arm_b(from: u32, to: u32) -> [u8; 4] {
-    arm_branch(from, to, 0xea00_0000)
-}
-
 fn arm_branch(from: u32, to: u32, opcode: u32) -> [u8; 4] {
     let offset = to
         .wrapping_sub(from + 8)
@@ -536,6 +643,17 @@ fn read_u32(unicorn: &Unicorn<'_, Context>, addr: u32) -> u32 {
     let mut buf = [0_u8; 4];
     match unicorn.mem_read(addr as u64, &mut buf) {
         Ok(()) => u32::from_le_bytes(buf),
+        Err(_) => 0,
+    }
+}
+
+fn read_u16(unicorn: &Unicorn<'_, Context>, addr: u32) -> u32 {
+    if addr == 0 {
+        return 0;
+    }
+    let mut buf = [0_u8; 2];
+    match unicorn.mem_read(addr as u64, &mut buf) {
+        Ok(()) => u16::from_le_bytes(buf) as u32,
         Err(_) => 0,
     }
 }

@@ -8,13 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use unicorn_engine::{RegisterARM, Unicorn};
 
 const GL_INVALID_ENUM: u32 = 0x0500;
-const GL_COMPILE_STATUS: u32 = 0x8b81;
-const GL_LINK_STATUS: u32 = 0x8b82;
 const GL_INFO_LOG_LENGTH: u32 = 0x8b84;
-const GL_VENDOR: u32 = 0x1f00;
-const GL_RENDERER: u32 = 0x1f01;
-const GL_VERSION: u32 = 0x1f02;
-const GL_EXTENSIONS: u32 = 0x1f03;
 
 const EGL_VENDOR: u32 = 0x3053;
 const EGL_VERSION: u32 = 0x3054;
@@ -31,8 +25,6 @@ thread_local! {
     static BACKEND_INIT_FAILED: Cell<bool> = const { Cell::new(false) };
     static API_LOG_COUNT: Cell<u32> = const { Cell::new(0) };
     static FRAME_DUMP_COUNT: Cell<u32> = const { Cell::new(0) };
-    static TEST_HMI_PROGRAM: Cell<u32> = const { Cell::new(0) };
-    static TEST_HMI_FAILED: Cell<bool> = const { Cell::new(false) };
 }
 
 struct Backend {
@@ -64,7 +56,7 @@ fn init_sdl_backend() -> Result<Backend, String> {
     let gl_context = window.gl_create_context()?;
     gl::load_with(|name| video.gl_get_proc_address(name) as *const _);
     let _ = video.gl_set_swap_interval(1);
-    let mut events = sdl.event_pump()?;
+    let events = sdl.event_pump()?;
 
     unsafe {
         gl::Viewport(0, 0, 800, 480);
@@ -92,7 +84,10 @@ pub fn tick() {
             match init_sdl_backend() {
                 Ok(backend) => *slot = Some(backend),
                 Err(err) => {
-                    log::warn!("GPU: SDL/GL backend unavailable, using null backend: {}", err);
+                    log::warn!(
+                        "GPU: SDL/GL backend unavailable, using null backend: {}",
+                        err
+                    );
                     BACKEND_INIT_FAILED.with(|failed| failed.set(true));
                     return;
                 }
@@ -139,7 +134,10 @@ fn ensure_backend() -> bool {
                 true
             }
             Err(err) => {
-                log::warn!("GPU: SDL/GL backend unavailable, using null backend: {}", err);
+                log::warn!(
+                    "GPU: SDL/GL backend unavailable, using null backend: {}",
+                    err
+                );
                 BACKEND_INIT_FAILED.with(|failed| failed.set(true));
                 false
             }
@@ -162,8 +160,12 @@ fn ureg(unicorn: &mut Unicorn<'_, Context>, register: RegisterARM) -> u32 {
     unicorn.reg_read(register).unwrap_or(0) as u32
 }
 
-fn float_reg(unicorn: &mut Unicorn<'_, Context>, register: RegisterARM) -> f32 {
-    f32::from_bits(unicorn.reg_read(register).unwrap_or(0) as u32)
+fn freg(unicorn: &mut Unicorn<'_, Context>, register: RegisterARM) -> f32 {
+    f32::from_bits(ureg(unicorn, register))
+}
+
+fn fstack(unicorn: &mut Unicorn<'_, Context>, index: usize) -> f32 {
+    f32::from_bits(stack_arg(unicorn, index))
 }
 
 fn read_u32(unicorn: &mut Unicorn<'_, Context>, address: u32) -> u32 {
@@ -313,9 +315,7 @@ fn clear_host_gl_errors() {
     if !backend_ready() {
         return;
     }
-    unsafe {
-        while gl::GetError() != 0 {}
-    }
+    unsafe { while gl::GetError() != 0 {} }
 }
 
 fn force_gl_error() {
@@ -372,246 +372,6 @@ fn dump_frame(backend: &mut Backend) {
         non_zero,
         path
     );
-}
-
-fn render_host_hmi_if_empty(backend: &mut Backend) {
-    if TEST_HMI_FAILED.with(|failed| failed.get()) {
-        return;
-    }
-
-    let (width, height) = backend.window.size();
-    if width == 0 || height == 0 {
-        return;
-    }
-
-    let area = (width as usize) * (height as usize) * 3;
-    let mut pixels = vec![0u8; area];
-    unsafe {
-        gl::ReadPixels(
-            0,
-            0,
-            width as i32,
-            height as i32,
-            gl::RGB,
-            gl::UNSIGNED_BYTE,
-            pixels.as_mut_ptr() as *mut core::ffi::c_void,
-        );
-    }
-
-    if pixels
-        .iter()
-        .any(|&value| value > 8)
-    {
-        return;
-    }
-
-    if draw_test_hmi(width, height) {
-        TEST_HMI_PROGRAM.with(|program| {
-            if program.get() != 0 {
-                log::info!("GPU: drew host HMI fallback buttons {}x{}", width, height);
-            }
-        });
-    }
-}
-
-fn draw_test_hmi(width: u32, height: u32) -> bool {
-    let program = match ensure_test_hmi_program() {
-        Some(program) => program,
-        None => {
-            TEST_HMI_FAILED.with(|failed| failed.set(true));
-            return false;
-        }
-    };
-
-    unsafe {
-        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-        gl::Disable(gl::SCISSOR_TEST);
-        gl::Disable(gl::DEPTH_TEST);
-        gl::Disable(gl::CULL_FACE);
-        gl::Disable(gl::BLEND);
-        gl::Viewport(0, 0, width as i32, height as i32);
-        gl::ClearColor(0.03, 0.04, 0.06, 1.0);
-        gl::Clear(gl::COLOR_BUFFER_BIT);
-        gl::UseProgram(program);
-
-        let position = gl::GetAttribLocation(program, b"pos\0".as_ptr());
-        let color = gl::GetUniformLocation(program, b"color\0".as_ptr());
-        let mut buffer = 0u32;
-        gl::GenBuffers(1, &mut buffer);
-        gl::BindBuffer(gl::ARRAY_BUFFER, buffer);
-        gl::BufferData(
-            gl::ARRAY_BUFFER,
-            128,
-            std::ptr::null(),
-            gl::DYNAMIC_DRAW,
-        );
-        if position >= 0 {
-            gl::EnableVertexAttribArray(position as u32);
-            gl::VertexAttribPointer(
-                position as u32,
-                2,
-                gl::FLOAT,
-                gl::FALSE,
-                8,
-                std::ptr::null(),
-            );
-        }
-
-        for rect in host_hmi_rects(width, height) {
-            let x = (rect.x / width as f32) * 2.0 - 1.0;
-            let y = 1.0 - (rect.y / height as f32) * 2.0;
-            let w = (rect.w / width as f32) * 2.0;
-            let h = (rect.h / height as f32) * 2.0;
-            let vertices = [
-                x, y, x + w, y, x, y - h, x + w, y - h,
-            ];
-            gl::BufferSubData(
-                gl::ARRAY_BUFFER,
-                0,
-                (vertices.len() * std::mem::size_of::<f32>()) as isize,
-                vertices.as_ptr() as *const core::ffi::c_void,
-            );
-            gl::Uniform4f(color, rect.r, rect.g, rect.b, 1.0);
-            gl::DrawArrays(gl::TRIANGLE_STRIP, 0, 4);
-        }
-
-        if position >= 0 {
-            gl::DisableVertexAttribArray(position as u32);
-        }
-        gl::UseProgram(0);
-        gl::Finish();
-    }
-
-    true
-}
-
-fn ensure_test_hmi_program() -> Option<u32> {
-    let existing = TEST_HMI_PROGRAM.with(|program| program.get());
-    if existing != 0 {
-        return Some(existing);
-    }
-
-    const VERTEX_SOURCE: &str = r#"
-attribute vec2 pos;
-void main() {
-    gl_Position = vec4(pos, 0.0, 1.0);
-}
-"#;
-
-    const FRAGMENT_SOURCE: &str = r#"
-precision mediump float;
-uniform vec4 color;
-void main() {
-    gl_FragColor = color;
-}
-"#;
-
-    unsafe {
-        let vertex = compile_test_shader(gl::VERTEX_SHADER, VERTEX_SOURCE)?;
-        let fragment = compile_test_shader(gl::FRAGMENT_SHADER, FRAGMENT_SOURCE)?;
-        let program = gl::CreateProgram();
-        gl::AttachShader(program, vertex);
-        gl::AttachShader(program, fragment);
-        gl::LinkProgram(program);
-
-        let mut status = 0i32;
-        gl::GetProgramiv(program, GL_LINK_STATUS, &mut status);
-        if status == 0 {
-            let mut log = vec![0u8; 1024];
-            let mut len = 0i32;
-            gl::GetProgramInfoLog(program, log.len() as i32, &mut len, log.as_mut_ptr() as *mut _);
-            log::warn!(
-                "GPU: host HMI fallback shader link failed: {}",
-                String::from_utf8_lossy(&log[..(len.max(0) as usize).min(log.len())])
-            );
-            return None;
-        }
-
-        gl::DeleteShader(vertex);
-        gl::DeleteShader(fragment);
-        TEST_HMI_PROGRAM.with(|stored| stored.set(program));
-        Some(program)
-    }
-}
-
-unsafe fn compile_test_shader(kind: u32, source: &str) -> Option<u32> {
-    let c_source = CString::new(source).ok()?;
-    let shader = gl::CreateShader(kind);
-    let ptrs = [c_source.as_ptr() as *const u8];
-    gl::ShaderSource(shader, 1, ptrs.as_ptr(), std::ptr::null());
-    gl::CompileShader(shader);
-
-    let mut status = 0i32;
-    gl::GetShaderiv(shader, GL_COMPILE_STATUS, &mut status);
-    if status == 0 {
-        let mut log = vec![0u8; 1024];
-        let mut len = 0i32;
-        gl::GetShaderInfoLog(shader, log.len() as i32, &mut len, log.as_mut_ptr() as *mut _);
-        log::warn!(
-            "GPU: host HMI fallback shader compile failed: {}",
-            String::from_utf8_lossy(&log[..(len.max(0) as usize).min(log.len())])
-        );
-        return None;
-    }
-
-    Some(shader)
-}
-
-struct HostRect {
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    r: f32,
-    g: f32,
-    b: f32,
-}
-
-fn host_hmi_rects(width: u32, height: u32) -> Vec<HostRect> {
-    let w = width as f32;
-    let h = height as f32;
-    let mut rects = Vec::new();
-
-    rects.push(rect(0.0, 0.0, w, 88.0, 0.06, 0.22, 0.48));
-    rects.push(rect(0.0, h - 120.0, w, 120.0, 0.08, 0.10, 0.16));
-    rects.push(rect(24.0, 112.0, w - 48.0, h - 256.0, 0.10, 0.13, 0.20));
-
-    let colors = [
-        (0.18, 0.55, 0.95),
-        (0.20, 0.72, 0.35),
-        (0.94, 0.55, 0.15),
-        (0.66, 0.32, 0.72),
-        (0.86, 0.24, 0.30),
-        (0.20, 0.72, 0.72),
-        (0.88, 0.76, 0.20),
-        (0.42, 0.48, 0.58),
-    ];
-    let cols = 4usize;
-    let rows = 2usize;
-    let margin = 44.0;
-    let top = 164.0;
-    let bottom = h - 180.0;
-    let area_h = bottom - top;
-    let gap = 24.0;
-    let cell_w = (w - (margin * 2.0) - gap * (cols as f32 - 1.0)) / cols as f32;
-    let cell_h = (area_h - gap * (rows as f32 - 1.0)) / rows as f32;
-
-    for row in 0..rows {
-        for col in 0..cols {
-            let index = row * cols + col;
-            let color = colors[index % colors.len()];
-            let x = margin + col as f32 * (cell_w + gap);
-            let y = top + row as f32 * (cell_h + gap);
-            rects.push(rect(x, y, cell_w, cell_h, color.0, color.1, color.2));
-            rects.push(rect(x + 12.0, y + 12.0, cell_w - 24.0, cell_h - 24.0, 0.05, 0.06, 0.09));
-        }
-    }
-
-    rects
-}
-
-fn rect(x: f32, y: f32, w: f32, h: f32, r: f32, g: f32, b: f32) -> HostRect {
-    HostRect { x, y, w, h, r, g, b }
 }
 
 fn log_api(unicorn: &mut Unicorn<'_, Context>, prefix: &str, name: &str) {
@@ -672,7 +432,6 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
                 unsafe {
                     gl::Finish();
                 }
-                render_host_hmi_if_empty(backend);
                 dump_frame(backend);
                 let _ = backend.window.gl_swap_window();
                 while let Some(event) = backend.events.poll_event() {
@@ -786,12 +545,15 @@ pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
                 ureg(unicorn, RegisterARM::R0),
                 ureg(unicorn, RegisterARM::R1),
             ),
-            "glBlendColor" => gl::BlendColor(
-                float_reg(unicorn, RegisterARM::S0),
-                float_reg(unicorn, RegisterARM::S1),
-                float_reg(unicorn, RegisterARM::S2),
-                float_reg(unicorn, RegisterARM::S3),
-            ),
+            "glBlendColor" => {
+                let values = [
+                    freg(unicorn, RegisterARM::R0),
+                    freg(unicorn, RegisterARM::R1),
+                    freg(unicorn, RegisterARM::R2),
+                    freg(unicorn, RegisterARM::R3),
+                ];
+                gl::BlendColor(values[0], values[1], values[2], values[3]);
+            }
             "glBlendEquation" => gl::BlendEquation(ureg(unicorn, RegisterARM::R0)),
             "glBlendEquationSeparate" => gl::BlendEquationSeparate(
                 ureg(unicorn, RegisterARM::R0),
@@ -848,18 +610,20 @@ pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
                     },
                 );
             }
-            "glCheckFramebufferStatus" => return gl::CheckFramebufferStatus(ureg(
-                unicorn,
-                RegisterARM::R0,
-            )) as u32,
+            "glCheckFramebufferStatus" => {
+                return gl::CheckFramebufferStatus(ureg(unicorn, RegisterARM::R0)) as u32
+            }
             "glClear" => gl::Clear(ureg(unicorn, RegisterARM::R0)),
-            "glClearColor" => gl::ClearColor(
-                float_reg(unicorn, RegisterARM::S0),
-                float_reg(unicorn, RegisterARM::S1),
-                float_reg(unicorn, RegisterARM::S2),
-                float_reg(unicorn, RegisterARM::S3),
-            ),
-            "glClearDepthf" => gl::ClearDepthf(float_reg(unicorn, RegisterARM::S0)),
+            "glClearColor" => {
+                let values = [
+                    freg(unicorn, RegisterARM::R0),
+                    freg(unicorn, RegisterARM::R1),
+                    freg(unicorn, RegisterARM::R2),
+                    freg(unicorn, RegisterARM::R3),
+                ];
+                gl::ClearColor(values[0], values[1], values[2], values[3]);
+            }
+            "glClearDepthf" => gl::ClearDepthf(freg(unicorn, RegisterARM::R0)),
             "glClearStencil" => gl::ClearStencil(ureg(unicorn, RegisterARM::R0) as i32),
             "glColorMask" => gl::ColorMask(
                 ureg(unicorn, RegisterARM::R0) as u8,
@@ -900,8 +664,8 @@ pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             "glDepthFunc" => gl::DepthFunc(ureg(unicorn, RegisterARM::R0)),
             "glDepthMask" => gl::DepthMask(ureg(unicorn, RegisterARM::R0) as u8),
             "glDepthRangef" => gl::DepthRangef(
-                float_reg(unicorn, RegisterARM::S0),
-                float_reg(unicorn, RegisterARM::S1),
+                freg(unicorn, RegisterARM::R0),
+                freg(unicorn, RegisterARM::R1),
             ),
             "glDetachShader" => gl::DetachShader(
                 ureg(unicorn, RegisterARM::R0),
@@ -1026,15 +790,18 @@ pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
                 let cname = CString::new(name).unwrap_or_else(|_| CString::new("").unwrap());
                 return gl::GetUniformLocation(program, cname.as_ptr()) as u32;
             }
-            "glHint" => gl::Hint(ureg(unicorn, RegisterARM::R0), ureg(unicorn, RegisterARM::R1)),
+            "glHint" => gl::Hint(
+                ureg(unicorn, RegisterARM::R0),
+                ureg(unicorn, RegisterARM::R1),
+            ),
             "glLinkProgram" => gl::LinkProgram(ureg(unicorn, RegisterARM::R0)),
             "glPixelStorei" => gl::PixelStorei(
                 ureg(unicorn, RegisterARM::R0),
                 ureg(unicorn, RegisterARM::R1) as i32,
             ),
             "glPolygonOffset" => gl::PolygonOffset(
-                float_reg(unicorn, RegisterARM::S0),
-                float_reg(unicorn, RegisterARM::S1),
+                freg(unicorn, RegisterARM::R0),
+                freg(unicorn, RegisterARM::R1),
             ),
             "glReadPixels" => {
                 let x = ureg(unicorn, RegisterARM::R0) as i32;
@@ -1100,6 +867,14 @@ pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
                     };
                     strings.push(CString::new(s).unwrap_or_else(|_| CString::new("").unwrap()));
                 }
+                strings = strings
+                    .into_iter()
+                    .map(|source| {
+                        let patched =
+                            patch_vertex_shader_position_w(source.to_string_lossy().as_ref());
+                        CString::new(patched).unwrap_or_else(|_| CString::new("").unwrap())
+                    })
+                    .collect();
                 let ptrs: Vec<*const u8> =
                     strings.iter().map(|s| s.as_ptr() as *const u8).collect();
                 gl::ShaderSource(shader, count as i32, ptrs.as_ptr(), std::ptr::null());
@@ -1174,7 +949,7 @@ pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             "glTexParameterf" => gl::TexParameterf(
                 ureg(unicorn, RegisterARM::R0),
                 ureg(unicorn, RegisterARM::R1),
-                float_reg(unicorn, RegisterARM::S0),
+                freg(unicorn, RegisterARM::R2),
             ),
             "glTexParameteri" => gl::TexParameteri(
                 ureg(unicorn, RegisterARM::R0),
@@ -1190,7 +965,8 @@ pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             }
             "glUniform1f" => {
                 let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                gl::Uniform1f(loc, float_reg(unicorn, RegisterARM::S0));
+                let value = freg(unicorn, RegisterARM::R1);
+                gl::Uniform1f(loc, value);
             }
             "glUniform1fv" => {
                 let loc = ureg(unicorn, RegisterARM::R0) as i32;
@@ -1210,11 +986,14 @@ pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
                 let values = read_i32_array(unicorn, values_ptr, count as usize);
                 gl::Uniform1iv(loc, count, values.as_ptr());
             }
-            "glUniform2f" => gl::Uniform2f(
-                ureg(unicorn, RegisterARM::R0) as i32,
-                float_reg(unicorn, RegisterARM::S0),
-                float_reg(unicorn, RegisterARM::S1),
-            ),
+            "glUniform2f" => {
+                let loc = ureg(unicorn, RegisterARM::R0) as i32;
+                let values = [
+                    freg(unicorn, RegisterARM::R1),
+                    freg(unicorn, RegisterARM::R2),
+                ];
+                gl::Uniform2f(loc, values[0], values[1]);
+            }
             "glUniform2fv" => {
                 let loc = ureg(unicorn, RegisterARM::R0) as i32;
                 let count = ureg(unicorn, RegisterARM::R1) as i32;
@@ -1234,12 +1013,15 @@ pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
                 let values = read_i32_array(unicorn, values_ptr, count as usize * 2);
                 gl::Uniform2iv(loc, count, values.as_ptr());
             }
-            "glUniform3f" => gl::Uniform3f(
-                ureg(unicorn, RegisterARM::R0) as i32,
-                float_reg(unicorn, RegisterARM::S0),
-                float_reg(unicorn, RegisterARM::S1),
-                float_reg(unicorn, RegisterARM::S2),
-            ),
+            "glUniform3f" => {
+                let loc = ureg(unicorn, RegisterARM::R0) as i32;
+                let values = [
+                    freg(unicorn, RegisterARM::R1),
+                    freg(unicorn, RegisterARM::R2),
+                    freg(unicorn, RegisterARM::R3),
+                ];
+                gl::Uniform3f(loc, values[0], values[1], values[2]);
+            }
             "glUniform3fv" => {
                 let loc = ureg(unicorn, RegisterARM::R0) as i32;
                 let count = ureg(unicorn, RegisterARM::R1) as i32;
@@ -1260,13 +1042,16 @@ pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
                 let values = read_i32_array(unicorn, values_ptr, count as usize * 3);
                 gl::Uniform3iv(loc, count, values.as_ptr());
             }
-            "glUniform4f" => gl::Uniform4f(
-                ureg(unicorn, RegisterARM::R0) as i32,
-                float_reg(unicorn, RegisterARM::S0),
-                float_reg(unicorn, RegisterARM::S1),
-                float_reg(unicorn, RegisterARM::S2),
-                float_reg(unicorn, RegisterARM::S3),
-            ),
+            "glUniform4f" => {
+                let loc = ureg(unicorn, RegisterARM::R0) as i32;
+                let values = [
+                    freg(unicorn, RegisterARM::R1),
+                    freg(unicorn, RegisterARM::R2),
+                    freg(unicorn, RegisterARM::R3),
+                    fstack(unicorn, 0),
+                ];
+                gl::Uniform4f(loc, values[0], values[1], values[2], values[3]);
+            }
             "glUniform4fv" => {
                 let loc = ureg(unicorn, RegisterARM::R0) as i32;
                 let count = ureg(unicorn, RegisterARM::R1) as i32;
@@ -1299,16 +1084,16 @@ pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             "glUniformMatrix3fv" => {
                 let loc = ureg(unicorn, RegisterARM::R0) as i32;
                 let count = ureg(unicorn, RegisterARM::R1) as i32;
-                let transpose = stack_arg(unicorn, 0) as u8;
-                let values_ptr = stack_arg(unicorn, 1);
+                let transpose = ureg(unicorn, RegisterARM::R2) as u8;
+                let values_ptr = ureg(unicorn, RegisterARM::R3);
                 let values = read_f32_array(unicorn, values_ptr, count as usize * 9);
                 gl::UniformMatrix3fv(loc, count, transpose, values.as_ptr());
             }
             "glUniformMatrix4fv" => {
                 let loc = ureg(unicorn, RegisterARM::R0) as i32;
                 let count = ureg(unicorn, RegisterARM::R1) as i32;
-                let transpose = stack_arg(unicorn, 0) as u8;
-                let values_ptr = stack_arg(unicorn, 1);
+                let transpose = ureg(unicorn, RegisterARM::R2) as u8;
+                let values_ptr = ureg(unicorn, RegisterARM::R3);
                 let values = read_f32_array(unicorn, values_ptr, count as usize * 16);
                 gl::UniformMatrix4fv(loc, count, transpose, values.as_ptr());
             }
@@ -1316,25 +1101,25 @@ pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             "glValidateProgram" => gl::ValidateProgram(ureg(unicorn, RegisterARM::R0)),
             "glVertexAttrib1f" => gl::VertexAttrib1f(
                 ureg(unicorn, RegisterARM::R0),
-                float_reg(unicorn, RegisterARM::S0),
+                freg(unicorn, RegisterARM::R1),
             ),
             "glVertexAttrib2f" => gl::VertexAttrib2f(
                 ureg(unicorn, RegisterARM::R0),
-                float_reg(unicorn, RegisterARM::S0),
-                float_reg(unicorn, RegisterARM::S1),
+                freg(unicorn, RegisterARM::R1),
+                freg(unicorn, RegisterARM::R2),
             ),
             "glVertexAttrib3f" => gl::VertexAttrib3f(
                 ureg(unicorn, RegisterARM::R0),
-                float_reg(unicorn, RegisterARM::S0),
-                float_reg(unicorn, RegisterARM::S1),
-                float_reg(unicorn, RegisterARM::S2),
+                freg(unicorn, RegisterARM::R1),
+                freg(unicorn, RegisterARM::R2),
+                freg(unicorn, RegisterARM::R3),
             ),
             "glVertexAttrib4f" => gl::VertexAttrib4f(
                 ureg(unicorn, RegisterARM::R0),
-                float_reg(unicorn, RegisterARM::S0),
-                float_reg(unicorn, RegisterARM::S1),
-                float_reg(unicorn, RegisterARM::S2),
-                float_reg(unicorn, RegisterARM::S3),
+                freg(unicorn, RegisterARM::R1),
+                freg(unicorn, RegisterARM::R2),
+                freg(unicorn, RegisterARM::R3),
+                fstack(unicorn, 0),
             ),
             "glVertexAttribPointer" => vertex_attrib_pointer(unicorn),
             "glViewport" => gl::Viewport(
@@ -1388,6 +1173,40 @@ fn gl_fallback(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
     }
 }
 
+fn patch_vertex_shader_position_w(source: &str) -> String {
+    if !source.contains("gl_Position") || source.contains("_hmi_fixw") {
+        return source.to_string();
+    }
+    if !source.contains("attribute") || !source.contains("position") {
+        return source.to_string();
+    }
+
+    let mut patched = source
+        .replace(
+            "gl_Position = mvp * position;",
+            "gl_Position = mvp * _hmi_fixw(position);",
+        )
+        .replace(
+            "gl_Position = position;",
+            "gl_Position = _hmi_fixw(position);",
+        );
+
+    if patched == source {
+        return patched;
+    }
+
+    if let Some(insert_at) = patched.find("void main") {
+        patched.insert_str(
+            insert_at,
+            "highp vec4 _hmi_fixw(highp vec4 p) { return vec4(p.xyz, 1.0); }\n",
+        );
+    } else {
+        patched.push_str("\nhighp vec4 _hmi_fixw(highp vec4 p) { return vec4(p.xyz, 1.0); }\n");
+    }
+
+    patched
+}
+
 #[derive(Clone, Copy)]
 enum GenKind {
     Buffer,
@@ -1438,22 +1257,23 @@ fn texture_bytes(
     let width = clamp_texture_dim(width) as usize;
     let height = clamp_texture_dim(height) as usize;
     let channels = match format {
-        0x1903 => 1,          // RED / LUMINANCE fallback
-        0x1906 => 1,          // LUMINANCE
-        0x1907 => 2,          // LUMINANCE_ALPHA
-        0x1908 => 3,          // RGB
-        0x1909 => 3,          // BGR
-        0x190a => 4,          // RGBA
-        0x8c42 => 4,          // BGRA
-        0x8d48 => 4,          // SRGB_ALPHA
+        0x1903 => 1,
+        0x1906 => 1,
+        0x1907 => 3,
+        0x1908 => 4,
+        0x1909 => 1,
+        0x190a => 2,
+        0x80e1 => 4,
+        0x8c40 => 3,
+        0x8c42 => 4,
+        0x8d48 => 4,
         _ => 4,
     };
-    let per_pixel = if kind == 0x1401 {
-        2
-    } else if kind == 0x1406 {
-        4
-    } else {
-        1
+    let per_pixel = match kind {
+        0x1400 | 0x1401 => 1,
+        0x1402 | 0x1403 => 2,
+        0x1404 | 0x1405 | 0x1406 => 4,
+        _ => 1,
     };
     let size = width
         .saturating_mul(height)
@@ -1524,13 +1344,6 @@ fn vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) {
             data.as_ptr() as *const _,
             gl::DYNAMIC_DRAW,
         );
-        gl::VertexAttribPointer(
-            index,
-            size,
-            kind,
-            normalized,
-            stride,
-            std::ptr::null(),
-        );
+        gl::VertexAttribPointer(index, size, kind, normalized, stride, std::ptr::null());
     }
 }
