@@ -19,6 +19,44 @@ pub fn hook_thread_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
             )
             .unwrap();
     }
+
+    if std::env::var_os("EMU_OSAL_TRACE_THREADS").is_some_and(|v| !v.is_empty() && v != "0") {
+        for (offset, reason, log_r10) in [
+            (
+                0x4851_58ac - ORIGINAL_BASE,
+                "OSAL_ThreadCreate duplicate process/thread name",
+                true,
+            ),
+            (
+                0x4851_5b1c - ORIGINAL_BASE,
+                "OSAL_ThreadCreate pthread_create failed",
+                false,
+            ),
+            (
+                0x4851_5b68 - ORIGINAL_BASE,
+                "OSAL_ThreadCreate thread table full",
+                false,
+            ),
+        ] {
+            let addr = base_address + offset;
+            unicorn
+                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                    let r10 = if log_r10 {
+                        uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32
+                    } else {
+                        0
+                    };
+                    log::warn!(
+                        "0x{:x} [{}] [LIBOSAL] {} (r10={:#x})",
+                        addr,
+                        uc.get_data().inner.thread_id(),
+                        reason,
+                        r10
+                    );
+                })
+                .unwrap();
+        }
+    }
 }
 
 fn log_thread_call(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address: u32, name: &str) {

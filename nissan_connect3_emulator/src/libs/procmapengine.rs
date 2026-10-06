@@ -7,17 +7,30 @@ const ORIGINAL_BASE: u32 = 0x0000_8000;
 const AIL_VSTART_APP_ENTRY: u32 = 0x0065_d664 - ORIGINAL_BASE;
 const APP_NEW_STATE: u32 = 0x0039_0064 - ORIGINAL_BASE;
 const CREATE_DEFAULT_VIEW_FLAG: u32 = 0x0071_5519 - ORIGINAL_BASE;
+const INIT_APP_MAP_ENGINE: u32 = 0x0038_ab50 - ORIGINAL_BASE;
+const INIT_APP_REGISTRY_CHECK: u32 = 0x0038_abE4 - ORIGINAL_BASE;
+const INIT_APP_MAP_GLOBAL_CHECK: u32 = 0x0038_abf4 - ORIGINAL_BASE;
+const INIT_APP_MAP_NEW_RESULT: u32 = 0x0038_ac04 - ORIGINAL_BASE;
+const INIT_MAP_ENGINE_VTABLE_RESULT: u32 = 0x0038_ac30 - ORIGINAL_BASE;
 const GUEST_CALL_STUB_SIZE: u32 = 4;
 const ACTIVE_APP_STATE: u32 = 3;
 
 static PROCMAP_BASE: AtomicU32 = AtomicU32::new(0);
 static PROCMAP_GUEST_CALL_STUB: AtomicU32 = AtomicU32::new(0);
 static APP_STATE_STARTED: AtomicBool = AtomicBool::new(false);
+static INIT_MAP_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     PROCMAP_BASE.store(base_address, Ordering::Relaxed);
     APP_STATE_STARTED.store(false, Ordering::Relaxed);
     PROCMAP_GUEST_CALL_STUB.store(0, Ordering::Relaxed);
+    INIT_MAP_TRACE_COUNT.store(0, Ordering::Relaxed);
+
+    if std::env::var_os("EMU_PROCMAPENGINE_TRACE_INIT")
+        .is_some_and(|value| !value.is_empty() && value != "0")
+    {
+        add_init_trace_hooks(unicorn, base_address);
+    }
 
     if std::env::var_os("EMU_PROCMAPENGINE_FORCE_ACTIVE_STATE")
         .is_none_or(|value| value.is_empty() || value == "0")
@@ -72,6 +85,53 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             }
         })
         .unwrap();
+}
+
+fn add_init_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    for (name, offset) in [
+        ("s32InitAppMapEngine", INIT_APP_MAP_ENGINE),
+        ("scd_bAppRegistryAvailable", INIT_APP_REGISTRY_CHECK),
+        (
+            "map-engine-global-check",
+            INIT_APP_MAP_GLOBAL_CHECK,
+        ),
+        ("map-engine-new-result", INIT_APP_MAP_NEW_RESULT),
+        ("map-engine-vtable-result", INIT_MAP_ENGINE_VTABLE_RESULT),
+    ] {
+        let addr = base_address + offset;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = INIT_MAP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count >= 20 {
+                    return;
+                }
+
+                let regs = [
+                    RegisterARM::R0,
+                    RegisterARM::R1,
+                    RegisterARM::R2,
+                    RegisterARM::R3,
+                    RegisterARM::R4,
+                    RegisterARM::R5,
+                    RegisterARM::R6,
+                ]
+                .map(|r| uc.reg_read(r).unwrap_or(0) as u32);
+                log::info!(
+                    "PROCMAPENGINE init trace {} at {:#x}: r0={:#x} r1={:#x} r2={:#x} \
+                     r3={:#x} r4={:#x} r5={:#x} r6={:#x}",
+                    name,
+                    addr,
+                    regs[0],
+                    regs[1],
+                    regs[2],
+                    regs[3],
+                    regs[4],
+                    regs[5],
+                    regs[6]
+                );
+            })
+            .unwrap();
+    }
 }
 
 fn ensure_guest_call_stub(unicorn: &mut Unicorn<'_, Context>) -> Option<u32> {

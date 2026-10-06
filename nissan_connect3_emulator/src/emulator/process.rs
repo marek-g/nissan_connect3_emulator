@@ -22,6 +22,7 @@ pub struct Process {
     file_system: Arc<Mutex<MountFileSystem>>,
     namespace: Arc<Mutex<SystemNamespace>>,
     next_thread_id: Arc<AtomicU32>,
+    process_id: u32,
 }
 
 impl Process {
@@ -30,11 +31,13 @@ impl Process {
         namespace: Arc<Mutex<SystemNamespace>>,
         // shared across every process so guest thread ids are globally unique
         next_thread_id: Arc<AtomicU32>,
+        process_id: u32,
     ) -> Self {
         Self {
             file_system,
             namespace,
             next_thread_id,
+            process_id,
         }
     }
 
@@ -57,6 +60,7 @@ impl Process {
                 self.namespace.clone(),
                 Arc::new(Mutex::new(Vec::new())),
                 self.next_thread_id.clone(),
+                self.process_id,
             )),
         };
 

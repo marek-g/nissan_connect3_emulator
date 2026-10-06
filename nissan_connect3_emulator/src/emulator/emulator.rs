@@ -6,7 +6,7 @@ use crate::os::file_system::MountFileSystem;
 use crate::os::syscalls::namespace::SystemNamespace;
 use crate::rtos;
 use std::error::Error;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -48,6 +48,7 @@ pub struct ProcessFactory {
     file_system: Arc<Mutex<MountFileSystem>>,
     namespace: Arc<Mutex<SystemNamespace>>,
     next_thread_id: Arc<AtomicU32>,
+    next_process_id: Arc<AtomicU32>,
 }
 
 impl ProcessFactory {
@@ -55,11 +56,13 @@ impl ProcessFactory {
         file_system: Arc<Mutex<MountFileSystem>>,
         namespace: Arc<Mutex<SystemNamespace>>,
         next_thread_id: Arc<AtomicU32>,
+        next_process_id: Arc<AtomicU32>,
     ) -> Self {
         Self {
             file_system,
             namespace,
             next_thread_id,
+            next_process_id,
         }
     }
 
@@ -68,10 +71,17 @@ impl ProcessFactory {
     }
 
     pub fn spawn_process(&self, spec: ProcessSpec) -> ProcessHandle {
+        let process_id = self.next_process_id.fetch_add(1, Ordering::Relaxed);
+        log::info!(
+            "spawn process pid={} path={}",
+            process_id,
+            spec.elf_filepath
+        );
         let process = Process::new(
             self.file_system.clone(),
             self.namespace.clone(),
             self.next_thread_id.clone(),
+            process_id,
         );
         let namespace = self.namespace.clone();
 
@@ -102,6 +112,8 @@ pub struct Emulator {
     namespace: Arc<Mutex<SystemNamespace>>,
     /// single monotonic counter so guest thread ids are unique across processes
     next_thread_id: Arc<AtomicU32>,
+    /// counter for guest process ids; OSAL uses getpid() for per-process bookkeeping
+    next_process_id: Arc<AtomicU32>,
 }
 
 impl Emulator {
@@ -110,6 +122,7 @@ impl Emulator {
             file_system: Arc::new(Mutex::new(file_system)),
             namespace: Arc::new(Mutex::new(SystemNamespace::new())),
             next_thread_id: Arc::new(AtomicU32::new(1)),
+            next_process_id: Arc::new(AtomicU32::new(1)),
         }
     }
 
@@ -123,6 +136,7 @@ impl Emulator {
             self.file_system.clone(),
             self.namespace.clone(),
             self.next_thread_id.clone(),
+            self.next_process_id.clone(),
         );
         let rtos_config = rtos::RtosBootConfig::from_env_with_default_envs(&specs);
         let handles = Arc::new(Mutex::new(Vec::with_capacity(specs.len())));

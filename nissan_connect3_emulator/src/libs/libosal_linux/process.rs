@@ -1,18 +1,46 @@
 use crate::emulator::context::Context;
 use crate::emulator::process_launcher;
 use crate::emulator::utils::read_string;
+use crate::os::code_stub::{add_code_stub, CodeStubHandler};
 use unicorn_engine::{RegisterARM, Unicorn};
 
 const OSAL_ERR_NONE: u32 = 0x72_0000;
 const OSAL_ERR_INTERNAL: u32 = 0x4d02;
 const OSAL_PROCESS_SPAWN: u32 = 0x4851_6d0c - 0x484d_8000;
+const OSAL_PROCESS_WHO_AM_I_PLT: u32 = 0x484e_ad84 - 0x484d_8000;
+const OSAL_PROCESS_WHO_AM_I_IMPL: u32 = 0x4851_41d8 - 0x484d_8000;
+const LIBC_GETPID_PLT: u32 = 0x484e_b138 - 0x484d_8000;
 
 fn is_out_process(filename: &str) -> bool {
     let lower = filename.to_ascii_lowercase();
     lower.ends_with(".out")
 }
 
+fn osal_process_who_am_i(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+    unicorn.get_data().process_id
+}
+
 pub fn hook_process_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    for (name, offset) in [
+        (
+            "OSAL_ProcessWhoAmI.plt",
+            base_address + OSAL_PROCESS_WHO_AM_I_PLT,
+        ),
+        (
+            "OSAL_ProcessWhoAmI",
+            base_address + OSAL_PROCESS_WHO_AM_I_IMPL,
+        ),
+        ("getpid", base_address + LIBC_GETPID_PLT),
+    ] {
+        add_code_stub(
+            unicorn,
+            "/opt/bosch/processes/libosal_linux_so.so",
+            offset,
+            name,
+            osal_process_who_am_i as CodeStubHandler,
+        );
+    }
+
     let address = base_address + OSAL_PROCESS_SPAWN;
     unicorn
         .add_code_hook(address as u64, address as u64, move |uc, _, _| {
