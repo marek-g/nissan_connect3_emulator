@@ -38,6 +38,16 @@ impl DevFileSystem {
             "/console",
             "/svg_resource",
             "/svg_layer",
+            "/cryptcard",
+            "/cryptcard2",
+            "/sda",
+            "/sdb",
+            "/sdc",
+            "/sdd",
+            "/sde",
+            "/sdf",
+            "/sdg",
+            "/sdh",
         ] {
             tmp_fs.insert_entry(name, FileType::File, Vec::new());
         }

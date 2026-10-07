@@ -208,6 +208,8 @@ fn open_internal(
 
     let open_file_flags = convert_open_file_flags(flags);
 
+    let thread = unicorn.get_data().inner.thread_id();
+    let elf_path = unicorn.get_data().elf_path.clone();
     match unicorn
         .get_data()
         .inner
@@ -216,8 +218,29 @@ fn open_internal(
         .unwrap()
         .open(&path_name, open_file_flags)
     {
-        Ok(fd) => fd as u32,
-        Err(err) => err.to_syscall_error(),
+        Ok(fd) => {
+            if path_name.starts_with("/dev") {
+                log::info!(
+                    "[{}] [SYSCALL] open {} flags={:#x} -> fd={}",
+                    thread,
+                    path_name,
+                    flags,
+                    fd
+                );
+            }
+            fd as u32
+        }
+        Err(err) => {
+            log::warn!(
+                "[{}] [SYSCALL] open {} flags={:#x} failed: {:?} (elf={})",
+                thread,
+                path_name,
+                flags,
+                err,
+                elf_path
+            );
+            err.to_syscall_error()
+        }
     }
 }
 
