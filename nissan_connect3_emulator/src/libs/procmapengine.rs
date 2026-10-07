@@ -22,6 +22,7 @@ const CCA_POWER_HANDLER: u32 = 0x0066_7a30 - ORIGINAL_BASE;
 const PORTCONTROL_AIL_BONINIT_RESULT: u32 = 0x0039_037c - ORIGINAL_BASE;
 const PORTCONTROL_INIT_RESULT: u32 = 0x0039_03b0 - ORIGINAL_BASE;
 const PORTCONTROL_HANDLER_RESULT: u32 = 0x0039_0424 - ORIGINAL_BASE;
+const PORTCONTROL_START_MAP_ENGINE: u32 = 0x0053_ae2c - ORIGINAL_BASE;
 const PORTCONTROL_HANDLER_FAILURE: u32 = 0x0039_04a4 - ORIGINAL_BASE;
 const MAP_TRACE_ERRMEM: u32 = 0x0047_eac4 - ORIGINAL_BASE;
 const AIL_HGET_LPM_IN_QUEUE_RESULT: u32 = 0x0065_d660 - ORIGINAL_BASE;
@@ -29,13 +30,61 @@ const AIL_SEND_CCA_POWER_MSG: u32 = 0x0066_14e4 - ORIGINAL_BASE;
 const AIL_SEND_CCA_POWER_MSG_RESULT: u32 = 0x0066_1578 - ORIGINAL_BASE;
 const AIL_POST_IPC_MESSAGE: u32 = 0x0067_0634 - ORIGINAL_BASE;
 const GUEST_CALL_STUB_SIZE: u32 = 4;
+const PROCMAP_ANSWER_SCRATCH_OFFSET: u32 = 0x100;
 const ACTIVE_APP_STATE: u32 = 3;
+const MAP_ENGINE_STATE_VAR: u32 = 0x0071_5520 - ORIGINAL_BASE;
+const RENDER_CONTROL_START: u32 = 0x003a_95ec - ORIGINAL_BASE;
+const RENDER_CONTROL_CREATE_VIEW_JOB: u32 = 0x004c_a9e0 - ORIGINAL_BASE;
+const RENDER_CONTROL_CREATE_VIEW_RESULT: u32 = 0x004c_aacc - ORIGINAL_BASE;
+const RENDER_CONTROL_GET_VIEW_RESULT: u32 = 0x003a_5d48 - ORIGINAL_BASE;
+const RENDER_CONTROL_QUEUE_STATE: u32 = 0x003a_8bec - ORIGINAL_BASE;
+const RENDER_CONTROL_ADD_JOB: u32 = 0x003a_79b8 - ORIGINAL_BASE;
+const RENDER_CONTROL_RENDER_VIEW: u32 = 0x003a_7f78 - ORIGINAL_BASE;
+const RC_JOB_START_QUEUE_EXECUTE: u32 = 0x0058_6318 - ORIGINAL_BASE;
+const RC_JOB_START_AND_RENDER_EXECUTE: u32 = 0x0058_69e8 - ORIGINAL_BASE;
+const RC_JOB_RENDER_PIXMAP_EXECUTE: u32 = 0x004d_61a4 - ORIGINAL_BASE;
+const RC_JOB_CREATE_VIEW_EXECUTE: u32 = 0x004c_a6f4 - ORIGINAL_BASE;
+const RC_JOB_RENDER_VIEW_EXECUTE: u32 = 0x004d_6b24 - ORIGINAL_BASE;
+const MAP_VIEW_RENDER_ENTRY: u32 = 0x0052_87f8 - ORIGINAL_BASE;
+const VIEW_RENDER_THREAD_ENTRY: u32 = 0x0053_0264 - ORIGINAL_BASE;
+const RC_JOB_CREATE_VIEW_FINAL: u32 = 0x004c_a780 - ORIGINAL_BASE;
+const RC_JOB_RENDER_PIXMAP_INSTANCE_RESULT: u32 = 0x004d_62e8 - ORIGINAL_BASE;
+const RC_JOB_RENDER_PIXMAP_VIEW_RESULT: u32 = 0x004d_62fc - ORIGINAL_BASE;
+const RC_JOB_RENDER_PIXMAP_VIEW_STATE: u32 = 0x004d_625c - ORIGINAL_BASE;
+const RENDER_CONTROL_PEEK_RESULT: u32 = 0x003a_8c20 - ORIGINAL_BASE;
+const RENDER_CONTROL_JOB_CAN_EXECUTE_RESULT: u32 = 0x003a_8c34 - ORIGINAL_BASE;
+const RENDER_CONTROL_JOB_RESULT: u32 = 0x003a_8df8 - ORIGINAL_BASE;
+const RENDER_CONTROL_SECOND_VIRTUAL_RESULT: u32 = 0x003a_8e0c - ORIGINAL_BASE;
+const RENDER_CONTROL_EXECUTE_RESULT: u32 = 0x003a_8e9c - ORIGINAL_BASE;
+const MAP_TRIGGER_PIXMAP_RENDER: u32 = 0x0053_b36c - ORIGINAL_BASE;
+const MAP_RENDER_VIEW_ID: u32 = 1;
 
 static PROCMAP_BASE: AtomicU32 = AtomicU32::new(0);
 static PROCMAP_GUEST_CALL_STUB: AtomicU32 = AtomicU32::new(0);
 static APP_STATE_STARTED: AtomicBool = AtomicBool::new(false);
 static MAP_POWER_CCA_MODE_SET: AtomicBool = AtomicBool::new(false);
 static MAP_IPC_WAIT_REPAIRED: AtomicBool = AtomicBool::new(false);
+static MAP_ENGINE_STARTED_AFTER_INIT: AtomicBool = AtomicBool::new(false);
+static MAP_RENDER_CONTROL_START_PENDING: AtomicBool = AtomicBool::new(false);
+static MAP_VIEW_CREATE_REQUESTED: AtomicBool = AtomicBool::new(false);
+static MAP_VIEW_CREATE_MUTATING: AtomicBool = AtomicBool::new(false);
+static MAP_VIEW_CREATE_PENDING: AtomicBool = AtomicBool::new(false);
+static MAP_VIEW_CREATE_ENQUEUE_PENDING: AtomicBool = AtomicBool::new(false);
+static MAP_VIEW_CREATE_JOB_ADDRESS: AtomicU32 = AtomicU32::new(0);
+static MAP_VIEW_READY: AtomicBool = AtomicBool::new(false);
+static MAP_RENDER_TRIGGER_PENDING: AtomicBool = AtomicBool::new(false);
+static MAP_INITIAL_RENDER_TRIGGERED: AtomicBool = AtomicBool::new(false);
+static RENDER_LOOP_QUEUE_STATE_LAST: AtomicU32 = AtomicU32::new(0xffff_ffff);
+static RENDER_LOOP_QUEUE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static RENDER_CONTROL_ADD_JOB_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static RENDER_CONTROL_RENDER_VIEW_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static RC_JOB_EXECUTE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static RENDER_CONTROL_PEEK_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static RENDER_CONTROL_JOB_CAN_EXECUTE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static RENDER_CONTROL_JOB_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static RENDER_CONTROL_SECOND_VIRTUAL_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static RENDER_CONTROL_EXECUTE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static RENDER_CONTROL_GET_VIEW_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static CCA_BODY_FORWARD_SUPPRESSED: AtomicU32 = AtomicU32::new(0);
 static INIT_MAP_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static CCA_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -48,6 +97,27 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     APP_STATE_STARTED.store(false, Ordering::Relaxed);
     MAP_POWER_CCA_MODE_SET.store(false, Ordering::Relaxed);
     MAP_IPC_WAIT_REPAIRED.store(false, Ordering::Relaxed);
+    MAP_ENGINE_STARTED_AFTER_INIT.store(false, Ordering::Relaxed);
+    MAP_RENDER_CONTROL_START_PENDING.store(false, Ordering::Relaxed);
+    MAP_VIEW_CREATE_REQUESTED.store(false, Ordering::Relaxed);
+    MAP_VIEW_CREATE_MUTATING.store(false, Ordering::Relaxed);
+    MAP_VIEW_CREATE_PENDING.store(false, Ordering::Relaxed);
+    MAP_VIEW_CREATE_ENQUEUE_PENDING.store(false, Ordering::Relaxed);
+    MAP_VIEW_CREATE_JOB_ADDRESS.store(0, Ordering::Relaxed);
+    MAP_VIEW_READY.store(false, Ordering::Relaxed);
+    MAP_RENDER_TRIGGER_PENDING.store(false, Ordering::Relaxed);
+    MAP_INITIAL_RENDER_TRIGGERED.store(false, Ordering::Relaxed);
+    RENDER_LOOP_QUEUE_STATE_LAST.store(0xffff_ffff, Ordering::Relaxed);
+    RENDER_LOOP_QUEUE_TRACE_COUNT.store(0, Ordering::Relaxed);
+    RENDER_CONTROL_ADD_JOB_TRACE_COUNT.store(0, Ordering::Relaxed);
+    RENDER_CONTROL_RENDER_VIEW_TRACE_COUNT.store(0, Ordering::Relaxed);
+    RC_JOB_EXECUTE_TRACE_COUNT.store(0, Ordering::Relaxed);
+    RENDER_CONTROL_PEEK_TRACE_COUNT.store(0, Ordering::Relaxed);
+    RENDER_CONTROL_JOB_CAN_EXECUTE_TRACE_COUNT.store(0, Ordering::Relaxed);
+    RENDER_CONTROL_JOB_TRACE_COUNT.store(0, Ordering::Relaxed);
+    RENDER_CONTROL_SECOND_VIRTUAL_TRACE_COUNT.store(0, Ordering::Relaxed);
+    RENDER_CONTROL_EXECUTE_TRACE_COUNT.store(0, Ordering::Relaxed);
+    RENDER_CONTROL_GET_VIEW_TRACE_COUNT.store(0, Ordering::Relaxed);
     CCA_BODY_FORWARD_SUPPRESSED.store(0, Ordering::Relaxed);
     PROCMAP_GUEST_CALL_STUB.store(0, Ordering::Relaxed);
     INIT_MAP_TRACE_COUNT.store(0, Ordering::Relaxed);
@@ -84,27 +154,61 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         add_init_trace_hooks(unicorn, base_address);
         add_port_control_trace_hooks(unicorn, base_address);
         add_map_engine_init_trace_hooks(unicorn, base_address);
+        add_render_control_trace_hooks(unicorn, base_address);
         add_ail_power_trace_hooks(unicorn, base_address);
         add_cca_trace_hooks(unicorn, base_address);
     }
 
     let repair_addr = base_address + PORTCONTROL_INIT_RESULT;
+    let activate_after_init = std::env::var_os("EMU_PROCMAPENGINE_SKIP_INITIAL_RENDER_TRIGGER")
+        .is_none_or(|value| value.is_empty() || value == "0");
     unicorn
         .add_code_hook(repair_addr as u64, repair_addr as u64, move |uc, _, _| {
             if uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 != 0 {
                 repair_map_ipc_wait_param(uc);
+                if activate_after_init {
+                    start_map_engine_after_init(uc, repair_addr);
+                }
             }
         })
         .unwrap();
 
-    if std::env::var_os("EMU_PROCMAPENGINE_FORCE_ACTIVE_STATE")
-        .is_some_and(|value| value.is_empty() || value == "0")
-    {
+    let handler_hook_addr = base_address + PORTCONTROL_HANDLER_RESULT;
+    unicorn
+        .add_code_hook(
+            handler_hook_addr as u64,
+            handler_hook_addr as u64,
+            move |uc, _, _| {
+                if uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 != 0 {
+                    trigger_pending_map_render(uc, handler_hook_addr);
+                }
+            },
+        )
+        .unwrap();
+
+    if activate_after_init {
+        let render_hook_addr = base_address + RENDER_CONTROL_QUEUE_STATE;
+        unicorn
+            .add_code_hook(
+                render_hook_addr as u64,
+                render_hook_addr as u64,
+                move |uc, _, _| {
+                    if MAP_VIEW_READY.load(Ordering::Relaxed) {
+                        trigger_pending_map_render(uc, render_hook_addr);
+                    }
+                },
+            )
+            .unwrap();
+    }
+
+    add_map_view_hooks(unicorn, base_address);
+
+    let force_early_active = std::env::var("EMU_PROCMAPENGINE_FORCE_ACTIVE_STATE")
+        .is_ok_and(|value| !value.is_empty() && value != "0");
+    if !force_early_active {
         log::info!(
-            "PROCMAPENGINE: startup hooks loaded; active-state forcing disabled \
-             (unset EMU_PROCMAPENGINE_FORCE_ACTIVE_STATE to force it)"
+            "PROCMAPENGINE: startup hooks loaded; active state is requested after PortControl init"
         );
-        return;
     }
 
     let hook_addr = base_address + AIL_VSTART_APP_ENTRY;
@@ -112,14 +216,9 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
 
     unicorn
         .add_code_hook(hook_addr as u64, hook_addr as u64, move |uc, _, _| {
-            if APP_STATE_STARTED.swap(true, Ordering::Relaxed) {
-                return;
-            }
-
             let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             if this == 0 {
                 log::warn!("PROCMAPENGINE: vStartAppEntry called with null app object");
-                APP_STATE_STARTED.store(false, Ordering::Relaxed);
                 return;
             }
 
@@ -129,7 +228,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                 let flag = base_address + CREATE_DEFAULT_VIEW_FLAG;
                 if uc.mem_write(flag as u64, &[0u8]).is_ok() {
                     log::info!(
-                        "PROCMAPENGINE: cleared g_bCreateDefaultView at {:#x} before forced active state",
+                        "PROCMAPENGINE: cleared g_bCreateDefaultView at {:#x} before map startup",
                         flag
                     );
                 } else {
@@ -140,13 +239,20 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                 }
             }
 
-            if call_guest_function(uc, hook_addr, state_function, [this, 0, ACTIVE_APP_STATE, 0]) {
-                log::info!(
-                    "PROCMAPENGINE: forced active app state on map engine object {:#x}",
-                    this
-                );
-            } else {
-                APP_STATE_STARTED.store(false, Ordering::Relaxed);
+            if force_early_active && !APP_STATE_STARTED.swap(true, Ordering::Relaxed) {
+                if call_guest_function(
+                    uc,
+                    hook_addr,
+                    state_function,
+                    [this, 0, ACTIVE_APP_STATE, 0],
+                ) {
+                    log::info!(
+                        "PROCMAPENGINE: forced active app state on map engine object {:#x}",
+                        this
+                    );
+                } else {
+                    APP_STATE_STARTED.store(false, Ordering::Relaxed);
+                }
             }
         })
         .unwrap();
@@ -452,6 +558,499 @@ fn repair_map_ipc_wait_param(unicorn: &mut Unicorn<'_, Context>) -> bool {
         queue
     );
     true
+}
+
+fn start_map_engine_after_init(unicorn: &mut Unicorn<'_, Context>, original_pc: u32) -> bool {
+    if MAP_ENGINE_STARTED_AFTER_INIT.swap(true, Ordering::Relaxed) {
+        return true;
+    }
+
+    let base_address = PROCMAP_BASE.load(Ordering::Relaxed);
+    if base_address == 0 {
+        MAP_ENGINE_STARTED_AFTER_INIT.store(false, Ordering::Relaxed);
+        return false;
+    }
+
+    let map_state = read_u32_or_invalid(unicorn, base_address + MAP_ENGINE_STATE_VAR);
+    if map_state == 0 || map_state == u32::MAX || map_state == 4 || map_state == 5 {
+        log::warn!(
+            "PROCMAPENGINE: skipped map engine Start after PortControl init; state={:#x}",
+            map_state
+        );
+        MAP_ENGINE_STARTED_AFTER_INIT.store(false, Ordering::Relaxed);
+        return false;
+    }
+
+    let function = base_address + PORTCONTROL_START_MAP_ENGINE;
+    if !call_guest_function(unicorn, original_pc, function, [0, 0, 0, 0]) {
+        log::warn!("PROCMAPENGINE: failed to call PortControl::StartMapEngine after init");
+        MAP_ENGINE_STARTED_AFTER_INIT.store(false, Ordering::Relaxed);
+        return false;
+    }
+
+    MAP_RENDER_CONTROL_START_PENDING.store(true, Ordering::Relaxed);
+    log::info!("PROCMAPENGINE: requested map engine start after PortControl init");
+    true
+}
+
+fn ensure_answer_scratch(unicorn: &mut Unicorn<'_, Context>) -> Option<u32> {
+    let stub = ensure_guest_call_stub(unicorn)?;
+    let addr = stub.checked_add(PROCMAP_ANSWER_SCRATCH_OFFSET)?;
+    if unicorn.mem_write(addr as u64, &[0u8; 16]).is_err() {
+        log::warn!("PROCMAPENGINE: failed to zero answer-info scratch at {:#x}", addr);
+        return None;
+    }
+    Some(addr)
+}
+
+fn queue_view_creation_job(unicorn: &mut Unicorn<'_, Context>, original_pc: u32) -> bool {
+    let base_address = PROCMAP_BASE.load(Ordering::Relaxed);
+    if base_address == 0 {
+        return false;
+    }
+
+    let Some(scratch) = ensure_answer_scratch(unicorn) else {
+        return false;
+    };
+
+    MAP_VIEW_CREATE_MUTATING.store(true, Ordering::Relaxed);
+    MAP_VIEW_CREATE_PENDING.store(true, Ordering::Relaxed);
+    let function = base_address + RENDER_CONTROL_CREATE_VIEW_JOB;
+    if !call_guest_function(unicorn, original_pc, function, [scratch, 0, 0, 0]) {
+        MAP_VIEW_CREATE_MUTATING.store(false, Ordering::Relaxed);
+        MAP_VIEW_CREATE_PENDING.store(false, Ordering::Relaxed);
+        log::warn!("PROCMAPENGINE: failed to call map view create job factory");
+        return false;
+    }
+
+    log::info!(
+        "PROCMAPENGINE: requested map view {} creation job with answer scratch {:#x}",
+        MAP_RENDER_VIEW_ID,
+        scratch
+    );
+    true
+}
+
+fn trigger_pending_map_render(unicorn: &mut Unicorn<'_, Context>, original_pc: u32) -> bool {
+    let base_address = PROCMAP_BASE.load(Ordering::Relaxed);
+    if base_address == 0 {
+        return false;
+    }
+
+    if MAP_RENDER_CONTROL_START_PENDING.swap(false, Ordering::Relaxed) {
+        let function = base_address + RENDER_CONTROL_START;
+        if !call_guest_function(unicorn, original_pc, function, [0, 0, 0, 0]) {
+            log::warn!("PROCMAPENGINE: failed to call RenderControl::Start");
+            MAP_RENDER_CONTROL_START_PENDING.store(true, Ordering::Relaxed);
+            return false;
+        }
+
+        MAP_VIEW_CREATE_REQUESTED.store(true, Ordering::Relaxed);
+        log::info!("PROCMAPENGINE: requested RenderControl Start after PortControl init");
+        return true;
+    }
+
+    if MAP_VIEW_CREATE_REQUESTED.load(Ordering::Relaxed)
+        && !MAP_VIEW_READY.load(Ordering::Relaxed)
+    {
+        if MAP_VIEW_CREATE_JOB_ADDRESS.load(Ordering::Relaxed) == 0
+            && !MAP_VIEW_CREATE_PENDING.load(Ordering::Relaxed)
+        {
+            return queue_view_creation_job(unicorn, original_pc);
+        }
+
+        if MAP_VIEW_CREATE_ENQUEUE_PENDING.swap(false, Ordering::Relaxed) {
+            let job = MAP_VIEW_CREATE_JOB_ADDRESS.load(Ordering::Relaxed);
+            if job == 0 {
+                return false;
+            }
+
+            let function = base_address + RENDER_CONTROL_ADD_JOB;
+            if !call_guest_function(unicorn, original_pc, function, [job, 0, 0, 0]) {
+                MAP_VIEW_CREATE_ENQUEUE_PENDING.store(true, Ordering::Relaxed);
+                log::warn!("PROCMAPENGINE: failed to enqueue map view create job {:#x}", job);
+                return false;
+            }
+
+            MAP_RENDER_TRIGGER_PENDING.store(true, Ordering::Relaxed);
+            log::info!("PROCMAPENGINE: enqueued map view create job {:#x}", job);
+            return true;
+        }
+
+        return false;
+    }
+
+    if MAP_INITIAL_RENDER_TRIGGERED.load(Ordering::Relaxed)
+        || !MAP_RENDER_TRIGGER_PENDING.load(Ordering::Relaxed)
+    {
+        return false;
+    }
+
+    let map_state = read_u32_or_invalid(unicorn, base_address + MAP_ENGINE_STATE_VAR);
+    if map_state == 0 || map_state == u32::MAX || map_state == 4 || map_state == 5 {
+        log::warn!(
+            "PROCMAPENGINE: skipped initial map render trigger; map engine state={:#x}",
+            map_state
+        );
+        return false;
+    }
+
+    MAP_INITIAL_RENDER_TRIGGERED.store(true, Ordering::Relaxed);
+    let function = base_address + MAP_TRIGGER_PIXMAP_RENDER;
+    if !call_guest_function(
+        unicorn,
+        original_pc,
+        function,
+        [MAP_RENDER_VIEW_ID, 0, 0, 0],
+    ) {
+        log::warn!("PROCMAPENGINE: failed to queue initial map render job for view 1");
+        return false;
+    }
+
+    log::info!(
+        "PROCMAPENGINE: queued initial map render job for view {} with map engine state {:#x}",
+        MAP_RENDER_VIEW_ID,
+        map_state
+    );
+    true
+}
+
+fn add_map_view_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    let create_result = base_address + RENDER_CONTROL_CREATE_VIEW_RESULT;
+    unicorn
+        .add_code_hook(create_result as u64, create_result as u64, |uc, _, _| {
+            if !MAP_VIEW_CREATE_MUTATING.swap(false, Ordering::Relaxed) {
+                return;
+            }
+
+            let job = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+            if job == 0 || job == u32::MAX {
+                MAP_VIEW_CREATE_PENDING.store(false, Ordering::Relaxed);
+                log::warn!("PROCMAPENGINE: map view create job factory returned null");
+                return;
+            }
+
+            if uc
+                .mem_write((job + 0x1c) as u64, &[MAP_RENDER_VIEW_ID as u8])
+                .is_err()
+            {
+                MAP_VIEW_CREATE_PENDING.store(false, Ordering::Relaxed);
+                log::warn!(
+                    "PROCMAPENGINE: failed to set view id on create job {:#x}",
+                    job
+                );
+                return;
+            }
+
+            MAP_VIEW_CREATE_JOB_ADDRESS.store(job, Ordering::Relaxed);
+            MAP_VIEW_CREATE_PENDING.store(false, Ordering::Relaxed);
+            MAP_VIEW_CREATE_ENQUEUE_PENDING.store(true, Ordering::Relaxed);
+            log::info!("PROCMAPENGINE: created map view {} job {:#x}", MAP_RENDER_VIEW_ID, job);
+        })
+        .unwrap();
+
+    let get_view_result = base_address + RENDER_CONTROL_GET_VIEW_RESULT;
+    unicorn
+        .add_code_hook(get_view_result as u64, get_view_result as u64, |uc, _, _| {
+            let view_id = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let view = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            if view_id != MAP_RENDER_VIEW_ID || view == 0 {
+                return;
+            }
+
+            let surface_state = read_u32_or_invalid(uc, view + 0xf50);
+            let surface = read_u32_or_invalid(uc, view + 0x40);
+            let count = RENDER_CONTROL_GET_VIEW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 20 {
+                log::info!(
+                    "PROCMAPENGINE: map view {} exists at {:#x} surface={:#x} surface_state={:#x}",
+                    MAP_RENDER_VIEW_ID,
+                    view,
+                    surface,
+                    surface_state
+                );
+            }
+
+            if surface != 0 && surface != u32::MAX {
+                if surface_state != 3 {
+                    if uc
+                        .mem_write((view + 0xf50) as u64, &3u32.to_le_bytes())
+                        .is_err()
+                    {
+                        log::warn!(
+                            "PROCMAPENGINE: failed to force surface state on view {:#x}",
+                            view
+                        );
+                        return;
+                    }
+                }
+
+                MAP_VIEW_READY.store(true, Ordering::Relaxed);
+            }
+        })
+        .unwrap();
+}
+
+fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    let queue_state_addr = base_address + RENDER_CONTROL_QUEUE_STATE;
+    let add_job_addr = base_address + RENDER_CONTROL_ADD_JOB;
+    unicorn
+        .add_code_hook(add_job_addr as u64, add_job_addr as u64, move |uc, _, _| {
+            let count = RENDER_CONTROL_ADD_JOB_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 50 {
+                let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let vtable = read_u32_or_invalid(uc, job);
+                log::info!(
+                    "PROCMAPENGINE render-control trace AddJob at {:#x}: job={:#x} vtable={:#x}",
+                    add_job_addr,
+                    job,
+                    vtable
+                );
+            }
+        })
+        .unwrap();
+
+    for (name, offset) in [
+        ("JobRCStartQueue::Execute", RC_JOB_START_QUEUE_EXECUTE),
+        ("JobRCStartQueueAndRenderView::Execute", RC_JOB_START_AND_RENDER_EXECUTE),
+        ("JobRCRenderPixmapView::Execute", RC_JOB_RENDER_PIXMAP_EXECUTE),
+        ("JobRCCreateView::Execute", RC_JOB_CREATE_VIEW_EXECUTE),
+        ("JobRCRenderView::Execute", RC_JOB_RENDER_VIEW_EXECUTE),
+    ] {
+        let job_addr = base_address + offset;
+        unicorn
+            .add_code_hook(job_addr as u64, job_addr as u64, move |uc, _, _| {
+                let count = RC_JOB_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 100 {
+                    let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE render-control trace {} at {:#x}: this={:#x}",
+                        name,
+                        job_addr,
+                        this
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    for (name, offset) in [
+        (
+            "RenderPixmapView instance result",
+            RC_JOB_RENDER_PIXMAP_INSTANCE_RESULT,
+        ),
+        ("RenderPixmapView view result", RC_JOB_RENDER_PIXMAP_VIEW_RESULT),
+    ] {
+        let step_addr = base_address + offset;
+        unicorn
+            .add_code_hook(step_addr as u64, step_addr as u64, move |uc, _, _| {
+                let count = RC_JOB_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 100 {
+                    let value = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE render-control trace {} at {:#x}: r0={:#x}",
+                        name,
+                        step_addr,
+                        value
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    let create_execute_result = base_address + RC_JOB_CREATE_VIEW_FINAL;
+    unicorn
+        .add_code_hook(
+            create_execute_result as u64,
+            create_execute_result as u64,
+            move |uc, _, _| {
+                let count = RC_JOB_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 100 {
+                    let job = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    let result = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    let view_id = read_u32_or_invalid(uc, job + 0x1c) & 0xff;
+                    let create_state = read_u32_or_invalid(uc, job + 0x20);
+                    log::info!(
+                        "PROCMAPENGINE render-control trace CreateView result at {:#x}: job={:#x} view={} state={:#x} result={:#x}",
+                        create_execute_result,
+                        job,
+                        view_id,
+                        create_state,
+                        result
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    let view_state_addr = base_address + RC_JOB_RENDER_PIXMAP_VIEW_STATE;
+    unicorn
+        .add_code_hook(view_state_addr as u64, view_state_addr as u64, move |uc, _, _| {
+            let count = RC_JOB_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 100 {
+                let state = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let view = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE render-control trace RenderPixmapView view state at {:#x}: view={:#x} state={:#x}",
+                    view_state_addr,
+                    view,
+                    state
+                );
+            }
+        })
+        .unwrap();
+
+    let map_view_render_addr = base_address + MAP_VIEW_RENDER_ENTRY;
+    unicorn
+        .add_code_hook(
+            map_view_render_addr as u64,
+            map_view_render_addr as u64,
+            move |uc, _, _| {
+                let count = RC_JOB_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 100 {
+                    let view = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE render-control trace MapView::Render at {:#x}: view={:#x}",
+                        map_view_render_addr,
+                        view
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    let view_render_thread_addr = base_address + VIEW_RENDER_THREAD_ENTRY;
+    unicorn
+        .add_code_hook(
+            view_render_thread_addr as u64,
+            view_render_thread_addr as u64,
+            move |uc, _, _| {
+                let count = RC_JOB_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 100 {
+                    let renderer = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE render-control trace ViewRenderThread at {:#x}: renderer={:#x}",
+                        view_render_thread_addr,
+                        renderer
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    let peek_addr = base_address + RENDER_CONTROL_PEEK_RESULT;
+    unicorn
+        .add_code_hook(peek_addr as u64, peek_addr as u64, move |uc, _, _| {
+            let count = RENDER_CONTROL_PEEK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 50 {
+                let queue = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE render-control trace PeekElement result at {:#x}: job={:#x}",
+                    peek_addr,
+                    queue
+                );
+            }
+        })
+        .unwrap();
+
+    let can_execute_addr = base_address + RENDER_CONTROL_JOB_CAN_EXECUTE_RESULT;
+    unicorn
+        .add_code_hook(
+            can_execute_addr as u64,
+            can_execute_addr as u64,
+            move |uc, _, _| {
+                let count = RENDER_CONTROL_JOB_CAN_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 100 {
+                    let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let job = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE render-control trace job can-execute result at {:#x}: job={:#x} result={:#x}",
+                        can_execute_addr,
+                        job,
+                        result
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    for (name, offset) in [
+        ("GetPeekedElement result", RENDER_CONTROL_JOB_RESULT),
+        ("second virtual result", RENDER_CONTROL_SECOND_VIRTUAL_RESULT),
+    ] {
+        let step_addr = base_address + offset;
+        unicorn
+            .add_code_hook(step_addr as u64, step_addr as u64, move |uc, _, _| {
+                let count = RENDER_CONTROL_JOB_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 100 {
+                    let value = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE render-control trace {} at {:#x}: r0={:#x}",
+                        name,
+                        step_addr,
+                        value
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    let execute_addr = base_address + RENDER_CONTROL_EXECUTE_RESULT;
+    unicorn
+        .add_code_hook(execute_addr as u64, execute_addr as u64, move |uc, _, _| {
+            let count = RENDER_CONTROL_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 100 {
+                let job = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                let vtable = read_u32_or_invalid(uc, job);
+                log::info!(
+                    "PROCMAPENGINE render-control trace Execute result at {:#x}: job={:#x} vtable={:#x}",
+                    execute_addr,
+                    job,
+                    vtable
+                );
+            }
+        })
+        .unwrap();
+
+    let render_view_addr = base_address + RENDER_CONTROL_RENDER_VIEW;
+    unicorn
+        .add_code_hook(
+            render_view_addr as u64,
+            render_view_addr as u64,
+            move |uc, _, _| {
+                let count = RENDER_CONTROL_RENDER_VIEW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 50 {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE render-control trace RenderView at {:#x}: r0={:#x}",
+                        render_view_addr,
+                        r0
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    unicorn
+        .add_code_hook(
+            queue_state_addr as u64,
+            queue_state_addr as u64,
+            move |uc, _, _| {
+                let queue = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let state = read_u32_or_invalid(uc, queue);
+                let last = RENDER_LOOP_QUEUE_STATE_LAST.swap(state, Ordering::Relaxed);
+                let count = RENDER_LOOP_QUEUE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if state != last || count < 20 {
+                    log::info!(
+                        "PROCMAPENGINE render-control trace queue state at {:#x}: queue={:#x} state={:#x}",
+                        queue_state_addr,
+                        queue,
+                        state
+                    );
+                }
+            },
+        )
+        .unwrap();
 }
 
 fn add_ail_power_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {

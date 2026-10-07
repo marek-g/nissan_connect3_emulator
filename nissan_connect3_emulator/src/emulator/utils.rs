@@ -86,14 +86,16 @@ pub fn read_string(unicorn: &Unicorn<'_, Context>, mut addr: u32) -> String {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        unicorn.mem_read(addr as u64, &mut byte).unwrap();
+        if unicorn.mem_read(addr as u64, &mut byte).is_err() || addr == 0xffff_ffff {
+            break;
+        }
         if byte[0] == 0 {
             break;
         }
         buf.push(byte[0]);
         addr += 1;
     }
-    String::from_utf8(buf).unwrap()
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 pub fn pack_u16(value: u16) -> Vec<u8> {
