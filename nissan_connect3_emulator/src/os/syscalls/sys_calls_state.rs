@@ -1,6 +1,9 @@
 use crate::os::syscalls::signal::SignalState;
 use std::collections::{HashMap, HashSet};
 
+const OSAL_MESSAGE_POOL_CHUNK: u32 = 0x1000;
+const OSAL_MESSAGE_POOL_SLOTS: u32 = 1024;
+
 /// Per-process syscall state. System-wide IPC objects (POSIX message queues and
 /// the IOSC driver) do NOT live here - they live in the shared
 /// [`SystemNamespace`](crate::os::syscalls::namespace::SystemNamespace) so that
@@ -21,6 +24,17 @@ pub struct SysCallsState {
 
     // signal dispositions + blocked mask (rt_sigaction / rt_sigreturn / SIGSEGV delivery)
     pub signals: SignalState,
+
+    // fallback allocator for OSAL type-2 message-pool messages
+    pub osal_messages: OsalMessagePool,
+}
+
+pub struct OsalMessagePool {
+    base: u32,
+    chunk: u32,
+    slots: u32,
+    used: Vec<bool>,
+    dynamic: HashSet<u32>,
 }
 
 impl SysCallsState {
@@ -32,6 +46,88 @@ impl SysCallsState {
             socket_fds: HashSet::new(),
             next_socket_fd: 0x1000,
             signals: SignalState::new(),
+            osal_messages: OsalMessagePool::new(),
         }
+    }
+}
+
+impl OsalMessagePool {
+    fn new() -> Self {
+        Self {
+            base: 0,
+            chunk: OSAL_MESSAGE_POOL_CHUNK,
+            slots: OSAL_MESSAGE_POOL_SLOTS,
+            used: Vec::new(),
+            dynamic: HashSet::new(),
+        }
+    }
+
+    pub fn base(&self) -> u32 {
+        self.base
+    }
+
+    pub fn chunk_size(&self) -> u32 {
+        self.chunk
+    }
+
+    pub fn slot_count(&self) -> u32 {
+        self.slots
+    }
+
+    pub fn set_base(&mut self, base: u32) {
+        if self.base != 0 {
+            return;
+        }
+
+        self.base = base;
+        self.used = vec![false; self.slots as usize];
+    }
+
+    pub fn take_slot(&mut self) -> Option<u32> {
+        let index = self
+            .used
+            .iter_mut()
+            .position(|used| {
+                if *used {
+                    false
+                } else {
+                    *used = true;
+                    true
+                }
+            })?;
+
+        Some(index as u32)
+    }
+
+    pub fn mark_dynamic(&mut self, content: u32) {
+        self.dynamic.insert(content);
+    }
+
+    pub fn release(&mut self, content: u32) -> bool {
+        if self.dynamic.remove(&content) {
+            return true;
+        }
+
+        if self.base == 0 || content < self.base {
+            return false;
+        }
+
+        let offset = content - self.base;
+        if offset % self.chunk != 0 {
+            return false;
+        }
+
+        let index = offset / self.chunk;
+        if index >= self.slots {
+            return false;
+        }
+
+        let slot = &mut self.used[index as usize];
+        if !*slot {
+            return false;
+        }
+
+        *slot = false;
+        true
     }
 }

@@ -53,6 +53,7 @@ pub fn hook_message_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     const QUEUE_PRIORITY_WAIT: u32 = 0x4850d8a8 - 0x484d8000;
     const GET_FROM_MQ: u32 = 0x48509c8c - 0x484d8000;
     const CHECK_FOR_IOS_QUEUE: u32 = 0x48509744 - 0x484d8000;
+    const MESSAGE_CREATE: u32 = 0x48513cc0 - 0x484d8000;
     const MESSAGE_DELETE: u32 = 0x48513850 - 0x484d8000;
 
     unicorn
@@ -90,6 +91,14 @@ pub fn hook_message_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
             )
             .unwrap();
     }
+
+    unicorn
+        .add_code_hook(
+            (base_address + MESSAGE_CREATE) as u64,
+            (base_address + MESSAGE_CREATE) as u64,
+            move |uc, addr, _| emulate_message_create(uc, addr as u32, base_address),
+        )
+        .unwrap();
 
     unicorn
         .add_code_hook(
@@ -929,6 +938,105 @@ fn synthesize_periodic_map_power_state_req(unicorn: &mut Unicorn<'_, Context>, b
     true
 }
 
+fn emulate_message_create(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address: u32) {
+    const TYPE_HEAP: u32 = 1;
+    const TYPE_POOL: u32 = 2;
+
+    let handle_ptr = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+    let size = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+    let message_type = unicorn.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+    if handle_ptr == 0 || handle_ptr > 0xf000_0000 {
+        return;
+    }
+    if message_type != TYPE_POOL {
+        return;
+    }
+
+    let thread = unicorn.get_data().inner.thread_id();
+    let state_arc = unicorn.get_data().sys_calls_state.clone();
+    let needs_base = state_arc.lock().unwrap().osal_messages.base() == 0;
+    if needs_base {
+        let pool_size = 0x1000 * 1024;
+        let mmu_arc = unicorn.get_data().mmu.clone();
+        let base = mmu_arc.lock().unwrap().heap_alloc(
+            unicorn,
+            pool_size,
+            Prot::READ | Prot::WRITE,
+            "[osal-msgpool]",
+        );
+        state_arc.lock().unwrap().osal_messages.set_base(base);
+        log::info!(
+            "0x{:x} [{}] [LIBOSAL] created emulated OSAL message pool base=0x{:x} slots=1024 chunk=0x1000",
+            addr - base_address + ORIGINAL_BASE,
+            thread,
+            base
+        );
+    }
+
+    let mut allocated = {
+        let mut state = state_arc.lock().unwrap();
+        let pool = &mut state.osal_messages;
+        if size <= pool.chunk_size() {
+            pool.take_slot()
+                .map(|index| pool.base() + index * pool.chunk_size())
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    };
+
+    if allocated == 0 && size > 0x1000 {
+        let mmu_arc = unicorn.get_data().mmu.clone();
+        allocated = mmu_arc.lock().unwrap().heap_alloc(
+            unicorn,
+            size,
+            Prot::READ | Prot::WRITE,
+            "[osal-msg-large]",
+        );
+        state_arc.lock().unwrap().osal_messages.mark_dynamic(allocated);
+    }
+
+    if allocated == 0 {
+        log::warn!(
+            "0x{:x} [{}] [LIBOSAL] OSAL_s32MessageCreate emulated pool exhausted size=0x{:x}",
+            addr - base_address + ORIGINAL_BASE,
+            thread,
+            size
+        );
+        return_to_caller(unicorn, u32::MAX);
+        return;
+    }
+
+    if unicorn
+        .mem_write(handle_ptr as u64, &TYPE_HEAP.to_le_bytes())
+        .is_err()
+        || unicorn
+            .mem_write((handle_ptr + 4) as u64, &allocated.to_le_bytes())
+            .is_err()
+    {
+        let mut state = state_arc.lock().unwrap();
+        state.osal_messages.release(allocated);
+        log::warn!(
+            "0x{:x} [{}] [LIBOSAL] failed to write emulated OSAL message handle=0x{:x} content=0x{:x}",
+            addr - base_address + ORIGINAL_BASE,
+            thread,
+            handle_ptr,
+            allocated
+        );
+        return;
+    }
+
+    log::debug!(
+        "0x{:x} [{}] [LIBOSAL] OSAL_s32MessageCreate(pool=0x{:x}, size=0x{:x}) -> heap content=0x{:x}",
+        addr - base_address + ORIGINAL_BASE,
+        thread,
+        handle_ptr,
+        size,
+        allocated
+    );
+    return_to_caller(unicorn, 0);
+}
+
 fn suppress_synthetic_message_delete(
     unicorn: &mut Unicorn<'_, Context>,
     addr: u32,
@@ -936,6 +1044,20 @@ fn suppress_synthetic_message_delete(
 ) {
     let handle = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
     let content = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+    if (handle & 0xff) == 1 && content != 0 && content < 0xf000_0000 {
+        let state_arc = unicorn.get_data().sys_calls_state.clone();
+        let released = state_arc.lock().unwrap().osal_messages.release(content);
+        if released {
+            log::debug!(
+                "0x{:x} [{}] [LIBOSAL] OSAL_s32MessageDelete released emulated message content=0x{:x}",
+                addr - base_address + ORIGINAL_BASE,
+                unicorn.get_data().inner.thread_id(),
+                content
+            );
+            return_to_caller(unicorn, 0);
+            return;
+        }
+    }
     let synthetic_contents = [
         SYNTH_PWR_START_CONF_CONTENT.load(Ordering::Relaxed),
         SYNTH_PWR_STATE_REQ_CONTENT.load(Ordering::Relaxed),

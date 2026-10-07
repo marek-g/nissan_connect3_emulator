@@ -3,7 +3,8 @@ use crate::os::file_system::{
     DevFileSystem, FileType, MountFileSystem, MountPoint, OsFileSystem, ProcFileSystem,
     StdFileSystem, TmpFileSystem,
 };
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 
 mod common;
 mod emulator;
@@ -12,8 +13,38 @@ mod libs;
 mod os;
 mod rtos;
 
+fn seed_dynamic_ffs() -> io::Result<()> {
+    const SOURCE: &str =
+        "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/D605_unpacked/lx001.tar.gz/var/opt/bosch/dynamic/ffs";
+    const DESTINATION: &str = "/tmp/opencode/nissan_emu/ffs_dynamic";
+
+    let source = PathBuf::from(SOURCE);
+    let destination = PathBuf::from(DESTINATION);
+    std::fs::create_dir_all(&destination)?;
+    seed_dynamic_ffs_recursive(&source, &destination)
+}
+
+fn seed_dynamic_ffs_recursive(source: &Path, destination: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+
+        if file_type.is_dir() {
+            std::fs::create_dir_all(&destination_path)?;
+            seed_dynamic_ffs_recursive(&source_path, &destination_path)?;
+        } else if file_type.is_file() && !destination_path.exists() {
+            std::fs::copy(&source_path, &destination_path)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     pretty_env_logger::init();
+    seed_dynamic_ffs()?;
 
     // mounted file systems
     let map_card_path =
