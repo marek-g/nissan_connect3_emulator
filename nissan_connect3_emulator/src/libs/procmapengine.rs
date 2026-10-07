@@ -12,32 +12,44 @@ const INIT_APP_REGISTRY_CHECK: u32 = 0x0038_abE4 - ORIGINAL_BASE;
 const INIT_APP_MAP_GLOBAL_CHECK: u32 = 0x0038_abf4 - ORIGINAL_BASE;
 const INIT_APP_MAP_NEW_RESULT: u32 = 0x0038_ac04 - ORIGINAL_BASE;
 const INIT_MAP_ENGINE_VTABLE_RESULT: u32 = 0x0038_ac30 - ORIGINAL_BASE;
+const MAP_ENGINE_GLOBAL: u32 = 0x0071_5514 - ORIGINAL_BASE;
+const APP_STATE_OFFSET: u32 = 0x30;
+const APP_SUBSTATE_OFFSET: u32 = 0x34;
+const APP_IPC_WAIT_PARAM_OFFSET: u32 = 0x78;
+const POWER_START_SUBSTATE: u32 = 2;
+const CCA_DISPATCH: u32 = 0x0066_c8e8 - ORIGINAL_BASE;
+const CCA_POWER_HANDLER: u32 = 0x0066_7a30 - ORIGINAL_BASE;
 const GUEST_CALL_STUB_SIZE: u32 = 4;
 const ACTIVE_APP_STATE: u32 = 3;
 
 static PROCMAP_BASE: AtomicU32 = AtomicU32::new(0);
 static PROCMAP_GUEST_CALL_STUB: AtomicU32 = AtomicU32::new(0);
 static APP_STATE_STARTED: AtomicBool = AtomicBool::new(false);
+static MAP_POWER_CCA_MODE_SET: AtomicBool = AtomicBool::new(false);
 static INIT_MAP_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static CCA_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     PROCMAP_BASE.store(base_address, Ordering::Relaxed);
     APP_STATE_STARTED.store(false, Ordering::Relaxed);
+    MAP_POWER_CCA_MODE_SET.store(false, Ordering::Relaxed);
     PROCMAP_GUEST_CALL_STUB.store(0, Ordering::Relaxed);
     INIT_MAP_TRACE_COUNT.store(0, Ordering::Relaxed);
+    CCA_TRACE_COUNT.store(0, Ordering::Relaxed);
 
     if std::env::var_os("EMU_PROCMAPENGINE_TRACE_INIT")
         .is_some_and(|value| !value.is_empty() && value != "0")
     {
         add_init_trace_hooks(unicorn, base_address);
+        add_cca_trace_hooks(unicorn, base_address);
     }
 
     if std::env::var_os("EMU_PROCMAPENGINE_FORCE_ACTIVE_STATE")
-        .is_none_or(|value| value.is_empty() || value == "0")
+        .is_some_and(|value| value.is_empty() || value == "0")
     {
         log::info!(
             "PROCMAPENGINE: startup hooks loaded; active-state forcing disabled \
-             (set EMU_PROCMAPENGINE_FORCE_ACTIVE_STATE=1 to force it)"
+             (unset EMU_PROCMAPENGINE_FORCE_ACTIVE_STATE to force it)"
         );
         return;
     }
@@ -134,6 +146,110 @@ fn add_init_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     }
 }
 
+pub fn force_map_power_cca_mode(unicorn: &mut Unicorn<'_, Context>) -> bool {
+    if MAP_POWER_CCA_MODE_SET.swap(true, Ordering::Relaxed) {
+        return true;
+    }
+
+    let base_address = PROCMAP_BASE.load(Ordering::Relaxed);
+    if base_address == 0 {
+        MAP_POWER_CCA_MODE_SET.store(false, Ordering::Relaxed);
+        return false;
+    }
+
+    let app = read_u32_or_invalid(unicorn, base_address + MAP_ENGINE_GLOBAL);
+    if app == 0 || app > 0xf000_0000 {
+        MAP_POWER_CCA_MODE_SET.store(false, Ordering::Relaxed);
+        return false;
+    }
+
+    let state_target = app + APP_STATE_OFFSET;
+    let substate_target = app + APP_SUBSTATE_OFFSET;
+    let state = read_u32_or_invalid(unicorn, state_target);
+    if state < ACTIVE_APP_STATE {
+        if unicorn
+            .mem_write(state_target as u64, &ACTIVE_APP_STATE.to_le_bytes())
+            .and_then(|_| {
+                unicorn.mem_write(substate_target as u64, &POWER_START_SUBSTATE.to_le_bytes())
+            })
+            .is_err()
+        {
+            MAP_POWER_CCA_MODE_SET.store(false, Ordering::Relaxed);
+            return false;
+        }
+        log::info!(
+            "PROCMAPENGINE: forced map app {:#x} CCA state {:#x} -> {:#x}/{:#x}",
+            app,
+            state,
+            ACTIVE_APP_STATE,
+            POWER_START_SUBSTATE
+        );
+    }
+
+    let target = app + APP_IPC_WAIT_PARAM_OFFSET;
+    if unicorn
+        .mem_write(target as u64, &u32::MAX.to_le_bytes())
+        .is_err()
+    {
+        MAP_POWER_CCA_MODE_SET.store(false, Ordering::Relaxed);
+        return false;
+    }
+
+    log::info!(
+        "PROCMAPENGINE: forced map app {:#x} IPC wait param to -1 for CCA power startup",
+        app
+    );
+    true
+}
+
+fn add_cca_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    for (name, offset) in [
+        ("cca-dispatch", CCA_DISPATCH),
+        ("cca-power-handler", CCA_POWER_HANDLER),
+    ] {
+        let addr = base_address + offset;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = CCA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count >= 50 {
+                    return;
+                }
+
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let app = read_u32_or_invalid(uc, r0);
+                let app_state = read_u32_or_invalid(uc, app + 0x30);
+                let app_target = read_u32_or_invalid(uc, app + 0x10);
+                let allow_power = read_u32_or_invalid(uc, app + 0x6c);
+                let message_content = read_u32_or_invalid(uc, r1 + 4);
+                let message_header = [
+                    read_u32_or_invalid(uc, message_content),
+                    read_u32_or_invalid(uc, message_content + 8),
+                    read_u32_or_invalid(uc, message_content + 0xc),
+                ];
+
+                log::info!(
+                    "PROCMAPENGINE cca trace {} at {:#x}: dispatch=0x{:x} app=0x{:x} app_state={:#x} app_target={:#x} allow_power={:#x} param3={:#x} msg=0x{:x} content=0x{:x} header=[{:#x}, {:#x}, {:#x}]",
+                    name,
+                    addr,
+                    r0,
+                    app,
+                    app_state,
+                    app_target,
+                    allow_power,
+                    r2,
+                    r1,
+                    message_content,
+                    message_header[0],
+                    message_header[1],
+                    message_header[2]
+                );
+            })
+            .unwrap();
+    }
+}
+
 fn ensure_guest_call_stub(unicorn: &mut Unicorn<'_, Context>) -> Option<u32> {
     let current = PROCMAP_GUEST_CALL_STUB.load(Ordering::Relaxed);
     if current != 0 {
@@ -216,6 +332,14 @@ fn call_guest_function(
     }
 
     true
+}
+
+fn read_u32_or_invalid(unicorn: &mut Unicorn<'_, Context>, address: u32) -> u32 {
+    let mut bytes = [0u8; 4];
+    match unicorn.mem_read(address as u64, &mut bytes) {
+        Ok(()) => u32::from_le_bytes(bytes),
+        Err(_) => 0xffff_ffff,
+    }
 }
 
 fn write_u32(unicorn: &mut Unicorn<'_, Context>, address: u32, value: u32) -> bool {
