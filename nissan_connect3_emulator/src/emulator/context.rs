@@ -41,6 +41,7 @@ pub struct ContextInner {
     pub next_thread_id: Arc<AtomicU32>,
     /// stable id of the guest process owning this VM
     pub process_id: u32,
+    pub elf_path: String,
 
     pub instruction_tracing: Arc<AtomicBool>,
     pub hooked_libraries: Arc<Mutex<HashSet<String>>>,
@@ -67,6 +68,7 @@ impl ContextInner {
         threads: Arc<Mutex<Vec<GuestThread>>>,
         next_thread_id: Arc<AtomicU32>,
         process_id: u32,
+        elf_path: String,
     ) -> Self {
         Self {
             mmu,
@@ -76,6 +78,7 @@ impl ContextInner {
             threads,
             next_thread_id,
             process_id,
+            elf_path,
             instruction_tracing: Arc::new(AtomicBool::new(false)),
             hooked_libraries: Arc::new(Mutex::new(HashSet::new())),
             code_stubs: Mutex::new(HashMap::new()),

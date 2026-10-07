@@ -188,7 +188,7 @@ pub fn run_process_loop(
     wake: &Wake,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     loop {
-        crate::gpu::tick();
+        crate::gpu::tick(unicorn);
         crate::libs::prochmi::tick(unicorn);
 
         // re-evaluate blocked guest threads: complete the ones whose IPC object is

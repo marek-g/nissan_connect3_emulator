@@ -61,6 +61,7 @@ impl Process {
                 Arc::new(Mutex::new(Vec::new())),
                 self.next_thread_id.clone(),
                 self.process_id,
+                elf_filepath.to_owned(),
             )),
         };
 

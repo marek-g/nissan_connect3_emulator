@@ -77,7 +77,11 @@ fn init_sdl_backend() -> Result<Backend, String> {
     })
 }
 
-pub fn tick() {
+pub fn tick(unicorn: &Unicorn<'_, Context>) {
+    if !gpu_process_allowed(&unicorn.get_data().elf_path) {
+        return;
+    }
+
     BACKEND.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
@@ -122,7 +126,26 @@ pub fn tick() {
     });
 }
 
-fn ensure_backend() -> bool {
+fn gpu_process_allowed(elf_path: &str) -> bool {
+    let Ok(filter) = std::env::var("EMU_GPU_PROCESS_FILTER") else {
+        return true;
+    };
+    if filter.trim().is_empty() {
+        return true;
+    }
+
+    filter
+        .split(',')
+        .map(|needle| needle.trim())
+        .filter(|needle| !needle.is_empty())
+        .any(|needle| elf_path.contains(needle))
+}
+
+fn ensure_backend(unicorn: &Unicorn<'_, Context>) -> bool {
+    if !gpu_process_allowed(&unicorn.get_data().elf_path) {
+        return false;
+    }
+
     BACKEND.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_some() {
@@ -148,12 +171,15 @@ fn ensure_backend() -> bool {
     })
 }
 
-fn backend_ready() -> bool {
-    ensure_backend()
+fn backend_ready(unicorn: &Unicorn<'_, Context>) -> bool {
+    ensure_backend(unicorn)
 }
 
-fn with_backend<T>(f: impl FnOnce(&mut Backend) -> T) -> Option<T> {
-    if !ensure_backend() {
+fn with_backend<T>(
+    unicorn: &Unicorn<'_, Context>,
+    f: impl FnOnce(&mut Backend) -> T,
+) -> Option<T> {
+    if !ensure_backend(unicorn) {
         return None;
     }
     BACKEND.with(|slot| slot.borrow_mut().as_mut().map(|backend| f(backend)))
@@ -314,16 +340,16 @@ fn host_cstr_to_string(ptr: *const std::os::raw::c_char) -> String {
     unsafe { std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string() }
 }
 
-fn clear_host_gl_errors() {
-    if !backend_ready() {
+fn clear_host_gl_errors(unicorn: &Unicorn<'_, Context>) {
+    if !backend_ready(unicorn) {
         return;
     }
     unsafe { while gl::GetError() != 0 {} }
 }
 
-fn force_gl_error() {
+fn force_gl_error(unicorn: &Unicorn<'_, Context>) {
     PENDING_GL_ERROR.with(|flag| flag.set(true));
-    clear_host_gl_errors();
+    clear_host_gl_errors(unicorn);
 }
 
 fn log_api(unicorn: &mut Unicorn<'_, Context>, prefix: &str, name: &str) {
@@ -440,7 +466,7 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             return 1;
         }
         "eglSwapBuffers" => {
-            if with_backend(|backend| {
+            if with_backend(unicorn, |backend| {
                 unsafe {
                     gl::Finish();
                 }
@@ -481,8 +507,8 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             return 1;
         }
         "eglCreateWindowSurface" => {
-            if backend_ready() {
-                clear_host_gl_errors();
+            if backend_ready(unicorn) {
+                clear_host_gl_errors(unicorn);
                 return 2;
             }
             return next_fallback_id();
@@ -498,17 +524,17 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
 
 pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
     log_api(unicorn, "GL", name);
-    let ready = backend_ready();
+    let ready = backend_ready(unicorn);
 
     if name == "glShaderBinary" {
-        force_gl_error();
+        force_gl_error(unicorn);
         return 0;
     }
 
     if name == "glGetError" {
         let pending = PENDING_GL_ERROR.with(|flag| flag.replace(false));
         if pending {
-            clear_host_gl_errors();
+            clear_host_gl_errors(unicorn);
             return GL_INVALID_ENUM;
         }
         if ready {
@@ -1145,7 +1171,7 @@ pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             _ => {}
         }
 
-        clear_host_gl_errors();
+        clear_host_gl_errors(unicorn);
     }
 
     0
