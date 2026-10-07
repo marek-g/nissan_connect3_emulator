@@ -62,7 +62,7 @@ const GUI_GL_OPENGL_MIX_LAYERS: u32 = 0x0134_6bb0 - ORIGINAL_BASE;
 const GUI_DM_EA_MANAGER_IS_BLOCKED: u32 = 0x0133_ede4 - ORIGINAL_BASE;
 const GUI_DM_EA_MANAGER_GET_BACKGROUND: u32 = 0x0133_f528 - ORIGINAL_BASE;
 const GOT_GUI_DM_DISPLAY_MANAGER_SINGLETON: u32 = 0x02a1_d970 - ORIGINAL_BASE;
-const GOT_GUI_MENU_MANAGER_TABLE: u32 = 0x02a1_3f50 - ORIGINAL_BASE;
+const GOT_GUI_MENU_MANAGER_INSTANCE: u32 = 0x02a1_3f50 - ORIGINAL_BASE;
 const GUI_DM_DISPLAY_MANAGER_IS_DIRTY: u32 = 0x0133_d8ac - ORIGINAL_BASE;
 
 const GUI_DM_DISPLAY_MANAGER_UPDATE: u32 = 0x0133_d99c - ORIGINAL_BASE;
@@ -70,53 +70,7 @@ const GUI_DM_DISPLAY_MANAGER_UPDATE: u32 = 0x0133_d99c - ORIGINAL_BASE;
 const GUI_DISPLAY_MANAGER_THREAD: u32 = 0x0133_be70 - ORIGINAL_BASE;
 const GUI_MAINLOOP_TRACE_START: u32 = 0x0133_be70 - ORIGINAL_BASE;
 const GUI_MAINLOOP_TRACE_END: u32 = 0x0133_c07c - ORIGINAL_BASE;
-const SYNTHETIC_VTABLE_SIZE: u32 = 0x80;
 const GUI_GL_CONTEXT_INITIALIZE: u32 = 0x0134_8b04 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_IS_DIRTY: u32 = 0x0134_6ff0 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_DRAW_BEGIN: u32 = 0x0134_8980 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_DRAW_END: u32 = 0x0134_88f4 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_INVALIDATE_RECT: u32 = 0x0134_8788 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_INVALIDATE_ALL: u32 = 0x0134_7010 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_DRAW_BITMAP: u32 = 0x0134_8560 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_DRAW_BITMAP_TRIANGLES: u32 = 0x0134_7bfc - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_GET_BITMAP_SIZE: u32 = 0x0134_7b6c - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_CREATE_DYNAMIC_BITMAP: u32 = 0x0134_7b4c - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_DESTROY_DYNAMIC_BITMAP: u32 = 0x0134_7b2c - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_SET_BITMAP_CACHE_HINT: u32 = 0x0134_7b0c - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_DRAW_RECT: u32 = 0x0134_7894 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_DRAW_STRING: u32 = 0x0134_7364 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_GET_FONT_INFO: u32 = 0x0134_704c - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_GET_TEXT_BOUNDING_BOX: u32 = 0x0134_7164 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_GET_PREVIOUS_UPDATE_REGION: u32 = 0x0134_7100 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_GET_TEXTURE: u32 = 0x0134_70f8 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_PUSH_ALPHA: u32 = 0x0137_f9b8 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_POP_ALPHA: u32 = 0x0137_f960 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_PUSH_CLIP_RECT: u32 = 0x0137_fa38 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_SET_CLIP_RECT: u32 = 0x0134_8fa8 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_POP_CLIP_RECT: u32 = 0x0137_f900 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_SET_SURFACE_ID: u32 = 0x0134_8fbc - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_GET_DIRTY_REGION: u32 = 0x0134_8fc4 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_DESTRUCTOR: u32 = 0x0134_8ce8 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_DELETING_DESTRUCTOR: u32 = 0x0134_8c34 - ORIGINAL_BASE;
-const GUI_GL_CONTEXT_GET_DYNAMIC_BITMAP_SIZE: u32 = 0x0134_7030 - ORIGINAL_BASE;
-
-const GUI_GL_INVISIBLE_INITIALIZE: u32 = 0x0134_8fcc - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_IS_DIRTY: u32 = 0x0134_8fd0 - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_DRAW_BEGIN: u32 = 0x0134_8fd8 - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_DRAW_END: u32 = 0x0134_8fe4 - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_INVALIDATE_RECT: u32 = 0x0134_8fe8 - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_INVALIDATE_ALL: u32 = 0x0134_901c - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_DRAW_BITMAP: u32 = 0x0134_9060 - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_DRAW_BITMAP_TRIANGLES: u32 = 0x0134_9064 - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_DRAW_RECT: u32 = 0x0134_9068 - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_GET_TEXTURE: u32 = 0x0134_9070 - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_SET_CLIP_RECT: u32 = 0x0134_9050 - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_DESTRUCTOR: u32 = 0x0134_9078 - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_DELETING_DESTRUCTOR: u32 = 0x0134_90e0 - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_RESET_CLIP_RECT: u32 = 0x0134_9054 - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_SET_ORIGIN: u32 = 0x0134_9058 - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_RESET_ORIGIN: u32 = 0x0134_905c - ORIGINAL_BASE;
-const GUI_GL_INVISIBLE_DRAW_STRING_NO_FLOAT: u32 = 0x0134_906c - ORIGINAL_BASE;
 const CL_LUA_DEBUGGER_S_INITIALIZE: u32 = 0x0133_ae10 - ORIGINAL_BASE;
 const GUI_DISPLAY_WIDTH: u32 = 800;
 const GUI_DISPLAY_HEIGHT: u32 = 480;
@@ -197,14 +151,34 @@ static GL_LAYER_COPY_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 static HMI_MAINLOOP_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
 static HMI_FIS_INIT_DONE: AtomicBool = AtomicBool::new(false);
-static MAP_LAYER_COPY_PENDING: AtomicBool = AtomicBool::new(false);
-static MAP_LAYER_COPY_OBJECT: AtomicU32 = AtomicU32::new(0);
 static HMI_VIEW_CLEAN_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
 static HMI_MAINLOOP_TRACE_ARMED: AtomicBool = AtomicBool::new(false);
 static HMI_MAINLOOP_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
-static GL_CONTEXT_VTABLE: AtomicU32 = AtomicU32::new(0);
-static GL_INVISIBLE_CONTEXT_VTABLE: AtomicU32 = AtomicU32::new(0);
-static HMI_VIEW_VTABLE_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
+
+static GL_CONTEXT_CTOR_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+static HMI_VIEW_CONTEXT_ASSIGN_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static HMI_WIDGET_CALL_DRAW_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static HMI_CONTEXT_VIRTUAL_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static HMI_UPDATE_TRACE_ARMED: AtomicBool = AtomicBool::new(false);
+static HMI_UPDATE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static GUI_GL_OPENGLCONTEXT_CTOR: u32 = 0x0134_8e40 - ORIGINAL_BASE;
+static GUI_GL_CONTEXT_IS_DIRTY: u32 = 0x0134_6ff0 - ORIGINAL_BASE;
+static GUI_GL_CONTEXT_DRAW_BEGIN: u32 = 0x0134_8980 - ORIGINAL_BASE;
+static GUI_GL_CONTEXT_GET_DIRTY_REGION: u32 = 0x0134_8fc4 - ORIGINAL_BASE;
+static GUI_WIDGET_CALL_DRAW: u32 = 0x0137_af7c - ORIGINAL_BASE;
+static GUI_DM_EA_MANAGER_UPDATE: u32 = 0x0133_f608 - ORIGINAL_BASE;
+static GUI_DM_EA_MANAGER_HIDE: u32 = 0x0133_e790 - ORIGINAL_BASE;
+static GUI_DM_EA_MANAGER_ABORT: u32 = 0x0133_e744 - ORIGINAL_BASE;
+static GUI_DM_EA_MANAGER_SHOW: u32 = 0x0133_ea84 - ORIGINAL_BASE;
+static HMI_UPDATE_TRACE_START: u32 = GUI_DM_DISPLAY_MANAGER_UPDATE;
+static HMI_UPDATE_TRACE_END: u32 = 0x0133_dd20 - ORIGINAL_BASE;
+static GUI_GL_OPENGLCONTEXT_STORE_VPTR: u32 = 0x0134_8e80 - ORIGINAL_BASE;
+static GUI_GL_OPENGLCONTEXT_INIT: u32 = GUI_GL_CONTEXT_INITIALIZE;
+static GUI_GL_INVISIBLE_CONTEXT_CTOR: u32 = 0x0134_911c - ORIGINAL_BASE;
+static GUI_MENU_MANAGER_VIEW_CHANGE_STORE_CONTEXT: u32 = 0x0136_4770 - ORIGINAL_BASE;
+static GUI_MENU_MANAGER_OVERLAY_STORE_CONTEXT: u32 = 0x0136_4964 - ORIGINAL_BASE;
+const GOT_GUI_GL_OPENGLCONTEXT_VTABLE: u32 = 0x02a1_db34 - ORIGINAL_BASE;
 static GUI_INTERNAL_POST_PENDING: AtomicU32 = AtomicU32::new(0);
 static NAV_STATE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static LUA_CALL_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -1636,50 +1610,7 @@ fn force_ea_manager_background(unicorn: &mut Unicorn<'_, Context>, base_address:
 
 
 
-fn maybe_refresh_map_layer_copy(unicorn: &mut Unicorn<'_, Context>, original_pc: u32) -> bool {
-    if MAP_LAYER_COPY_PENDING.swap(false, Ordering::AcqRel) {
-        return false;
-    }
 
-    let display_manager = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
-    if display_manager == 0 {
-        return false;
-    }
-    let ea_manager = read_u32(unicorn, display_manager);
-    if ea_manager == 0 {
-        return false;
-    }
-
-    let _ = write_u8(unicorn, ea_manager + 0x154, 0xff);
-    let layer_copy = ea_manager + 0x130;
-    MAP_LAYER_COPY_OBJECT.store(layer_copy, Ordering::Release);
-
-    let base = PROCHMI_BASE.load(Ordering::Relaxed);
-    if base == 0 {
-        return false;
-    }
-
-    let function = base + GUI_GL_LAYER_COPY_COPY;
-    if call_guest_function(
-        unicorn,
-        original_pc,
-        function,
-        [layer_copy, 0, SVG_MAP_LAYER_HANDLE, 0],
-    ) {
-        MAP_LAYER_COPY_PENDING.store(true, Ordering::Release);
-        let count = GL_LAYER_COPY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-        if count < 5 {
-            log::info!(
-                "PROCHMI: requested map SVG layer copy display_manager={:#x} ea={:#x} copy={:#x}",
-                display_manager,
-                ea_manager,
-                layer_copy
-            );
-        }
-        return true;
-    }
-    false
-}
 
 fn force_display_manager_dirty(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let addr = base_address + GUI_DM_DISPLAY_MANAGER_IS_DIRTY;
@@ -1691,6 +1622,8 @@ fn force_display_manager_dirty(unicorn: &mut Unicorn<'_, Context>, base_address:
         })
         .unwrap();
 }
+
+
 
 fn force_hmi_mainloop_display_update(unicorn: &mut Unicorn<'_, Context>) {
     let base = PROCHMI_BASE.load(Ordering::Relaxed);
@@ -1708,38 +1641,61 @@ fn force_hmi_mainloop_display_update(unicorn: &mut Unicorn<'_, Context>) {
     }
 }
 
-fn force_hmi_views_clean(unicorn: &mut Unicorn<'_, Context>) {
+fn suppress_hmi_view_dirty_regions(unicorn: &mut Unicorn<'_, Context>) {
     let base = PROCHMI_BASE.load(Ordering::Relaxed);
     if base == 0 {
         return;
     }
-    let menu_manager = read_u32(unicorn, base + GOT_GUI_MENU_MANAGER_TABLE);
-    if HMI_VIEW_CLEAN_DIAG_COUNT.load(Ordering::Relaxed) < 5 {
-        log::info!("PROCHMI: HMI views menu_manager={:#x}", menu_manager);
+    let instance_slot = read_u32(unicorn, base + GOT_GUI_MENU_MANAGER_INSTANCE);
+    let menu_manager = read_u32(unicorn, instance_slot);
+    if menu_manager == 0 {
+        return;
+    }
+    for index in 0..4u32 {
+        let widget = read_u32(unicorn, menu_manager + index * 4);
+        let view = read_u32(unicorn, widget + 0x28);
+        let draw_context = read_u32(unicorn, view + 0x40);
+        if widget != 0 && view != 0 && draw_context != 0 {
+            let _ = write_u32(unicorn, draw_context + 0xb8, 0);
+        }
+    }
+}
+
+fn trace_hmi_view_draw_contexts(unicorn: &mut Unicorn<'_, Context>) {
+    suppress_hmi_view_dirty_regions(unicorn);
+    let base = PROCHMI_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    let instance_slot = read_u32(unicorn, base + GOT_GUI_MENU_MANAGER_INSTANCE);
+    let menu_manager = read_u32(unicorn, instance_slot);
+    let logged = HMI_VIEW_CLEAN_DIAG_COUNT.load(Ordering::Relaxed);
+    if logged < 5 {
+        log::info!(
+            "PROCHMI: MenuManager instance_slot={:#x} menu_manager={:#x}",
+            instance_slot,
+            menu_manager
+        );
     }
     if menu_manager == 0 {
         return;
     }
     for index in 0..4u32 {
-        let view = read_u32(unicorn, menu_manager + index * 4);
+        let widget = read_u32(unicorn, menu_manager + index * 4);
+        let view = read_u32(unicorn, widget + 0x28);
         let draw_context = read_u32(unicorn, view + 0x40);
-        if HMI_VIEW_CLEAN_DIAG_COUNT.load(Ordering::Relaxed) < 5 {
+        if logged < 5 {
             log::info!(
-                "PROCHMI: HMI view {} view={:#x} draw_context={:#x} vptr={:#x} region_count={}",
+                "PROCHMI: HMI view {} widget={:#x} view={:#x} draw_context={:#x} vptr={:#x} vtable_initialize={:#x} region_count={}",
                 index,
+                widget,
                 view,
                 draw_context,
                 read_u32(unicorn, draw_context),
+                read_u32(unicorn, read_u32(unicorn, draw_context) + GUI_GL_CONTEXT_INITIALIZE),
                 read_u32(unicorn, draw_context + 0xb8)
             );
         }
-        if view == 0 || draw_context == 0 {
-            continue;
-        }
-        let _ = write_u32(unicorn, view + 0x40, 0);
-        let _ = write_u32(unicorn, draw_context + 0x88, u32::MAX);
-        let _ = write_u32(unicorn, draw_context + 0x8c, u32::MAX);
-        let _ = write_u32(unicorn, draw_context + 0xb8, 0);
     }
     HMI_VIEW_CLEAN_DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
 }
@@ -1770,10 +1726,7 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
                     force_hmi_mainloop_display_update(uc);
                 }
                 if name == "GUI_DM_DisplayManager::update" {
-                    force_hmi_views_clean(uc);
-                    if maybe_refresh_map_layer_copy(uc, address as u32) {
-                        return;
-                    }
+                    trace_hmi_view_draw_contexts(uc);
                 }
 
                 let count = GL_LAYER_COPY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
