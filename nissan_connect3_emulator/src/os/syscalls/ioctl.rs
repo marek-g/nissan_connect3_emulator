@@ -11,14 +11,25 @@ pub fn ioctl(mut unicorn: &mut Unicorn<'_, Context>, fd: u32, request: u32, addr
         addr,
     );
 
+    let file_system = unicorn.get_data().inner.file_system.clone();
+    let mut fs = file_system.lock().unwrap();
+    let path = fs.get_file_info(fd as i32).map(|info| info.file_path);
+
+    if !crate::os::dev::iosc::is_iosc_fd(&unicorn, fd) {
+        log::warn!(
+            "ioctl path fd={:#x} path={:?} request={:#x} addr={:#x}",
+            fd,
+            path,
+            request,
+            addr
+        );
+    }
+
     // /dev/iosc fds are backed by the emulated IOSC driver, not a filesystem
     if crate::os::dev::iosc::is_iosc_fd(&unicorn, fd) {
         return crate::os::dev::iosc::ioctl(&mut unicorn, fd, request, addr);
     }
 
-    let file_system = unicorn.get_data().inner.file_system.clone();
-    let mut fs = file_system.lock().unwrap();
-    let path = fs.get_file_info(fd as i32).map(|info| info.file_path);
     let res = match path.as_deref() {
         Some("/dev/svg_resource") => {
             crate::os::dev::svg_resource::ioctl(&mut unicorn, request, addr) as u32

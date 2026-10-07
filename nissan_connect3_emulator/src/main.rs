@@ -121,6 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
                     FileType::File,
                     b"/dev/media/sda1".to_vec(),
                 );
+                tmp_fs.insert_entry("/.automount/mmcblk1p1", FileType::Directory, vec![]);
                 Box::new(tmp_fs)
             },
             is_read_only: false,
@@ -147,6 +148,49 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
             mount_point: "/dev/shm".to_string(),
             file_system: Box::new(TmpFileSystem::new()),
             is_read_only: false,
+        },
+        // sysfs SD-card device node
+        MountPoint {
+            mount_point: "/sys".to_string(),
+            file_system: {
+                let mut sys_fs = TmpFileSystem::new();
+                sys_fs.insert_entry("/block", FileType::Directory, vec![]);
+                sys_fs.insert_entry("/block/mmcblk1", FileType::Directory, vec![]);
+                sys_fs.insert_entry("/block/mmcblk1/device", FileType::Directory, vec![]);
+                sys_fs.insert_entry(
+                    "/block/mmcblk1/device/cid",
+                    FileType::File,
+                    b"5d5342303031364712e055a86c013301".to_vec(),
+                );
+                sys_fs.insert_entry(
+                    "/block/mmcblk1/device/csd",
+                    FileType::File,
+                    b"400e00325b59000000000000000000f7".to_vec(),
+                );
+                sys_fs.insert_entry(
+                    "/block/mmcblk1/device/scr",
+                    FileType::File,
+                    b"0235800000000000".to_vec(),
+                );
+                sys_fs.insert_entry(
+                    "/block/mmcblk1/device/manfid",
+                    FileType::File,
+                    b"5d".to_vec(),
+                );
+                sys_fs.insert_entry(
+                    "/block/mmcblk1/device/serial",
+                    FileType::File,
+                    b"12e055a8".to_vec(),
+                );
+                sys_fs.insert_entry("/block/mmcblk1/device/ro", FileType::File, b"0".to_vec());
+                sys_fs.insert_entry(
+                    "/block/mmcblk1/size",
+                    FileType::File,
+                    b"134217728".to_vec(),
+                );
+                Box::new(sys_fs)
+            },
+            is_read_only: true,
         },
         // proc-fs
         MountPoint {

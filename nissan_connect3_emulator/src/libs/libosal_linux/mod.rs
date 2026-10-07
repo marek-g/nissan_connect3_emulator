@@ -32,6 +32,28 @@ fn stub_zero(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
     0
 }
 
+fn hook_sd_trace(
+    unicorn: &mut Unicorn<'_, Context>,
+    base_address: u32,
+    libosal_address: u32,
+    name: &'static str,
+) {
+    let address = base_address + (libosal_address - 0x484d_8000);
+    unicorn
+        .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+            log::warn!(
+                "libosal {} [{}] {} entry addr={:#x} r0={:#x} lr={:#x}",
+                uc.get_data().elf_path,
+                uc.get_data().inner.thread_id(),
+                name,
+                addr,
+                uc.reg_read(RegisterARM::R0).unwrap_or(0),
+                uc.reg_read(RegisterARM::LR).unwrap_or(0)
+            );
+        })
+        .unwrap();
+}
+
 pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     // Stubbed functions are patched to `svc #0` and dispatched from the single
     // intr hook, so no per-instruction Unicorn code hooks are registered.
@@ -53,6 +75,21 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     hook_svg_code(unicorn, base_address);
     hook_thread_code(unicorn, base_address);
     hook_trace_code(unicorn, base_address);
+
+    for (address, name) in [
+        (0x4853_707c, "fd_device_ctrl_u32DirectSDCardInfo"),
+        (0x4853_37dc, "pu8GetCID"),
+        (0x4853_7f44, "fd_device_ctrl_u32ReadCid"),
+        (0x4853_7d38, "fd_device_ctrl_u32SDCardInfo"),
+        (0x4853_6c08, "fd_device_ctrl_vCIDPatternAdapt"),
+        (0x4853_789c, "fd_device_ctrl_u32UsbSdCardInfo"),
+        (0x4853_9010, "s32obtainPath"),
+        (0x4853_9328, "GetSdCardRefreshStatus"),
+        (0x4853_8d84, "SD_Refresh_s32ForcedRefresh"),
+        (0x4853_8ab4, "SD_Refresh_s32StartRefresh"),
+    ] {
+        hook_sd_trace(unicorn, base_address, address, name);
+    }
 
     /*let mut method_entries = HashMap::new();
     insert_libosal_method_entries(&mut method_entries);
