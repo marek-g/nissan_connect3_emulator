@@ -2,9 +2,12 @@ use crate::emulator::context::Context;
 use sdl2::event::Event;
 use sdl2::video::{GLContext, Window};
 use sdl2::EventPump;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::ffi::CString;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Once, OnceLock};
+use std::time::Duration;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 const GL_INVALID_ENUM: u32 = 0x0500;
@@ -21,24 +24,52 @@ const MAX_TEXTURE_DIM: i32 = 4096;
 const MAX_TEXTURE_BYTES: usize = 32 * 1024 * 1024;
 
 static NEXT_FALLBACK_ID: AtomicU32 = AtomicU32::new(0x1001);
+static REAL_GL_DRAW_COUNT: AtomicU32 = AtomicU32::new(0);
+static REAL_EGL_SWAP_COUNT: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Default)]
+struct GpuOutput {
+    ret: u32,
+    out_u32: Vec<u32>,
+    out_bytes: Vec<u8>,
+    out_string: Option<String>,
+    swap_requested: bool,
+}
+
+type GpuFuture = Box<dyn FnOnce() -> GpuOutput + Send>;
+
+struct GpuCommand {
+    future: GpuFuture,
+    reply: mpsc::Sender<GpuOutput>,
+}
 
 thread_local! {
-    static BACKEND: RefCell<Option<Backend>> = const { RefCell::new(None) };
     static PENDING_GL_ERROR: Cell<bool> = const { Cell::new(false) };
-    static BACKEND_INIT_FAILED: Cell<bool> = const { Cell::new(false) };
     static API_LOG_COUNT: Cell<u32> = const { Cell::new(0) };
     static EGL_CURRENT_API: Cell<u32> = const { Cell::new(EGL_OPENGL_ES_API) };
 }
 
+static GPU_SENDER: OnceLock<mpsc::Sender<GpuCommand>> = OnceLock::new();
+static GPU_START: Once = Once::new();
+static GPU_FAILED: AtomicBool = AtomicBool::new(false);
+static GPU_MAKE_CURRENT_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
+
 struct Backend {
     _sdl: sdl2::Sdl,
     _video: sdl2::VideoSubsystem,
-    _gl_context: GLContext,
+    gl_context: GLContext,
     window: Window,
-    events: EventPump,
+    events: Option<EventPump>,
 }
 
-fn init_sdl_backend() -> Result<Backend, String> {
+fn gpu_backend_visible() -> bool {
+    std::env::var("EMU_GPU_VISIBLE")
+        .map(|value| value != "0" && !value.is_empty())
+        .unwrap_or(true)
+}
+
+fn init_backend() -> Result<Backend, String> {
+    let visible = gpu_backend_visible();
     let sdl = sdl2::init()?;
     let video = sdl.video()?;
 
@@ -48,82 +79,253 @@ fn init_sdl_backend() -> Result<Backend, String> {
         attrs.set_context_version(2, 0);
     }
 
-    let window = video
-        .window("Nissan Connect 3 HMI", 800, 480)
-        .position_centered()
-        .resizable()
-        .opengl()
-        .build()
-        .map_err(|err| format!("{:?}", err))?;
+    let window = if visible {
+        video
+            .window("Nissan Connect 3 HMI", 800, 480)
+            .position_centered()
+            .resizable()
+            .opengl()
+            .build()
+            .map_err(|err| format!("{:?}", err))?
+    } else {
+        video
+            .window("Nissan Connect 3 HMI", 800, 480)
+            .position_centered()
+            .resizable()
+            .hidden()
+            .opengl()
+            .build()
+            .map_err(|err| format!("{:?}", err))?
+    };
 
     let gl_context = window.gl_create_context()?;
     gl::load_with(|name| video.gl_get_proc_address(name) as *const _);
     let _ = video.gl_set_swap_interval(1);
-    let events = sdl.event_pump()?;
+    let events = if visible {
+        Some(sdl.event_pump()?)
+    } else {
+        None
+    };
 
     unsafe {
         gl::Viewport(0, 0, 800, 480);
         gl::ClearColor(0.0, 0.0, 0.0, 1.0);
         gl::Clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
     }
-    let _ = window.gl_swap_window();
+    if visible {
+        let _ = window.gl_swap_window();
+    }
+
+    log::info!(
+        "GPU: dedicated SDL/GL backend thread started visible={} thread={:?}",
+        visible,
+        std::thread::current().id()
+    );
 
     Ok(Backend {
         _sdl: sdl,
         _video: video,
-        _gl_context: gl_context,
+        gl_context,
         window,
         events,
     })
 }
 
-pub fn tick(unicorn: &Unicorn<'_, Context>) {
-    if !gpu_process_allowed(&unicorn.get_data().elf_path) {
-        return;
-    }
+fn poll_events(backend: &mut Backend) -> bool {
+    let Some(events) = backend.events.as_mut() else {
+        return false;
+    };
 
-    BACKEND.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            if BACKEND_INIT_FAILED.with(|failed| failed.get()) {
-                return;
+    while let Some(event) = events.poll_event() {
+        match event {
+            Event::Quit { .. } => {
+                std::process::exit(0);
             }
-            match init_sdl_backend() {
-                Ok(backend) => *slot = Some(backend),
-                Err(err) => {
-                    log::warn!(
-                        "GPU: SDL/GL backend unavailable, using null backend: {}",
-                        err
-                    );
-                    BACKEND_INIT_FAILED.with(|failed| failed.set(true));
-                    return;
-                }
-            }
-        }
-
-        let backend = match slot.as_mut() {
-            Some(backend) => backend,
-            None => return,
-        };
-
-        while let Some(event) = backend.events.poll_event() {
-            match event {
-                Event::Quit { .. } => {
-                    std::process::exit(0);
-                }
-                Event::Window { win_event, .. } => {
-                    if let sdl2::event::WindowEvent::Resized(width, height) = win_event {
-                        if width > 0 && height > 0 {
-                            unsafe {
-                                gl::Viewport(0, 0, width, height);
-                            }
+            Event::Window { win_event, .. } => {
+                if let sdl2::event::WindowEvent::Resized(width, height) = win_event {
+                    if width > 0 && height > 0 {
+                        unsafe {
+                            gl::Viewport(0, 0, width, height);
                         }
                     }
                 }
-                _ => {}
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
+fn backend_main(rx: mpsc::Receiver<GpuCommand>, ready_tx: mpsc::Sender<bool>) {
+    let mut backend = match init_backend() {
+        Ok(backend) => backend,
+        Err(err) => {
+            log::warn!("GPU: dedicated SDL/GL backend unavailable: {}", err);
+            let _ = ready_tx.send(false);
+            return;
+        }
+    };
+
+    if ready_tx.send(true).is_err() {
+        return;
+    }
+
+    loop {
+        match rx.recv_timeout(Duration::from_millis(16)) {
+            Ok(command) => {
+                if let Err(err) = backend.window.gl_make_current(&backend.gl_context) {
+                    if !GPU_MAKE_CURRENT_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
+                        log::warn!("GPU: failed to make backend GL context current: {}", err);
+                    }
+                }
+
+                let mut output = (command.future)();
+                if output.swap_requested {
+                    unsafe {
+                        gl::Finish();
+                    }
+                    let _ = backend.window.gl_swap_window();
+                    if poll_events(&mut backend) {
+                        return;
+                    }
+                }
+
+                let _ = command.reply.send(output);
+
+                if poll_events(&mut backend) {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if poll_events(&mut backend) {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                break;
             }
         }
+    }
+}
+
+fn ensure_gpu_thread() -> bool {
+    GPU_START.call_once(|| {
+        let (sender, receiver) = mpsc::channel();
+        if GPU_SENDER.set(sender).is_err() {
+            GPU_FAILED.store(true, Ordering::Release);
+            return;
+        }
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        std::thread::spawn(move || backend_main(receiver, ready_tx));
+
+        match ready_rx.recv() {
+            Ok(true) => {}
+            Ok(false) | Err(_) => GPU_FAILED.store(true, Ordering::Release),
+        }
     });
+
+    !GPU_FAILED.load(Ordering::Acquire)
+}
+
+fn gpu_call<F>(future: F) -> Option<GpuOutput>
+where
+    F: FnOnce() -> GpuOutput + Send + 'static,
+{
+    if !ensure_gpu_thread() {
+        return None;
+    }
+
+    let sender = GPU_SENDER.get()?;
+    let (reply_tx, reply_rx) = mpsc::channel();
+    sender
+        .send(GpuCommand {
+            future: Box::new(future),
+            reply: reply_tx,
+        })
+        .ok()?;
+    reply_rx.recv().ok()
+}
+
+fn gpu_void_clear<F>(f: F) -> bool
+where
+    F: FnOnce() + Send + 'static,
+{
+    gpu_call(move || {
+        f();
+        unsafe {
+            while gl::GetError() != 0 {}
+        }
+        GpuOutput::default()
+    })
+    .is_some()
+}
+
+fn gpu_ret_clear<F>(f: F) -> Option<u32>
+where
+    F: FnOnce() -> u32 + Send + 'static,
+{
+    gpu_call(move || {
+        let ret = f();
+        unsafe {
+            while gl::GetError() != 0 {}
+        }
+        GpuOutput {
+            ret,
+            ..Default::default()
+        }
+    })
+    .map(|output| output.ret)
+}
+
+fn gpu_u32_clear<F>(f: F) -> Option<u32>
+where
+    F: FnOnce() -> u32 + Send + 'static,
+{
+    gpu_ret_clear(f)
+}
+
+fn gpu_bytes_clear<F>(f: F) -> Option<Vec<u8>>
+where
+    F: FnOnce() -> Vec<u8> + Send + 'static,
+{
+    gpu_call(move || {
+        let out_bytes = f();
+        unsafe {
+            while gl::GetError() != 0 {}
+        }
+        GpuOutput {
+            out_bytes,
+            ..Default::default()
+        }
+    })
+    .map(|output| output.out_bytes)
+}
+
+fn gpu_string_clear<F>(f: F) -> Option<String>
+where
+    F: FnOnce() -> String + Send + 'static,
+{
+    gpu_call(move || {
+        let out_string = f();
+        unsafe {
+            while gl::GetError() != 0 {}
+        }
+        GpuOutput {
+            out_string: Some(out_string),
+            ..Default::default()
+        }
+    })
+    .and_then(|output| output.out_string)
+}
+
+fn gpu_clear_errors() {
+    gpu_void_clear(|| {});
+}
+
+pub fn tick(unicorn: &Unicorn<'_, Context>) {
+    ensure_backend(unicorn);
 }
 
 fn gpu_process_allowed(elf_path: &str) -> bool {
@@ -142,47 +344,7 @@ fn gpu_process_allowed(elf_path: &str) -> bool {
 }
 
 fn ensure_backend(unicorn: &Unicorn<'_, Context>) -> bool {
-    if !gpu_process_allowed(&unicorn.get_data().elf_path) {
-        return false;
-    }
-
-    BACKEND.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_some() {
-            return true;
-        }
-        if BACKEND_INIT_FAILED.with(|failed| failed.get()) {
-            return false;
-        }
-        match init_sdl_backend() {
-            Ok(backend) => {
-                *slot = Some(backend);
-                true
-            }
-            Err(err) => {
-                log::warn!(
-                    "GPU: SDL/GL backend unavailable, using null backend: {}",
-                    err
-                );
-                BACKEND_INIT_FAILED.with(|failed| failed.set(true));
-                false
-            }
-        }
-    })
-}
-
-fn backend_ready(unicorn: &Unicorn<'_, Context>) -> bool {
-    ensure_backend(unicorn)
-}
-
-fn with_backend<T>(
-    unicorn: &Unicorn<'_, Context>,
-    f: impl FnOnce(&mut Backend) -> T,
-) -> Option<T> {
-    if !ensure_backend(unicorn) {
-        return None;
-    }
-    BACKEND.with(|slot| slot.borrow_mut().as_mut().map(|backend| f(backend)))
+    gpu_process_allowed(&unicorn.get_data().elf_path) && ensure_gpu_thread()
 }
 
 fn ureg(unicorn: &mut Unicorn<'_, Context>, register: RegisterARM) -> u32 {
@@ -340,11 +502,10 @@ fn host_cstr_to_string(ptr: *const std::os::raw::c_char) -> String {
     unsafe { std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string() }
 }
 
-fn clear_host_gl_errors(unicorn: &Unicorn<'_, Context>) {
-    if !backend_ready(unicorn) {
-        return;
-    }
-    unsafe { while gl::GetError() != 0 {} }
+fn clear_host_gl_errors(_unicorn: &Unicorn<'_, Context>) {
+    // Do not enqueue a command here. `force_gl_error()` sets the local pending
+    // flag before clearing host-side GL errors, and enqueueing can change guest
+    // scheduling. The worker drains real GL errors with explicit GL commands.
 }
 
 fn force_gl_error(unicorn: &Unicorn<'_, Context>) {
@@ -358,15 +519,41 @@ fn log_api(unicorn: &mut Unicorn<'_, Context>, prefix: &str, name: &str) {
         count.set(old.wrapping_add(1));
         old
     });
-    if count < 3000 {
+    let important = name.starts_with("glDraw")
+        || matches!(
+            name,
+            "glClear" | "glClearColor" | "glViewport" | "eglSwapBuffers"
+        );
+    if important || count < 3000 {
         log::info!(
-            "GPU: {} {} r0={:x} r1={:x} r2={:x} r3={:x}",
+            "GPU: {} {} process={} r0={:x} r1={:x} r2={:x} r3={:x}",
             prefix,
             name,
+            process_label(unicorn),
             ureg(unicorn, RegisterARM::R0),
             ureg(unicorn, RegisterARM::R1),
             ureg(unicorn, RegisterARM::R2),
             ureg(unicorn, RegisterARM::R3)
+        );
+    }
+}
+
+fn process_label(unicorn: &Unicorn<'_, Context>) -> String {
+    let elf_path = &unicorn.get_data().elf_path;
+    elf_path.rsplit('/').next().unwrap_or(elf_path).to_string()
+}
+
+fn note_real_gl_output(unicorn: &Unicorn<'_, Context>, kind: &str) {
+    let count = match kind {
+        "draw" => REAL_GL_DRAW_COUNT.fetch_add(1, Ordering::Relaxed),
+        _ => REAL_EGL_SWAP_COUNT.fetch_add(1, Ordering::Relaxed),
+    } + 1;
+    if count == 1 || count % 60 == 0 {
+        log::info!(
+            "GPU: REAL {} process={} count={}",
+            kind,
+            process_label(unicorn),
+            count
         );
     }
 }
@@ -466,20 +653,15 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             return 1;
         }
         "eglSwapBuffers" => {
-            if with_backend(unicorn, |backend| {
-                unsafe {
-                    gl::Finish();
-                }
-                let _ = backend.window.gl_swap_window();
-                while let Some(event) = backend.events.poll_event() {
-                    if let Event::Quit { .. } = event {
-                        std::process::exit(0);
-                    }
+            let swapped = gpu_call(|| {
+                GpuOutput {
+                    swap_requested: true,
+                    ..Default::default()
                 }
             })
-            .is_some()
-            {
-                return 1;
+            .is_some();
+            if swapped {
+                note_real_gl_output(unicorn, "swap");
             }
             return 1;
         }
@@ -507,7 +689,7 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             return 1;
         }
         "eglCreateWindowSurface" => {
-            if backend_ready(unicorn) {
+            if ensure_backend(unicorn) {
                 clear_host_gl_errors(unicorn);
                 return 2;
             }
@@ -522,664 +704,71 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
     next_fallback_id()
 }
 
+fn backend_ready(unicorn: &Unicorn<'_, Context>) -> bool {
+    ensure_backend(unicorn)
+}
+
 pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
     log_api(unicorn, "GL", name);
-    let ready = backend_ready(unicorn);
+
+    if ensure_backend(unicorn) {
+        match name {
+            "glDrawArrays" => {
+                let mode = ureg(unicorn, RegisterARM::R0);
+                let first = ureg(unicorn, RegisterARM::R1) as i32;
+                let count = ureg(unicorn, RegisterARM::R2) as i32;
+                let ok = gpu_void_clear(move || unsafe {
+                    gl::DrawArrays(mode, first, count);
+                });
+                if ok {
+                    note_real_gl_output(unicorn, "draw");
+                }
+                return 0;
+            }
+            "glDrawElements" => {
+                let mode = ureg(unicorn, RegisterARM::R0);
+                let count = ureg(unicorn, RegisterARM::R1) as i32;
+                let kind = ureg(unicorn, RegisterARM::R2);
+                let offset = ureg(unicorn, RegisterARM::R3);
+                let ok = gpu_void_clear(move || unsafe {
+                    gl::DrawElements(mode, count, kind, offset as *const std::ffi::c_void);
+                });
+                if ok {
+                    note_real_gl_output(unicorn, "draw");
+                }
+                return 0;
+            }
+            _ => {}
+        }
+    }
 
     if name == "glShaderBinary" {
-        force_gl_error(unicorn);
+        PENDING_GL_ERROR.with(|flag| flag.set(true));
         return 0;
     }
 
     if name == "glGetError" {
         let pending = PENDING_GL_ERROR.with(|flag| flag.replace(false));
         if pending {
-            clear_host_gl_errors(unicorn);
             return GL_INVALID_ENUM;
         }
-        if ready {
-            let err = unsafe { gl::GetError() } as u32;
-            if err != 0 {
-                return err;
-            }
-            while unsafe { gl::GetError() } != 0 {}
+        if ensure_backend(unicorn) {
+            return gpu_ret_clear(move || unsafe {
+                let err = gl::GetError();
+                while gl::GetError() != 0 {}
+                err
+            })
+            .unwrap_or(0);
         }
         return 0;
     }
 
-    if !ready {
-        return gl_fallback(unicorn, name);
-    }
-
-    unsafe {
-        match name {
-            "glActiveTexture" => gl::ActiveTexture(ureg(unicorn, RegisterARM::R0)),
-            "glAttachShader" => gl::AttachShader(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-            ),
-            "glBindAttribLocation" => {
-                let program = ureg(unicorn, RegisterARM::R0);
-                let index = ureg(unicorn, RegisterARM::R1);
-                let name_ptr = ureg(unicorn, RegisterARM::R2);
-                let name = read_guest_cstr(unicorn, name_ptr, 128);
-                let cname = CString::new(name).unwrap_or_else(|_| CString::new("").unwrap());
-                gl::BindAttribLocation(program, index, cname.as_ptr() as *const _);
-            }
-            "glBindBuffer" => gl::BindBuffer(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-            ),
-            "glBindFramebuffer" => gl::BindFramebuffer(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-            ),
-            "glBindRenderbuffer" => gl::BindRenderbuffer(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-            ),
-            "glBindTexture" => gl::BindTexture(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-            ),
-            "glBlendColor" => {
-                let values = [
-                    freg(unicorn, RegisterARM::R0),
-                    freg(unicorn, RegisterARM::R1),
-                    freg(unicorn, RegisterARM::R2),
-                    freg(unicorn, RegisterARM::R3),
-                ];
-                gl::BlendColor(values[0], values[1], values[2], values[3]);
-            }
-            "glBlendEquation" => gl::BlendEquation(ureg(unicorn, RegisterARM::R0)),
-            "glBlendEquationSeparate" => gl::BlendEquationSeparate(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-            ),
-            "glBlendFunc" => gl::BlendFunc(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-            ),
-            "glBlendFuncSeparate" => gl::BlendFuncSeparate(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-                ureg(unicorn, RegisterARM::R2),
-                ureg(unicorn, RegisterARM::R3),
-            ),
-            "glBufferData" => {
-                let target = ureg(unicorn, RegisterARM::R0);
-                let size = (ureg(unicorn, RegisterARM::R1) as usize).min(MAX_TEXTURE_BYTES);
-                let data_addr = ureg(unicorn, RegisterARM::R2);
-                let data = if data_addr == 0 || size == 0 {
-                    Vec::new()
-                } else {
-                    read_best_effort_bytes(unicorn, data_addr, size)
-                        .map(|(_, data)| data)
-                        .unwrap_or_default()
-                };
-                gl::BufferData(
-                    target,
-                    size as isize,
-                    if data.is_empty() {
-                        std::ptr::null()
-                    } else {
-                        data.as_ptr() as *const _
-                    },
-                    gl::STATIC_DRAW,
-                );
-            }
-            "glBufferSubData" => {
-                let target = ureg(unicorn, RegisterARM::R0);
-                let offset = ureg(unicorn, RegisterARM::R1) as isize;
-                let size = (ureg(unicorn, RegisterARM::R2) as usize).min(MAX_TEXTURE_BYTES);
-                let data_addr = ureg(unicorn, RegisterARM::R3);
-                let data = read_best_effort_bytes(unicorn, data_addr, size)
-                    .map(|(_, data)| data)
-                    .unwrap_or_default();
-                gl::BufferSubData(
-                    target,
-                    offset,
-                    size as isize,
-                    if data.is_empty() {
-                        std::ptr::null()
-                    } else {
-                        data.as_ptr() as *const _
-                    },
-                );
-            }
-            "glCheckFramebufferStatus" => {
-                return gl::CheckFramebufferStatus(ureg(unicorn, RegisterARM::R0)) as u32
-            }
-            "glClear" => gl::Clear(ureg(unicorn, RegisterARM::R0)),
-            "glClearColor" => {
-                let values = [
-                    freg(unicorn, RegisterARM::R0),
-                    freg(unicorn, RegisterARM::R1),
-                    freg(unicorn, RegisterARM::R2),
-                    freg(unicorn, RegisterARM::R3),
-                ];
-                gl::ClearColor(values[0], values[1], values[2], values[3]);
-            }
-            "glClearDepthf" => gl::ClearDepthf(freg(unicorn, RegisterARM::R0)),
-            "glClearStencil" => gl::ClearStencil(ureg(unicorn, RegisterARM::R0) as i32),
-            "glColorMask" => gl::ColorMask(
-                ureg(unicorn, RegisterARM::R0) as u8,
-                ureg(unicorn, RegisterARM::R1) as u8,
-                ureg(unicorn, RegisterARM::R2) as u8,
-                ureg(unicorn, RegisterARM::R3) as u8,
-            ),
-            "glCompileShader" => gl::CompileShader(ureg(unicorn, RegisterARM::R0)),
-            "glCreateProgram" => return gl::CreateProgram(),
-            "glCreateShader" => return gl::CreateShader(ureg(unicorn, RegisterARM::R0)),
-            "glCullFace" => gl::CullFace(ureg(unicorn, RegisterARM::R0)),
-            "glDeleteBuffers" => {
-                let count = ureg(unicorn, RegisterARM::R0) as i32;
-                let ptr = ureg(unicorn, RegisterARM::R1);
-                let values = read_u32_array(unicorn, ptr, count as usize);
-                gl::DeleteBuffers(count, values.as_ptr());
-            }
-            "glDeleteFramebuffers" => {
-                let count = ureg(unicorn, RegisterARM::R0) as i32;
-                let ptr = ureg(unicorn, RegisterARM::R1);
-                let values = read_u32_array(unicorn, ptr, count as usize);
-                gl::DeleteFramebuffers(count, values.as_ptr());
-            }
-            "glDeleteProgram" => gl::DeleteProgram(ureg(unicorn, RegisterARM::R0)),
-            "glDeleteRenderbuffers" => {
-                let count = ureg(unicorn, RegisterARM::R0) as i32;
-                let ptr = ureg(unicorn, RegisterARM::R1);
-                let values = read_u32_array(unicorn, ptr, count as usize);
-                gl::DeleteRenderbuffers(count, values.as_ptr());
-            }
-            "glDeleteShader" => gl::DeleteShader(ureg(unicorn, RegisterARM::R0)),
-            "glDeleteTextures" => {
-                let count = ureg(unicorn, RegisterARM::R0) as i32;
-                let ptr = ureg(unicorn, RegisterARM::R1);
-                let values = read_u32_array(unicorn, ptr, count as usize);
-                gl::DeleteTextures(count, values.as_ptr());
-            }
-            "glDepthFunc" => gl::DepthFunc(ureg(unicorn, RegisterARM::R0)),
-            "glDepthMask" => gl::DepthMask(ureg(unicorn, RegisterARM::R0) as u8),
-            "glDepthRangef" => gl::DepthRangef(
-                freg(unicorn, RegisterARM::R0),
-                freg(unicorn, RegisterARM::R1),
-            ),
-            "glDetachShader" => gl::DetachShader(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-            ),
-            "glDisable" => gl::Disable(ureg(unicorn, RegisterARM::R0)),
-            "glDisableVertexAttribArray" => {
-                gl::DisableVertexAttribArray(ureg(unicorn, RegisterARM::R0))
-            }
-            "glDrawArrays" => gl::DrawArrays(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1) as i32,
-                ureg(unicorn, RegisterARM::R2) as i32,
-            ),
-            "glDrawElements" => gl::DrawElements(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1) as i32,
-                ureg(unicorn, RegisterARM::R2),
-                ureg(unicorn, RegisterARM::R3) as *const _,
-            ),
-            "glEnable" => gl::Enable(ureg(unicorn, RegisterARM::R0)),
-            "glEnableVertexAttribArray" => {
-                gl::EnableVertexAttribArray(ureg(unicorn, RegisterARM::R0))
-            }
-            "glFinish" => gl::Finish(),
-            "glFlush" => gl::Flush(),
-            "glFramebufferRenderbuffer" => gl::FramebufferRenderbuffer(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-                ureg(unicorn, RegisterARM::R2),
-                ureg(unicorn, RegisterARM::R3),
-            ),
-            "glFramebufferTexture2D" => {
-                let target = ureg(unicorn, RegisterARM::R0);
-                let attachment = ureg(unicorn, RegisterARM::R1);
-                let textarget = ureg(unicorn, RegisterARM::R2);
-                let texture = ureg(unicorn, RegisterARM::R3);
-                let level = stack_arg(unicorn, 0) as i32;
-                gl::FramebufferTexture2D(target, attachment, textarget, texture, level);
-            }
-            "glFrontFace" => gl::FrontFace(ureg(unicorn, RegisterARM::R0)),
-            "glGenBuffers" => gen_ids(unicorn, GenKind::Buffer),
-            "glGenerateMipmap" => gl::GenerateMipmap(ureg(unicorn, RegisterARM::R0)),
-            "glGenFramebuffers" => gen_ids(unicorn, GenKind::Framebuffer),
-            "glGenRenderbuffers" => gen_ids(unicorn, GenKind::Renderbuffer),
-            "glGenTextures" => gen_ids(unicorn, GenKind::Texture),
-            "glGetAttribLocation" => {
-                let program = ureg(unicorn, RegisterARM::R0);
-                let addr = ureg(unicorn, RegisterARM::R1);
-                let name = read_guest_cstr(unicorn, addr, 128);
-                let cname = CString::new(name).unwrap_or_else(|_| CString::new("").unwrap());
-                return gl::GetAttribLocation(program, cname.as_ptr()) as u32;
-            }
-            "glGetError" => unreachable!(),
-            "glGetIntegerv" => {
-                let pname = ureg(unicorn, RegisterARM::R0);
-                let out = ureg(unicorn, RegisterARM::R1);
-                let mut value = 0i32;
-                gl::GetIntegerv(pname, &mut value);
-                write_u32(unicorn, out, value as u32);
-            }
-            "glGetProgramInfoLog" => {
-                let program = ureg(unicorn, RegisterARM::R0);
-                let buf_size = ureg(unicorn, RegisterARM::R1) as i32;
-                let len_out = ureg(unicorn, RegisterARM::R2);
-                let buf = ureg(unicorn, RegisterARM::R3);
-                if buf_size > 0 && buf != 0 {
-                    let mut log = vec![0u8; buf_size as usize];
-                    let mut len = 0i32;
-                    gl::GetProgramInfoLog(program, buf_size, &mut len, log.as_mut_ptr() as *mut _);
-                    let copy_len = (len.max(0) as usize).min(buf_size as usize);
-                    let _ = unicorn.mem_write(buf as u64, &log[..copy_len]);
-                    write_u32(unicorn, len_out, len.max(0) as u32);
-                }
-            }
-            "glGetProgramiv" => {
-                let program = ureg(unicorn, RegisterARM::R0);
-                let pname = ureg(unicorn, RegisterARM::R1);
-                let out = ureg(unicorn, RegisterARM::R2);
-                let mut value = 0i32;
-                gl::GetProgramiv(program, pname, &mut value);
-                if pname == GL_INFO_LOG_LENGTH && value <= 0 {
-                    value = 1;
-                }
-                write_u32(unicorn, out, value as u32);
-            }
-            "glGetShaderInfoLog" => {
-                let shader = ureg(unicorn, RegisterARM::R0);
-                let buf_size = ureg(unicorn, RegisterARM::R1) as i32;
-                let len_out = ureg(unicorn, RegisterARM::R2);
-                let buf = ureg(unicorn, RegisterARM::R3);
-                if buf_size > 0 && buf != 0 {
-                    let mut log = vec![0u8; buf_size as usize];
-                    let mut len = 0i32;
-                    gl::GetShaderInfoLog(shader, buf_size, &mut len, log.as_mut_ptr() as *mut _);
-                    let copy_len = (len.max(0) as usize).min(buf_size as usize);
-                    let _ = unicorn.mem_write(buf as u64, &log[..copy_len]);
-                    write_u32(unicorn, len_out, len.max(0) as u32);
-                }
-            }
-            "glGetShaderiv" => {
-                let shader = ureg(unicorn, RegisterARM::R0);
-                let pname = ureg(unicorn, RegisterARM::R1);
-                let out = ureg(unicorn, RegisterARM::R2);
-                let mut value = 0i32;
-                gl::GetShaderiv(shader, pname, &mut value);
-                if pname == GL_INFO_LOG_LENGTH && value <= 0 {
-                    value = 1;
-                }
-                write_u32(unicorn, out, value as u32);
-            }
-            "glGetString" => {
-                let name = ureg(unicorn, RegisterARM::R0);
-                let ptr = gl::GetString(name);
-                let mut text = host_cstr_to_string(ptr as *const _);
-                if name == gl::EXTENSIONS {
-                    text = suppress_unstubbed_gl_extensions(&text);
-                }
-                return alloc_write_guest_cstr(unicorn, &text);
-            }
-            "glGetUniformLocation" => {
-                let program = ureg(unicorn, RegisterARM::R0);
-                let addr = ureg(unicorn, RegisterARM::R1);
-                let name = read_guest_cstr(unicorn, addr, 128);
-                let cname = CString::new(name).unwrap_or_else(|_| CString::new("").unwrap());
-                return gl::GetUniformLocation(program, cname.as_ptr()) as u32;
-            }
-            "glHint" => gl::Hint(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-            ),
-            "glLinkProgram" => gl::LinkProgram(ureg(unicorn, RegisterARM::R0)),
-            "glPixelStorei" => gl::PixelStorei(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1) as i32,
-            ),
-            "glPolygonOffset" => gl::PolygonOffset(
-                freg(unicorn, RegisterARM::R0),
-                freg(unicorn, RegisterARM::R1),
-            ),
-            "glReadPixels" => {
-                let x = ureg(unicorn, RegisterARM::R0) as i32;
-                let y = ureg(unicorn, RegisterARM::R1) as i32;
-                let width = ureg(unicorn, RegisterARM::R2) as i32;
-                let height = ureg(unicorn, RegisterARM::R3) as i32;
-                let format = stack_arg(unicorn, 0);
-                let kind = stack_arg(unicorn, 1);
-                let out = stack_arg(unicorn, 2);
-                let size = (width.max(0) as usize)
-                    .saturating_mul(height.max(0) as usize)
-                    .saturating_mul(4);
-                let mut data = vec![0u8; size];
-                if !data.is_empty() {
-                    gl::ReadPixels(
-                        x,
-                        y,
-                        width,
-                        height,
-                        format,
-                        kind,
-                        data.as_mut_ptr() as *mut _,
-                    );
-                    let _ = unicorn.mem_write(out as u64, &data);
-                }
-            }
-            "glRenderbufferStorage" => {
-                let target = ureg(unicorn, RegisterARM::R0);
-                let internal = ureg(unicorn, RegisterARM::R1);
-                let width = ureg(unicorn, RegisterARM::R2) as i32;
-                let height = ureg(unicorn, RegisterARM::R3) as i32;
-                gl::RenderbufferStorage(target, internal, width, height);
-            }
-            "glScissor" => gl::Scissor(
-                ureg(unicorn, RegisterARM::R0) as i32,
-                ureg(unicorn, RegisterARM::R1) as i32,
-                ureg(unicorn, RegisterARM::R2) as i32,
-                ureg(unicorn, RegisterARM::R3) as i32,
-            ),
-            "glShaderSource" => {
-                let shader = ureg(unicorn, RegisterARM::R0);
-                let count = (ureg(unicorn, RegisterARM::R1) as usize).min(64);
-                let strings_ptr = ureg(unicorn, RegisterARM::R2);
-                let lengths_ptr = ureg(unicorn, RegisterARM::R3);
-                let mut strings = Vec::new();
-                for index in 0..count {
-                    let src_ptr = read_u32(unicorn, strings_ptr + (index as u32 * 4));
-                    let len = if lengths_ptr != 0 {
-                        let len = read_u32(unicorn, lengths_ptr + (index as u32 * 4));
-                        if len == 0 || len == u32::MAX {
-                            None
-                        } else {
-                            Some(len as usize)
-                        }
-                    } else {
-                        None
-                    };
-                    let s = if let Some(len) = len {
-                        let bytes = read_bytes(unicorn, src_ptr, len).unwrap_or_default();
-                        String::from_utf8_lossy(&bytes).to_string()
-                    } else {
-                        read_guest_cstr(unicorn, src_ptr, 64 * 1024)
-                    };
-                    strings.push(CString::new(s).unwrap_or_else(|_| CString::new("").unwrap()));
-                }
-                strings = strings
-                    .into_iter()
-                    .map(|source| {
-                        let patched =
-                            patch_vertex_shader_position_w(source.to_string_lossy().as_ref());
-                        CString::new(patched).unwrap_or_else(|_| CString::new("").unwrap())
-                    })
-                    .collect();
-                let ptrs: Vec<*const u8> =
-                    strings.iter().map(|s| s.as_ptr() as *const u8).collect();
-                gl::ShaderSource(shader, count as i32, ptrs.as_ptr(), std::ptr::null());
-            }
-            "glTexImage2D" => {
-                let target = ureg(unicorn, RegisterARM::R0);
-                let level = ureg(unicorn, RegisterARM::R1) as i32;
-                let internal = ureg(unicorn, RegisterARM::R2);
-                let width = ureg(unicorn, RegisterARM::R3) as i32;
-                let height = stack_arg(unicorn, 0) as i32;
-                let border = stack_arg(unicorn, 1) as i32;
-                let format = stack_arg(unicorn, 2);
-                let kind = stack_arg(unicorn, 3);
-                let data_addr = stack_arg(unicorn, 4);
-                let width = clamp_texture_dim(width);
-                let height = clamp_texture_dim(height);
-                log::info!(
-                    "GPU: glTexImage2D detail target={:#x} level={} internal={:#x} w={} h={} format={:#x} type={:#x} data={:#x}",
-                    target,
-                    level,
-                    internal,
-                    width,
-                    height,
-                    format,
-                    kind,
-                    data_addr
-                );
-                let data = texture_bytes(unicorn, format, kind, width, height, data_addr);
-                gl::TexImage2D(
-                    target,
-                    level,
-                    internal as i32,
-                    width,
-                    height,
-                    border,
-                    format,
-                    kind,
-                    if data_addr == 0 || data.is_empty() {
-                        std::ptr::null()
-                    } else {
-                        data.as_ptr() as *const _
-                    },
-                );
-            }
-            "glTexSubImage2D" => {
-                let target = ureg(unicorn, RegisterARM::R0);
-                let level = ureg(unicorn, RegisterARM::R1) as i32;
-                let x = ureg(unicorn, RegisterARM::R2) as i32;
-                let y = ureg(unicorn, RegisterARM::R3) as i32;
-                let width = clamp_texture_dim(stack_arg(unicorn, 0) as i32);
-                let height = clamp_texture_dim(stack_arg(unicorn, 1) as i32);
-                let format = stack_arg(unicorn, 2);
-                let kind = stack_arg(unicorn, 3);
-                let data_addr = stack_arg(unicorn, 4);
-                let data = texture_bytes(unicorn, format, kind, width, height, data_addr);
-                gl::TexSubImage2D(
-                    target,
-                    level,
-                    x,
-                    y,
-                    width,
-                    height,
-                    format,
-                    kind,
-                    if data_addr == 0 || data.is_empty() {
-                        std::ptr::null()
-                    } else {
-                        data.as_ptr() as *const _
-                    },
-                );
-            }
-            "glTexParameterf" => gl::TexParameterf(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-                freg(unicorn, RegisterARM::R2),
-            ),
-            "glTexParameteri" => gl::TexParameteri(
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-                ureg(unicorn, RegisterARM::R2) as i32,
-            ),
-            "glTexParameteriv" => {
-                let target = ureg(unicorn, RegisterARM::R0);
-                let pname = ureg(unicorn, RegisterARM::R1);
-                let value = ureg(unicorn, RegisterARM::R2);
-                let values = read_i32_array(unicorn, value, 1);
-                gl::TexParameteriv(target, pname, values.as_ptr());
-            }
-            "glUniform1f" => {
-                let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                let value = freg(unicorn, RegisterARM::R1);
-                gl::Uniform1f(loc, value);
-            }
-            "glUniform1fv" => {
-                let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                let count = ureg(unicorn, RegisterARM::R1) as i32;
-                let values_ptr = ureg(unicorn, RegisterARM::R2);
-                let values = read_f32_array(unicorn, values_ptr, count as usize);
-                gl::Uniform1fv(loc, count, values.as_ptr());
-            }
-            "glUniform1i" => gl::Uniform1i(
-                ureg(unicorn, RegisterARM::R0) as i32,
-                ureg(unicorn, RegisterARM::R1) as i32,
-            ),
-            "glUniform1iv" => {
-                let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                let count = ureg(unicorn, RegisterARM::R1) as i32;
-                let values_ptr = ureg(unicorn, RegisterARM::R2);
-                let values = read_i32_array(unicorn, values_ptr, count as usize);
-                gl::Uniform1iv(loc, count, values.as_ptr());
-            }
-            "glUniform2f" => {
-                let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                let values = [
-                    freg(unicorn, RegisterARM::R1),
-                    freg(unicorn, RegisterARM::R2),
-                ];
-                gl::Uniform2f(loc, values[0], values[1]);
-            }
-            "glUniform2fv" => {
-                let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                let count = ureg(unicorn, RegisterARM::R1) as i32;
-                let values_ptr = ureg(unicorn, RegisterARM::R2);
-                let values = read_f32_array(unicorn, values_ptr, count as usize * 2);
-                gl::Uniform2fv(loc, count, values.as_ptr());
-            }
-            "glUniform2i" => gl::Uniform2i(
-                ureg(unicorn, RegisterARM::R0) as i32,
-                ureg(unicorn, RegisterARM::R1) as i32,
-                ureg(unicorn, RegisterARM::R2) as i32,
-            ),
-            "glUniform2iv" => {
-                let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                let count = ureg(unicorn, RegisterARM::R1) as i32;
-                let values_ptr = ureg(unicorn, RegisterARM::R2);
-                let values = read_i32_array(unicorn, values_ptr, count as usize * 2);
-                gl::Uniform2iv(loc, count, values.as_ptr());
-            }
-            "glUniform3f" => {
-                let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                let values = [
-                    freg(unicorn, RegisterARM::R1),
-                    freg(unicorn, RegisterARM::R2),
-                    freg(unicorn, RegisterARM::R3),
-                ];
-                gl::Uniform3f(loc, values[0], values[1], values[2]);
-            }
-            "glUniform3fv" => {
-                let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                let count = ureg(unicorn, RegisterARM::R1) as i32;
-                let values_ptr = ureg(unicorn, RegisterARM::R2);
-                let values = read_f32_array(unicorn, values_ptr, count as usize * 3);
-                gl::Uniform3fv(loc, count, values.as_ptr());
-            }
-            "glUniform3i" => gl::Uniform3i(
-                ureg(unicorn, RegisterARM::R0) as i32,
-                ureg(unicorn, RegisterARM::R1) as i32,
-                ureg(unicorn, RegisterARM::R2) as i32,
-                ureg(unicorn, RegisterARM::R3) as i32,
-            ),
-            "glUniform3iv" => {
-                let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                let count = ureg(unicorn, RegisterARM::R1) as i32;
-                let values_ptr = ureg(unicorn, RegisterARM::R2);
-                let values = read_i32_array(unicorn, values_ptr, count as usize * 3);
-                gl::Uniform3iv(loc, count, values.as_ptr());
-            }
-            "glUniform4f" => {
-                let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                let values = [
-                    freg(unicorn, RegisterARM::R1),
-                    freg(unicorn, RegisterARM::R2),
-                    freg(unicorn, RegisterARM::R3),
-                    fstack(unicorn, 0),
-                ];
-                gl::Uniform4f(loc, values[0], values[1], values[2], values[3]);
-            }
-            "glUniform4fv" => {
-                let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                let count = ureg(unicorn, RegisterARM::R1) as i32;
-                let values_ptr = ureg(unicorn, RegisterARM::R2);
-                let values = read_f32_array(unicorn, values_ptr, count as usize * 4);
-                gl::Uniform4fv(loc, count, values.as_ptr());
-            }
-            "glUniform4i" => gl::Uniform4i(
-                ureg(unicorn, RegisterARM::R0) as i32,
-                ureg(unicorn, RegisterARM::R1) as i32,
-                ureg(unicorn, RegisterARM::R2) as i32,
-                ureg(unicorn, RegisterARM::R3) as i32,
-                stack_arg(unicorn, 0) as i32,
-            ),
-            "glUniform4iv" => {
-                let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                let count = ureg(unicorn, RegisterARM::R1) as i32;
-                let values_ptr = ureg(unicorn, RegisterARM::R2);
-                let values = read_i32_array(unicorn, values_ptr, count as usize * 4);
-                gl::Uniform4iv(loc, count, values.as_ptr());
-            }
-            "glUniformMatrix2fv" => {
-                let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                let count = ureg(unicorn, RegisterARM::R1) as i32;
-                let transpose = ureg(unicorn, RegisterARM::R2) as u8;
-                let values_ptr = ureg(unicorn, RegisterARM::R3);
-                let values = read_f32_array(unicorn, values_ptr, count as usize * 4);
-                gl::UniformMatrix2fv(loc, count, transpose, values.as_ptr());
-            }
-            "glUniformMatrix3fv" => {
-                let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                let count = ureg(unicorn, RegisterARM::R1) as i32;
-                let transpose = ureg(unicorn, RegisterARM::R2) as u8;
-                let values_ptr = ureg(unicorn, RegisterARM::R3);
-                let values = read_f32_array(unicorn, values_ptr, count as usize * 9);
-                gl::UniformMatrix3fv(loc, count, transpose, values.as_ptr());
-            }
-            "glUniformMatrix4fv" => {
-                let loc = ureg(unicorn, RegisterARM::R0) as i32;
-                let count = ureg(unicorn, RegisterARM::R1) as i32;
-                let transpose = ureg(unicorn, RegisterARM::R2) as u8;
-                let values_ptr = ureg(unicorn, RegisterARM::R3);
-                let values = read_f32_array(unicorn, values_ptr, count as usize * 16);
-                gl::UniformMatrix4fv(loc, count, transpose, values.as_ptr());
-            }
-            "glUseProgram" => gl::UseProgram(ureg(unicorn, RegisterARM::R0)),
-            "glValidateProgram" => gl::ValidateProgram(ureg(unicorn, RegisterARM::R0)),
-            "glVertexAttrib1f" => gl::VertexAttrib1f(
-                ureg(unicorn, RegisterARM::R0),
-                freg(unicorn, RegisterARM::R1),
-            ),
-            "glVertexAttrib2f" => gl::VertexAttrib2f(
-                ureg(unicorn, RegisterARM::R0),
-                freg(unicorn, RegisterARM::R1),
-                freg(unicorn, RegisterARM::R2),
-            ),
-            "glVertexAttrib3f" => gl::VertexAttrib3f(
-                ureg(unicorn, RegisterARM::R0),
-                freg(unicorn, RegisterARM::R1),
-                freg(unicorn, RegisterARM::R2),
-                freg(unicorn, RegisterARM::R3),
-            ),
-            "glVertexAttrib4f" => gl::VertexAttrib4f(
-                ureg(unicorn, RegisterARM::R0),
-                freg(unicorn, RegisterARM::R1),
-                freg(unicorn, RegisterARM::R2),
-                freg(unicorn, RegisterARM::R3),
-                fstack(unicorn, 0),
-            ),
-            "glVertexAttribPointer" => vertex_attrib_pointer(unicorn),
-            "glViewport" => gl::Viewport(
-                ureg(unicorn, RegisterARM::R0) as i32,
-                ureg(unicorn, RegisterARM::R1) as i32,
-                ureg(unicorn, RegisterARM::R2) as i32,
-                ureg(unicorn, RegisterARM::R3) as i32,
-            ),
-            _ => {}
-        }
-
-        clear_host_gl_errors(unicorn);
-    }
-
-    0
+    gl_fallback(unicorn, name)
 }
 
 fn gl_fallback(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
     match name {
-        "glGetError" | "glGetString" => 0,
+        "glGetError" => 0,
         "glCreateShader" | "glCreateProgram" => next_fallback_id(),
         "glGenTextures" | "glGenFramebuffers" | "glGenRenderbuffers" | "glGenBuffers" => {
             let count = ureg(unicorn, RegisterARM::R0).min(1024);
@@ -1205,6 +794,20 @@ fn gl_fallback(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             };
             write_u32(unicorn, out, value);
             0
+        }
+        "glGetString" => {
+            let name = ureg(unicorn, RegisterARM::R0);
+            let text = match name {
+                gl::VENDOR => "emulator",
+                gl::RENDERER => "emulator",
+                gl::VERSION => "OpenGL ES 1.1",
+                0x8b8c => "OpenGL ES GLSL ES 1.00",
+                gl::EXTENSIONS => "",
+                _ => "emulator",
+            };
+            let addr = alloc_write_guest_cstr(unicorn, text);
+            log::info!("GPU: fallback glGetString name={:#x} addr={:#x}", name, addr);
+            addr
         }
         "glCheckFramebufferStatus" => 0x8cd5,
         "glGetAttribLocation" => 0,

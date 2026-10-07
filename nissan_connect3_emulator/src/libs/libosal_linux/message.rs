@@ -221,12 +221,14 @@ fn handle_queue_api(
                     decoded.name
                 );
             } else {
+                let elf_path = unicorn.get_data().elf_path.clone();
                 synthesize_ail_power_startup_sequence(
                     unicorn,
                     api_name,
                     &decoded.name,
                     r1,
                     synthetic_stack_timeout,
+                    &elf_path,
                 );
             }
         }
@@ -516,15 +518,21 @@ fn synthesize_ail_power_startup_sequence(
     name: &str,
     buf: u32,
     stack_timeout: u32,
+    elf_path: &str,
 ) -> bool {
     if name == "mbx_1024" {
-        return synthesize_map_power_startup_sequence(
-            unicorn,
-            api_name,
-            name,
-            buf,
-            stack_timeout,
-        );
+        return elf_path.contains("procmapengine")
+            && synthesize_map_power_startup_sequence(
+                unicorn,
+                api_name,
+                name,
+                buf,
+                stack_timeout,
+            );
+    }
+
+    if !elf_path.contains("prochmi") {
+        return false;
     }
 
     for message in [

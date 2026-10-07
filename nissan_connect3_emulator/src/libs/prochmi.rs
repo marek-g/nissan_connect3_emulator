@@ -68,6 +68,25 @@ const GUI_TRANSITION_TYPE: u32 = 0xe;
 const SYSDLG_NAV_STARTING_UP_STATE: u32 = 0x1e5;
 const SYSDLG_NAV_STARTING_UP_TRANSITION: u32 = 0x1977;
 
+const CL_HMI_NAV_SERVER_HANDLER_C1: u32 = 0x015e_871c - ORIGINAL_BASE;
+const CL_HMI_NAV_SERVER_HANDLER_C2: u32 = 0x015e_9e5c - ORIGINAL_BASE;
+const CL_HMI_NAV_SERVER_INIT: u32 = 0x015e_0824 - ORIGINAL_BASE;
+const CL_HMI_NAV_HANDLE_INIT_MAP_SCREEN: u32 = 0x015b_0884 - ORIGINAL_BASE;
+const CL_HMI_NAV_FORCE_MAP_INIT: u32 = 0x015a_d8b8 - ORIGINAL_BASE;
+const CL_HMI_NAV_REQUEST_CREATE_RENDER_VIEW: u32 = 0x015a_dfbc - ORIGINAL_BASE;
+const ENAVI_RENDER_VIEW_C1: u32 = 0x016a_5bd4 - ORIGINAL_BASE;
+const ENAVI_RENDER_VIEW_CREATE_PIXMAP_REQUEST: u32 = 0x016a_558c - ORIGINAL_BASE;
+const ENAVI_RENDER_VIEW_CREATE_INTERNAL_REQUEST: u32 = 0x016a_58c4 - ORIGINAL_BASE;
+const ENAVI_RENDER_VIEW_REGISTER_SINK: u32 = 0x016a_2824 - ORIGINAL_BASE;
+
+const CL_HMI_NAV_DISPLAY_MODE: u32 = 0x148;
+const CL_HMI_NAV_NAV_SERVER: u32 = 0x15c;
+const CL_HMI_NAV_TRACE: u32 = 0x160;
+const CL_HMI_NAV_RENDER_VIEW: u32 = 0x808;
+const CL_HMI_NAV_SINK_IMPLEMENTATION: u32 = 0x9a8;
+const CL_HMI_NAV_MAP_DRAW_FLAG: u32 = 0x1c74;
+const DAT_ENAVI_FI_CLIENT: u32 = 0x0597_3de0;
+
 const CL_HSI_CM_MANAGER_PHSI_BASE_GET: u32 = 0x0182_79f4 - ORIGINAL_BASE;
 const HSI_CM_STARTUP_BEXECUTE_MESSAGE: u32 = 0x0184_b958 - ORIGINAL_BASE;
 const HSI_FACTORY_CREATE_POST_ASSIGN: u32 = 0x0185_1edc - ORIGINAL_BASE;
@@ -108,6 +127,8 @@ static HSI_POWER_STATE_PENDING: AtomicU32 = AtomicU32::new(0);
 static HSI_CM_STARTUP_COMPONENT: AtomicU32 = AtomicU32::new(0);
 static PROCHMI_GUEST_CALL_STUB: AtomicU32 = AtomicU32::new(0);
 static HSI_POWER_STATE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static HMI_NAV_HANDLER: AtomicU32 = AtomicU32::new(0);
+static HMI_NAV_HANDLER_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 const GUI_INTERNAL_EVENT_COUNT: u32 = 3;
 const GUI_INTERNAL_EVENTS: [u32; 3] = [0x8d, 0x8e, 0x8f];
@@ -207,6 +228,44 @@ fn nav_trace_allowed() -> bool {
     NAV_STATE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < NAV_STATE_TRACE_LIMIT
 }
 
+fn hmi_nav_handler_trace_allowed() -> bool {
+    HMI_NAV_HANDLER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < NAV_STATE_TRACE_LIMIT
+}
+
+fn log_hmi_nav_handler_state(
+    unicorn: &mut Unicorn<'_, Context>,
+    handler: u32,
+    label: &str,
+    force: bool,
+) -> bool {
+    if handler == 0 {
+        if force {
+            log::info!("PROCHMI: {} saw null clHmiNavServerHandler", label);
+        }
+        return false;
+    }
+    if !force && !hmi_nav_handler_trace_allowed() {
+        return false;
+    }
+
+    let previous = HMI_NAV_HANDLER.swap(handler, Ordering::Relaxed);
+    if force || previous == 0 {
+        log::info!(
+            "PROCHMI: {} handler={:#x} mode={} nav={} trace={} render_view={} sink={} fi={} flag={}",
+            label,
+            handler,
+            read_u32(unicorn, handler + CL_HMI_NAV_DISPLAY_MODE),
+            read_u32(unicorn, handler + CL_HMI_NAV_NAV_SERVER),
+            read_u32(unicorn, handler + CL_HMI_NAV_TRACE),
+            read_u32(unicorn, handler + CL_HMI_NAV_RENDER_VIEW),
+            handler + CL_HMI_NAV_SINK_IMPLEMENTATION,
+            read_u32(unicorn, DAT_ENAVI_FI_CLIENT),
+            read_u8(unicorn, handler + CL_HMI_NAV_MAP_DRAW_FLAG),
+        );
+    }
+    true
+}
+
 thread_local! {
     static PROCHMI_TICK_NEXT: Cell<Option<Instant>> = const { Cell::new(None) };
     static PROCHMI_GUI_INTERNAL_NEXT: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -283,6 +342,81 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         HMI_GUI_POINTER.store(ptr, Ordering::Relaxed);
                     }
                     log::debug!("PROCHMI: recorded {} object {:#x}", store, ptr);
+                }
+            })
+            .unwrap();
+    }
+
+    for (offset, label) in [
+        (CL_HMI_NAV_SERVER_HANDLER_C1, "clHmiNavServerHandler C1"),
+        (CL_HMI_NAV_SERVER_HANDLER_C2, "clHmiNavServerHandler C2"),
+        (CL_HMI_NAV_SERVER_INIT, "clHmiNavServerHandler vHMIInitialization"),
+        (CL_HMI_NAV_HANDLE_INIT_MAP_SCREEN, "clHmiNavServerHandler vHandleInitMapScreen"),
+        (CL_HMI_NAV_FORCE_MAP_INIT, "clHmiNavServerHandler vForceMapInitialization"),
+        (
+            CL_HMI_NAV_REQUEST_CREATE_RENDER_VIEW,
+            "clHmiNavServerHandler vHandleOnRequestCreateRenderView",
+        ),
+    ] {
+        let addr = base_address + offset;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let handler = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let force = matches!(
+                    label,
+                    "clHmiNavServerHandler vHMIInitialization"
+                        | "clHmiNavServerHandler vHandleInitMapScreen"
+                        | "clHmiNavServerHandler vForceMapInitialization"
+                        | "clHmiNavServerHandler vHandleOnRequestCreateRenderView"
+                );
+                log_hmi_nav_handler_state(uc, handler, label, force || nav_trace_enabled());
+            })
+            .unwrap();
+    }
+
+    for (offset, label) in [
+        (
+            ENAVI_RENDER_VIEW_C1,
+            "enavi_tclRenderView constructor",
+        ),
+        (
+            ENAVI_RENDER_VIEW_CREATE_PIXMAP_REQUEST,
+            "enavi_tclRenderView bRequestCreateRenderPixmapView",
+        ),
+        (
+            ENAVI_RENDER_VIEW_CREATE_INTERNAL_REQUEST,
+            "enavi_tclRenderView bRequestCreateRenderViewInternal",
+        ),
+        (
+            ENAVI_RENDER_VIEW_REGISTER_SINK,
+            "enavi_tclRenderView bRegisterSinkInterface",
+        ),
+    ] {
+        let addr = base_address + offset;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let render_view = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let sink = if offset == ENAVI_RENDER_VIEW_REGISTER_SINK {
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32
+                } else {
+                    0
+                };
+                let width = if matches!(
+                    offset,
+                    ENAVI_RENDER_VIEW_CREATE_PIXMAP_REQUEST | ENAVI_RENDER_VIEW_CREATE_INTERNAL_REQUEST
+                ) {
+                    read_u32(uc, uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32)
+                } else {
+                    0
+                };
+                if hmi_nav_handler_trace_allowed() || nav_trace_enabled() {
+                    log::info!(
+                        "PROCHMI: {} this={:#x} sink={:#x} stack0={:#x}",
+                        label,
+                        render_view,
+                        sink,
+                        width
+                    );
                 }
             })
             .unwrap();

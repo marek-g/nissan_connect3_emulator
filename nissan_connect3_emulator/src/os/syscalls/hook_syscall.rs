@@ -9,6 +9,12 @@ use crate::os::syscalls::{
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
+    // Guest C code expects ARM callee-saved registers to survive OSAL stubs and
+    // Linux syscalls. Some host stub/syscall paths use R4-R10 as scratch space, so
+    // preserve them unless the handler is rt_sigreturn, which intentionally restores
+    // a complete saved CPU context.
+    let saved_callee_saved = save_callee_saved_regs(unicorn);
+
     // A stubbed function entry was patched to `svc #0`. When it executes the intr
     // hook fires with PC already advanced past the svc, so the entry address is
     // PC - 4. If this interrupt came from one of our stubs, run its handler, return
@@ -31,6 +37,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         crate::os::code_stub::set_current_stub_name(stub.name);
         let res = (stub.handler)(unicorn);
         crate::os::code_stub::set_current_stub_name("");
+        restore_callee_saved_regs(unicorn, saved_callee_saved);
         log::trace!(
             "{:#x}: [{}] [{} HOOK] {}() => {}",
             pc,
@@ -53,7 +60,8 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
     // sample implementations:
     // - https://github.com/zeropointdynamics/zelos/blob/master/src/zelos/ext/platforms/linux/syscalls/syscalls.py
     // - https://github.com/qilingframework/qiling/tree/master/qiling/os/posix/syscall
-    let res = match unicorn.get_syscall_number() {
+    let syscall = unicorn.get_syscall_number();
+    let res = match syscall {
         1 => unistd::exit(unicorn, unicorn.get_u32_arg(0)),
         3 => unistd::read(
             unicorn,
@@ -395,6 +403,17 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
             unicorn.get_u32_arg(1),
             unicorn.get_u32_arg(2),
         ),
+        220 => {
+            log::debug!(
+                "{:#x}: [{}] no-op ARM syscall #220, args: {:#x}, {:#x}, {:#x}, ...",
+                unicorn.reg_read(RegisterARM::PC).unwrap(),
+                unicorn.get_data().thread_id(),
+                unicorn.get_u32_arg(0),
+                unicorn.get_u32_arg(1),
+                unicorn.get_u32_arg(2),
+            );
+            0
+        }
         316 => unistd::inotify_init(unicorn, 0),
         317 => unistd::inotify_add_watch(
             unicorn,
@@ -435,12 +454,42 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
     };
     unicorn.set_u32_result(res);
 
+    if syscall != 173 {
+        restore_callee_saved_regs(unicorn, saved_callee_saved);
+    }
+
     // a syscall handler may have requested a scheduling action
     match unicorn.get_data().take_action() {
         ThreadAction::None => {}
         ThreadAction::Block(reason) => block_current_thread(unicorn, reason),
         ThreadAction::ExitThread(code) => exit_current_thread(unicorn, code),
         ThreadAction::ExitProcess(code) => exit_process(unicorn, code),
+    }
+}
+
+fn save_callee_saved_regs(unicorn: &mut Unicorn<'_, Context>) -> [u64; 7] {
+    [
+        unicorn.reg_read(RegisterARM::R4).unwrap_or(0),
+        unicorn.reg_read(RegisterARM::R5).unwrap_or(0),
+        unicorn.reg_read(RegisterARM::R6).unwrap_or(0),
+        unicorn.reg_read(RegisterARM::R7).unwrap_or(0),
+        unicorn.reg_read(RegisterARM::R8).unwrap_or(0),
+        unicorn.reg_read(RegisterARM::R9).unwrap_or(0),
+        unicorn.reg_read(RegisterARM::R10).unwrap_or(0),
+    ]
+}
+
+fn restore_callee_saved_regs(unicorn: &mut Unicorn<'_, Context>, values: [u64; 7]) {
+    for (register, value) in [
+        (RegisterARM::R4, values[0]),
+        (RegisterARM::R5, values[1]),
+        (RegisterARM::R6, values[2]),
+        (RegisterARM::R7, values[3]),
+        (RegisterARM::R8, values[4]),
+        (RegisterARM::R9, values[5]),
+        (RegisterARM::R10, values[6]),
+    ] {
+        let _ = unicorn.reg_write(register, value);
     }
 }
 
