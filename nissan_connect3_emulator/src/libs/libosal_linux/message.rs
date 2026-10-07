@@ -190,6 +190,19 @@ fn handle_queue_api(
             }
 
             let stack_timeout = read_stack_timeout(unicorn, api_name);
+            let synthetic_stack_timeout = if is_synthetic_periodic_queue(&decoded.name)
+                && matches!(
+                    api_name,
+                    "OSAL_s32MessageQueueWait" | "OSAL_s32MessageQueuePriorityWait"
+                )
+                && stack_timeout == u32::MAX
+                && shorten_native_wait_timeout(unicorn)
+            {
+                u32::MAX
+            } else {
+                stack_timeout
+            };
+
             if bridge_guest_osal_queue(
                 unicorn,
                 api_name,
@@ -198,7 +211,7 @@ fn handle_queue_api(
                 r1,
                 r2,
                 r3,
-                stack_timeout,
+                synthetic_stack_timeout,
             ) {
                 log::info!(
                     "0x{:x} [{}] [LIBOSAL-OSAL-SERVICE] {} handled name={}",
@@ -213,7 +226,7 @@ fn handle_queue_api(
                     api_name,
                     &decoded.name,
                     r1,
-                    stack_timeout,
+                    synthetic_stack_timeout,
                 );
             }
         }
@@ -480,6 +493,23 @@ fn log_osal_message_bytes(
     );
 }
 
+fn is_synthetic_periodic_queue(name: &str) -> bool {
+    name == "mbx_1024" || name == "mbx_265"
+}
+
+fn shorten_native_wait_timeout(unicorn: &mut Unicorn<'_, Context>) -> bool {
+    const TIMEOUT_MS: u32 = 100;
+
+    let sp = unicorn.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+    if sp == 0 || sp > 0xf000_0000 {
+        return false;
+    }
+
+    unicorn
+        .mem_write(sp as u64, &TIMEOUT_MS.to_le_bytes())
+        .is_ok()
+}
+
 fn synthesize_ail_power_startup_sequence(
     unicorn: &mut Unicorn<'_, Context>,
     api_name: &str,
@@ -653,8 +683,8 @@ fn synthesize_periodic_ail_power_state_req(
     let now = Instant::now();
     let ready = SYNTH_PWR_PERIODIC_NEXT.with(|cell| match cell.get() {
         None => {
-            cell.set(Some(now + Duration::from_millis(500)));
-            false
+            cell.set(Some(now + Duration::from_millis(1000)));
+            true
         }
         Some(next) => now >= next,
     });
@@ -880,8 +910,8 @@ fn synthesize_periodic_map_power_state_req(unicorn: &mut Unicorn<'_, Context>, b
     let now = Instant::now();
     let ready = SYNTH_MAP_PWR_PERIODIC_NEXT.with(|cell| match cell.get() {
         None => {
-            cell.set(Some(now + Duration::from_millis(500)));
-            false
+            cell.set(Some(now + Duration::from_millis(1000)));
+            true
         }
         Some(next) => now >= next,
     });

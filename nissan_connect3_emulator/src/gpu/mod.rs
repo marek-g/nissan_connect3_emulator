@@ -392,10 +392,51 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
         | "eglSwapInterval"
         | "eglCopyBuffers"
         | "eglQueryContext"
-        | "eglGetConfigAttrib"
-        | "eglGetConfigs"
         | "eglCreatePbufferFromClientBuffer"
         | "eglCreatePixmapSurface" => {
+            return 1;
+        }
+        "eglGetConfigs" => {
+            let configs = ureg(unicorn, RegisterARM::R1);
+            let max_count = ureg(unicorn, RegisterARM::R2);
+            let num_config = ureg(unicorn, RegisterARM::R3);
+            let count = if max_count == 0 { 0 } else { 1 };
+
+            write_u32(unicorn, num_config, count);
+            if configs != 0 && count != 0 {
+                write_u32(unicorn, configs, 1);
+            }
+            return 1;
+        }
+        "eglGetConfigAttrib" => {
+            let attribute = ureg(unicorn, RegisterARM::R2);
+            let out = ureg(unicorn, RegisterARM::R3);
+            let value = match attribute {
+                0x3020 => 32,
+                0x3021 => 8,
+                0x3022 => 8,
+                0x3023 => 8,
+                0x3024 => 8,
+                0x3025 => 0,
+                0x3026 => 0,
+                0x3027 => 0x3038,
+                0x3028 => 1,
+                0x3029 => 0,
+                0x302a | 0x302c => 4096,
+                0x302b => 4096 * 4096,
+                0x302d => 1,
+                0x302e | 0x302f => 1,
+                0x3030 => 1,
+                0x3031 => 1,
+                0x3032 => 0,
+                0x3033 => 1,
+                0x3036 => 0x3022,
+                0x3037 => 4,
+                0x303d | 0x3040 => 4096,
+                _ => 0,
+            };
+
+            write_u32(unicorn, out, value);
             return 1;
         }
         "eglSwapBuffers" => {
