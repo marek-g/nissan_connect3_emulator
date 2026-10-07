@@ -32,6 +32,89 @@ fn stub_zero(_unicorn: &mut Unicorn<'_, Context>) -> u32 {
     0
 }
 
+fn read_u32_at(unicorn: &Unicorn<'_, Context>, addr: u32) -> Option<u32> {
+    let mut buf = [0u8; 4];
+    unicorn
+        .mem_read(addr as u64, &mut buf)
+        .ok()
+        .map(|_| u32::from_le_bytes(buf))
+}
+
+fn read_u16_at(unicorn: &Unicorn<'_, Context>, addr: u32) -> Option<u16> {
+    let mut buf = [0u8; 2];
+    unicorn
+        .mem_read(addr as u64, &mut buf)
+        .ok()
+        .map(|_| u16::from_le_bytes(buf))
+}
+
+fn read_cstr_at(unicorn: &Unicorn<'_, Context>, addr: u32, limit: usize) -> String {
+    if addr == 0 {
+        return String::new();
+    }
+    let mut out = Vec::new();
+    for offset in 0..limit {
+        let mut byte = [0u8];
+        if unicorn
+            .mem_read((addr + offset as u32) as u64, &mut byte)
+            .is_err()
+            || byte[0] == 0
+        {
+            break;
+        }
+        if !byte[0].is_ascii_graphic() && byte[0] != b' ' {
+            break;
+        }
+        out.push(byte[0]);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn prm_notification_callback_offset(event: u32) -> u32 {
+    match event {
+        0 => 0x303f8,
+        1 => 0x303fc,
+        2 => 0x30400,
+        3 => 0x30404,
+        4 => 0x30408,
+        5 => 0x30410,
+        6 => 0x30414,
+        7 => 0x30418,
+        9 => 0x3041c,
+        10 => 0x3040c,
+        0xc => 0x30420,
+        _ => 0,
+    }
+}
+
+fn hook_prm_notify_trace(
+    unicorn: &mut Unicorn<'_, Context>,
+    base_address: u32,
+    libosal_address: u32,
+    name: &'static str,
+) {
+    let address = base_address + (libosal_address - 0x484d_8000);
+    unicorn
+        .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+            log::warn!(
+                "libosal {} [{}] {} r0={:#x} r1={:#x} r2={:#x} r3={:#x} addr={:#x}",
+                uc.get_data().elf_path,
+                uc.get_data().inner.thread_id(),
+                name,
+                r0,
+                r1,
+                r2,
+                r3,
+                addr
+            );
+        })
+        .unwrap();
+}
+
 fn hook_sd_trace(
     unicorn: &mut Unicorn<'_, Context>,
     base_address: u32,
@@ -49,6 +132,137 @@ fn hook_sd_trace(
                 addr,
                 uc.reg_read(RegisterARM::R0).unwrap_or(0),
                 uc.reg_read(RegisterARM::LR).unwrap_or(0)
+            );
+        })
+        .unwrap();
+}
+
+fn hook_prm_register_trace(
+    unicorn: &mut Unicorn<'_, Context>,
+    base_address: u32,
+    libosal_address: u32,
+    name: &'static str,
+) {
+    let address = base_address + (libosal_address - 0x484d_8000);
+    unicorn
+        .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+            let client = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let path_ptr = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let mask = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let callback = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+            let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+            let extra = read_u32_at(uc, sp).unwrap_or(0);
+            let status = read_u32_at(uc, sp + 4).unwrap_or(0);
+            let two_parameter = read_u32_at(uc, sp + 8).unwrap_or(0);
+            log::warn!(
+                "libosal {} [{}] {} client={:#x} path={}({:#x}) mask={:#x} callback={:#x} extra={:#x} status={:#x} two_parameter={:#x}",
+                uc.get_data().elf_path,
+                uc.get_data().inner.thread_id(),
+                name,
+                client,
+                read_cstr_at(uc, path_ptr, 0x28),
+                path_ptr,
+                mask,
+                callback,
+                extra,
+                status,
+                two_parameter
+            );
+        })
+        .unwrap();
+}
+
+fn hook_prm_io_trace(
+    unicorn: &mut Unicorn<'_, Context>,
+    base_address: u32,
+    libosal_address: u32,
+    name: &'static str,
+) {
+    let address = base_address + (libosal_address - 0x484d_8000);
+    unicorn
+        .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+            let fd = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let command = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let data = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            if command == 0x7fff_fffc && data != 0 {
+                let client = read_u16_at(uc, data).unwrap_or(0xffff);
+                let path_ptr = read_u32_at(uc, data + 4).unwrap_or(0);
+                let mask = read_u16_at(uc, data + 8).unwrap_or(0xffff);
+                let callback = read_u32_at(uc, data + 12).unwrap_or(0);
+                let extra = read_u32_at(uc, data + 16).unwrap_or(0);
+                let status = read_u32_at(uc, data + 20).unwrap_or(0);
+                log::warn!(
+                    "libosal {} [{}] {} ioctl=0x{:x} fd={} data={:#x} client={:#x} path={}({:#x}) mask={:#x} callback={:#x} extra={:#x} status={:#x}",
+                    uc.get_data().elf_path,
+                    uc.get_data().inner.thread_id(),
+                    name,
+                    command,
+                    fd,
+                    data,
+                    client,
+                    read_cstr_at(uc, path_ptr, 0x28),
+                    path_ptr,
+                    mask,
+                    callback,
+                    extra,
+                    status
+                );
+            } else {
+                log::warn!(
+                    "libosal {} [{}] {} ioctl=0x{:x} fd={} data={:#x}",
+                    uc.get_data().elf_path,
+                    uc.get_data().inner.thread_id(),
+                    name,
+                    command,
+                    fd,
+                    data
+                );
+            }
+        })
+        .unwrap();
+}
+
+fn hook_prm_delivery_trace(
+    unicorn: &mut Unicorn<'_, Context>,
+    base_address: u32,
+    libosal_address: u32,
+    name: &'static str,
+) {
+    let address = base_address + (libosal_address - 0x484d_8000);
+    let table_global = base_address + (0x90ad_a928 - 0x484d_8000);
+    unicorn
+        .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+            let target_process = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let thread = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let data = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let client = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+            let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+            let event = read_u32_at(uc, sp).unwrap_or(0);
+            let extra = read_u32_at(uc, sp + 4).unwrap_or(0);
+            let table = read_u32_at(uc, table_global).unwrap_or(0);
+            let callback = if table != 0 {
+                let offset = prm_notification_callback_offset(event);
+                if offset != 0 && client <= 12 {
+                    read_u32_at(uc, table + client * 0x8c + offset).unwrap_or(0)
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            log::warn!(
+                "libosal {} [{}] {} target_process={:#x} thread={:#x} data={:#x} client={} event={} callback={:#x} table={:#x} extra={:#x}",
+                uc.get_data().elf_path,
+                uc.get_data().inner.thread_id(),
+                name,
+                target_process,
+                thread,
+                data,
+                client,
+                event,
+                callback,
+                table,
+                extra
             );
         })
         .unwrap();
@@ -90,6 +304,102 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     ] {
         hook_sd_trace(unicorn, base_address, address, name);
     }
+
+    const FORCE_DNL_SD_CARD: u32 = 0x4850_1710 - 0x484d_8000;
+    let force_dnl_sd_card = base_address + FORCE_DNL_SD_CARD;
+    unicorn
+        .add_code_hook(force_dnl_sd_card as u64, force_dnl_sd_card as u64, {
+            |uc, addr, _| {
+                let handle = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                let mut table_bytes = [0u8; 4];
+                let table = if uc.mem_read(handle as u64, &mut table_bytes).is_ok() {
+                    u32::from_le_bytes(table_bytes)
+                } else {
+                    0
+                };
+                if table != 0 {
+                    let flags_addr = table + 0x30dc5;
+                    let mut flags = [0u8];
+                    if uc.mem_read(flags_addr as u64, &mut flags).is_ok() {
+                        flags[0] |= 5;
+                        let _ = uc.mem_write(flags_addr as u64, &flags);
+                        log::warn!(
+                            "libosal {} [{}] forced DNL SD card ready addr={:#x} handle={:#x} table={:#x} flags={:#x}",
+                            uc.get_data().elf_path,
+                            uc.get_data().inner.thread_id(),
+                            addr,
+                            handle,
+                            table,
+                            flags[0]
+                        );
+                    } else {
+                        log::warn!(
+                            "libosal {} [{}] forced DNL SD card flag read failed handle={:#x} table={:#x}",
+                            uc.get_data().elf_path,
+                            uc.get_data().inner.thread_id(),
+                            handle,
+                            table
+                        );
+                    }
+                } else {
+                    log::warn!(
+                        "libosal {} [{}] forced DNL SD card table null handle={:#x}",
+                        uc.get_data().elf_path,
+                        uc.get_data().inner.thread_id(),
+                        handle
+                    );
+                }
+            }
+        })
+        .unwrap();
+
+    const FORCE_DNL_SD_ACTIVATE_BRANCH: u32 = 0x4850_1718 - 0x484d_8000;
+    let force_dnl_sd_activate_branch = base_address + FORCE_DNL_SD_ACTIVATE_BRANCH;
+    unicorn
+        .add_code_hook(
+            force_dnl_sd_activate_branch as u64,
+            force_dnl_sd_activate_branch as u64,
+            |uc, addr, _| {
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                if r2 != 0 {
+                    let _ = uc.reg_write(RegisterARM::R2, 0);
+                    log::warn!(
+                        "libosal {} [{}] forced DNL SD activation branch addr={:#x} old_r2={:#x}",
+                        uc.get_data().elf_path,
+                        uc.get_data().inner.thread_id(),
+                        addr,
+                        r2
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    hook_prm_notify_trace(
+        unicorn,
+        base_address,
+        0x4850_05c0,
+        "FUN_485005c0_PRM_NotifyChange",
+    );
+    hook_prm_notify_trace(
+        unicorn,
+        base_address,
+        0x484f_f694,
+        "FUN_484ff694_PRM_NotifyEvent",
+    );
+    hook_prm_register_trace(
+        unicorn,
+        base_address,
+        0x484f_cfc0,
+        "FUN_484fcfc0_PRM_Register",
+    );
+    hook_prm_io_trace(unicorn, base_address, 0x484f_e13c, "prm_u32Prm");
+    hook_prm_delivery_trace(
+        unicorn,
+        base_address,
+        0x484f_eccc,
+        "FUN_484feccc_PRM_Deliver",
+    );
 
     /*let mut method_entries = HashMap::new();
     insert_libosal_method_entries(&mut method_entries);

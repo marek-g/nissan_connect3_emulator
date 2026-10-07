@@ -30,6 +30,7 @@ static SYNTH_MAP_PWR_STATE_REQ_CONTENT: AtomicU32 = AtomicU32::new(0);
 static SYNTH_MAP_PWR_CVM_SIGNAL_CHANGED_SENT: AtomicBool = AtomicBool::new(false);
 static SYNTH_MAP_PWR_CVM_SIGNAL_CHANGED_CONTENT: AtomicU32 = AtomicU32::new(0);
 
+
 thread_local! {
     static SYNTH_PWR_PERIODIC_NEXT: Cell<Option<Instant>> = const { Cell::new(None) };
     static SYNTH_MAP_PWR_PERIODIC_NEXT: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -202,6 +203,8 @@ fn handle_queue_api(
             } else {
                 stack_timeout
             };
+
+
 
             if bridge_guest_osal_queue(
                 unicorn,
@@ -587,6 +590,8 @@ fn synthesize_ail_power_startup_sequence(
 
     false
 }
+
+
 
 fn synthesize_ail_power_message(
     unicorn: &mut Unicorn<'_, Context>,
