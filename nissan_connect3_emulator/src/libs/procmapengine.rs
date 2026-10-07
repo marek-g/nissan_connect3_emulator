@@ -77,6 +77,9 @@ const MAP_DRAW_BLIT_ICON_BRANCH_3: u32 = 0x0043_eb_48 - ORIGINAL_BASE;
 const MAP_DRAW_BLIT_ICON_BRANCH_4: u32 = 0x0043_eb_64 - ORIGINAL_BASE;
 const MAP_RENDERER_DRAW_LIST_VCALL_3C: u32 = 0x0052_cd9c - ORIGINAL_BASE;
 const MAP_RENDERER_DRAW_LIST_TARGET_3C: u32 = 0x003d_59c0 - ORIGINAL_BASE;
+const MAP_ELEMENT_LIST_ADD: u32 = 0x003f_1398 - ORIGINAL_BASE;
+const MAP_CURRENT_ARRAY_USAGE: u32 = 0x0073_ca14 - ORIGINAL_BASE;
+const MAP_DRAW_LAYER_LISTS_ADD_ELEMENT: u32 = 0x003c_373c - ORIGINAL_BASE;
 const MAP_JOB_QUEUE_ADD_ELEMENT_ENTRY: u32 = 0x004a_4284 - ORIGINAL_BASE;
 const MAP_JOB_QUEUE_ADD_ELEMENT_PRE_POST: u32 = 0x004a_436c - ORIGINAL_BASE;
 const MAP_JOB_QUEUE_ADD_ELEMENT_AFTER_POST: u32 = 0x004a_4370 - ORIGINAL_BASE;
@@ -130,6 +133,8 @@ static MAP_ENGINE_NATURALLY_STARTED: AtomicBool = AtomicBool::new(false);
 static MAP_RENDERER_FORCE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_RENDERER_EXECUTE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_RENDERER_DRAW_LIST_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_ELEMENT_LIST_ADD_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_DRAW_LAYER_ADD_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_RENDERER_DRAW_LIST_VCALL_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_DRAW_BLIT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_DRAW_BLIT_FAKE_CONTEXT: AtomicU32 = AtomicU32::new(0);
@@ -238,6 +243,8 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     MAP_RENDERER_FORCE_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_RENDERER_EXECUTE_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_RENDERER_DRAW_LIST_TRACE_COUNT.store(0, Ordering::Relaxed);
+    MAP_ELEMENT_LIST_ADD_TRACE_COUNT.store(0, Ordering::Relaxed);
+    MAP_DRAW_LAYER_ADD_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_RENDERER_DRAW_LIST_VCALL_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_DRAW_BLIT_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_DRAW_BLIT_BRANCH_TRACE_COUNT.store(0, Ordering::Relaxed);
@@ -1132,6 +1139,70 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
         )
         .unwrap();
 
+    let element_list_add = base_address + MAP_ELEMENT_LIST_ADD;
+    unicorn
+        .add_code_hook(
+            element_list_add as u64,
+            element_list_add as u64,
+            move |uc, _, _| {
+                let list = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let element = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let list_count = read_u32_or_invalid(uc, list + 10) & 0xffff;
+                let list_array = read_u32_or_invalid(uc, list + 4);
+                let element_vtable = read_u32_or_invalid(uc, element);
+                let count =
+                    MAP_ELEMENT_LIST_ADD_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 100 {
+                    log::info!(
+                        "PROCMAPENGINE: map element list Add list={:#x} element={:#x} vtable={:#x} list_count={} array={:#x} trace={}",
+                        list,
+                        element,
+                        element_vtable,
+                        list_count,
+                        list_array,
+                        count + 1
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    let draw_layer_add = base_address + MAP_DRAW_LAYER_LISTS_ADD_ELEMENT;
+    unicorn
+        .add_code_hook(
+            draw_layer_add as u64,
+            draw_layer_add as u64,
+            move |uc, _, _| {
+                let draw_layers = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let element = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let layer = (uc.reg_read(RegisterARM::R2).unwrap_or(0) & 0xff) as u32;
+                let list = draw_layers.wrapping_add(layer * 0x10);
+                let list_count = if list == 0 {
+                    0xffff
+                } else {
+                    read_u32_or_invalid(uc, list + 10) & 0xffff
+                };
+                let element_vtable = read_u32_or_invalid(uc, element);
+                let usage_addr = base_address + MAP_CURRENT_ARRAY_USAGE;
+                let current_usage = read_u32_or_invalid(uc, usage_addr);
+                let count = MAP_DRAW_LAYER_ADD_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 300 {
+                    log::info!(
+                        "PROCMAPENGINE: draw layer AddElement layers={:#x} element={:#x} vtable={:#x} layer={} list={:#x} list_count={} usage={} trace={}",
+                        draw_layers,
+                        element,
+                        element_vtable,
+                        layer,
+                        list,
+                        list_count,
+                        current_usage,
+                        count + 1
+                    );
+                }
+            },
+        )
+        .unwrap();
+
     let draw_list_entry = base_address + MAP_RENDERER_DRAW_LIST_ENTRY;
     unicorn
         .add_code_hook(
@@ -1275,15 +1346,18 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
             let object = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let layer = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let mode = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let current_usage =
+                read_u32_or_invalid(uc, base_address + MAP_CURRENT_ARRAY_USAGE);
             let count = MAP_DRAW_BLIT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 40 {
                 log::info!(
-                    "PROCMAPENGINE: DrawBlit entry global={:#x} context={:#x} object={:#x} layer={:#x} mode={:#x} fake={:#x} trace={}",
+                    "PROCMAPENGINE: DrawBlit entry global={:#x} context={:#x} object={:#x} layer={:#x} mode={:#x} usage={} fake={:#x} trace={}",
                     context_global,
                     context,
                     object,
                     layer,
                     mode,
+                    current_usage,
                     fake_blit_context,
                     count + 1
                 );
