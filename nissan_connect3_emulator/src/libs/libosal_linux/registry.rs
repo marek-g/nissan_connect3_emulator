@@ -272,19 +272,25 @@ fn lookup_app_path(unicorn: &mut Unicorn<'_, Context>, path: &str, flags: u32, b
     };
 
     let app_path = match app_path {
-        Some(app_path) => app_path,
-        None => return ERROR_NOT_FOUND,
+        Some(app_path) => relative_registry_path(&app_path),
+        None => {
+            if app_id == 7 {
+                log::warn!("REGISTRY lookup AppID 7 -> not found opened={}", path);
+            }
+            return ERROR_NOT_FOUND;
+        }
     };
 
     if !write_cstr(unicorn, buffer, 0x100, &app_path) {
         return ERROR_PARAM;
     }
-    log::debug!(
-        "REGISTRY lookup AppID {:#x} path={} opened={}",
-        app_id,
-        app_path,
-        path
-    );
+    if app_id == 7 {
+        log::warn!(
+            "REGISTRY lookup AppID 7 -> path={} opened={}",
+            app_path,
+            path
+        );
+    }
     SUCCESS
 }
 
@@ -316,13 +322,14 @@ fn lookup_service_path(
     };
 
     let service_path = match service_path {
-        Some(service_path) => service_path,
+        Some(service_path) => relative_registry_path(&service_path),
         None => return ERROR_NOT_FOUND,
     };
 
+    let app_path = format!("/dev/registry/{}", service_path);
     let app_id = {
         let namespace = unicorn.get_data().namespace.lock().unwrap();
-        namespace.registry.query_u32(&service_path, "APPID")
+        namespace.registry.query_u32(&app_path, "APPID")
     };
 
     let app_id = match app_id {
@@ -343,6 +350,13 @@ fn lookup_service_path(
         path
     );
     SUCCESS
+}
+
+fn relative_registry_path(path: &str) -> String {
+    path.strip_prefix("/dev/registry/")
+        .or_else(|| path.strip_prefix("/dev/registry"))
+        .unwrap_or(path)
+        .to_string()
 }
 
 fn close(unicorn: &mut Unicorn<'_, Context>) -> u32 {
