@@ -4,10 +4,12 @@ use sdl2::video::Window;
 use sdl2::{sys, EventPump};
 use std::cell::Cell;
 use std::ffi::CString;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::Duration;
+use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 const GL_INVALID_ENUM: u32 = 0x0500;
@@ -58,8 +60,14 @@ thread_local! {
     static CURRENT_GPU_TARGET: Cell<Option<GpuTarget>> = const { Cell::new(None) };
 }
 
+const MAP_SURFACE_WIDTH: usize = 800;
+const MAP_SURFACE_HEIGHT: usize = 480;
+const MAP_SURFACE_SIZE: usize = MAP_SURFACE_WIDTH * MAP_SURFACE_HEIGHT * 4;
+const MAP_SURFACE_HANDLE: u32 = 0x5f4d4150;
+
 static MAP_SURFACE_DIRTY: AtomicBool = AtomicBool::new(false);
 static MAP_SURFACE_BYTES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+static MAP_SURFACE_GUEST_BASES: OnceLock<Mutex<HashMap<u32, u32>>> = OnceLock::new();
 
 static GPU_SENDER: OnceLock<mpsc::Sender<GpuCommand>> = OnceLock::new();
 static GPU_START: Once = Once::new();
@@ -115,6 +123,84 @@ pub fn take_map_surface() -> Option<Vec<u8>> {
         MAP_SURFACE_BYTES.lock().ok().map(|bytes| bytes.clone())
     } else {
         None
+    }
+}
+
+fn map_surface_bases() -> &'static Mutex<HashMap<u32, u32>> {
+    MAP_SURFACE_GUEST_BASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn write_map_surface_to_guest(unicorn: &mut Unicorn<'_, Context>) -> Option<u32> {
+    let process_id = unicorn.get_data().process_id;
+    let existing = map_surface_bases()
+        .lock()
+        .ok()
+        .and_then(|bases| bases.get(&process_id).copied());
+
+    let bytes = latest_map_surface_bytes();
+
+    if let Some(base) = existing {
+        unicorn
+            .mem_write(base as u64, &bytes)
+            .ok()
+            .map(|_| base)
+            .or_else(|| Some(base))
+    } else {
+        let base = {
+            let mmu = unicorn.get_data().mmu.clone();
+            let allocated = mmu.lock().unwrap().heap_alloc(
+                unicorn,
+                MAP_SURFACE_SIZE as u32,
+                Prot::READ | Prot::WRITE,
+                "[svg-map-surface]",
+            );
+            allocated
+        };
+        if base == 0 {
+            return None;
+        }
+        if let Ok(mut bases) = map_surface_bases().lock() {
+            bases.insert(process_id, base);
+        }
+        log::info!(
+            "GPU: allocated SVG map surface copy process={} guest={:#x} size={:#x}",
+            process_id,
+            base,
+            MAP_SURFACE_SIZE
+        );
+        unicorn
+            .mem_write(base as u64, &bytes)
+            .ok()
+            .map(|_| base)
+            .or_else(|| Some(base))
+    }
+}
+
+fn latest_map_surface_bytes() -> Vec<u8> {
+    let bytes = MAP_SURFACE_BYTES
+        .lock()
+        .ok()
+        .map(|bytes| bytes.clone())
+        .unwrap_or_default();
+    if bytes.len() == MAP_SURFACE_SIZE {
+        bytes
+    } else {
+        vec![0u8; MAP_SURFACE_SIZE]
+    }
+}
+
+pub fn map_surface_guest_base(unicorn: &Unicorn<'_, Context>) -> Option<u32> {
+    let process_id = unicorn.get_data().process_id;
+    map_surface_bases()
+        .lock()
+        .ok()
+        .and_then(|bases| bases.get(&process_id).copied())
+}
+
+fn publish_map_surface_pixels(pixels: &[u8]) {
+    if let Ok(mut host) = MAP_SURFACE_BYTES.lock() {
+        *host = pixels.to_vec();
+        MAP_SURFACE_DIRTY.store(true, Ordering::Release);
     }
 }
 
@@ -188,7 +274,7 @@ fn init_backend() -> Result<Backend, String> {
         sys::SDL_GL_MakeCurrent(window_raw, hmi_context);
     }
 
-    let map_pixels = vec![0u8; 800 * 480 * 4];
+    let map_pixels = vec![0u8; MAP_SURFACE_SIZE];
     let events = if visible {
         Some(sdl.event_pump()?)
     } else {
@@ -302,16 +388,13 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
             gl::ReadPixels(
                 0,
                 0,
-                800,
-                480,
+                MAP_SURFACE_WIDTH as i32,
+                MAP_SURFACE_HEIGHT as i32,
                 gl::RGBA,
                 gl::UNSIGNED_BYTE,
                 backend.map_pixels.as_mut_ptr() as *mut _,
             );
-            if let Ok(mut host) = MAP_SURFACE_BYTES.lock() {
-                *host = backend.map_pixels.clone();
-                MAP_SURFACE_DIRTY.store(true, Ordering::Release);
-            }
+            publish_map_surface_pixels(&backend.map_pixels);
             gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
         },
     }
@@ -896,6 +979,9 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
         "eglCreateWindowSurface" => {
             if ensure_backend(unicorn) {
                 clear_host_gl_errors(unicorn);
+                if current_gpu_target() == GpuTarget::Map {
+                    return MAP_SURFACE_HANDLE;
+                }
                 return 2;
             }
             return next_fallback_id();

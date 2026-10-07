@@ -41,6 +41,23 @@ const CL_HSI_CM_STARTUP_CHECK_STATUS: u32 = 0x0184_bdd0 - ORIGINAL_BASE;
 const SVG_INIT_RESOURCE: u32 = 0x00fb_6ad0 - ORIGINAL_BASE;
 const SVG_CREATE_SURFACE: u32 = 0x00fb_7058 - ORIGINAL_BASE;
 const SVG_CREATE_LAYER_CONTEXT: u32 = 0x00fb_68e4 - ORIGINAL_BASE;
+const SVG_GET_LAYER_BY_NAME: u32 = 0x00fb_68f0 - ORIGINAL_BASE;
+const SVG_GET_LAYER_STATUS: u32 = 0x00fb_6ac4 - ORIGINAL_BASE;
+const SVG_GET_SURFACE_STATUS: u32 = 0x00fb_64b8 - ORIGINAL_BASE;
+const SVG_GET_LAYER_ERROR: u32 = 0x00fb_6c38 - ORIGINAL_BASE;
+const SVG_GET_RESOURCE_ERROR: u32 = 0x00fb_6a10 - ORIGINAL_BASE;
+const SVG_APPLY_LAYER_IN_SYNC: u32 = 0x00fb_6e90 - ORIGINAL_BASE;
+const SVG_WAIT_LAYER_VSYNC: u32 = 0x00fb_6cc8 - ORIGINAL_BASE;
+const SVG_MAP_LAYER_HANDLE: u32 = 0x5f4c_0001;
+const SVG_MAP_SURFACE_HANDLE: u32 = 0x5f4d_4150;
+const SVG_MAP_WIDTH: u16 = 800;
+const SVG_MAP_HEIGHT: u16 = 480;
+const SVG_MAP_PITCH: u16 = SVG_MAP_WIDTH * 4;
+const GUI_GL_LAYER_SYNC_COPY_LAYER: u32 = 0x0134_359c - ORIGINAL_BASE;
+const GUI_GL_LAYER_COPY_COPY: u32 = 0x0134_2b98 - ORIGINAL_BASE;
+const GUI_GL_LAYER_COPY_PERFORM_COPY: u32 = 0x0134_2754 - ORIGINAL_BASE;
+const GUI_GL_TEXTURE_CONSTRUCTOR: u32 = 0x0134_a844 - ORIGINAL_BASE;
+const GUI_GL_OPENGL_MIX_LAYERS: u32 = 0x0134_6bb0 - ORIGINAL_BASE;
 const CL_LUA_DEBUGGER_S_INITIALIZE: u32 = 0x0133_ae10 - ORIGINAL_BASE;
 const GUI_DISPLAY_WIDTH: u32 = 800;
 const GUI_DISPLAY_HEIGHT: u32 = 480;
@@ -116,6 +133,7 @@ static HMI_EVENT_WAKE_LOGGED: AtomicBool = AtomicBool::new(false);
 static HMI_MNGR_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
 static SVG_FAKE_HANDLE: AtomicU32 = AtomicU32::new(0);
 static SVG_BYPASS_LOGGED: AtomicBool = AtomicBool::new(false);
+static GL_LAYER_COPY_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static GUI_INTERNAL_POST_PENDING: AtomicU32 = AtomicU32::new(0);
 static NAV_STATE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static LUA_CALL_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -299,6 +317,9 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
             })
             .unwrap();
     }
+
+    install_svg_map_surface_hooks(unicorn, base_address);
+    install_gl_layer_copy_trace_hooks(unicorn, base_address);
 
     for (offset, name) in [
         (
@@ -1394,6 +1415,114 @@ fn maybe_inject_hsi_power_state(unicorn: &mut Unicorn<'_, Context>, original_pc:
     HSI_POWER_STATE_PENDING.store(0, Ordering::Relaxed);
     log::warn!("PROCHMI: failed to call clHSI_CMStartup::bExecuteMessage for HSI power-state");
     false
+}
+
+fn install_svg_map_surface_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    for (offset, kind) in [
+        (SVG_GET_LAYER_BY_NAME, "layer_by_name"),
+        (SVG_GET_LAYER_STATUS, "layer_status"),
+        (SVG_GET_SURFACE_STATUS, "surface_status"),
+        (SVG_GET_LAYER_ERROR, "layer_error"),
+        (SVG_GET_RESOURCE_ERROR, "resource_error"),
+        (SVG_APPLY_LAYER_IN_SYNC, "apply_in_sync"),
+        (SVG_WAIT_LAYER_VSYNC, "wait_vsync"),
+    ] {
+        let addr = base_address + offset;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let result = match kind {
+                    "layer_by_name" | "layer_status" => SVG_MAP_LAYER_HANDLE,
+                    "surface_status" => SVG_MAP_SURFACE_HANDLE,
+                    _ => 0,
+                };
+                if kind == "layer_status" {
+                    let status = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    write_svg_layer_status(uc, status);
+                } else if kind == "surface_status" {
+                    let status = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    write_svg_surface_status(uc, status);
+                }
+                if !SVG_BYPASS_LOGGED.swap(true, Ordering::Relaxed) {
+                    log::info!("PROCHMI: bypassing SVG layer-sync resource functions");
+                }
+                uc.reg_write(RegisterARM::R0, result as u64).unwrap();
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0);
+                uc.reg_write(RegisterARM::PC, lr).unwrap();
+            })
+            .unwrap();
+    }
+}
+
+fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    for (offset, name) in [
+        (GUI_GL_LAYER_SYNC_COPY_LAYER, "GUI_GL_LayerSync::copyLayer"),
+        (GUI_GL_LAYER_COPY_COPY, "GUI_GL_LayerCopy::copy"),
+        (
+            GUI_GL_LAYER_COPY_PERFORM_COPY,
+            "GUI_GL_LayerCopy::performCopy",
+        ),
+        (GUI_GL_TEXTURE_CONSTRUCTOR, "GUI_GL_Texture::GUI_GL_Texture"),
+        (GUI_GL_OPENGL_MIX_LAYERS, "GUI_GL_OpenGL::mixLayers"),
+    ] {
+        let addr = base_address + offset;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = GL_LAYER_COPY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 40 {
+                    log::info!(
+                        "PROCHMI: GL composition {} count={} r0={:#x} r1={:#x} r2={:#x} r3={:#x}",
+                        name,
+                        count,
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0),
+                        uc.reg_read(RegisterARM::R1).unwrap_or(0),
+                        uc.reg_read(RegisterARM::R2).unwrap_or(0),
+                        uc.reg_read(RegisterARM::R3).unwrap_or(0),
+                    );
+                }
+            })
+            .unwrap();
+    }
+}
+
+fn write_svg_layer_status(unicorn: &mut Unicorn<'_, Context>, status: u32) {
+    if status == 0 {
+        return;
+    }
+    let mut data = vec![0u8; 0x40];
+    write_u16_at(&mut data, 0x10, 0);
+    write_u16_at(&mut data, 0x12, 0);
+    write_u16_at(&mut data, 0x14, SVG_MAP_WIDTH);
+    write_u16_at(&mut data, 0x16, SVG_MAP_HEIGHT);
+    write_u16_at(&mut data, 0x18, 0);
+    write_u16_at(&mut data, 0x1a, 0);
+    write_u32_at(&mut data, 0x1c, SVG_MAP_SURFACE_HANDLE);
+    let _ = unicorn.mem_write(status as u64, &data);
+}
+
+fn write_svg_surface_status(unicorn: &mut Unicorn<'_, Context>, status: u32) {
+    if status == 0 {
+        return;
+    }
+    let Some(base) = crate::gpu::write_map_surface_to_guest(unicorn) else {
+        return;
+    };
+    let mut data = vec![0u8; 0x40];
+    write_u32_at(&mut data, 0x00, base);
+    write_u32_at(&mut data, 0x04, 0);
+    write_u16_at(&mut data, 0x08, SVG_MAP_WIDTH);
+    write_u16_at(&mut data, 0x0a, 4);
+    write_u32_at(&mut data, 0x0c, 1);
+    write_u16_at(&mut data, 0x10, SVG_MAP_PITCH);
+    write_u32_at(&mut data, 0x34, SVG_MAP_SURFACE_HANDLE);
+    let _ = unicorn.mem_write(status as u64, &data);
+}
+
+fn write_u16_at(data: &mut [u8], offset: usize, value: u16) {
+    data[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32_at(data: &mut [u8], offset: usize, value: u32) {
+    data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
 fn svg_fake_handle(unicorn: &mut Unicorn<'_, Context>) -> u32 {
