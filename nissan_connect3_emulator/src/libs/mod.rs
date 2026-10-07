@@ -1,3 +1,4 @@
+pub mod dapi;
 pub mod gl_stub;
 pub mod libosal_linux;
 pub mod libsvg_resource;
