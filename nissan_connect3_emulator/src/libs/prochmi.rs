@@ -56,8 +56,67 @@ const SVG_MAP_PITCH: u16 = SVG_MAP_WIDTH * 4;
 const GUI_GL_LAYER_SYNC_COPY_LAYER: u32 = 0x0134_359c - ORIGINAL_BASE;
 const GUI_GL_LAYER_COPY_COPY: u32 = 0x0134_2b98 - ORIGINAL_BASE;
 const GUI_GL_LAYER_COPY_PERFORM_COPY: u32 = 0x0134_2754 - ORIGINAL_BASE;
+
 const GUI_GL_TEXTURE_CONSTRUCTOR: u32 = 0x0134_a844 - ORIGINAL_BASE;
 const GUI_GL_OPENGL_MIX_LAYERS: u32 = 0x0134_6bb0 - ORIGINAL_BASE;
+const GUI_DM_EA_MANAGER_IS_BLOCKED: u32 = 0x0133_ede4 - ORIGINAL_BASE;
+const GUI_DM_EA_MANAGER_GET_BACKGROUND: u32 = 0x0133_f528 - ORIGINAL_BASE;
+const GOT_GUI_DM_DISPLAY_MANAGER_SINGLETON: u32 = 0x02a1_d970 - ORIGINAL_BASE;
+const GOT_GUI_MENU_MANAGER_TABLE: u32 = 0x02a1_3f50 - ORIGINAL_BASE;
+const GUI_DM_DISPLAY_MANAGER_IS_DIRTY: u32 = 0x0133_d8ac - ORIGINAL_BASE;
+
+const GUI_DM_DISPLAY_MANAGER_UPDATE: u32 = 0x0133_d99c - ORIGINAL_BASE;
+
+const GUI_DISPLAY_MANAGER_THREAD: u32 = 0x0133_be70 - ORIGINAL_BASE;
+const GUI_MAINLOOP_TRACE_START: u32 = 0x0133_be70 - ORIGINAL_BASE;
+const GUI_MAINLOOP_TRACE_END: u32 = 0x0133_c07c - ORIGINAL_BASE;
+const SYNTHETIC_VTABLE_SIZE: u32 = 0x80;
+const GUI_GL_CONTEXT_INITIALIZE: u32 = 0x0134_8b04 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_IS_DIRTY: u32 = 0x0134_6ff0 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_DRAW_BEGIN: u32 = 0x0134_8980 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_DRAW_END: u32 = 0x0134_88f4 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_INVALIDATE_RECT: u32 = 0x0134_8788 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_INVALIDATE_ALL: u32 = 0x0134_7010 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_DRAW_BITMAP: u32 = 0x0134_8560 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_DRAW_BITMAP_TRIANGLES: u32 = 0x0134_7bfc - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_GET_BITMAP_SIZE: u32 = 0x0134_7b6c - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_CREATE_DYNAMIC_BITMAP: u32 = 0x0134_7b4c - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_DESTROY_DYNAMIC_BITMAP: u32 = 0x0134_7b2c - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_SET_BITMAP_CACHE_HINT: u32 = 0x0134_7b0c - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_DRAW_RECT: u32 = 0x0134_7894 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_DRAW_STRING: u32 = 0x0134_7364 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_GET_FONT_INFO: u32 = 0x0134_704c - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_GET_TEXT_BOUNDING_BOX: u32 = 0x0134_7164 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_GET_PREVIOUS_UPDATE_REGION: u32 = 0x0134_7100 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_GET_TEXTURE: u32 = 0x0134_70f8 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_PUSH_ALPHA: u32 = 0x0137_f9b8 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_POP_ALPHA: u32 = 0x0137_f960 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_PUSH_CLIP_RECT: u32 = 0x0137_fa38 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_SET_CLIP_RECT: u32 = 0x0134_8fa8 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_POP_CLIP_RECT: u32 = 0x0137_f900 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_SET_SURFACE_ID: u32 = 0x0134_8fbc - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_GET_DIRTY_REGION: u32 = 0x0134_8fc4 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_DESTRUCTOR: u32 = 0x0134_8ce8 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_DELETING_DESTRUCTOR: u32 = 0x0134_8c34 - ORIGINAL_BASE;
+const GUI_GL_CONTEXT_GET_DYNAMIC_BITMAP_SIZE: u32 = 0x0134_7030 - ORIGINAL_BASE;
+
+const GUI_GL_INVISIBLE_INITIALIZE: u32 = 0x0134_8fcc - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_IS_DIRTY: u32 = 0x0134_8fd0 - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_DRAW_BEGIN: u32 = 0x0134_8fd8 - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_DRAW_END: u32 = 0x0134_8fe4 - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_INVALIDATE_RECT: u32 = 0x0134_8fe8 - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_INVALIDATE_ALL: u32 = 0x0134_901c - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_DRAW_BITMAP: u32 = 0x0134_9060 - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_DRAW_BITMAP_TRIANGLES: u32 = 0x0134_9064 - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_DRAW_RECT: u32 = 0x0134_9068 - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_GET_TEXTURE: u32 = 0x0134_9070 - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_SET_CLIP_RECT: u32 = 0x0134_9050 - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_DESTRUCTOR: u32 = 0x0134_9078 - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_DELETING_DESTRUCTOR: u32 = 0x0134_90e0 - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_RESET_CLIP_RECT: u32 = 0x0134_9054 - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_SET_ORIGIN: u32 = 0x0134_9058 - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_RESET_ORIGIN: u32 = 0x0134_905c - ORIGINAL_BASE;
+const GUI_GL_INVISIBLE_DRAW_STRING_NO_FLOAT: u32 = 0x0134_906c - ORIGINAL_BASE;
 const CL_LUA_DEBUGGER_S_INITIALIZE: u32 = 0x0133_ae10 - ORIGINAL_BASE;
 const GUI_DISPLAY_WIDTH: u32 = 800;
 const GUI_DISPLAY_HEIGHT: u32 = 480;
@@ -102,9 +161,10 @@ const CL_HMI_NAV_TRACE: u32 = 0x160;
 const CL_HMI_NAV_RENDER_VIEW: u32 = 0x808;
 const CL_HMI_NAV_SINK_IMPLEMENTATION: u32 = 0x9a8;
 const CL_HMI_NAV_MAP_DRAW_FLAG: u32 = 0x1c74;
-const DAT_ENAVI_FI_CLIENT: u32 = 0x0597_3de0;
+const DAT_ENAVI_FI_CLIENT: u32 = 0x0597_3de0 - ORIGINAL_BASE;
 
 const CL_HSI_CM_MANAGER_PHSI_BASE_GET: u32 = 0x0182_79f4 - ORIGINAL_BASE;
+const CL_HSI_MNGR_BINIT_FIS: u32 = 0x0135_2cbc - ORIGINAL_BASE;
 const HSI_CM_STARTUP_BEXECUTE_MESSAGE: u32 = 0x0184_b958 - ORIGINAL_BASE;
 const HSI_FACTORY_CREATE_POST_ASSIGN: u32 = 0x0185_1edc - ORIGINAL_BASE;
 const CL_HMI_MNGR_CMMNGR_OFFSET: u32 = 0x640;
@@ -116,7 +176,7 @@ const HSI_POWER_STATE_MESSAGE: u32 = 0x2715;
 const HSI_POWER_STATE_DEFAULT: u32 = 0x12;
 const HSI_POWER_STATE_PENDING_CREATE: u32 = 1;
 const HSI_POWER_STATE_PENDING_SEND: u32 = 2;
-const GUEST_CALL_STUB_SIZE: u32 = 4;
+const GUEST_CALL_STUB_SIZE: u32 = 16;
 
 static PROCHMI_BASE: AtomicU32 = AtomicU32::new(0);
 static HMI_MNGR_POINTER: AtomicU32 = AtomicU32::new(0);
@@ -134,6 +194,17 @@ static HMI_MNGR_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
 static SVG_FAKE_HANDLE: AtomicU32 = AtomicU32::new(0);
 static SVG_BYPASS_LOGGED: AtomicBool = AtomicBool::new(false);
 static GL_LAYER_COPY_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+static HMI_MAINLOOP_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
+static HMI_FIS_INIT_DONE: AtomicBool = AtomicBool::new(false);
+static MAP_LAYER_COPY_PENDING: AtomicBool = AtomicBool::new(false);
+static MAP_LAYER_COPY_OBJECT: AtomicU32 = AtomicU32::new(0);
+static HMI_VIEW_CLEAN_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
+static HMI_MAINLOOP_TRACE_ARMED: AtomicBool = AtomicBool::new(false);
+static HMI_MAINLOOP_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static GL_CONTEXT_VTABLE: AtomicU32 = AtomicU32::new(0);
+static GL_INVISIBLE_CONTEXT_VTABLE: AtomicU32 = AtomicU32::new(0);
+static HMI_VIEW_VTABLE_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
 static GUI_INTERNAL_POST_PENDING: AtomicU32 = AtomicU32::new(0);
 static NAV_STATE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static LUA_CALL_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -262,12 +333,9 @@ fn log_hmi_nav_handler_state(
         }
         return false;
     }
-    if !force && !hmi_nav_handler_trace_allowed() {
-        return false;
-    }
-
     let previous = HMI_NAV_HANDLER.swap(handler, Ordering::Relaxed);
-    if force || previous == 0 {
+    let should_log = force || previous == 0 || hmi_nav_handler_trace_allowed();
+    if should_log {
         log::info!(
             "PROCHMI: {} handler={:#x} mode={} nav={} trace={} render_view={} sink={} fi={} flag={}",
             label,
@@ -277,7 +345,10 @@ fn log_hmi_nav_handler_state(
             read_u32(unicorn, handler + CL_HMI_NAV_TRACE),
             read_u32(unicorn, handler + CL_HMI_NAV_RENDER_VIEW),
             handler + CL_HMI_NAV_SINK_IMPLEMENTATION,
-            read_u32(unicorn, DAT_ENAVI_FI_CLIENT),
+            read_u32(
+                unicorn,
+                PROCHMI_BASE.load(Ordering::Relaxed) + DAT_ENAVI_FI_CLIENT,
+            ),
             read_u8(unicorn, handler + CL_HMI_NAV_MAP_DRAW_FLAG),
         );
     }
@@ -319,6 +390,9 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     }
 
     install_svg_map_surface_hooks(unicorn, base_address);
+
+    force_display_manager_dirty(unicorn, base_address);
+    force_ea_manager_background(unicorn, base_address);
     install_gl_layer_copy_trace_hooks(unicorn, base_address);
 
     for (offset, name) in [
@@ -479,7 +553,10 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
 
     let gui_mainloop = base_address + CL_GUI_MAINLOOP;
     unicorn
-        .add_code_hook(gui_mainloop as u64, gui_mainloop as u64, |uc, address, _| {
+        .        add_code_hook(gui_mainloop as u64, gui_mainloop as u64, |uc, address, _| {
+            if maybe_force_hmi_fi_init(uc, address as u32) {
+                return;
+            }
             if maybe_inject_hsi_power_state(uc, address as u32) {
                 return;
             }
@@ -489,6 +566,33 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 GUI_ENGINE_ADDRESS.store(gui, Ordering::Relaxed);
             }
             let mode = read_u8(uc, gui + 0x3d);
+            let diag_count = HMI_MAINLOOP_DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
+            let hmi = HMI_MNGR_POINTER.load(Ordering::Relaxed);
+            if hmi != 0 && diag_count < 20 {
+                log::info!(
+                    "PROCHMI: HMI manager diag count={} hmi={:#x} adapter={:#x} cfg={:#x} trace={:#x} fi_factory={:#x}",
+                    diag_count,
+                    hmi,
+                    read_u32(uc, hmi + 8),
+                    read_u32(uc, hmi + 0xc),
+                    read_u32(uc, hmi + 0x10),
+                    read_u32(uc, hmi + 0x18),
+                );
+            }
+            let handler = HMI_NAV_HANDLER.load(Ordering::Relaxed);
+            if handler != 0 && diag_count < 20 {
+                log::info!(
+                    "PROCHMI: nav handler diag count={} handler={:#x} mode={:#x} nav={:#x} trace={:#x} render={:#x} fi={:#x} flag={:#x}",
+                    diag_count,
+                    handler,
+                    read_u32(uc, handler + 0x148),
+                    read_u32(uc, handler + 0x15c),
+                    read_u32(uc, handler + 0x160),
+                    read_u32(uc, handler + 0x808),
+                    read_u32(uc, PROCHMI_BASE.load(Ordering::Relaxed) + DAT_ENAVI_FI_CLIENT),
+                    read_u32(uc, handler + 0x1c74),
+                );
+            }
             log::info!(
                 "PROCHMI: clGUIWidgetEngine::bGUIMainloop this={:#x} display_mode={}",
                 gui,
@@ -1259,8 +1363,13 @@ fn ensure_guest_call_stub(unicorn: &mut Unicorn<'_, Context>) -> Option<u32> {
             Prot::READ | Prot::WRITE | Prot::EXEC,
             "[prochmi-call-stub]",
         );
-    if addr == 0 || unicorn.mem_write(addr as u64, &[0x0f, 0xc0, 0xbd, 0xe8]).is_err() {
-        log::warn!("PROCHMI: failed to allocate ARM pop{{r0-r3,lr,pc}} guest-call stub");
+    let stub_code = [
+        0x34, 0xc0, 0x8c, 0xe2, // add r12, sp, #0x34
+        0xff, 0x4f, 0xbd, 0xe8, // pop {r0-r11,lr}
+        0x00, 0xa0, 0xb0, 0xe8, // ldmia r12, {sp,pc}
+    ];
+    if addr == 0 || unicorn.mem_write(addr as u64, &stub_code).is_err() {
+        log::warn!("PROCHMI: failed to allocate ARM r0-r11+sp+pc guest-call stub");
         return None;
     }
 
@@ -1283,19 +1392,31 @@ fn call_guest_function(
         return false;
     };
 
-    let r0 = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
-    let r1 = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
-    let r2 = unicorn.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
-    let r3 = unicorn.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
-    let lr = unicorn.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
     let sp = unicorn.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
     if sp < 0x1000 {
         log::warn!("PROCHMI: refusing guest call from invalid SP {:#x}", sp);
         return false;
     }
 
-    let new_sp = sp.wrapping_sub(24);
-    let saved = [r0, r1, r2, r3, lr, original_pc];
+    let saved = [
+        unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R4).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R5).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R6).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R7).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R8).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R9).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R10).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R11).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+        sp,
+        original_pc,
+        0,
+    ];
+    let new_sp = sp.wrapping_sub(saved.len() as u32 * 4) & !7;
     if !saved
         .iter()
         .enumerate()
@@ -1324,6 +1445,39 @@ fn call_guest_function(
     }
 
     true
+}
+
+fn maybe_force_hmi_fi_init(unicorn: &mut Unicorn<'_, Context>, original_pc: u32) -> bool {
+    if true || HMI_FIS_INIT_DONE.load(Ordering::Relaxed) {
+        return false;
+    }
+    let hmi = HMI_MNGR_POINTER.load(Ordering::Relaxed);
+    if hmi == 0 {
+        return false;
+    }
+    let factory = read_u32(unicorn, hmi + 0x18);
+    if factory == 0 {
+        let count = HMI_MAINLOOP_DIAG_COUNT.load(Ordering::Relaxed);
+        if count < 5 {
+            log::info!("PROCHMI: FI init waiting for HSI FI factory hmi={:#x}", hmi);
+        }
+        return false;
+    }
+    let base = PROCHMI_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return false;
+    }
+    let function = base + CL_HSI_MNGR_BINIT_FIS;
+    if call_guest_function(unicorn, original_pc, function, [hmi, 0, 0, 0]) {
+        HMI_FIS_INIT_DONE.store(true, Ordering::Relaxed);
+        log::info!(
+            "PROCHMI: forced clHSIMngr::bInitFIs hmi={:#x} factory={:#x}",
+            hmi,
+            factory
+        );
+        return true;
+    }
+    false
 }
 
 fn maybe_inject_hsi_power_state(unicorn: &mut Unicorn<'_, Context>, original_pc: u32) -> bool {
@@ -1453,6 +1607,143 @@ fn install_svg_map_surface_hooks(unicorn: &mut Unicorn<'_, Context>, base_addres
     }
 }
 
+fn force_ea_manager_background(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    let addr = base_address + GUI_DM_EA_MANAGER_GET_BACKGROUND;
+    unicorn
+        .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            let ea = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let layer_copy = ea + 0x130;
+            let texture = read_u32(uc, layer_copy);
+            if texture != 0 {
+                let count = GL_LAYER_COPY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 40 {
+                    log::info!(
+                        "PROCHMI: forced EA background count={} ea={:#x} layer_copy={:#x} texture={:#x}",
+                        count,
+                        ea,
+                        layer_copy,
+                        texture
+                    );
+                }
+                HMI_MAINLOOP_TRACE_ARMED.store(true, Ordering::Relaxed);
+                uc.reg_write(RegisterARM::R0, layer_copy as u64).unwrap();
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0);
+                uc.reg_write(RegisterARM::PC, lr).unwrap();
+            }
+        })
+        .unwrap();
+}
+
+
+
+fn maybe_refresh_map_layer_copy(unicorn: &mut Unicorn<'_, Context>, original_pc: u32) -> bool {
+    if MAP_LAYER_COPY_PENDING.swap(false, Ordering::AcqRel) {
+        return false;
+    }
+
+    let display_manager = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+    if display_manager == 0 {
+        return false;
+    }
+    let ea_manager = read_u32(unicorn, display_manager);
+    if ea_manager == 0 {
+        return false;
+    }
+
+    let _ = write_u8(unicorn, ea_manager + 0x154, 0xff);
+    let layer_copy = ea_manager + 0x130;
+    MAP_LAYER_COPY_OBJECT.store(layer_copy, Ordering::Release);
+
+    let base = PROCHMI_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return false;
+    }
+
+    let function = base + GUI_GL_LAYER_COPY_COPY;
+    if call_guest_function(
+        unicorn,
+        original_pc,
+        function,
+        [layer_copy, 0, SVG_MAP_LAYER_HANDLE, 0],
+    ) {
+        MAP_LAYER_COPY_PENDING.store(true, Ordering::Release);
+        let count = GL_LAYER_COPY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if count < 5 {
+            log::info!(
+                "PROCHMI: requested map SVG layer copy display_manager={:#x} ea={:#x} copy={:#x}",
+                display_manager,
+                ea_manager,
+                layer_copy
+            );
+        }
+        return true;
+    }
+    false
+}
+
+fn force_display_manager_dirty(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    let addr = base_address + GUI_DM_DISPLAY_MANAGER_IS_DIRTY;
+    unicorn
+        .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            uc.reg_write(RegisterARM::R0, 1).unwrap();
+            let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0);
+            uc.reg_write(RegisterARM::PC, lr).unwrap();
+        })
+        .unwrap();
+}
+
+fn force_hmi_mainloop_display_update(unicorn: &mut Unicorn<'_, Context>) {
+    let base = PROCHMI_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    let engine = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+    if engine != 0 {
+        let _ = write_u8(unicorn, engine + 0x3d, 0);
+    }
+    let singleton_slot = read_u32(unicorn, base + GOT_GUI_DM_DISPLAY_MANAGER_SINGLETON);
+    let display_manager = read_u32(unicorn, singleton_slot);
+    if display_manager != 0 {
+        let _ = write_u8(unicorn, display_manager + 0x3c, 1);
+    }
+}
+
+fn force_hmi_views_clean(unicorn: &mut Unicorn<'_, Context>) {
+    let base = PROCHMI_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    let menu_manager = read_u32(unicorn, base + GOT_GUI_MENU_MANAGER_TABLE);
+    if HMI_VIEW_CLEAN_DIAG_COUNT.load(Ordering::Relaxed) < 5 {
+        log::info!("PROCHMI: HMI views menu_manager={:#x}", menu_manager);
+    }
+    if menu_manager == 0 {
+        return;
+    }
+    for index in 0..4u32 {
+        let view = read_u32(unicorn, menu_manager + index * 4);
+        let draw_context = read_u32(unicorn, view + 0x40);
+        if HMI_VIEW_CLEAN_DIAG_COUNT.load(Ordering::Relaxed) < 5 {
+            log::info!(
+                "PROCHMI: HMI view {} view={:#x} draw_context={:#x} vptr={:#x} region_count={}",
+                index,
+                view,
+                draw_context,
+                read_u32(unicorn, draw_context),
+                read_u32(unicorn, draw_context + 0xb8)
+            );
+        }
+        if view == 0 || draw_context == 0 {
+            continue;
+        }
+        let _ = write_u32(unicorn, view + 0x40, 0);
+        let _ = write_u32(unicorn, draw_context + 0x88, u32::MAX);
+        let _ = write_u32(unicorn, draw_context + 0x8c, u32::MAX);
+        let _ = write_u32(unicorn, draw_context + 0xb8, 0);
+    }
+    HMI_VIEW_CLEAN_DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     for (offset, name) in [
         (GUI_GL_LAYER_SYNC_COPY_LAYER, "GUI_GL_LayerSync::copyLayer"),
@@ -1463,10 +1754,28 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
         ),
         (GUI_GL_TEXTURE_CONSTRUCTOR, "GUI_GL_Texture::GUI_GL_Texture"),
         (GUI_GL_OPENGL_MIX_LAYERS, "GUI_GL_OpenGL::mixLayers"),
+        (
+            GUI_DM_DISPLAY_MANAGER_UPDATE,
+            "GUI_DM_DisplayManager::update",
+        ),
+        (
+            GUI_DISPLAY_MANAGER_THREAD,
+            "GUI_DM_DisplayManager thread entry",
+        ),
     ] {
         let addr = base_address + offset;
         unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            .add_code_hook(addr as u64, addr as u64, move |uc, address, _| {
+                if name == "GUI_DM_DisplayManager thread entry" {
+                    force_hmi_mainloop_display_update(uc);
+                }
+                if name == "GUI_DM_DisplayManager::update" {
+                    force_hmi_views_clean(uc);
+                    if maybe_refresh_map_layer_copy(uc, address as u32) {
+                        return;
+                    }
+                }
+
                 let count = GL_LAYER_COPY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 40 {
                     log::info!(
@@ -1482,6 +1791,47 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
             })
             .unwrap();
     }
+
+    let trace_start = base_address + GUI_MAINLOOP_TRACE_START;
+    let trace_end = base_address + GUI_MAINLOOP_TRACE_END;
+    unicorn
+        .add_code_hook(trace_start as u64, trace_end as u64, move |uc, address, _| {
+            if !HMI_MAINLOOP_TRACE_ARMED.load(Ordering::Relaxed) {
+                return;
+            }
+            let count = HMI_MAINLOOP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if address as u32 == trace_end - 0x70 {
+                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCHMI: mainloop epilogue count={} sp={:#x} s0={:#x} s1={:#x} s2={:#x} s3={:#x} s4={:#x} s5={:#x} s6={:#x} s7={:#x} s8={:#x}",
+                    count,
+                    sp,
+                    read_u32(uc, sp),
+                    read_u32(uc, sp + 4),
+                    read_u32(uc, sp + 8),
+                    read_u32(uc, sp + 0xc),
+                    read_u32(uc, sp + 0x10),
+                    read_u32(uc, sp + 0x14),
+                    read_u32(uc, sp + 0x18),
+                    read_u32(uc, sp + 0x1c),
+                    read_u32(uc, sp + 0x20)
+                );
+            }
+            if count < 3000 {
+                log::info!(
+                    "PROCHMI: mainloop trace {} pc={:#x} r0={:#x} r1={:#x} r2={:#x} r3={:#x} lr={:#x} sp={:#x}",
+                    count,
+                    address,
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0),
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0),
+                    uc.reg_read(RegisterARM::R2).unwrap_or(0),
+                    uc.reg_read(RegisterARM::R3).unwrap_or(0),
+                    uc.reg_read(RegisterARM::LR).unwrap_or(0),
+                    uc.reg_read(RegisterARM::SP).unwrap_or(0),
+                );
+            }
+        })
+        .unwrap();
 }
 
 fn write_svg_layer_status(unicorn: &mut Unicorn<'_, Context>, status: u32) {
