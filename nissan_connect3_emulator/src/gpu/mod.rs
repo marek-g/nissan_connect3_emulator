@@ -1,12 +1,12 @@
 use crate::emulator::context::Context;
 use sdl2::event::Event;
-use sdl2::video::{GLContext, Window};
-use sdl2::EventPump;
+use sdl2::video::Window;
+use sdl2::{sys, EventPump};
 use std::cell::Cell;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Once, OnceLock};
+use std::sync::{Mutex, Once, OnceLock};
 use std::time::Duration;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -38,7 +38,14 @@ struct GpuOutput {
 
 type GpuFuture = Box<dyn FnOnce() -> GpuOutput + Send>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GpuTarget {
+    Hmi,
+    Map,
+}
+
 struct GpuCommand {
+    target: GpuTarget,
     future: GpuFuture,
     reply: mpsc::Sender<GpuOutput>,
 }
@@ -48,19 +55,30 @@ thread_local! {
     static API_LOG_COUNT: Cell<u32> = const { Cell::new(0) };
     static REAL_GL_OUTPUT_LOG_COUNT: Cell<u32> = const { Cell::new(0) };
     static EGL_CURRENT_API: Cell<u32> = const { Cell::new(EGL_OPENGL_ES_API) };
+    static CURRENT_GPU_TARGET: Cell<Option<GpuTarget>> = const { Cell::new(None) };
 }
+
+static MAP_SURFACE_DIRTY: AtomicBool = AtomicBool::new(false);
+static MAP_SURFACE_BYTES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
 static GPU_SENDER: OnceLock<mpsc::Sender<GpuCommand>> = OnceLock::new();
 static GPU_START: Once = Once::new();
 static GPU_FAILED: AtomicBool = AtomicBool::new(false);
 static GPU_MAKE_CURRENT_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
+static GPU_TARGET_SWITCH_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 static GL_ERROR_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 
 struct Backend {
     _sdl: sdl2::Sdl,
     _video: sdl2::VideoSubsystem,
-    gl_context: GLContext,
     window: Window,
+    window_raw: *mut sys::SDL_Window,
+    hmi_context: sys::SDL_GLContext,
+    map_context: sys::SDL_GLContext,
+    map_framebuffer: u32,
+    map_renderbuffer: u32,
+    map_pixels: Vec<u8>,
+    current_target: Option<GpuTarget>,
     events: Option<EventPump>,
 }
 
@@ -68,6 +86,36 @@ fn gpu_backend_visible() -> bool {
     std::env::var("EMU_GPU_VISIBLE")
         .map(|value| value != "0" && !value.is_empty())
         .unwrap_or(true)
+}
+
+fn gpu_target_for_elf(elf_path: &str) -> GpuTarget {
+    if elf_path.contains("procmapengine") {
+        GpuTarget::Map
+    } else {
+        GpuTarget::Hmi
+    }
+}
+
+fn set_gpu_target_for_elf(elf_path: &str) -> GpuTarget {
+    let target = gpu_target_for_elf(elf_path);
+    CURRENT_GPU_TARGET.with(|slot| slot.set(Some(target)));
+    target
+}
+
+fn current_gpu_target() -> GpuTarget {
+    CURRENT_GPU_TARGET.with(|slot| slot.get()).unwrap_or(GpuTarget::Hmi)
+}
+
+pub fn map_surface_is_dirty() -> bool {
+    MAP_SURFACE_DIRTY.load(Ordering::Acquire)
+}
+
+pub fn take_map_surface() -> Option<Vec<u8>> {
+    if MAP_SURFACE_DIRTY.swap(false, Ordering::AcqRel) {
+        MAP_SURFACE_BYTES.lock().ok().map(|bytes| bytes.clone())
+    } else {
+        None
+    }
 }
 
 fn init_backend() -> Result<Backend, String> {
@@ -100,9 +148,47 @@ fn init_backend() -> Result<Backend, String> {
             .map_err(|err| format!("{:?}", err))?
     };
 
-    let gl_context = window.gl_create_context()?;
+    let window_raw = window.raw();
+    let hmi_context = unsafe { sys::SDL_GL_CreateContext(window_raw) };
+    if hmi_context.is_null() {
+        return Err("SDL_GL_CreateContext(HMI) returned null".to_string());
+    }
     gl::load_with(|name| video.gl_get_proc_address(name) as *const _);
     let _ = video.gl_set_swap_interval(1);
+
+    unsafe {
+        sys::SDL_GL_SetAttribute(
+            sys::SDL_GLattr::SDL_GL_SHARE_WITH_CURRENT_CONTEXT,
+            1,
+        );
+    }
+    let map_context = unsafe { sys::SDL_GL_CreateContext(window_raw) };
+    if map_context.is_null() {
+        return Err("SDL_GL_CreateContext(map) returned null".to_string());
+    }
+
+    let mut map_framebuffer = 0u32;
+    let mut map_renderbuffer = 0u32;
+    unsafe {
+        sys::SDL_GL_MakeCurrent(window_raw, map_context);
+        gl::GenFramebuffers(1, &mut map_framebuffer);
+        gl::BindFramebuffer(gl::FRAMEBUFFER, map_framebuffer);
+        gl::GenRenderbuffers(1, &mut map_renderbuffer);
+        gl::BindRenderbuffer(gl::RENDERBUFFER, map_renderbuffer);
+        gl::RenderbufferStorage(gl::RENDERBUFFER, gl::RGBA8, 800, 480);
+        gl::FramebufferRenderbuffer(
+            gl::FRAMEBUFFER,
+            gl::COLOR_ATTACHMENT0,
+            gl::RENDERBUFFER,
+            map_renderbuffer,
+        );
+        if gl::CheckFramebufferStatus(gl::FRAMEBUFFER) != gl::FRAMEBUFFER_COMPLETE {
+            map_framebuffer = 0;
+        }
+        sys::SDL_GL_MakeCurrent(window_raw, hmi_context);
+    }
+
+    let map_pixels = vec![0u8; 800 * 480 * 4];
     let events = if visible {
         Some(sdl.event_pump()?)
     } else {
@@ -119,16 +205,23 @@ fn init_backend() -> Result<Backend, String> {
     }
 
     log::info!(
-        "GPU: dedicated SDL/GL backend thread started visible={} thread={:?}",
+        "GPU: dedicated SDL/GL backend thread started visible={} map_fbo={} thread={:?}",
         visible,
+        map_framebuffer,
         std::thread::current().id()
     );
 
     Ok(Backend {
         _sdl: sdl,
         _video: video,
-        gl_context,
         window,
+        window_raw,
+        hmi_context,
+        map_context,
+        map_framebuffer,
+        map_renderbuffer,
+        map_pixels,
+        current_target: Some(GpuTarget::Hmi),
         events,
     })
 }
@@ -159,6 +252,71 @@ fn poll_events(backend: &mut Backend) -> bool {
     false
 }
 
+fn make_target_current(backend: &mut Backend, target: GpuTarget) {
+    if backend.current_target == Some(target) {
+        return;
+    }
+
+    let context = match target {
+        GpuTarget::Hmi => backend.hmi_context,
+        GpuTarget::Map => backend.map_context,
+    };
+
+    let result = unsafe { sys::SDL_GL_MakeCurrent(backend.window_raw, context) };
+    let count = GPU_TARGET_SWITCH_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < 20 {
+        log::info!(
+            "GPU: target switch from {:?} to {:?} make_current={} map_fbo={}",
+            backend.current_target,
+            target,
+            result,
+            backend.map_framebuffer
+        );
+    }
+    if result != 0 {
+        if !GPU_MAKE_CURRENT_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
+            log::warn!("GPU: failed to make target {:?} GL context current", target);
+        }
+        return;
+    }
+
+    unsafe {
+        match target {
+            GpuTarget::Hmi => gl::BindFramebuffer(gl::FRAMEBUFFER, 0),
+            GpuTarget::Map => gl::BindFramebuffer(gl::FRAMEBUFFER, backend.map_framebuffer),
+        }
+    }
+    backend.current_target = Some(target);
+}
+
+fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
+    match target {
+        GpuTarget::Hmi => {
+            unsafe {
+                gl::Finish();
+            }
+            let _ = backend.window.gl_swap_window();
+        }
+        GpuTarget::Map => unsafe {
+            gl::BindFramebuffer(gl::FRAMEBUFFER, backend.map_framebuffer);
+            gl::ReadPixels(
+                0,
+                0,
+                800,
+                480,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                backend.map_pixels.as_mut_ptr() as *mut _,
+            );
+            if let Ok(mut host) = MAP_SURFACE_BYTES.lock() {
+                *host = backend.map_pixels.clone();
+                MAP_SURFACE_DIRTY.store(true, Ordering::Release);
+            }
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+        },
+    }
+}
+
 fn backend_main(rx: mpsc::Receiver<GpuCommand>, ready_tx: mpsc::Sender<bool>) {
     let mut backend = match init_backend() {
         Ok(backend) => backend,
@@ -176,18 +334,10 @@ fn backend_main(rx: mpsc::Receiver<GpuCommand>, ready_tx: mpsc::Sender<bool>) {
     loop {
         match rx.recv_timeout(Duration::from_millis(16)) {
             Ok(command) => {
-                if let Err(err) = backend.window.gl_make_current(&backend.gl_context) {
-                    if !GPU_MAKE_CURRENT_ERROR_LOGGED.swap(true, Ordering::Relaxed) {
-                        log::warn!("GPU: failed to make backend GL context current: {}", err);
-                    }
-                }
-
-                let mut output = (command.future)();
+                make_target_current(&mut backend, command.target);
+                let output = (command.future)();
                 if output.swap_requested {
-                    unsafe {
-                        gl::Finish();
-                    }
-                    let _ = backend.window.gl_swap_window();
+                    handle_surface_swap(&mut backend, command.target);
                     if poll_events(&mut backend) {
                         return;
                     }
@@ -243,6 +393,7 @@ where
     let (reply_tx, reply_rx) = mpsc::channel();
     sender
         .send(GpuCommand {
+            target: current_gpu_target(),
             future: Box::new(future),
             reply: reply_tx,
         })
@@ -264,6 +415,7 @@ where
     let (reply_tx, _reply_rx) = mpsc::channel();
     sender
         .send(GpuCommand {
+            target: current_gpu_target(),
             future: Box::new(move || {
                 f();
                 unsafe {
@@ -358,7 +510,9 @@ fn gpu_process_allowed(elf_path: &str) -> bool {
 }
 
 fn ensure_backend(unicorn: &Unicorn<'_, Context>) -> bool {
-    gpu_process_allowed(&unicorn.get_data().elf_path) && ensure_gpu_thread()
+    let elf_path = &unicorn.get_data().elf_path;
+    set_gpu_target_for_elf(elf_path);
+    gpu_process_allowed(elf_path) && ensure_gpu_thread()
 }
 
 fn ureg(unicorn: &mut Unicorn<'_, Context>, register: RegisterARM) -> u32 {
@@ -546,6 +700,7 @@ fn force_gl_error(unicorn: &Unicorn<'_, Context>) {
 }
 
 fn log_api(unicorn: &mut Unicorn<'_, Context>, prefix: &str, name: &str) {
+    set_gpu_target_for_elf(&unicorn.get_data().elf_path);
     let count = API_LOG_COUNT.with(|count| {
         let old = count.get();
         count.set(old.wrapping_add(1));
@@ -697,6 +852,7 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
                     .map(|sender| {
                         sender
                             .send(GpuCommand {
+                                target: current_gpu_target(),
                                 future: Box::new(|| GpuOutput {
                                     swap_requested: true,
                                     ..Default::default()
@@ -1995,6 +2151,18 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
     }
 
     None
+}
+
+pub fn request_draw_list(unicorn: &mut Unicorn<'_, Context>, count: i32) {
+    let count = count.clamp(1, 1024);
+    if !ensure_backend(unicorn) {
+        return;
+    }
+    if gpu_void_clear(move || unsafe {
+        gl::DrawArrays(gl::TRIANGLES, 0, count);
+    }) {
+        note_real_gl_output(unicorn, "draw");
+    }
 }
 
 pub fn gl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {

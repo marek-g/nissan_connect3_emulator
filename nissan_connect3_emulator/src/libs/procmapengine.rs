@@ -1,4 +1,5 @@
 use crate::emulator::context::Context;
+use crate::gpu;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use unicorn_engine::unicorn_const::Prot;
@@ -75,6 +76,7 @@ const MAP_DRAW_BLIT_ICON_BRANCH_2: u32 = 0x0043_e8_68 - ORIGINAL_BASE;
 const MAP_DRAW_BLIT_ICON_BRANCH_3: u32 = 0x0043_eb_48 - ORIGINAL_BASE;
 const MAP_DRAW_BLIT_ICON_BRANCH_4: u32 = 0x0043_eb_64 - ORIGINAL_BASE;
 const MAP_RENDERER_DRAW_LIST_VCALL_3C: u32 = 0x0052_cd9c - ORIGINAL_BASE;
+const MAP_RENDERER_DRAW_LIST_TARGET_3C: u32 = 0x003d_59c0 - ORIGINAL_BASE;
 const MAP_JOB_QUEUE_ADD_ELEMENT_ENTRY: u32 = 0x004a_4284 - ORIGINAL_BASE;
 const MAP_JOB_QUEUE_ADD_ELEMENT_PRE_POST: u32 = 0x004a_436c - ORIGINAL_BASE;
 const MAP_JOB_QUEUE_ADD_ELEMENT_AFTER_POST: u32 = 0x004a_4370 - ORIGINAL_BASE;
@@ -1173,11 +1175,13 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
         )
         .unwrap();
 
+    let draw_list_blit_target = base_address + MAP_RENDERER_DRAW_LIST_TARGET_3C;
     for (offset, slot, kind) in [
         (MAP_RENDERER_DRAW_LIST_VCALL_38, 0x38u32, "0x38"),
         (MAP_RENDERER_DRAW_LIST_VCALL_3C, 0x3cu32, "0x3c"),
     ] {
         let vcall_addr = base_address + offset;
+        let draw_list_blit_target = draw_list_blit_target;
         unicorn
             .add_code_hook(vcall_addr as u64, vcall_addr as u64, move |uc, _, _| {
                 let object = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -1198,6 +1202,16 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
                         count + 1
                     );
                 }
+                if std::env::var_os("EMU_PROCMAPENGINE_SYNTH_DRAWLIST").is_some()
+                    && target == draw_list_blit_target
+                    && list != 0
+                    && list != u32::MAX
+                {
+                    let element_count = read_u32_or_invalid(uc, list + 10) & 0xffff;
+                    if element_count != 0 {
+                        gpu::request_draw_list(uc, element_count as i32);
+                    }
+                }
             })
             .unwrap();
     }
@@ -1217,7 +1231,11 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
                 read_u32_or_invalid(uc, context_global)
             };
 
-            if context_global != 0 && context_global != u32::MAX && context == 0 {
+            if std::env::var_os("EMU_PROCMAPENGINE_FORCE_BLIT_CONTEXT").is_some()
+                && context_global != 0
+                && context_global != u32::MAX
+                && context == 0
+            {
                 if fake_blit_context == 0 {
                     let mmu_arc = {
                         let data = uc.get_data();
