@@ -64,6 +64,17 @@ const MAP_RENDERER_SKIP_BRANCH: u32 = 0x0053_0408 - ORIGINAL_BASE;
 const MAP_RENDERER_EXECUTE_BODY: u32 = 0x0053_0480 - ORIGINAL_BASE;
 const MAP_RENDERER_EXECUTE_ENTRY: u32 = 0x0052_d618 - ORIGINAL_BASE;
 const MAP_RENDERER_DRAW_LIST_ENTRY: u32 = 0x0052_ccc8 - ORIGINAL_BASE;
+const MAP_RENDERER_DRAW_LIST_VCALL_38: u32 = 0x0052_cd40 - ORIGINAL_BASE;
+const MAP_DRAW_BLIT_ICON_ENTRY: u32 = 0x0043_e78c - ORIGINAL_BASE;
+const MAP_DRAW_BLIT_ICON_GLOBAL: u32 = 0x0043_ed_e4 - ORIGINAL_BASE;
+const MAP_DRAW_BLIT_ICON_TABLE_GLOBAL: u32 = 0x0043_ed_fc - ORIGINAL_BASE;
+const MAP_DRAW_BLIT_ICON_GLOBAL_END: u32 = 0x0043_ee_80 - ORIGINAL_BASE;
+const MAP_DRAW_BLIT_ICON_NULL_RETURN: u32 = 0x0043_e7_b0 - ORIGINAL_BASE;
+const MAP_DRAW_BLIT_ICON_BRANCH_1: u32 = 0x0043_e8_54 - ORIGINAL_BASE;
+const MAP_DRAW_BLIT_ICON_BRANCH_2: u32 = 0x0043_e8_68 - ORIGINAL_BASE;
+const MAP_DRAW_BLIT_ICON_BRANCH_3: u32 = 0x0043_eb_48 - ORIGINAL_BASE;
+const MAP_DRAW_BLIT_ICON_BRANCH_4: u32 = 0x0043_eb_64 - ORIGINAL_BASE;
+const MAP_RENDERER_DRAW_LIST_VCALL_3C: u32 = 0x0052_cd9c - ORIGINAL_BASE;
 const MAP_JOB_QUEUE_ADD_ELEMENT_ENTRY: u32 = 0x004a_4284 - ORIGINAL_BASE;
 const MAP_JOB_QUEUE_ADD_ELEMENT_PRE_POST: u32 = 0x004a_436c - ORIGINAL_BASE;
 const MAP_JOB_QUEUE_ADD_ELEMENT_AFTER_POST: u32 = 0x004a_4370 - ORIGINAL_BASE;
@@ -117,6 +128,10 @@ static MAP_ENGINE_NATURALLY_STARTED: AtomicBool = AtomicBool::new(false);
 static MAP_RENDERER_FORCE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_RENDERER_EXECUTE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_RENDERER_DRAW_LIST_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_RENDERER_DRAW_LIST_VCALL_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_DRAW_BLIT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_DRAW_BLIT_FAKE_CONTEXT: AtomicU32 = AtomicU32::new(0);
+static MAP_DRAW_BLIT_BRANCH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_JOB_QUEUE_ADD_ENTRY_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_JOB_QUEUE_AFTER_POST_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_JOB_QUEUE_PRE_CRASH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -221,6 +236,9 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     MAP_RENDERER_FORCE_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_RENDERER_EXECUTE_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_RENDERER_DRAW_LIST_TRACE_COUNT.store(0, Ordering::Relaxed);
+    MAP_RENDERER_DRAW_LIST_VCALL_TRACE_COUNT.store(0, Ordering::Relaxed);
+    MAP_DRAW_BLIT_TRACE_COUNT.store(0, Ordering::Relaxed);
+    MAP_DRAW_BLIT_BRANCH_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_JOB_QUEUE_ADD_ENTRY_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_JOB_QUEUE_AFTER_POST_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_JOB_QUEUE_PRE_CRASH_TRACE_COUNT.store(0, Ordering::Relaxed);
@@ -1154,6 +1172,160 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
             },
         )
         .unwrap();
+
+    for (offset, slot, kind) in [
+        (MAP_RENDERER_DRAW_LIST_VCALL_38, 0x38u32, "0x38"),
+        (MAP_RENDERER_DRAW_LIST_VCALL_3C, 0x3cu32, "0x3c"),
+    ] {
+        let vcall_addr = base_address + offset;
+        unicorn
+            .add_code_hook(vcall_addr as u64, vcall_addr as u64, move |uc, _, _| {
+                let object = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let vtable = uc.reg_read(RegisterARM::R12).unwrap_or(0) as u32;
+                let target = read_u32_or_invalid(uc, vtable + slot);
+                let list = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                let layer = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let count = MAP_RENDERER_DRAW_LIST_VCALL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 120 {
+                    log::info!(
+                        "PROCMAPENGINE: DrawList vcall {} object={:#x} vtable={:#x} target={:#x} list={:#x} layer={:#x} trace={}",
+                        kind,
+                        object,
+                        vtable,
+                        target,
+                        list,
+                        layer,
+                        count + 1
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    let blit_entry = base_address + MAP_DRAW_BLIT_ICON_ENTRY;
+    let blit_global = base_address + MAP_DRAW_BLIT_ICON_GLOBAL;
+    let blit_table_global = base_address + MAP_DRAW_BLIT_ICON_TABLE_GLOBAL;
+    let blit_global_end = base_address + MAP_DRAW_BLIT_ICON_GLOBAL_END;
+    let blit_null_return = base_address + MAP_DRAW_BLIT_ICON_NULL_RETURN;
+    let mut fake_blit_context = 0u32;
+    unicorn
+        .add_code_hook(blit_entry as u64, blit_entry as u64, move |uc, _, _| {
+            let mut context_global = read_u32_or_invalid(uc, blit_global);
+            let mut context = if context_global == 0 || context_global == u32::MAX {
+                0
+            } else {
+                read_u32_or_invalid(uc, context_global)
+            };
+
+            if context_global != 0 && context_global != u32::MAX && context == 0 {
+                if fake_blit_context == 0 {
+                    let mmu_arc = {
+                        let data = uc.get_data();
+                        data.mmu.clone()
+                    };
+                    fake_blit_context = mmu_arc.lock().unwrap().heap_alloc(
+                        uc,
+                        0x40000,
+                        Prot::READ | Prot::WRITE,
+                        "[procmap-blit-context]",
+                    );
+                    if fake_blit_context != 0 {
+                        MAP_DRAW_BLIT_FAKE_CONTEXT.store(fake_blit_context, Ordering::Relaxed);
+                        let fill = vec![(fake_blit_context + 4).to_le_bytes(); 0x40000 / 4].concat();
+                        let _ = uc.mem_write(fake_blit_context as u64, &fill);
+
+                        let mut global = blit_global;
+                        while global < blit_global_end {
+                            if read_u32_or_invalid(uc, global) == 0 {
+                                let _ = uc.mem_write(global as u64, &fake_blit_context.to_le_bytes());
+                            }
+                            global = global.wrapping_add(4);
+                        }
+                    }
+                }
+                if fake_blit_context != 0 {
+                    let _ = uc.mem_write(blit_global as u64, &fake_blit_context.to_le_bytes());
+                    context_global = read_u32_or_invalid(uc, blit_global);
+                    context = if context_global == 0 || context_global == u32::MAX {
+                        0
+                    } else {
+                        read_u32_or_invalid(uc, context_global)
+                    };
+                }
+            }
+
+            let object = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let layer = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let mode = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let count = MAP_DRAW_BLIT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 40 {
+                log::info!(
+                    "PROCMAPENGINE: DrawBlit entry global={:#x} context={:#x} object={:#x} layer={:#x} mode={:#x} fake={:#x} trace={}",
+                    context_global,
+                    context,
+                    object,
+                    layer,
+                    mode,
+                    fake_blit_context,
+                    count + 1
+                );
+            }
+        })
+        .unwrap();
+    for (name, offset) in [
+        ("return", MAP_DRAW_BLIT_ICON_NULL_RETURN),
+        ("branch1", MAP_DRAW_BLIT_ICON_BRANCH_1),
+        ("branch2", MAP_DRAW_BLIT_ICON_BRANCH_2),
+        ("branch3", MAP_DRAW_BLIT_ICON_BRANCH_3),
+        ("branch4", MAP_DRAW_BLIT_ICON_BRANCH_4),
+    ] {
+        let addr = base_address + offset;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                let r9 = uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32;
+                if name == "branch1" && r3 == 0 {
+                    let fake = MAP_DRAW_BLIT_FAKE_CONTEXT.load(Ordering::Relaxed);
+                    if fake != 0 && r9 != 0 && r9 != u32::MAX {
+                        let slot = r9.wrapping_add(r4);
+                        let page = slot & !0xfff;
+                        let mmu_arc = {
+                            let data = uc.get_data();
+                            data.mmu.clone()
+                        };
+                        mmu_arc.lock().unwrap().mem_protect(
+                            uc,
+                            page,
+                            0x1000,
+                            Prot::READ | Prot::WRITE,
+                        );
+                        if uc.mem_write(slot as u64, &fake.to_le_bytes()).is_ok() {
+                            let _ = uc.reg_write(RegisterARM::R3, fake as u64);
+                        }
+                    }
+                }
+                let count = MAP_DRAW_BLIT_BRANCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 80 {
+                    log::info!(
+                        "PROCMAPENGINE: DrawBlit {} at {:#x} r0={:#x} r3={:#x} r4={:#x} r7={:#x} r9={:#x} trace={}",
+                        name,
+                        addr,
+                        r0,
+                        r3,
+                        r4,
+                        r7,
+                        r9,
+                        count + 1
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    let _ = blit_null_return;
 
     let flip_entry = base_address + SURFACE_FLIP_ENTRY;
     unicorn
