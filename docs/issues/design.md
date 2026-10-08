@@ -175,3 +175,25 @@ to avoid is reintroducing any direct read/write of another process' guest memory
   for `svgCreateResourceSurface` / `svgCreateLayerContextTriple` and the
   `eglCreateWindowSurface` branch, so regressions in the SVG setup path are
   visible without loading Ghidra.
+- **Additional finding (commit bf2cfb8):** prochmi's own SVG-consuming code
+  path is dead in the current UI state. `GUI_GL_LayerSync::getLayers`
+  (prochmi+0x1342e38, the only non-debug caller of `svgGetLayerByName`) is
+  never reached; `GUI_GL_LayerSync::copyLayer` is never reached; none of the
+  fake-handle bypasses in `prochmi.rs::install_svg_map_surface_hooks` fire
+  except `svgApplyLayerInSync` (2 hits from prochmi's own HMI-layer commit).
+  Therefore *either* alternative (shared VRAM registry or in-emulator
+  libsvg-layer implementation) will not close the gap by itself: prochmi's
+  HMI widget layout must also learn to reference a layer named
+  `"MAP_View1"`, which is inside the guest and currently not the case.
+  **Untried paths**:
+  - Check whether an HSI/PowerManager state transition (or a specific HMI
+    screen / navigation-mode entry) causes prochmi to switch into the mode
+    that owns `GUI_GL_LayerSync` and would populate its layer list from SVG.
+    `clHmiNavServerHandler` was seen starting in `mode=1819239265` but the
+    mode never progresses.
+  - Implement `svgMergeAllLayers` / `svgMergeAllLayersFB` (real hardware
+    composes SVG layers to `/dev/fb0` from inside libsvg-layer.so's
+    background `SVG_Layer_Thread`) in an emulator-owned libsvg-layer hook,
+    and route the merged output to the SDL window. This is composition at
+    the framebuffer level (outside both processes) - allowed by AGENTS.md.
+    It sidesteps the need for prochmi to know about the map layer at all.
