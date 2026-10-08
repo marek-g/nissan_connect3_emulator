@@ -1281,6 +1281,17 @@ fn emulate_message_create(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_ad
     }
 
     if allocated == 0 {
+        let mmu_arc = unicorn.get_data().mmu.clone();
+        allocated = mmu_arc.lock().unwrap().heap_alloc(
+            unicorn,
+            size,
+            Prot::READ | Prot::WRITE,
+            "[osal-msg-dynamic]",
+        );
+        state_arc.lock().unwrap().osal_messages.mark_dynamic(allocated);
+    }
+
+    if allocated == 0 {
         log::warn!(
             "0x{:x} [{}] [LIBOSAL] OSAL_s32MessageCreate emulated pool exhausted size=0x{:x}",
             addr - base_address + ORIGINAL_BASE,
@@ -1310,7 +1321,7 @@ fn emulate_message_create(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_ad
         return;
     }
 
-    log::debug!(
+    log::info!(
         "0x{:x} [{}] [LIBOSAL] OSAL_s32MessageCreate(pool=0x{:x}, size=0x{:x}) -> heap content=0x{:x}",
         addr - base_address + ORIGINAL_BASE,
         thread,
@@ -1328,11 +1339,12 @@ fn suppress_synthetic_message_delete(
 ) {
     let handle = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
     let content = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
-    if (handle & 0xff) == 1 && content != 0 && content < 0xf000_0000 {
+    let _ = handle;
+    if content != 0 && content < 0xf000_0000 {
         let state_arc = unicorn.get_data().sys_calls_state.clone();
         let released = state_arc.lock().unwrap().osal_messages.release(content);
         if released {
-            log::debug!(
+            log::info!(
                 "0x{:x} [{}] [LIBOSAL] OSAL_s32MessageDelete released emulated message content=0x{:x}",
                 addr - base_address + ORIGINAL_BASE,
                 unicorn.get_data().inner.thread_id(),
@@ -1350,7 +1362,7 @@ fn suppress_synthetic_message_delete(
         SYNTH_MAP_PWR_STATE_REQ_CONTENT.load(Ordering::Relaxed),
         SYNTH_MAP_PWR_CVM_SIGNAL_CHANGED_CONTENT.load(Ordering::Relaxed),
     ];
-    if !synthetic_contents.contains(&content) || (handle & 0xff) != 1 {
+    if !synthetic_contents.contains(&content) {
         return;
     }
 

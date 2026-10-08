@@ -2,7 +2,7 @@ use crate::os::syscalls::signal::SignalState;
 use std::collections::{HashMap, HashSet};
 
 const OSAL_MESSAGE_POOL_CHUNK: u32 = 0x1000;
-const OSAL_MESSAGE_POOL_SLOTS: u32 = 1024;
+const OSAL_MESSAGE_POOL_SLOTS: u32 = 4096;
 
 /// Per-process syscall state. System-wide IPC objects (POSIX message queues and
 /// the IOSC driver) do NOT live here - they live in the shared
