@@ -1,7 +1,7 @@
-//! Host-side emulation of the Bosch PWR-proxy daemon.
+//! Host-side policy for the Bosch PWR-proxy handshake.
 //!
-//! On real hardware the power-state handshake lives in a BSP/PMU daemon below
-//! Linux. None of the shipped guest binaries contain the proxy: every
+//! On real hardware the power-state handshake is driven by a BSP/PMU daemon
+//! below Linux. None of the shipped guest binaries contain the proxy: every
 //! `/opt/bosch/processes/*` file carries only the libail *client* half
 //! (`PWR_PROXY_START_CONF received, PWR_APP_INITIALIZED sent`,
 //! `STATE_CHANGE_REQ from %s to %s`, `CVM_SIGNAL_CHANGED to %s`). Without a
@@ -9,29 +9,38 @@
 //! `ail_bIpcMessageWait(mbx_<app_id>, ...)` and applications such as
 //! `procmapengine` never call `vStartApp`.
 //!
-//! This service owns the proxy side of that handshake on the host:
+//! # Why this is only the policy layer
 //!
-//! * discovers `mbx_<app_id>` queues as applications open them,
-//! * posts `PWR_PROXY_START_CONF` on every discovered `mbx_<app_id>`,
-//! * drains `mbx_0` (the shared LPM inbound queue) looking for
-//!   `PWR_APP_INITIALIZED` replies,
-//! * once every expected application has acknowledged (or after a settle
-//!   timeout) broadcasts `STATE_CHANGE_REQ` from `INITIALIZED` to `NORMAL`,
-//! * emits one `CVM_SIGNAL_CHANGED(NORMAL voltage)`, and
-//! * keeps draining `mbx_0` for the rest of the run so it never overflows.
+//! `OSAL_s32MessageQueueWait(queue, out, 8, ...)` returns an eight-byte
+//! *message reference*, not the message body. Two of those words are an
+//! OSAL pool handle and a pointer to the payload, and the payload lives in
+//! the recipient's own address space (each process has its own Unicorn VM
+//! with its own OSAL message pool; see `docs/threading.md`). The host
+//! therefore cannot pre-stage a PowerMessage in another VM and push it
+//! through the shared `MqState`: it must be materialised from inside the
+//! recipient's Wait hook, at the moment the recipient actually wakes up.
 //!
-//! All message bodies follow the exact `amt_tclPowerMessage` layout used by
-//! libail. The reference for the layout is procmap's
-//! `amt_tclPowerMessage::amt_tclPowerMessage(...)` constructor at Ghidra
-//! `0x003882f8` (see the byte-by-byte decode in [`power_message`]).
+//! That split is what this module encodes. It is pure state:
+//!
+//! * `register_app_queue_open` is called by the libosal hook when a process
+//!   opens its own `mbx_<app_id>` queue. That is the only event the host
+//!   reliably gets, and it marks the moment an application becomes reachable.
+//! * `observe_power_post` is called by the libosal hook when a process posts
+//!   a PowerMessage to `mbx_0` (the shared LPM inbound queue). We peek at
+//!   the content before the guest's own queue stores it.
+//! * `take_pending_for` is called from a guest's Wait hook on its
+//!   `mbx_<app_id>`. It returns the next PowerMessage the proxy wants that
+//!   application to receive; the caller then allocates a slot in the guest's
+//!   OSAL message pool, writes the 0x20-byte body there and hands the
+//!   8-byte ref back through the Wait out-parameter.
+//!
+//! The state machine matches libail's expectations byte-for-byte. Constants
+//! come from procmap's `ail_bHandleMsgPowerMessage` switch (Ghidra
+//! `0x00668004`) and the layout from `amt_tclPowerMessage::amt_tclPowerMessage`
+//! (Ghidra `0x003882f8`), decoded in [`encode_power_message`].
 
-use crate::common::osal_queues::{message_words, OsalQueueService};
-use crate::os::syscalls::namespace::SystemNamespace;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Mutex, OnceLock};
 
 /// Application state values (`ail_coszAppStatus`).
 pub const APP_STATE_UNINITIALIZED: u32 = 1;
@@ -42,8 +51,7 @@ pub const APP_STATE_DIAGNOSIS: u32 = 4;
 /// CVM voltage signal values (`ail_coszCVMStatus`).
 pub const CVM_VOLTAGE_NORMAL: u32 = 0;
 
-/// `amt_tclPowerMessage` power-type discriminators (the switch inside
-/// `ail_tclInternalDispatch::ail_bHandleMsgPowerMessage`).
+/// `amt_tclPowerMessage` power-type discriminators.
 pub const PWR_APP_INITIALIZED: u16 = 1;
 pub const PWR_PROXY_START_CONF: u16 = 3;
 pub const PWR_PROXY_START_REJ: u16 = 4;
@@ -53,245 +61,226 @@ pub const PWR_SHUTDOWN: u16 = 0x20;
 pub const PWR_WDG_KEEPALIVE: u16 = 0x41;
 pub const PWR_CVM_SIGNAL_CHANGED: u16 = 0x50;
 
-/// `amt_tclPowerMessage` message-type tag written at offset 8 of the body.
+/// `amt_tclPowerMessage` message-type tag at offset 8 of the body.
 const MSG_TYPE_POWER: u16 = 2;
 
 /// Every PowerMessage is 0x20 bytes on the wire.
-const POWER_MESSAGE_LEN: usize = 0x20;
+pub const POWER_MESSAGE_LEN: usize = 0x20;
 
-/// The shared LPM inbound queue every application opens in addition to its own
-/// `mbx_<app_id>`. Applications post `PWR_APP_INITIALIZED`, watchdog
-/// keep-alives and other proxy-destined traffic here; the proxy never needs to
-/// write to it.
+/// The shared LPM inbound queue every application opens in addition to its
+/// own `mbx_<app_id>`. Applications post `PWR_APP_INITIALIZED`, watchdog
+/// keep-alives and other proxy-destined traffic here.
 pub const LPM_IN_QUEUE: &str = "mbx_0";
 
+/// Sender app id used for proxy-originated messages. procmap does not check
+/// this field; the value matches the historical synthetic (which the
+/// shipping unit's LPM used as its own app id).
+const PROXY_APP_ID: u16 = 0x0109;
+
+/// Sub-id written at offset 0x0c of the PowerMessage body. procmap's own
+/// `bSendCCAPowerMsg` uses 0; the historical synthetic used 1. libail
+/// ignores the field in dispatch.
+const PROXY_SUB_ID: u16 = 1;
+
+/// A PowerMessage the proxy has queued for delivery to a specific
+/// application. The Wait hook calls [`take_pending_for`], receives one of
+/// these, materialises `body` in the guest's own OSAL message pool and
+/// returns the ref to the waiting thread.
 #[derive(Clone, Debug)]
-pub struct PwrProxyConfig {
-    pub enabled: bool,
-    /// Time the proxy waits before it starts driving the handshake. Gives
-    /// libosal enough time to see `OSAL_s32MessageQueueOpen` calls from every
-    /// boot-critical application.
-    pub discovery_grace: Duration,
-    /// Time the proxy waits for `PWR_APP_INITIALIZED` replies before it
-    /// broadcasts the state change anyway.
-    pub init_reply_timeout: Duration,
-    /// Sleep between host-side polls.
-    pub poll_interval: Duration,
-    /// Sub-id written at offset 0x0c of the PowerMessage body. procmap's own
-    /// `bSendCCAPowerMsg` uses 0, but the historical synthetic used 1 and both
-    /// are accepted by libail (the field is unused by dispatch).
-    pub sub_id: u16,
-    /// Sender app id used for proxy-originated messages. On the real headunit
-    /// this is the LPM/PWR-proxy app id; procmap does not check it.
-    pub proxy_app_id: u16,
-}
-
-impl Default for PwrProxyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: env_flag_or_default("EMU_RTOS_PWR_PROXY", true),
-            discovery_grace: env_duration_ms("EMU_RTOS_PWR_DISCOVERY_MS", Duration::from_millis(500)),
-            init_reply_timeout: env_duration_ms("EMU_RTOS_PWR_INIT_TIMEOUT_MS", Duration::from_millis(2000)),
-            poll_interval: env_duration_ms("EMU_RTOS_PWR_POLL_MS", Duration::from_millis(5)),
-            sub_id: 1,
-            proxy_app_id: env_u16("EMU_RTOS_PWR_PROXY_APP_ID", 0x0109),
-        }
-    }
-}
-
-pub struct PwrProxyService {
-    stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl PwrProxyService {
-    pub fn start(namespace: Arc<Mutex<SystemNamespace>>, config: PwrProxyConfig) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let service_stop = stop.clone();
-        let handle = thread::spawn(move || {
-            run(namespace, config, service_stop);
-        });
-        Self {
-            stop,
-            handle: Some(handle),
-        }
-    }
-
-    pub fn stop(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Phase {
-    /// Waiting for `discovery_grace` to elapse so applications can open their
-    /// `mbx_<app_id>` queues.
-    Discovering,
-    /// Sending `PWR_PROXY_START_CONF` to each discovered application.
-    Handshaking,
-    /// Every known application is initialized; broadcast state change and CVM.
-    Promoting,
-    /// Steady state: keep draining `mbx_0` so its slots never fill up.
-    Idle,
-}
-
-fn run(namespace: Arc<Mutex<SystemNamespace>>, config: PwrProxyConfig, stop: Arc<AtomicBool>) {
-    if !config.enabled {
-        log::info!("PWR proxy disabled via EMU_RTOS_PWR_PROXY=0");
-        return;
-    }
-
-    let started_at = Instant::now();
-    let mut phase = Phase::Discovering;
-    let mut handshake_started_at: Option<Instant> = None;
-    let mut apps: HashMap<u16, AppRecord> = HashMap::new();
-    let mut state_change_sent = false;
-    let mut cvm_signal_sent = false;
-
-    while !stop.load(Ordering::Relaxed) {
-        let mut notify = false;
-        {
-            let mut guard = namespace.lock().unwrap();
-
-            discover_new_applications(&mut guard.mq, &mut apps, started_at, &mut notify);
-            notify |= drain_lpm_inbound(&mut guard.mq, &mut apps);
-
-            match phase {
-                Phase::Discovering => {
-                    if started_at.elapsed() >= config.discovery_grace {
-                        log::info!(
-                            "PWR proxy: discovery window closed with {} application queue(s): {}",
-                            apps.len(),
-                            format_app_ids(&apps)
-                        );
-                        for (&app_id, record) in apps.iter_mut() {
-                            if send_start_conf(&mut guard.mq, app_id, record, &config) {
-                                record.start_conf_sent = true;
-                                notify = true;
-                            }
-                        }
-                        handshake_started_at = Some(Instant::now());
-                        phase = Phase::Handshaking;
-                    }
-                }
-                Phase::Handshaking => {
-                    for (&app_id, record) in apps.iter_mut() {
-                        if !record.start_conf_sent
-                            && send_start_conf(&mut guard.mq, app_id, record, &config)
-                        {
-                            record.start_conf_sent = true;
-                            notify = true;
-                        }
-                    }
-
-                    let all_ready = !apps.is_empty() && apps.values().all(|r| r.initialized);
-                    let timed_out = handshake_started_at
-                        .map(|t| t.elapsed() >= config.init_reply_timeout)
-                        .unwrap_or(false);
-
-                    if all_ready || timed_out {
-                        if timed_out && !all_ready {
-                            log::warn!(
-                                "PWR proxy: init-reply timeout reached with pending apps: {} (promoting anyway)",
-                                pending_app_ids(&apps)
-                            );
-                        }
-                        phase = Phase::Promoting;
-                    }
-                }
-                Phase::Promoting => {
-                    if !state_change_sent {
-                        let mut ok = true;
-                        for (&app_id, record) in apps.iter() {
-                            ok &= send_state_change_req(&mut guard.mq, app_id, record, &config);
-                        }
-                        if ok {
-                            state_change_sent = true;
-                            notify = true;
-                        }
-                    }
-
-                    if state_change_sent && !cvm_signal_sent {
-                        let mut ok = true;
-                        for (&app_id, record) in apps.iter() {
-                            ok &= send_cvm_signal_changed(&mut guard.mq, app_id, record, &config);
-                        }
-                        if ok {
-                            cvm_signal_sent = true;
-                            notify = true;
-                            log::info!("PWR proxy: state change + CVM signal delivered");
-                            phase = Phase::Idle;
-                        }
-                    }
-                }
-                Phase::Idle => {
-                    for (&app_id, record) in apps.iter_mut() {
-                        if !record.start_conf_sent && !record.initialized {
-                            // A late-registered application that we missed
-                            // during the promoting phase. Kick it back in.
-                            if send_start_conf(&mut guard.mq, app_id, record, &config) {
-                                record.start_conf_sent = true;
-                                notify = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if notify {
-                guard.notify_waiters();
-            }
-        }
-
-        thread::sleep(config.poll_interval);
-    }
+pub struct PendingPowerMessage {
+    pub app_id: u16,
+    pub power_type: u16,
+    pub power_data1: u32,
+    pub power_data2: u32,
+    pub body: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
 struct AppRecord {
     app_id: u16,
-    queue_name: String,
-    start_conf_sent: bool,
+    queue_open_observed: bool,
+    start_conf_delivered: bool,
     initialized: bool,
+    state_change_delivered: bool,
+    cvm_signal_delivered: bool,
 }
 
-fn discover_new_applications(
-    mq: &mut crate::common::queues::MqState,
-    apps: &mut HashMap<u16, AppRecord>,
-    started_at: Instant,
-    notify: &mut bool,
-) {
-    for (name, _id) in mq.name_to_id.iter() {
-        if let Some(app_id) = parse_mbx_app_id(name) {
-            if apps.contains_key(&app_id) {
-                continue;
-            }
-            log::info!(
-                "PWR proxy: discovered application queue {} (app_id 0x{:04x}) after {:?}",
-                name,
+/// Everything the proxy tracks. Kept small and lock-fast so both the Wait
+/// hook and the Post hook can call into it without contention.
+#[derive(Debug, Default)]
+pub struct PwrProxyState {
+    apps: HashMap<u16, AppRecord>,
+    pending: HashMap<u16, VecDeque<PendingPowerMessage>>,
+}
+
+impl PwrProxyState {
+    fn note_queue_open(&mut self, app_id: u16) {
+        if self.queue_open_observed(app_id) {
+            return;
+        }
+        let record = self
+            .apps
+            .entry(app_id)
+            .or_insert_with(|| AppRecord {
                 app_id,
-                started_at.elapsed()
-            );
-            apps.insert(
-                app_id,
+                queue_open_observed: false,
+                start_conf_delivered: false,
+                initialized: false,
+                state_change_delivered: false,
+                cvm_signal_delivered: false,
+            });
+        record.queue_open_observed = true;
+        log::info!(
+            "PWR proxy: app 0x{:04x} opened its queue; queueing PWR_PROXY_START_CONF",
+            app_id
+        );
+        self.push_pending(app_id, PWR_PROXY_START_CONF, 0, 0);
+    }
+
+    fn queue_open_observed(&self, app_id: u16) -> bool {
+        self.apps
+            .get(&app_id)
+            .map(|r| r.queue_open_observed)
+            .unwrap_or(false)
+    }
+
+    fn push_pending(&mut self, app_id: u16, power_type: u16, data1: u32, data2: u32) {
+        let body = encode_power_message(
+            PROXY_APP_ID,
+            app_id,
+            power_type,
+            data1,
+            data2,
+            PROXY_SUB_ID,
+        );
+        self.pending.entry(app_id).or_default().push_back(PendingPowerMessage {
+            app_id,
+            power_type,
+            power_data1: data1,
+            power_data2: data2,
+            body,
+        });
+    }
+
+    /// Mark `sender` as having acknowledged initialization. Immediately
+    /// promote that specific application to NORMAL (STATE_CHANGE_REQ) and
+    /// notify it of nominal CVM voltage. Doing this per-application,
+    /// rather than waiting for every process to acknowledge, matches what
+    /// a real PWR-proxy does: applications that come up late do not hold
+    /// the rest of the system in INITIALIZED.
+    fn note_initialized(&mut self, sender: u16) {
+        if !self.apps.contains_key(&sender) {
+            self.apps.insert(
+                sender,
                 AppRecord {
-                    app_id,
-                    queue_name: name.clone(),
-                    start_conf_sent: false,
+                    app_id: sender,
+                    queue_open_observed: false,
+                    start_conf_delivered: true,
                     initialized: false,
+                    state_change_delivered: false,
+                    cvm_signal_delivered: false,
                 },
             );
-            *notify = true;
         }
+        if let Some(record) = self.apps.get_mut(&sender) {
+            if record.initialized {
+                return;
+            }
+            record.initialized = true;
+        }
+        log::info!(
+            "PWR proxy: app 0x{:04x} acknowledged initialization; promoting to NORMAL",
+            sender
+        );
+        if self
+            .apps
+            .get(&sender)
+            .map(|r| !r.state_change_delivered)
+            .unwrap_or(false)
+        {
+            if let Some(record) = self.apps.get_mut(&sender) {
+                record.state_change_delivered = true;
+            }
+            self.push_pending(sender, PWR_STATE_CHANGE_REQ, APP_STATE_INITIALIZED, APP_STATE_NORMAL);
+        }
+        if self
+            .apps
+            .get(&sender)
+            .map(|r| !r.cvm_signal_delivered)
+            .unwrap_or(false)
+        {
+            if let Some(record) = self.apps.get_mut(&sender) {
+                record.cvm_signal_delivered = true;
+            }
+            self.push_pending(sender, PWR_CVM_SIGNAL_CHANGED, CVM_VOLTAGE_NORMAL, 0);
+        }
+    }
+
+    fn take_next(&mut self, app_id: u16) -> Option<PendingPowerMessage> {
+        let message = self.pending.get_mut(&app_id)?.pop_front()?;
+        if message.power_type == PWR_PROXY_START_CONF {
+            if let Some(record) = self.apps.get_mut(&app_id) {
+                record.start_conf_delivered = true;
+            }
+        }
+        Some(message)
     }
 }
 
-/// `mbx_<N>` where `<N>` is a decimal application id. Everything else (LPM in,
-/// terminal queues, IOSC queues) is ignored by discovery.
-fn parse_mbx_app_id(name: &str) -> Option<u16> {
+/// Global proxy. Initialized lazily on first access; no configuration
+/// needed because the handshake is deterministic.
+fn global() -> &'static Mutex<PwrProxyState> {
+    static STATE: OnceLock<Mutex<PwrProxyState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(PwrProxyState::default()))
+}
+
+/// Called by the libosal hook when a guest opens an `mbx_<decimal_app_id>`
+/// queue. Nothing happens for `mbx_0` or names that don't match.
+pub fn register_app_queue_open(name: &str) {
+    let Some(app_id) = parse_mbx_app_id(name) else {
+        return;
+    };
+    let mut state = global().lock().unwrap();
+    state.note_queue_open(app_id);
+}
+
+/// Called by the libosal hook when a guest posts a message to `mbx_0`. The
+/// caller is responsible for reading the content out of the guest's own
+/// memory first (the recipient can never read another VM's message pool).
+/// We only care about `PWR_APP_INITIALIZED`; anything else is logged and
+/// dropped.
+pub fn observe_power_post(sender_app_id: u16, power_type: u16, data1: u32, data2: u32) {
+    if power_type != PWR_APP_INITIALIZED {
+        // `vAppBody` posts a `PowerType=0` registration message on startup
+        // carrying its own app id in PowerData1; the queue-open event we
+        // already get from libosal is enough, so we ignore the duplicate.
+        // Watchdog keepalives, shutdown notices and service chatter are
+        // logged at debug to keep the bring-up log readable.
+        log::debug!(
+            "PWR proxy: ignoring {} from app 0x{:04x} (data1 {} data2 {})",
+            power_type_name(power_type),
+            sender_app_id,
+            data1,
+            data2
+        );
+        return;
+    }
+    let mut state = global().lock().unwrap();
+    state.note_initialized(sender_app_id);
+}
+
+/// Called by the guest's Wait hook on `mbx_<app_id>`. Returns the next
+/// PowerMessage to hand to that application, or `None` if the proxy has
+/// nothing queued right now (in which case the Wait must fall through to
+/// the guest's own queue semantics).
+pub fn take_pending_for(app_id: u16) -> Option<PendingPowerMessage> {
+    let mut state = global().lock().unwrap();
+    state.take_next(app_id)
+}
+
+/// `mbx_<N>` where `<N>` is a decimal application id. Everything else
+/// (`mbx_0`, terminal queues, IOSC queues) is ignored.
+pub fn parse_mbx_app_id(name: &str) -> Option<u16> {
     let tail = name.strip_prefix("mbx_")?;
     if tail.is_empty() {
         return None;
@@ -306,157 +295,9 @@ fn parse_mbx_app_id(name: &str) -> Option<u16> {
     Some(value as u16)
 }
 
-/// Drain every pending message off `mbx_0` (the shared LPM inbound queue). Any
-/// message with the PowerMessage tag and `PWR_APP_INITIALIZED` power-type
-/// acknowledges an application; everything else is logged and dropped.
-fn drain_lpm_inbound(
-    mq: &mut crate::common::queues::MqState,
-    apps: &mut HashMap<u16, AppRecord>,
-) -> bool {
-    let mut touched = false;
-    while let Some(message) = OsalQueueService::guest_wait_nonblock(mq, LPM_IN_QUEUE, 0x100) {
-        touched = true;
-        match PowerMessage::parse(&message.data) {
-            Some(power) => {
-                log::info!(
-                    "PWR proxy: {} delivered from app 0x{:04x} type {} data1 {} data2 {}",
-                    power_type_name(power.power_type),
-                    power.sender_app_id,
-                    power.power_type,
-                    power.power_data1,
-                    power.power_data2
-                );
-                if power.power_type == PWR_APP_INITIALIZED {
-                    if let Some(record) = apps.get_mut(&power.sender_app_id) {
-                        if !record.initialized {
-                            record.initialized = true;
-                            log::info!(
-                                "PWR proxy: app 0x{:04x} acknowledged initialization",
-                                power.sender_app_id
-                            );
-                        }
-                    } else {
-                        log::warn!(
-                            "PWR proxy: app 0x{:04x} sent INITIALIZED before discovery recorded its queue",
-                            power.sender_app_id
-                        );
-                    }
-                }
-            }
-            None => {
-                let words = message_words(&message.data);
-                log::debug!(
-                    "PWR proxy: non-power message on {} (len {}, words [{:#x}, {:#x}, {:#x}, {:#x}])",
-                    LPM_IN_QUEUE,
-                    message.data.len(),
-                    words[0],
-                    words[1],
-                    words[2],
-                    words[3]
-                );
-            }
-        }
-    }
-    touched
-}
-
-fn send_start_conf(
-    mq: &mut crate::common::queues::MqState,
-    app_id: u16,
-    record: &AppRecord,
-    config: &PwrProxyConfig,
-) -> bool {
-    let accepted = post_power_message(
-        mq,
-        &record.queue_name,
-        config.proxy_app_id,
-        app_id,
-        PWR_PROXY_START_CONF,
-        0,
-        0,
-        config.sub_id,
-    );
-    log::info!(
-        "PWR proxy: PWR_PROXY_START_CONF -> {} accepted {}",
-        record.queue_name,
-        accepted
-    );
-    accepted
-}
-
-fn send_state_change_req(
-    mq: &mut crate::common::queues::MqState,
-    app_id: u16,
-    record: &AppRecord,
-    config: &PwrProxyConfig,
-) -> bool {
-    let accepted = post_power_message(
-        mq,
-        &record.queue_name,
-        config.proxy_app_id,
-        app_id,
-        PWR_STATE_CHANGE_REQ,
-        APP_STATE_INITIALIZED,
-        APP_STATE_NORMAL,
-        config.sub_id,
-    );
-    log::info!(
-        "PWR proxy: STATE_CHANGE_REQ (INITIALIZED -> NORMAL) -> {} accepted {}",
-        record.queue_name,
-        accepted
-    );
-    accepted
-}
-
-fn send_cvm_signal_changed(
-    mq: &mut crate::common::queues::MqState,
-    app_id: u16,
-    record: &AppRecord,
-    config: &PwrProxyConfig,
-) -> bool {
-    let accepted = post_power_message(
-        mq,
-        &record.queue_name,
-        config.proxy_app_id,
-        app_id,
-        PWR_CVM_SIGNAL_CHANGED,
-        CVM_VOLTAGE_NORMAL,
-        0,
-        config.sub_id,
-    );
-    log::info!(
-        "PWR proxy: CVM_SIGNAL_CHANGED (NORMAL voltage) -> {} accepted {}",
-        record.queue_name,
-        accepted
-    );
-    accepted
-}
-
-fn post_power_message(
-    mq: &mut crate::common::queues::MqState,
-    queue_name: &str,
-    sender_app_id: u16,
-    target_app_id: u16,
-    power_type: u16,
-    power_data1: u32,
-    power_data2: u32,
-    sub_id: u16,
-) -> bool {
-    let body = encode_power_message(
-        sender_app_id,
-        target_app_id,
-        power_type,
-        power_data1,
-        power_data2,
-        sub_id,
-    );
-    // libail posts every CCA message at OSAL priority 8 (see
-    // `ail_bIpcMessagePost`).
-    OsalQueueService::guest_post(mq, queue_name, body, 8)
-}
-
-/// Byte-for-byte reproduction of `amt_tclPowerMessage::amt_tclPowerMessage`
-/// (`0x003882f8` in procmap Ghidra). The body is exactly 0x20 bytes:
+/// Byte-for-byte reproduction of
+/// `amt_tclPowerMessage::amt_tclPowerMessage` (`0x003882f8` in procmap
+/// Ghidra). The body is exactly 0x20 bytes:
 ///
 /// ```text
 /// 0x00: u16 sender_app_id
@@ -473,7 +314,7 @@ fn post_power_message(
 /// 0x18: u32 power_data1
 /// 0x1c: u32 power_data2
 /// ```
-fn encode_power_message(
+pub fn encode_power_message(
     sender_app_id: u16,
     target_app_id: u16,
     power_type: u16,
@@ -494,32 +335,23 @@ fn encode_power_message(
     body
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PowerMessage {
-    sender_app_id: u16,
-    target_app_id: u16,
-    power_type: u16,
-    power_data1: u32,
-    power_data2: u32,
-}
-
-impl PowerMessage {
-    fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() < POWER_MESSAGE_LEN {
-            return None;
-        }
-        let message_type = u16::from_le_bytes([data[0x08], data[0x09]]);
-        if message_type != MSG_TYPE_POWER {
-            return None;
-        }
-        Some(Self {
-            sender_app_id: u16::from_le_bytes([data[0x00], data[0x01]]),
-            target_app_id: u16::from_le_bytes([data[0x02], data[0x03]]),
-            power_type: u16::from_le_bytes([data[0x14], data[0x15]]),
-            power_data1: u32::from_le_bytes([data[0x18], data[0x19], data[0x1a], data[0x1b]]),
-            power_data2: u32::from_le_bytes([data[0x1c], data[0x1d], data[0x1e], data[0x1f]]),
-        })
+/// Parse a `PowerMessage` body. Used by the libosal Post hook, which has to
+/// look at the content before it hits the shared queue (the queue itself
+/// only carries an 8-byte ref, which is meaningless to the host).
+pub fn parse_power_message(data: &[u8]) -> Option<(u16, u16, u32, u32)> {
+    if data.len() < POWER_MESSAGE_LEN {
+        return None;
     }
+    let message_type = u16::from_le_bytes([data[0x08], data[0x09]]);
+    if message_type != MSG_TYPE_POWER {
+        return None;
+    }
+    Some((
+        u16::from_le_bytes([data[0x00], data[0x01]]),
+        u16::from_le_bytes([data[0x14], data[0x15]]),
+        u32::from_le_bytes([data[0x18], data[0x19], data[0x1a], data[0x1b]]),
+        u32::from_le_bytes([data[0x1c], data[0x1d], data[0x1e], data[0x1f]]),
+    ))
 }
 
 fn power_type_name(power_type: u16) -> &'static str {
@@ -534,58 +366,6 @@ fn power_type_name(power_type: u16) -> &'static str {
         PWR_CVM_SIGNAL_CHANGED => "PWR_CVM_SIGNAL_CHANGED",
         _ => "UNKNOWN_PWR_TYPE",
     }
-}
-
-fn format_app_ids(apps: &HashMap<u16, AppRecord>) -> String {
-    let mut seen: HashSet<u16> = apps.keys().copied().collect();
-    let mut sorted: Vec<u16> = seen.drain().collect();
-    sorted.sort();
-    sorted
-        .iter()
-        .map(|id| format!("0x{:04x}", id))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn pending_app_ids(apps: &HashMap<u16, AppRecord>) -> String {
-    let mut sorted: Vec<u16> = apps
-        .iter()
-        .filter(|(_, r)| !r.initialized)
-        .map(|(id, _)| *id)
-        .collect();
-    sorted.sort();
-    sorted
-        .iter()
-        .map(|id| format!("0x{:04x}", id))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn env_flag_or_default(name: &str, default: bool) -> bool {
-    match std::env::var(name) {
-        Ok(value) => match value.as_str() {
-            "0" | "off" | "false" | "FALSE" => false,
-            "1" | "on" | "true" | "TRUE" => true,
-            _ => default,
-        },
-        Err(_) => default,
-    }
-}
-
-fn env_duration_ms(name: &str, default: Duration) -> Duration {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(default)
-}
-
-fn env_u16(name: &str, default: u16) -> u16 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| u32::from_str_radix(value.trim_start_matches("0x"), 16).ok())
-        .and_then(|value| u16::try_from(value).ok())
-        .unwrap_or(default)
 }
 
 #[cfg(test)]
@@ -608,26 +388,32 @@ mod tests {
         assert_eq!(body.len(), POWER_MESSAGE_LEN);
         assert_eq!(u16::from_le_bytes([body[0x00], body[0x01]]), 0x109);
         assert_eq!(u16::from_le_bytes([body[0x02], body[0x03]]), 0x400);
-        assert_eq!(u32::from_le_bytes([body[0x04], body[0x05], body[0x06], body[0x07]]), 0x20);
+        assert_eq!(
+            u32::from_le_bytes([body[0x04], body[0x05], body[0x06], body[0x07]]),
+            0x20
+        );
         assert_eq!(u16::from_le_bytes([body[0x08], body[0x09]]), MSG_TYPE_POWER);
         assert_eq!(body[0x0b], 0x40);
-        assert_eq!(u16::from_le_bytes([body[0x14], body[0x15]]), PWR_PROXY_START_CONF);
+        assert_eq!(
+            u16::from_le_bytes([body[0x14], body[0x15]]),
+            PWR_PROXY_START_CONF
+        );
     }
 
     #[test]
     fn round_trips_power_message() {
         let body = encode_power_message(0x400, 0x109, PWR_STATE_CHANGE_REQ, 2, 3, 7);
-        let parsed = PowerMessage::parse(&body).expect("body parses");
-        assert_eq!(parsed.sender_app_id, 0x400);
-        assert_eq!(parsed.target_app_id, 0x109);
-        assert_eq!(parsed.power_type, PWR_STATE_CHANGE_REQ);
-        assert_eq!(parsed.power_data1, 2);
-        assert_eq!(parsed.power_data2, 3);
+        let (sender, power_type, data1, data2) =
+            parse_power_message(&body).expect("body parses");
+        assert_eq!(sender, 0x400);
+        assert_eq!(power_type, PWR_STATE_CHANGE_REQ);
+        assert_eq!(data1, 2);
+        assert_eq!(data2, 3);
     }
 
     #[test]
     fn rejects_non_power_message() {
         let body = vec![0u8; POWER_MESSAGE_LEN];
-        assert!(PowerMessage::parse(&body).is_none());
+        assert!(parse_power_message(&body).is_none());
     }
 }

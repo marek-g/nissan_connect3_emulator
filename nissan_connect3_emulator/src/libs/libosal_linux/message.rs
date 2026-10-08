@@ -2,6 +2,7 @@ use crate::common::osal_queues::{
     callback_message_command, OsalQueueService, OSAL_CB_HDR_LI_MAIN, OSAL_START_PROC_COMMAND,
 };
 use crate::emulator::context::Context;
+use crate::rtos::pwr_proxy;
 
 const ORIGINAL_BASE: u32 = 0x484d_8000;
 const OSAL_CORE_GLOBAL: u32 = 0x4856_79e0;
@@ -213,6 +214,23 @@ fn handle_queue_api(
 
 
 
+            if pwr_proxy_service_handle(
+                unicorn,
+                api_name,
+                &decoded.name,
+                r1,
+                r2,
+            ) {
+                log::info!(
+                    "0x{:x} [{}] [LIBOSAL-PWR-PROXY] {} handled name={}",
+                    addr - base_address + 0x484d8000,
+                    thread,
+                    api_name,
+                    decoded.name
+                );
+                return;
+            }
+
             if bridge_guest_osal_queue(
                 unicorn,
                 api_name,
@@ -270,6 +288,7 @@ fn fallback_open_to_create(
         handle_ptr,
         caller
     );
+    pwr_proxy::register_app_queue_open(&name);
     let Some((max_msg, msg_size)) = fallback_create_params(&name) else {
         return;
     };
@@ -1368,6 +1387,132 @@ fn suppress_synthetic_message_delete(
         content
     );
     return_to_caller(unicorn, 0);
+}
+
+/// Dispatch hook for the host-side Bosch PWR-proxy policy. Runs before
+/// `bridge_guest_osal_queue` for the small set of OSAL queue calls the
+/// proxy cares about. `mbx_0` posts are observed (never intercepted) so
+/// the guest's own Post still succeeds; `mbx_<app_id>` waits are served
+/// from the proxy's pending queue when it has anything queued.
+fn pwr_proxy_service_handle(
+    unicorn: &mut Unicorn<'_, Context>,
+    api_name: &str,
+    name: &str,
+    r1: u32,
+    r2: u32,
+) -> bool {
+    match api_name {
+        "OSAL_s32MessageQueueWait" | "OSAL_s32MessageQueuePriorityWait" => {
+            inject_pwr_proxy_pending_message(unicorn, name, r1, r2)
+        }
+        "OSAL_s32MessageQueuePost" => {
+            observe_pwr_proxy_post(unicorn, name, r1, r2);
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Serve a Wait on `mbx_<app_id>` from the PWR-proxy's pending queue. If
+/// the proxy has nothing queued we return `false` so the Wait falls
+/// through to the guest's own queue semantics.
+fn inject_pwr_proxy_pending_message(
+    unicorn: &mut Unicorn<'_, Context>,
+    name: &str,
+    buf: u32,
+    buf_len: u32,
+) -> bool {
+    let Some(app_id) = pwr_proxy::parse_mbx_app_id(name) else {
+        return false;
+    };
+    if buf == 0 || buf > 0xf000_0000 || buf_len < 8 {
+        return false;
+    }
+    let Some(message) = pwr_proxy::take_pending_for(app_id) else {
+        return false;
+    };
+
+    let mmu_arc = unicorn.get_data().mmu.clone();
+    let content = mmu_arc.lock().unwrap().heap_alloc(
+        unicorn,
+        pwr_proxy::POWER_MESSAGE_LEN as u32,
+        Prot::READ | Prot::WRITE,
+        "[pwr-proxy-power-message]",
+    );
+    if content == 0 || content > 0xf000_0000 {
+        return false;
+    }
+
+    if unicorn.mem_write(content as u64, &message.body).is_err() {
+        return false;
+    }
+    // The guest's `ail_bIpcMessageWait` expects an 8-byte OSAL message
+    // reference: `[type_flag, content_ptr]`. Type flag 1 means "direct
+    // pointer to content" (see `OSAL_pu8MessageContentGet`); the historical
+    // synthetic used the same encoding, so procmap's dispatch accepts our
+    // injection unchanged.
+    if unicorn.mem_write(buf as u64, &1u32.to_le_bytes()).is_err()
+        || unicorn
+            .mem_write((buf + 4) as u64, &content.to_le_bytes())
+            .is_err()
+    {
+        return false;
+    }
+
+    let thread = unicorn.get_data().inner.thread_id();
+    log::info!(
+        "[{}] [LIBOSAL] PWR proxy delivered power type {} (data1 {} data2 {}) to app 0x{:04x} via Wait({}) content=0x{:x}",
+        thread,
+        message.power_type,
+        message.power_data1,
+        message.power_data2,
+        app_id,
+        name,
+        content
+    );
+    return_to_caller(unicorn, 8);
+    true
+}
+
+/// Observe a Post to `mbx_0` (the shared LPM inbound queue). The OSAL
+/// queue itself only carries an 8-byte reference; we resolve the pointer
+/// against the sender's own message pool while the sender's VM is still
+/// accessible and hand the parsed fields to the proxy. Returns nothing
+/// so the guest's own Post proceeds normally (the queue is unused by any
+/// recipient but the sender expects it to succeed).
+fn observe_pwr_proxy_post(
+    unicorn: &mut Unicorn<'_, Context>,
+    name: &str,
+    msg_ptr: u32,
+    msg_len: u32,
+) {
+    if name != pwr_proxy::LPM_IN_QUEUE {
+        return;
+    }
+    if msg_ptr == 0 || msg_ptr > 0xf000_0000 || msg_len < 8 {
+        return;
+    }
+    let type_flag = match read_guest_buffer(unicorn, msg_ptr, 4) {
+        Some(data) => u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        None => return,
+    };
+    if type_flag != 1 {
+        return;
+    }
+    let content_ptr = match read_guest_buffer(unicorn, msg_ptr + 4, 4) {
+        Some(data) => u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+        None => return,
+    };
+    if content_ptr == 0 || content_ptr > 0xf000_0000 {
+        return;
+    }
+    let Some(body) = read_guest_buffer(unicorn, content_ptr, pwr_proxy::POWER_MESSAGE_LEN) else {
+        return;
+    };
+    if let Some((sender_app_id, power_type, data1, data2)) = pwr_proxy::parse_power_message(&body)
+    {
+        pwr_proxy::observe_power_post(sender_app_id, power_type, data1, data2);
+    }
 }
 
 fn bridge_guest_osal_queue(

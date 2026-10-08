@@ -173,7 +173,6 @@ impl Emulator {
         } else {
             None
         };
-        let pwr_proxy = rtos::PwrProxyService::start(factory.namespace(), rtos::PwrProxyConfig::default());
         let rtos_service =
             rtos::RtosBootService::new(factory, handles.clone(), rtos_config).start();
 
@@ -215,7 +214,6 @@ impl Emulator {
         if let Some(rtos_queues) = rtos_queues {
             rtos_queues.stop();
         }
-        pwr_proxy.stop();
 
         match first_error {
             Some(e) => Err(e),
