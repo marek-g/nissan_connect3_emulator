@@ -80,20 +80,33 @@ to avoid is reintroducing any direct read/write of another process' guest memory
   PMU daemon). Without it `procmapengine`'s AE_400 thread blocks indefinitely
   in `ail_bIpcMessageWait(mbx_1024, ...)` and never calls `vStartApp`, so
   `s32InitAppMapEngine` never runs and DAPI is never asked for map blocks.
-- **Fix:** add `src/rtos/pwr_proxy.rs` — a host-side service that owns the
-  `mbx_*` power traffic end-to-end:
-  1. Wait for `PWR_APP_INITIALIZED` from any `mbx_<app_id>` queue.
-  2. Reply `PWR_PROXY_START_CONF` on the same queue.
-  3. When all boot-critical apps are initialized, broadcast
-     `STATE_CHANGE_REQ` (previous_state=INIT, new_state=NORMAL=3) on every
-     registered `mbx_*`.
-  4. Emit `CVM_SIGNAL_CHANGED` once after entering NORMAL.
-  Payloads must match the libail CCA `PowerMessage` layout: 8-byte words with
-  `[sender_app_id, content_ptr, PowerType, PowerData1, PowerData2]`. Message
-  queue `mbx_1024` is procmap (app_id `0x400`), `mbx_17` is prochmi (`0x11`).
-  Reference strings in the binaries for format verification:
-  `Application 0x%04x: PowerMessage received! PowerType = %d, PowerData1 = %d,
-  PowerData2 = %d`.
+- **Fix (implemented):** `src/rtos/pwr_proxy.rs` holds proxy policy; delivery
+  happens inside the recipient's own `OSAL_s32MessageQueueWait` hook (see
+  `pwr_proxy_service_handle` in `libosal_linux::message`). Order of events on
+  real hardware, and now in the emulator:
+  1. App opens `mbx_<app_id>` and `mbx_0`; the hook observes the queue-open
+     and queues `PWR_PROXY_START_CONF` in the proxy's pending list.
+  2. The app's first Wait on `mbx_<app_id>` is answered with that pending
+     message: the hook heap-allocates 0x20 bytes in the recipient's own
+     guest VM, mem_writes the encoded `PowerMessage`, then emits the 8-byte
+     OSAL message ref `[1, content_ptr]` into the caller's out-buffer and
+     returns 8. Content lives in the recipient's VM because each process has
+     its own Unicorn VM + message pool; only the recipient can produce a
+     pointer its own code can dereference.
+  3. Post to `mbx_0` is observed (never intercepted): we read the sender's
+     own OSAL message pool, extract `PowerType` and `Sender`, and hand the
+     tuple to the proxy. On `PWR_APP_INITIALIZED` the proxy immediately
+     enqueues `STATE_CHANGE_REQ` and `CVM_SIGNAL_CHANGED` for that specific
+     app (per-app promotion, not gated on all apps acking).
+  4. The next Wait on that `mbx_<app_id>` hands the pending message back
+     via the same content-injection path.
+- **Payload format** (0x20 bytes, matches Ghidra's `amt_tclPowerMessage`
+  ctor at procmap 0x003882f8):
+  `[0x00:u16 sender, 0x02:u16 target, 0x04:u32 len(0x20), 0x08:u16 kind(2),
+  0x0a:u16 length_low, 0x0b:u8 flags(0x40 for PowerMessage), 0x0c:u32
+  reserved, 0x10:u32 reserved, 0x14:u16 power_type, 0x16:u16 pad, 0x18:u32
+  power_data1, 0x1c:u32 power_data2]`. Verified against live posts made by
+  procmap/DAPI/prochmi.
 - **Non-goals:** no periodic broadcasts, no per-queue special-casing in the
   libosal hooks. Real libail handles everything once the queue has the right
   messages on it.
