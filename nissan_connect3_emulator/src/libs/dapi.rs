@@ -51,6 +51,7 @@ fn hook_result(
         .unwrap();
 }
 
+#[allow(dead_code)]
 fn hook_force_return(
     unicorn: &mut Unicorn<'_, Context>,
     base_address: u32,
@@ -199,11 +200,4 @@ pub fn dapiapp_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     }
     hook_power_dispatch_state(unicorn, base_address);
     hook_power_ack_call(unicorn, base_address);
-    hook_force_return(
-        unicorn,
-        base_address,
-        0x00b4_8a04,
-        "ail::ail_bIpcMessagePost",
-        0x0007_2000,
-    );
 }

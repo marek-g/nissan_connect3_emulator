@@ -361,7 +361,6 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     add_procmap_switch_trace_hook(unicorn, base_address);
     suppress_duplicate_procmap_start_conf(unicorn, base_address);
     add_procmap_type3_state_hook(unicorn, base_address);
-    force_ail_ipc_post_success(unicorn, base_address);
 
     let repair_addr = base_address + PORTCONTROL_INIT_RESULT;
     let activate_after_init = std::env::var_os("EMU_PROCMAPENGINE_SKIP_INITIAL_RENDER_TRIGGER")
@@ -2553,6 +2552,7 @@ fn add_ail_power_dispatch_state_hook(unicorn: &mut Unicorn<'_, Context>, base_ad
         .unwrap();
 }
 
+#[allow(dead_code)]
 fn force_ail_ipc_post_success(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let addr = base_address + AIL_POST_IPC_MESSAGE;
     unicorn
