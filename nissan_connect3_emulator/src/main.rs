@@ -108,6 +108,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
             file_system: Box::new(TmpFileSystem::new()),
             is_read_only: false,
         },
+        // The firmware /etc holds runtime configuration the guest expects to
+        // read (svg_config.ini for libsvg-common, localtime for libc, and so
+        // on). Real unit has /etc on the rootfs; we expose the unpacked
+        // firmware copy read-only.
+        MountPoint {
+            mount_point: "/etc".to_string(),
+            file_system: Box::new(OsFileSystem::new(PathBuf::from(
+                "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/D605_unpacked/lx001.tar.gz/etc",
+            ))),
+            is_read_only: true,
+        },
         // tmp-fs: OSAL/PRM expects /tmp to be writable and automount-ready.
         // One emulated USB storage device is enough to get past the PRM table
         // startup checks without a host-side USB backend.
