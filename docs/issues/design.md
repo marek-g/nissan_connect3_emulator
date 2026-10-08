@@ -63,3 +63,37 @@ to avoid is reintroducing any direct read/write of another process' guest memory
 - **Location:** `nissan_connect3_emulator/src/main.rs:17-102`
 - **Problem:** Firmware paths (`/home/marek/Ext/reverse_engineering/...`) and the target process are hardcoded; which process runs is selected by commenting lines out.
 - **Fix:** take the firmware root + target binary as CLI arguments (e.g. `clap` or plain `env::args`).
+
+## Missing PWR-proxy service (BSP layer not shipped in guest firmware)
+
+- **Locations:** new service to add under `nissan_connect3_emulator/src/rtos/`;
+  consumes shared `mbx_*` queues from `crate::common::osal_queues::OsalQueueService`;
+  previous workaround lived in `nissan_connect3_emulator/src/libs/libosal_linux/message.rs`
+  (disabled in commit `16dde50`) and hooked `ail::bPostIpcMessage` stub in
+  `dapi.rs:202` + `procmapengine.rs:364` (removed in commit `ef271f5`).
+- **Problem:** Every guest binary contains only the libail *client* side of the
+  Bosch power handshake (`PWR_PROXY_START_CONF received, PWR_APP_INITIALIZED
+  sent`, `STATE_CHANGE_REQ from %s to %s`, `CVM_SIGNAL_CHANGED to %s`). None
+  contains a `PWR_PROXY_START_REQ` sender nor any code that emits
+  `PWR_PROXY_START_CONF` — verified by grepping every `/opt/bosch/processes/*`
+  and `/usr/lib/*.so`. The power proxy is below Linux on real hardware (BSP /
+  PMU daemon). Without it `procmapengine`'s AE_400 thread blocks indefinitely
+  in `ail_bIpcMessageWait(mbx_1024, ...)` and never calls `vStartApp`, so
+  `s32InitAppMapEngine` never runs and DAPI is never asked for map blocks.
+- **Fix:** add `src/rtos/pwr_proxy.rs` — a host-side service that owns the
+  `mbx_*` power traffic end-to-end:
+  1. Wait for `PWR_APP_INITIALIZED` from any `mbx_<app_id>` queue.
+  2. Reply `PWR_PROXY_START_CONF` on the same queue.
+  3. When all boot-critical apps are initialized, broadcast
+     `STATE_CHANGE_REQ` (previous_state=INIT, new_state=NORMAL=3) on every
+     registered `mbx_*`.
+  4. Emit `CVM_SIGNAL_CHANGED` once after entering NORMAL.
+  Payloads must match the libail CCA `PowerMessage` layout: 8-byte words with
+  `[sender_app_id, content_ptr, PowerType, PowerData1, PowerData2]`. Message
+  queue `mbx_1024` is procmap (app_id `0x400`), `mbx_17` is prochmi (`0x11`).
+  Reference strings in the binaries for format verification:
+  `Application 0x%04x: PowerMessage received! PowerType = %d, PowerData1 = %d,
+  PowerData2 = %d`.
+- **Non-goals:** no periodic broadcasts, no per-queue special-casing in the
+  libosal hooks. Real libail handles everything once the queue has the right
+  messages on it.
