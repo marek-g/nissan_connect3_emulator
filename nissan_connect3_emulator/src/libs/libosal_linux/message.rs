@@ -1459,6 +1459,16 @@ fn inject_pwr_proxy_pending_message(
         return false;
     }
 
+    // The map application's `bDispatchCCAMessages` silently drops a
+    // START_CONF unless its CCA state has already been bumped to
+    // INITIALIZED. Real hardware gets that bump for free from the body
+    // thread's `vAppBody`; the emulated entry thread wins the race and
+    // observes state==NOT_STARTED. Hand it the same state the body
+    // thread would have set before we return from Wait.
+    if message.power_type == pwr_proxy::PWR_PROXY_START_CONF && app_id == 0x0400 {
+        crate::libs::procmapengine::prepare_app_state_for_start_conf(unicorn);
+    }
+
     let thread = unicorn.get_data().inner.thread_id();
     log::info!(
         "[{}] [LIBOSAL] PWR proxy delivered power type {} (data1 {} data2 {}) to app 0x{:04x} via Wait({}) content=0x{:x}",

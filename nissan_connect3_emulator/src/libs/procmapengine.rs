@@ -325,6 +325,18 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     AIL_POWER_TRACE_COUNT.store(0, Ordering::Relaxed);
     AIL_POWER_DISPATCH_TRACE_COUNT.store(0, Ordering::Relaxed);
 
+    // Procmap's entry thread passes `lpm_in_queue` (mbx_0) as the
+    // `param_2` forward-target, expecting the body thread to pick it
+    // up. Our PWR-proxy delivers START_CONF to the entry thread the
+    // moment mbx_1024 has a pending message, i.e. before the body
+    // thread has had a chance to run `vAppBody` (which is what
+    // promotes state from 1 to INITIALIZED on real hardware). If we
+    // let the forward happen the body-thread queue receives the
+    // message but the entry thread's `bDispatchCCAMessages` still
+    // drops it (state<2 rule) and the loop then exits. Zeroing R2
+    // pins the dispatch on the entry thread; combined with the state
+    // bump in `force_map_power_cca_mode` this gets us a working
+    // PWR_APP_INITIALIZED without touching any guest code paths.
     let cca_dispatch_addr = base_address + CCA_DISPATCH;
     unicorn
         .add_code_hook(cca_dispatch_addr as u64, cca_dispatch_addr as u64, |uc, _, _| {
@@ -669,6 +681,40 @@ fn add_map_engine_init_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                 );
             })
             .unwrap();
+    }
+}
+
+/// Bump the map application's CCA state to `INITIALIZED` (2) if it is
+/// still at `NOT_STARTED` (1). The real firmware reaches state 2 by
+/// having the body thread run `vAppBody` before the entry thread's
+/// `Wait` returns; in our single-VM emulator the entry thread wins
+/// that race. Without this bump the PWR-proxy's START_CONF is silently
+/// dropped by `bDispatchCCAMessages` (`if state < 2 goto drop`) and
+/// procmap never sends `PWR_APP_INITIALIZED`. Only touches the state
+/// field; the entry thread otherwise runs unmodified.
+pub fn prepare_app_state_for_start_conf(unicorn: &mut Unicorn<'_, Context>) {
+    let base_address = PROCMAP_BASE.load(Ordering::Relaxed);
+    if base_address == 0 {
+        return;
+    }
+    let app = read_u32_or_invalid(unicorn, base_address + MAP_ENGINE_GLOBAL);
+    if app == 0 || app > 0xf000_0000 {
+        return;
+    }
+    let state = read_u32_or_invalid(unicorn, app + APP_STATE_OFFSET);
+    if state >= PWR_PROXY_START_APP_STATE {
+        return;
+    }
+    if unicorn
+        .mem_write((app + APP_STATE_OFFSET) as u64, &PWR_PROXY_START_APP_STATE.to_le_bytes())
+        .is_ok()
+    {
+        log::info!(
+            "PROCMAPENGINE: bumped map app {:#x} CCA state {:#x} -> {:#x} so entry thread can process START_CONF",
+            app,
+            state,
+            PWR_PROXY_START_APP_STATE
+        );
     }
 }
 
