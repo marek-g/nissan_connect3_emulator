@@ -123,6 +123,14 @@ const MAP_DATA_MAINLOOP_GET_ELEMENT_RESULT: u32 = 0x0050_be64 - ORIGINAL_BASE;
 const MAP_DATA_MAINLOOP_JOB_CAN_EXECUTE: u32 = 0x0050_be94 - ORIGINAL_BASE;
 const MAP_DATA_MAINLOOP_WAIT_GET_ELEMENT_RESULT: u32 = 0x0050_bf00 - ORIGINAL_BASE;
 const MAP_DATA_MAINLOOP_WAIT_JOB_CAN_EXECUTE: u32 = 0x0050_bf30 - ORIGINAL_BASE;
+const AIL_EN_CHECK_CLIENT_MAIL_VALIDITY: u32 = 0x0066_dd00 - ORIGINAL_BASE;
+const AIL_EN_CHECK_CLIENT_MAIL_VALIDITY_EPILOGUE: u32 = 0x0066_de18 - ORIGINAL_BASE;
+const AIL_EN_POST_MESSAGE_ENTRY: u32 = 0x0066_1a3c - ORIGINAL_BASE;
+const AIL_EN_POST_MESSAGE_AFTER_VALIDITY: u32 = 0x0066_1b08 - ORIGINAL_BASE;
+const AIL_EN_POST_MESSAGE_SUCCESS_PATH: u32 = 0x0066_1bb8 - ORIGINAL_BASE;
+const AIL_EN_POST_MESSAGE_RECEIVER_QUEUE_CALL: u32 = 0x0066_1c2c - ORIGINAL_BASE;
+const AIL_EN_POST_MESSAGE_POST_RESULT: u32 = 0x0066_1c48 - ORIGINAL_BASE;
+const AIL_EN_POST_MESSAGE_DELETE_PATH: u32 = 0x0066_1b9c - ORIGINAL_BASE;
 const MAP_TRIGGER_PIXMAP_RENDER: u32 = 0x0053_b36c - ORIGINAL_BASE;
 const MAP_RENDER_VIEW_ID: u32 = 1;
 const MAP_RENDER_TRIGGER_INTERVAL: u32 = 20;
@@ -186,6 +194,10 @@ static MAP_DATA_MAINLOOP_JOB_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_DATA_REQUEST_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_DATA_HANDLE_REQUEST_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_DATA_DAPI_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static AIL_MAIL_VALIDITY_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static AIL_MAIL_VALIDITY_RESULT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static AIL_POST_MESSAGE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_DATA_CLIENT_SERVICE_REF_NODE: AtomicU32 = AtomicU32::new(0);
 static MAP_DATA_MEDIUM_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static MAP_DATA_MEDIUM_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
 static CCA_BODY_FORWARD_SUPPRESSED: AtomicU32 = AtomicU32::new(0);
@@ -1975,6 +1987,110 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             }
         })
         .unwrap();
+
+    let post_message_entry = base_address + AIL_EN_POST_MESSAGE_ENTRY;
+    unicorn
+        .add_code_hook(post_message_entry as u64, post_message_entry as u64, move |uc, _, _| {
+            let count = AIL_MAIL_VALIDITY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 20 {
+                log::info!(
+                    "PROCMAPENGINE ail trace PostMessage entry at {:#x}: r0={:#x} r1={:#x} r2={:#x} r3={:#x} app_id={:#x} service_refs={:#x}",
+                    post_message_entry,
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0),
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0),
+                    uc.reg_read(RegisterARM::R2).unwrap_or(0),
+                    uc.reg_read(RegisterARM::R3).unwrap_or(0),
+                    read_u16_or_invalid(uc, uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 + 0x10),
+                    read_u32_or_invalid(uc, uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 + 0x50)
+                );
+            }
+        })
+        .unwrap();
+
+    let mail_validity_entry = base_address + AIL_EN_CHECK_CLIENT_MAIL_VALIDITY;
+    unicorn
+        .add_code_hook(mail_validity_entry as u64, mail_validity_entry as u64, move |uc, _, _| {
+            let count = AIL_MAIL_VALIDITY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 20 {
+                let app_id = (uc.reg_read(RegisterARM::R0).unwrap_or(0) & 0xffff) as u32;
+                let semaphore = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let message = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let service_refs = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let header = read_u32_or_invalid(uc, message + 4);
+                synthesize_client_service_reference(uc, message, service_refs);
+                let first_node = read_u32_or_invalid(uc, service_refs + 4);
+                log::info!(
+                    "PROCMAPENGINE ail trace CheckClientMailValidity entry at {:#x}: app_id={:#x} semaphore={:#x} message={:#x} service_refs={:#x} header={:#x} source={:#x} target={:#x} service={:#x} dataset={:#x} register={:#x} msg_type={:#x} first_node={:#x} node_service={:#x} node_server={:#x} node_register={:#x} node_state={:#x}",
+                    mail_validity_entry,
+                    app_id,
+                    semaphore,
+                    message,
+                    service_refs,
+                    header,
+                    read_u16_or_invalid(uc, header),
+                    read_u16_or_invalid(uc, header + 2),
+                    read_u16_or_invalid(uc, header + 12),
+                    read_u16_or_invalid(uc, header + 20),
+                    read_u16_or_invalid(uc, header + 22),
+                    read_u16_or_invalid(uc, header + 26),
+                    first_node,
+                    read_u16_or_invalid(uc, first_node + 8),
+                    read_u16_or_invalid(uc, first_node + 10),
+                    read_u16_or_invalid(uc, first_node + 12),
+                    read_u16_or_invalid(uc, first_node + 14) & 0xff
+                );
+            }
+        })
+        .unwrap();
+
+    let mail_validity_epilogue = base_address + AIL_EN_CHECK_CLIENT_MAIL_VALIDITY_EPILOGUE;
+    unicorn
+        .add_code_hook(
+            mail_validity_epilogue as u64,
+            mail_validity_epilogue as u64,
+            move |uc, _, _| {
+                let count = AIL_MAIL_VALIDITY_RESULT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 20 {
+                    log::info!(
+                        "PROCMAPENGINE ail trace CheckClientMailValidity epilogue at {:#x}: r4={:#x}",
+                        mail_validity_epilogue,
+                        uc.reg_read(RegisterARM::R4).unwrap_or(0)
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    for (name, offset) in [
+        ("after validity", AIL_EN_POST_MESSAGE_AFTER_VALIDITY),
+        ("success path", AIL_EN_POST_MESSAGE_SUCCESS_PATH),
+        ("receiver queue call", AIL_EN_POST_MESSAGE_RECEIVER_QUEUE_CALL),
+        ("post result", AIL_EN_POST_MESSAGE_POST_RESULT),
+        ("delete path", AIL_EN_POST_MESSAGE_DELETE_PATH),
+    ] {
+        let addr = base_address + offset;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = AIL_POST_MESSAGE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 40 {
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE ail trace PostMessage {} at {:#x}: sp={:#x} result={:#x} r0={:#x} r1={:#x} r2={:#x} r3={:#x} lr={:#x}",
+                        name,
+                        addr,
+                        sp,
+                        read_u32_or_invalid(uc, sp + 0x2c),
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0),
+                        uc.reg_read(RegisterARM::R1).unwrap_or(0),
+                        uc.reg_read(RegisterARM::R2).unwrap_or(0),
+                        uc.reg_read(RegisterARM::R3).unwrap_or(0),
+                        uc.reg_read(RegisterARM::LR).unwrap_or(0),
+                    );
+                }
+            })
+            .unwrap();
+    }
+
     let cca_get_block_ids_result = base_address + MAP_DATA_CCA_GET_BLOCK_IDS_RESULT;
     unicorn
         .add_code_hook(
@@ -2703,7 +2819,21 @@ fn read_u32_or_invalid(unicorn: &mut Unicorn<'_, Context>, address: u32) -> u32 
     }
 }
 
+fn read_u16_or_invalid(unicorn: &mut Unicorn<'_, Context>, address: u32) -> u32 {
+    let mut bytes = [0u8; 2];
+    match unicorn.mem_read(address as u64, &mut bytes) {
+        Ok(()) => u16::from_le_bytes(bytes) as u32,
+        Err(_) => 0xffff_ffff,
+    }
+}
+
 fn write_u32(unicorn: &mut Unicorn<'_, Context>, address: u32, value: u32) -> bool {
+    unicorn
+        .mem_write(address as u64, &value.to_le_bytes())
+        .is_ok()
+}
+
+fn write_u16(unicorn: &mut Unicorn<'_, Context>, address: u32, value: u16) -> bool {
     unicorn
         .mem_write(address as u64, &value.to_le_bytes())
         .is_ok()
@@ -2711,6 +2841,79 @@ fn write_u32(unicorn: &mut Unicorn<'_, Context>, address: u32, value: u32) -> bo
 
 fn write_u8(unicorn: &mut Unicorn<'_, Context>, address: u32, value: u8) -> bool {
     unicorn.mem_write(address as u64, &[value]).is_ok()
+}
+
+fn synthesize_client_service_reference(
+    unicorn: &mut Unicorn<'_, Context>,
+    message: u32,
+    service_refs: u32,
+) -> Option<u32> {
+    if message == 0 || message == u32::MAX || service_refs == 0 || service_refs == u32::MAX {
+        return None;
+    }
+
+    let existing = read_u32_or_invalid(unicorn, service_refs + 4);
+    if existing != 0 {
+        return Some(existing);
+    }
+
+    let header = read_u32_or_invalid(unicorn, message + 4);
+    if header == 0 || header == u32::MAX {
+        return None;
+    }
+
+    let service_id = (read_u16_or_invalid(unicorn, header + 20) & 0xffff) as u16;
+    let server_app_id = (read_u16_or_invalid(unicorn, header + 2) & 0xffff) as u16;
+    let dataset_id = (read_u16_or_invalid(unicorn, header + 12) & 0xffff) as u16;
+
+    let node = MAP_DATA_CLIENT_SERVICE_REF_NODE.load(Ordering::Relaxed);
+    let node = if node != 0 {
+        node
+    } else {
+        let mmu_arc = {
+            let data = unicorn.get_data();
+            data.mmu.clone()
+        };
+        let node = mmu_arc.lock().unwrap().heap_alloc(
+            unicorn,
+            0x18,
+            Prot::READ | Prot::WRITE,
+            "[procmap-svc-ref]",
+        );
+        if node == 0 {
+            log::warn!("PROCMAPENGINE: failed to allocate synthetic client service reference");
+            return None;
+        }
+        MAP_DATA_CLIENT_SERVICE_REF_NODE.store(node, Ordering::Relaxed);
+        node
+    };
+
+    write_u32(unicorn, node, 0);
+    write_u32(unicorn, node + 4, 0);
+    write_u16(unicorn, node + 8, service_id);
+    write_u16(unicorn, node + 10, server_app_id);
+    write_u16(unicorn, node + 12, 0);
+    write_u8(unicorn, node + 14, 0);
+    write_u8(unicorn, node + 15, 0);
+    write_u16(unicorn, node + 16, dataset_id);
+    write_u16(unicorn, node + 18, 0xffff);
+    write_u16(unicorn, node + 20, 0xffff);
+    write_u16(unicorn, node + 22, 0xffff);
+
+    write_u32(unicorn, service_refs + 4, node);
+    write_u32(unicorn, service_refs + 8, node);
+    write_u32(unicorn, service_refs + 12, 1);
+
+    log::info!(
+        "PROCMAPENGINE: synthesized DAPI client service ref node={:#x} list={:#x} service={:#x} server={:#x} dataset={:#x}",
+        node,
+        service_refs,
+        service_id,
+        server_app_id,
+        dataset_id
+    );
+
+    Some(node)
 }
 
 fn initialize_map_data_medium(unicorn: &mut Unicorn<'_, Context>, base_address: u32) -> bool {
