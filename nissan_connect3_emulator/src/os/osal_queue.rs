@@ -45,6 +45,13 @@ pub(crate) fn finish_guest_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, no
 
     match message {
         Some(message) => {
+            log::info!(
+                "[{}] [LIBOSAL] OSAL queue wait woke queue_id={} len={} data={:02x?}",
+                tid,
+                queue_id,
+                message.data.len(),
+                message.data
+            );
             if !message.data.is_empty() {
                 unicorn.mem_write(msg_ptr as u64, &message.data).unwrap();
             }

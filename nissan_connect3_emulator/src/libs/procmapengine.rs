@@ -162,6 +162,7 @@ static MAP_INIT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static AIL_POWER_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static AIL_POWER_DISPATCH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static AIL_POWER_SWITCH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static DUPLICATE_PROCMAP_START_CONF_SUPPRESSED: AtomicU32 = AtomicU32::new(0);
 const AIL_POWER_SWITCH_TRACE_LIMIT: u32 = 500;
 
 #[derive(Clone, Copy)]
@@ -309,6 +310,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     }
     add_ail_power_dispatch_state_hook(unicorn, base_address);
     add_procmap_switch_trace_hook(unicorn, base_address);
+    suppress_duplicate_procmap_start_conf(unicorn, base_address);
     add_procmap_type3_state_hook(unicorn, base_address);
     force_ail_ipc_post_success(unicorn, base_address);
 
@@ -2044,6 +2046,34 @@ fn force_ail_ipc_post_success(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 "PROCMAPENGINE stubbed bPostIpcMessage at {:#x} -> 0x72000",
                 addr
             );
+        })
+        .unwrap();
+}
+
+fn suppress_duplicate_procmap_start_conf(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    let addr = base_address + (0x0066_7cd8u32 - ORIGINAL_BASE);
+    let exit_addr = base_address + (0x0066_7c5cu32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+            let object = read_u32_or_invalid(uc, r7);
+            let state = read_u32_or_invalid(uc, object + APP_STATE_OFFSET);
+            if state <= 2 {
+                return;
+            }
+
+            if uc.reg_write(RegisterARM::PC, exit_addr as u64).is_err() {
+                return;
+            }
+
+            let count = DUPLICATE_PROCMAP_START_CONF_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+            if count < 20 {
+                log::info!(
+                    "PROCMAPENGINE: suppressed duplicate PWR_PROXY_START_CONF for map app 0x{:x} in state 0x{:x}",
+                    object,
+                    state
+                );
+            }
         })
         .unwrap();
 }

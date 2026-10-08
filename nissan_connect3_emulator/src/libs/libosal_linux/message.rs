@@ -1454,6 +1454,12 @@ fn bridge_guest_osal_queue(
                 return true;
             }
 
+            log::info!(
+                "[{}] [LIBOSAL] OSAL queue wait blocking name={} queue_id={}",
+                unicorn.get_data().inner.thread_id(),
+                name,
+                queue_id
+            );
             block_guest_osal_wait(
                 unicorn,
                 queue_id,
