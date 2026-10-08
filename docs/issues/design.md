@@ -110,3 +110,68 @@ to avoid is reintroducing any direct read/write of another process' guest memory
 - **Non-goals:** no periodic broadcasts, no per-queue special-casing in the
   libosal hooks. Real libail handles everything once the queue has the right
   messages on it.
+
+## SVG layer composition between procmapengine and prochmi is not wired
+
+- **Locations:** `nissan_connect3_emulator/src/libs/prochmi.rs:1549`
+  (`install_svg_map_surface_hooks`), `nissan_connect3_emulator/src/gpu/mod.rs:70`
+  (`MAP_SURFACE_BYTES`), `nissan_connect3_emulator/src/os/dev/svg_resource.rs`.
+- **Current state after commit e7b9e0f (revert of g_bCreateDefaultView
+  clearing):** procmapengine's natural boot path now executes
+  `MDBC_CreateDefaultView` → `JobRCCreateView::Execute` →
+  `rl_tclWindow_ContextHandler_Platform::bCreateWindow`. Diagnostic trace in
+  commit ea6299e confirms the call chain runs end-to-end:
+  - `bCreateWindow` is entered with `view_type=1, w=800, h=480`.
+  - `svgCreateResourceSurface` × 3 returns nonzero handles (0x1, 0x10001, 0x1)
+    — `libsvg-resource.so` is loaded at procmap+0x9003e000 and works.
+  - `svgCreateLayerContextTriple` returns handle `0x11000000` and
+    `svgSetLayerName(layer, "MAP_View1", 9)` runs — `libsvg-layer.so` is
+    loaded even though we do not hook it in `os/mod.rs::add_library_hook`.
+  - `svgApplyLayerInSync(0)` runs; `eglCreateWindowSurface` branch is reached
+    with a valid layer handle. The GPU backend returns a Map FBO for that
+    handle and `handle_surface_swap(Map)` reads 800×480 RGBA into
+    `MAP_SURFACE_BYTES` on every swap (131 swaps per boot).
+- **Problem:** prochmi never calls `svgGetLayerByName("MAP_View1")` (or
+  `svgGetLayerStatus` / `svgGetSurfaceStatus`), so the emulator's
+  `write_map_surface_to_guest` is never invoked; procmap's rendered pixels
+  never reach prochmi's GL texture. The `install_svg_map_surface_hooks`
+  table in prochmi.rs is a no-op on the natural path — it only fires if the
+  guest happens to hit those PLT stubs, and it does not. On the HMI we
+  currently observe a small grey rectangle in the middle of the screen that
+  is NOT the map surface (it is prochmi's own HMI background widget at
+  (76,184)–(722,300)); the actual map surface never appears.
+- **Why prochmi does not look it up:** prochmi's composition path calls
+  `GUI_GL_OpenGL::mixLayers` on its own display-manager layer list; it does
+  not query libsvg-layer for external layers by name. On the real device,
+  libsvg-layer's registry lives in shared VRAM backed by `/dev/svg_resource`
+  mmap, so a separate HMI compositor (or a display-manager widget bound to
+  the "MAP_View1" name) can find and blit procmap's surface. We do not model
+  that shared registry across processes today: `os/dev/svg_resource.rs`
+  keeps a per-unicorn `STATUS` mutex; libsvg-layer's own layer-name table
+  lives inside each guest's own memory.
+- **Fix (open, no cheating):** two possible non-cheating directions —
+  1. Model the shared VRAM region across processes. Have `svg_resource.rs`
+     keep one shared buffer keyed by (fd, offset) that both procmap's and
+     prochmi's libsvg-layer instances mmap, so `svgGetLayerByName("MAP_View1")`
+     called from prochmi finds the layer that procmap registered. Then
+     remove the fake-handle bypasses at prochmi.rs:344–365 and route
+     `svgGetSurfaceStatus` to a real shm-backed surface (already partially
+     in place via `MAP_SURFACE_BYTES`).
+  2. If the SVG registry cannot be made shared cleanly, keep a single
+     in-emulator SVG layer registry as a *replacement implementation* of
+     libsvg-layer.so's public API (the AGENTS.md-allowed path:
+     "alternative implementation for functions in shared libraries").
+     Route `svgCreateLayerContextTriple` / `svgSetLayerName` in procmap
+     there, and let `svgGetLayerByName` / `svgGetLayerStatus` /
+     `svgGetSurfaceStatus` in prochmi return real handles backed by
+     `MAP_SURFACE_BYTES`. Both processes then agree on the same registry
+     without touching procmap/prochmi guest code.
+  Either way, once a name→surface lookup exists, prochmi's HMI config
+  (currently a static widget layout) needs a widget bound to the map layer
+  or `GUI_GL_OpenGL::mixLayers` needs to iterate the SVG layer list; that
+  side is inside the guest process and does not require hooks.
+- **Diagnostics:** `EMU_PROCMAPENGINE_TRACE_INIT=1` now also prints
+  `PROCMAPENGINE bCreateWindow trace ...` lines with per-call return values
+  for `svgCreateResourceSurface` / `svgCreateLayerContextTriple` and the
+  `eglCreateWindowSurface` branch, so regressions in the SVG setup path are
+  visible without loading Ghidra.
