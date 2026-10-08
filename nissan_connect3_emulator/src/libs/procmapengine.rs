@@ -96,6 +96,33 @@ const RENDER_CONTROL_JOB_CAN_EXECUTE_RESULT: u32 = 0x003a_8c34 - ORIGINAL_BASE;
 const RENDER_CONTROL_JOB_RESULT: u32 = 0x003a_8df8 - ORIGINAL_BASE;
 const RENDER_CONTROL_SECOND_VIRTUAL_RESULT: u32 = 0x003a_8e0c - ORIGINAL_BASE;
 const RENDER_CONTROL_EXECUTE_RESULT: u32 = 0x003a_8e9c - ORIGINAL_BASE;
+const MAP_DATA_JOB_MAP_DATA_REQUEST_CALL: u32 = 0x004b_9ca4 - ORIGINAL_BASE;
+const MAP_DATA_JOB_MAP_DATA_REQUEST_RESULT: u32 = 0x004b_9ca8 - ORIGINAL_BASE;
+const MAP_DATA_JOB_HANDLE_REQUEST_RESULT: u32 = 0x004b_6830 - ORIGINAL_BASE;
+const MAP_DATA_INT_GET_BLOCK_IDS_CALL: u32 = 0x0051_1fd4 - ORIGINAL_BASE;
+const MAP_DATA_INT_GET_BLOCK_IDS_RESULT: u32 = 0x0051_1fd8 - ORIGINAL_BASE;
+const MAP_DATA_DAPI_GET_BLOCK_IDS_CALL: u32 = 0x0053_a274 - ORIGINAL_BASE;
+const MAP_DATA_DAPI_GET_BLOCK_IDS_ENTRY: u32 = 0x0038_f918 - ORIGINAL_BASE;
+const MAP_DATA_CCA_GET_BLOCK_IDS_VCALL: u32 = 0x0053_ddc8 - ORIGINAL_BASE;
+const MAP_DATA_CCA_SEND_REQUEST_ENTRY: u32 = 0x0059_1af0 - ORIGINAL_BASE;
+const MAP_DATA_SEND_REQUEST_CONSTRUCTOR_RESULT: u32 = 0x0059_1b68 - ORIGINAL_BASE;
+const MAP_DATA_SEND_SERVICE_VCALL: u32 = 0x0059_05ec - ORIGINAL_BASE;
+const MAP_DATA_SEND_SERVICE_RESULT: u32 = 0x0059_05f0 - ORIGINAL_BASE;
+const MAP_DATA_CCA_GET_BLOCK_IDS_RESULT: u32 = 0x0053_ddcc - ORIGINAL_BASE;
+const MAP_DATA_DAPI_GET_BLOCK_IDS_RESULT: u32 = 0x0053_a278 - ORIGINAL_BASE;
+const MAP_DATA_DAPI_LOAD_BLOCKS_CALL: u32 = 0x0053_a230 - ORIGINAL_BASE;
+const MAP_DATA_DAPI_LOAD_BLOCKS_RESULT: u32 = 0x0053_a234 - ORIGINAL_BASE;
+const MAP_DATA_DATASET_ID_GLOBAL: u32 = 0x0078_f7f0 - ORIGINAL_BASE;
+const MAP_DATA_DATASET_ID_VALIDATED_GLOBAL: u32 = 0x0078_f874 - ORIGINAL_BASE;
+const MAP_DATA_FASTMAP_AVAILABLE_GLOBAL: u32 = 0x0078_f7f8 - ORIGINAL_BASE;
+const MAP_DATA_STOP_LOADING_GLOBAL: u32 = 0x0078_f7a0 - ORIGINAL_BASE;
+const MAP_DATA_FAKE_DATASET_ID: u32 = 1;
+const MAP_DATA_JOB_QUEUE_GLOBAL: u32 = 0x0050_c08c - ORIGINAL_BASE;
+const MAP_DATA_MAINLOOP_QUEUE_STATE: u32 = 0x0050_be18 - ORIGINAL_BASE;
+const MAP_DATA_MAINLOOP_GET_ELEMENT_RESULT: u32 = 0x0050_be64 - ORIGINAL_BASE;
+const MAP_DATA_MAINLOOP_JOB_CAN_EXECUTE: u32 = 0x0050_be94 - ORIGINAL_BASE;
+const MAP_DATA_MAINLOOP_WAIT_GET_ELEMENT_RESULT: u32 = 0x0050_bf00 - ORIGINAL_BASE;
+const MAP_DATA_MAINLOOP_WAIT_JOB_CAN_EXECUTE: u32 = 0x0050_bf30 - ORIGINAL_BASE;
 const MAP_TRIGGER_PIXMAP_RENDER: u32 = 0x0053_b36c - ORIGINAL_BASE;
 const MAP_RENDER_VIEW_ID: u32 = 1;
 const MAP_RENDER_TRIGGER_INTERVAL: u32 = 20;
@@ -154,6 +181,13 @@ static RENDER_CONTROL_JOB_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RENDER_CONTROL_SECOND_VIRTUAL_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RENDER_CONTROL_EXECUTE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RENDER_CONTROL_GET_VIEW_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_DATA_MAINLOOP_STATE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_DATA_MAINLOOP_JOB_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_DATA_REQUEST_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_DATA_HANDLE_REQUEST_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_DATA_DAPI_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_DATA_MEDIUM_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static MAP_DATA_MEDIUM_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
 static CCA_BODY_FORWARD_SUPPRESSED: AtomicU32 = AtomicU32::new(0);
 static INIT_MAP_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static CCA_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -267,6 +301,9 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     RENDER_CONTROL_SECOND_VIRTUAL_TRACE_COUNT.store(0, Ordering::Relaxed);
     RENDER_CONTROL_EXECUTE_TRACE_COUNT.store(0, Ordering::Relaxed);
     RENDER_CONTROL_GET_VIEW_TRACE_COUNT.store(0, Ordering::Relaxed);
+    MAP_DATA_MAINLOOP_STATE_TRACE_COUNT.store(0, Ordering::Relaxed);
+    MAP_DATA_MAINLOOP_JOB_TRACE_COUNT.store(0, Ordering::Relaxed);
+    MAP_DATA_REQUEST_TRACE_COUNT.store(0, Ordering::Relaxed);
     CCA_BODY_FORWARD_SUPPRESSED.store(0, Ordering::Relaxed);
     PROCMAP_GUEST_CALL_STUB.store(0, Ordering::Relaxed);
     INIT_MAP_TRACE_COUNT.store(0, Ordering::Relaxed);
@@ -371,6 +408,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     }
 
     add_map_view_hooks(unicorn, base_address);
+    add_map_data_main_loop_trace_hooks(unicorn, base_address);
 
     let force_early_active = std::env::var("EMU_PROCMAPENGINE_FORCE_ACTIVE_STATE")
         .is_ok_and(|value| !value.is_empty() && value != "0");
@@ -1066,19 +1104,20 @@ fn add_natural_map_engine_start_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 );
             }
 
-            if control_state != 1 && control_state != 3 && control_state != u32::MAX {
+            if control_state == 0 {
                 if write_u32(uc, base_address + MAP_ENGINE_CONTROL_STATE, 1) {
                     let trace_count =
                         NATURAL_MAP_START_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                     if trace_count < 10 {
                         log::info!(
-                            "PROCMAPENGINE: forced natural map engine start state {:#x} to stopped",
-                            control_state
+                            "PROCMAPENGINE: forced uninitialized map engine state to stopped"
                         );
                     }
                 } else {
                     log::warn!("PROCMAPENGINE: failed to force natural map engine start state");
                 }
+            } else if control_state == 2 {
+                initialize_map_data_medium(uc, base_address);
             }
         })
         .unwrap();
@@ -1092,6 +1131,9 @@ fn add_natural_map_engine_start_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             if r0 == 1 {
                 MAP_ENGINE_NATURALLY_STARTED.store(true, Ordering::Relaxed);
                 MAP_VIEW_READY.store(true, Ordering::Relaxed);
+            }
+            if r0 == 1 || control_state == 2 {
+                initialize_map_data_medium(uc, base_address);
             }
             if count < 10 {
                 log::info!(
@@ -1130,8 +1172,8 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
                 let renderer = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let surface = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
                 let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
-                let layer_list = read_u32_or_invalid(uc, sp);
-                let layer_count = read_u32_or_invalid(uc, sp + 4);
+                let layer_list = read_u32_or_invalid(uc, sp + 0x18);
+                let layer_count = read_u32_or_invalid(uc, sp + 0x1c) & 0xff;
                 let map_engine = read_u32_or_invalid(uc, renderer + 0x18);
                 let count = MAP_RENDERER_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 20 {
@@ -1693,6 +1735,369 @@ fn add_map_view_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
             }
         })
         .unwrap();
+}
+
+fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    let queue_global = base_address + MAP_DATA_JOB_QUEUE_GLOBAL;
+    let queue_state_addr = base_address + MAP_DATA_MAINLOOP_QUEUE_STATE;
+
+    unicorn
+        .add_code_hook(queue_state_addr as u64, queue_state_addr as u64, move |uc, _, _| {
+            let queue = read_u32_or_invalid(uc, queue_global);
+            let state = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let last = RENDER_LOOP_QUEUE_STATE_LAST.swap(state, Ordering::Relaxed);
+            let count = MAP_DATA_MAINLOOP_STATE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if state != last || count < 50 {
+                log::info!(
+                    "PROCMAPENGINE map-data trace mainloop state at {:#x}: queue={:#x} state={:#x}",
+                    queue_state_addr,
+                    queue,
+                    state
+                );
+            }
+        })
+        .unwrap();
+
+    let request_call_addr = base_address + MAP_DATA_JOB_MAP_DATA_REQUEST_CALL;
+    unicorn
+        .add_code_hook(
+            request_call_addr as u64,
+            request_call_addr as u64,
+            move |uc, _, _| {
+                let count = MAP_DATA_REQUEST_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 200 {
+                    let request = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let priority = (uc.reg_read(RegisterARM::R1).unwrap_or(0) & 0xff) as u32;
+                    let scale = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    let data_type = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                    let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE map-data trace PerformMapDataRequest call at {:#x}: request={} priority={} scale={:#x} data_type={:#x} rect=[{:#x},{:#x},{:#x},{:#x}]",
+                        request_call_addr,
+                        request,
+                        priority,
+                        scale,
+                        data_type,
+                        read_u32_or_invalid(uc, sp),
+                        read_u32_or_invalid(uc, sp + 4),
+                        read_u32_or_invalid(uc, sp + 8),
+                        read_u32_or_invalid(uc, sp + 12)
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    let request_result_addr = base_address + MAP_DATA_JOB_MAP_DATA_REQUEST_RESULT;
+    unicorn
+        .add_code_hook(
+            request_result_addr as u64,
+            request_result_addr as u64,
+            move |uc, _, _| {
+                let count = MAP_DATA_REQUEST_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 200 {
+                    let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE map-data trace PerformMapDataRequest result at {:#x}: r0={:#x}",
+                        request_result_addr,
+                        result
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    let handle_result_addr = base_address + MAP_DATA_JOB_HANDLE_REQUEST_RESULT;
+    unicorn
+        .add_code_hook(
+            handle_result_addr as u64,
+            handle_result_addr as u64,
+            move |uc, _, _| {
+                let count = MAP_DATA_HANDLE_REQUEST_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 200 {
+                    let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE map-data trace HandleMapDataRequest result at {:#x}: r0={:#x}",
+                        handle_result_addr,
+                        result
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    let dapi_get_block_ids_entry = base_address + MAP_DATA_DAPI_GET_BLOCK_IDS_ENTRY;
+    unicorn
+        .add_code_hook(
+            dapi_get_block_ids_entry as u64,
+            dapi_get_block_ids_entry as u64,
+            move |uc, _, _| {
+                let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 200 {
+                    let platform = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let handler = read_u32_or_invalid(uc, platform + 0xb0);
+                    let service_handler = if handler == 0 || handler == u32::MAX {
+                        0xffff_ffff
+                    } else {
+                        read_u32_or_invalid(uc, handler + 0x24)
+                    };
+                    let service_state_before = if service_handler == 0 || service_handler == u32::MAX
+                    {
+                        0xffff_ffff
+                    } else {
+                        let state = read_u32_or_invalid(uc, service_handler + 0xe) & 0xff;
+                        let _ = write_u8(uc, service_handler + 0xe, 0);
+                        state
+                    };
+                    let rect = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE map-data trace DapiGetBlockIDs entry at {:#x}: platform={:#x} handler={:#x} service_handler={:#x} service_state_before={:#x} rect={:#x} rect=[{:#x},{:#x},{:#x},{:#x}]",
+                        dapi_get_block_ids_entry,
+                        platform,
+                        handler,
+                        service_handler,
+                        service_state_before,
+                        rect,
+                        read_u32_or_invalid(uc, rect),
+                        read_u32_or_invalid(uc, rect + 4),
+                        read_u32_or_invalid(uc, rect + 8),
+                        read_u32_or_invalid(uc, rect + 12)
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    let cca_get_block_ids_vcall = base_address + MAP_DATA_CCA_GET_BLOCK_IDS_VCALL;
+    unicorn
+        .add_code_hook(
+            cca_get_block_ids_vcall as u64,
+            cca_get_block_ids_vcall as u64,
+            move |uc, _, _| {
+                let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 200 {
+                    let service = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let request = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let refcounter = uc.reg_read(RegisterARM::R2).unwrap_or(0) & 0xffff;
+                    let vtable = read_u32_or_invalid(uc, service);
+                    let target = read_u32_or_invalid(uc, vtable + 0x10);
+                    log::info!(
+                        "PROCMAPENGINE map-data trace CcaGetBlockIDs vcall at {:#x}: service={:#x} request={:#x} refcounter={:#x} vtable={:#x} target={:#x}",
+                        cca_get_block_ids_vcall,
+                        service,
+                        request,
+                        refcounter,
+                        vtable,
+                        target
+                    );
+                }
+            },
+        )
+        .unwrap();
+    let send_request_entry = base_address + MAP_DATA_CCA_SEND_REQUEST_ENTRY;
+    unicorn
+        .add_code_hook(send_request_entry as u64, send_request_entry as u64, move |uc, _, _| {
+            let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 200 {
+                let handler = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let message_vtable = read_u32_or_invalid(uc, message);
+                log::info!(
+                    "PROCMAPENGINE map-data trace SendCCARequest entry at {:#x}: handler={:#x} message={:#x} message_vtable={:#x} handler_service={:#x} handler_function={:#x} vt[4]={:#x} vt[8]={:#x} vt[c]={:#x} vt[10]={:#x}",
+                    send_request_entry,
+                    handler,
+                    message,
+                    message_vtable,
+                    read_u32_or_invalid(uc, handler + 4) & 0xffff,
+                    read_u32_or_invalid(uc, handler + 6) & 0xffff,
+                    read_u32_or_invalid(uc, message_vtable + 4),
+                    read_u32_or_invalid(uc, message_vtable + 8),
+                    read_u32_or_invalid(uc, message_vtable + 0xc),
+                    read_u32_or_invalid(uc, message_vtable + 0x10)
+                );
+            }
+        })
+        .unwrap();
+
+    let request_ctor_result = base_address + MAP_DATA_SEND_REQUEST_CONSTRUCTOR_RESULT;
+    unicorn
+        .add_code_hook(
+            request_ctor_result as u64,
+            request_ctor_result as u64,
+            move |uc, _, _| {
+                let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 200 {
+                    let message_object = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let base_message = read_u32_or_invalid(uc, message_object + 4);
+                    log::info!(
+                        "PROCMAPENGINE map-data trace request ctor result at {:#x}: object={:#x} base_message={:#x} valid={:#x}",
+                        request_ctor_result,
+                        message_object,
+                        base_message,
+                        read_u32_or_invalid(uc, message_object + 0x20) & 0xff
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    let send_service_vcall = base_address + MAP_DATA_SEND_SERVICE_VCALL;
+    unicorn
+        .add_code_hook(send_service_vcall as u64, send_service_vcall as u64, move |uc, _, _| {
+            let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 200 {
+                let client = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let data = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let vtable = read_u32_or_invalid(uc, client);
+                let target = read_u32_or_invalid(uc, vtable + 0x48);
+                log::info!(
+                    "PROCMAPENGINE map-data trace SendServiceDataMsg vcall at {:#x}: client={:#x} data={:#x} vtable={:#x} target={:#x}",
+                    send_service_vcall,
+                    client,
+                    data,
+                    vtable,
+                    target
+                );
+            }
+        })
+        .unwrap();
+    let send_service_result = base_address + MAP_DATA_SEND_SERVICE_RESULT;
+    unicorn
+        .add_code_hook(send_service_result as u64, send_service_result as u64, move |uc, _, _| {
+            let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 200 {
+                let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE map-data trace SendServiceDataMsg result at {:#x}: r0={:#x}",
+                    send_service_result,
+                    result
+                );
+            }
+        })
+        .unwrap();
+    let cca_get_block_ids_result = base_address + MAP_DATA_CCA_GET_BLOCK_IDS_RESULT;
+    unicorn
+        .add_code_hook(
+            cca_get_block_ids_result as u64,
+            cca_get_block_ids_result as u64,
+            move |uc, _, _| {
+                let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 200 {
+                    let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE map-data trace CcaGetBlockIDs result at {:#x}: r0={:#x}",
+                        cca_get_block_ids_result,
+                        result
+                    );
+                }
+            },
+        )
+        .unwrap();
+
+    for (name, call_offset, result_offset) in [
+        (
+            "IntGetBlockIDs",
+            MAP_DATA_INT_GET_BLOCK_IDS_CALL,
+            MAP_DATA_INT_GET_BLOCK_IDS_RESULT,
+        ),
+        (
+            "DapiGetBlockIDs",
+            MAP_DATA_DAPI_GET_BLOCK_IDS_CALL,
+            MAP_DATA_DAPI_GET_BLOCK_IDS_RESULT,
+        ),
+        (
+            "DapiLoadBlocks",
+            MAP_DATA_DAPI_LOAD_BLOCKS_CALL,
+            MAP_DATA_DAPI_LOAD_BLOCKS_RESULT,
+        ),
+    ] {
+        let call_addr = base_address + call_offset;
+        let result_addr = base_address + result_offset;
+        unicorn
+            .add_code_hook(call_addr as u64, call_addr as u64, move |uc, _, _| {
+                let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 200 {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE map-data trace {} call at {:#x}: r0={:#x} r1={:#x} r2={:#x} r3={:#x}",
+                        name,
+                        call_addr,
+                        r0,
+                        r1,
+                        r2,
+                        r3
+                    );
+                }
+            })
+            .unwrap();
+        unicorn
+            .add_code_hook(result_addr as u64, result_addr as u64, move |uc, _, _| {
+                let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 200 {
+                    let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE map-data trace {} result at {:#x}: r0={:#x}",
+                        name,
+                        result_addr,
+                        result
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    for (name, offset) in [
+        ("direct", MAP_DATA_MAINLOOP_GET_ELEMENT_RESULT),
+        ("wait", MAP_DATA_MAINLOOP_WAIT_GET_ELEMENT_RESULT),
+    ] {
+        let addr = base_address + offset;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = MAP_DATA_MAINLOOP_STATE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 100 {
+                    let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let state = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                    let job_type = read_u32_or_invalid(uc, job + 8);
+                    log::info!(
+                        "PROCMAPENGINE map-data trace {} GetElement at {:#x}: job={:#x} queue_state={:#x} job_type={:#x}",
+                        name,
+                        addr,
+                        job,
+                        state,
+                        job_type
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    for (name, offset) in [
+        ("direct", MAP_DATA_MAINLOOP_JOB_CAN_EXECUTE),
+        ("wait", MAP_DATA_MAINLOOP_WAIT_JOB_CAN_EXECUTE),
+    ] {
+        let addr = base_address + offset;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = MAP_DATA_MAINLOOP_JOB_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 100 {
+                    let job = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    let vtable = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                    let target = read_u32_or_invalid(uc, vtable + 0x24);
+                    log::info!(
+                        "PROCMAPENGINE map-data trace {} job can-execute at {:#x}: job={:#x} vtable={:#x} target={:#x}",
+                        name,
+                        addr,
+                        job,
+                        vtable,
+                        target
+                    );
+                }
+            })
+            .unwrap();
+    }
 }
 
 fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
@@ -2302,4 +2707,42 @@ fn write_u32(unicorn: &mut Unicorn<'_, Context>, address: u32, value: u32) -> bo
     unicorn
         .mem_write(address as u64, &value.to_le_bytes())
         .is_ok()
+}
+
+fn write_u8(unicorn: &mut Unicorn<'_, Context>, address: u32, value: u8) -> bool {
+    unicorn.mem_write(address as u64, &[value]).is_ok()
+}
+
+fn initialize_map_data_medium(unicorn: &mut Unicorn<'_, Context>, base_address: u32) -> bool {
+    if MAP_DATA_MEDIUM_INITIALIZED.load(Ordering::Relaxed) {
+        return true;
+    }
+
+    let ok = write_u32(
+        unicorn,
+        base_address + MAP_DATA_STOP_LOADING_GLOBAL,
+        0,
+    ) && write_u8(unicorn, base_address + MAP_DATA_FASTMAP_AVAILABLE_GLOBAL, 1)
+        && write_u32(
+            unicorn,
+            base_address + MAP_DATA_DATASET_ID_GLOBAL,
+            MAP_DATA_FAKE_DATASET_ID,
+        )
+        && write_u32(
+            unicorn,
+            base_address + MAP_DATA_DATASET_ID_VALIDATED_GLOBAL,
+            MAP_DATA_FAKE_DATASET_ID,
+        );
+
+    if ok {
+        MAP_DATA_MEDIUM_INITIALIZED.store(true, Ordering::Relaxed);
+        log::info!(
+            "PROCMAPENGINE: initialized synthetic map medium dataset_id={:#x} fastmap_available=1 stop_loading=0",
+            MAP_DATA_FAKE_DATASET_ID
+        );
+    } else if !MAP_DATA_MEDIUM_FAILURE_LOGGED.swap(true, Ordering::Relaxed) {
+        log::warn!("PROCMAPENGINE: failed to initialize synthetic map medium globals");
+    }
+
+    ok
 }
