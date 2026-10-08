@@ -54,6 +54,7 @@ const SVG_MAP_WIDTH: u16 = 800;
 const SVG_MAP_HEIGHT: u16 = 480;
 const SVG_MAP_PITCH: u16 = SVG_MAP_WIDTH * 4;
 const GUI_GL_LAYER_SYNC_COPY_LAYER: u32 = 0x0134_359c - ORIGINAL_BASE;
+const GUI_GL_LAYER_SYNC_GET_LAYERS: u32 = 0x0134_2e38 - ORIGINAL_BASE;
 const GUI_GL_LAYER_COPY_COPY: u32 = 0x0134_2b98 - ORIGINAL_BASE;
 const GUI_GL_LAYER_COPY_PERFORM_COPY: u32 = 0x0134_2754 - ORIGINAL_BASE;
 
@@ -147,6 +148,7 @@ static HMI_EVENT_WAKE_LOGGED: AtomicBool = AtomicBool::new(false);
 static HMI_MNGR_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
 static SVG_FAKE_HANDLE: AtomicU32 = AtomicU32::new(0);
 static SVG_BYPASS_LOGGED: AtomicBool = AtomicBool::new(false);
+static SVG_HOOK_HIT_COUNT: AtomicU32 = AtomicU32::new(0);
 static GL_LAYER_COPY_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 static HMI_MAINLOOP_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -1571,6 +1573,33 @@ fn install_svg_map_surface_hooks(unicorn: &mut Unicorn<'_, Context>, base_addres
                     let status = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                     write_svg_surface_status(uc, status);
                 }
+                let name_arg = if kind == "layer_by_name" {
+                    let ptr = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let len = (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32).min(64) as usize;
+                    let mut buf = vec![0u8; len];
+                    if uc.mem_read(ptr as u64, &mut buf).is_ok() {
+                        String::from_utf8_lossy(&buf)
+                            .trim_end_matches('\0')
+                            .to_string()
+                    } else {
+                        "<unread>".to_string()
+                    }
+                } else {
+                    String::new()
+                };
+                let count = SVG_HOOK_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 20 {
+                    log::info!(
+                        "PROCHMI: SVG hook {} fired count={} r0={:#x} r1={:#x} r2={:#x} name_arg={} ret={:#x}",
+                        kind,
+                        count,
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0),
+                        uc.reg_read(RegisterARM::R1).unwrap_or(0),
+                        uc.reg_read(RegisterARM::R2).unwrap_or(0),
+                        name_arg,
+                        result
+                    );
+                }
                 if !SVG_BYPASS_LOGGED.swap(true, Ordering::Relaxed) {
                     log::info!("PROCHMI: bypassing SVG layer-sync resource functions");
                 }
@@ -1716,6 +1745,10 @@ fn trace_hmi_view_draw_contexts(unicorn: &mut Unicorn<'_, Context>) {
 
 fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     for (offset, name) in [
+        (
+            GUI_GL_LAYER_SYNC_GET_LAYERS,
+            "GUI_GL_LayerSync::getLayers",
+        ),
         (GUI_GL_LAYER_SYNC_COPY_LAYER, "GUI_GL_LayerSync::copyLayer"),
         (GUI_GL_LAYER_COPY_COPY, "GUI_GL_LayerCopy::copy"),
         (
