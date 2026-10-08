@@ -201,7 +201,7 @@ impl PwrProxyState {
             if let Some(record) = self.apps.get_mut(&sender) {
                 record.state_change_delivered = true;
             }
-            self.push_pending(sender, PWR_STATE_CHANGE_REQ, APP_STATE_INITIALIZED, APP_STATE_NORMAL);
+            self.push_pending(sender, PWR_STATE_CHANGE_REQ, APP_STATE_NORMAL, 0);
         }
         if self
             .apps

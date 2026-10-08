@@ -1446,6 +1446,19 @@ fn inject_pwr_proxy_pending_message(
     if unicorn.mem_write(content as u64, &message.body).is_err() {
         return false;
     }
+    // Register the allocation with the recipient's OSAL message pool so the
+    // eventual `amt_tclMappableMessage::bDelete` -> `OSAL_s32MessageDelete`
+    // path finds it and returns success. Without this the caller trips
+    // `OSAL_vAssertFunction("ALWAYS", "amt_MMObj.cpp", ...)` which aborts the
+    // process. See bDelete at procmap 0x00388ef0.
+    {
+        let state_arc = unicorn.get_data().sys_calls_state.clone();
+        state_arc
+            .lock()
+            .unwrap()
+            .osal_messages
+            .mark_dynamic(content);
+    }
     // The guest's `ail_bIpcMessageWait` expects an 8-byte OSAL message
     // reference: `[type_flag, content_ptr]`. Type flag 1 means "direct
     // pointer to content" (see `OSAL_pu8MessageContentGet`); the historical

@@ -2586,13 +2586,13 @@ fn add_ail_power_dispatch_state_hook(unicorn: &mut Unicorn<'_, Context>, base_ad
             let object = read_u32_or_invalid(uc, r7);
             let state = read_u32_or_invalid(uc, object + APP_STATE_OFFSET);
             log::info!(
-                "PROCMAPENGINE power dispatch trace at {:#x}: object={:#x} state={:#x} type={:#x} data1={:#x} data2={:#x}",
+                "PROCMAPENGINE power dispatch trace at {:#x}: object={:#x} state={:#x} type={:#x} new_state(data1@0x18)={:#x} data2@0x1c={:#x}",
                 addr,
                 object,
                 state,
                 r5,
-                r4,
-                r6
+                r6,
+                r4
             );
         })
         .unwrap();
