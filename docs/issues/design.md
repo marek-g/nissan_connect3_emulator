@@ -134,19 +134,18 @@ to avoid is reintroducing any direct read/write of another process' guest memory
   swaps ReadPixels the Map surface into `MAP_SURFACE_BYTES`; HMI swaps
   ReadPixels the HMI surface, CPU-composites it over the latest Map pixels,
   and presents the merged 800x480 image to the SDL window with a GLES-2
-  fullscreen-quad shader (ES has no glDrawPixels). The merge treats exact
-  black HMI pixels as a colorkey hole (the Atlas-VI display composites
-  graphics layers with the per-layer ColorKey that libsvg-layer dumps show;
-  no guest calls `svgSetLayerColorkey`, the display stack owns it - which is
-  why prochmi legally clears to opaque black), partial alpha still blends.
-  Result: at boot the window shows procmapengine's map layer with prochmi's
-  compass/scale-strip widgets on top.
-- **Remaining gap:** this composes at the emulator display level. The
-  libsvg-layer registry is still not shared between processes and prochmi's
-  `GUI_GL_OpenGL::mixLayers` layer list still does not know about
-  `MAP_View1`; if prochmi later starts drawing its map-widget placeholder
-  (opaque grey) the colorkey hole will need to become a real region/layer
-  model. Historical notes on that gap follow.
+  fullscreen-quad shader (ES has no glDrawPixels). The merge uses only the
+  HMI layer's real per-pixel alpha: transparent pixels reveal the map,
+  opaque pixels (including intentionally black widgets) occlude it. Black
+  is *not* treated as a colorkey - prochmi legitimately paints opaque black
+  UI that must stay visible.
+- **Remaining gap:** prochmi's HMI layer currently clears to fully opaque
+  black and its `GUI_GL_OpenGL::mixLayers` does not include the map, so at
+  this UI state the opaque black covers procmap's map layer and only the
+  widgets render. Making the map show through requires wiring prochmi's
+  layer list to `MAP_View1` (see below), not inventing a colorkey. The
+  libsvg-layer registry is still not shared between processes. Historical
+  notes on that gap follow.
 
 ## SVG layer composition between procmapengine and prochmi is not wired (historical)
 

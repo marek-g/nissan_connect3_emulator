@@ -892,13 +892,9 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
 
 // Merge SVG layers into the HMI frame the way libsvg-layer's
 // svgMergeAllLayersFB does on real hardware: procmap's map layer sits below,
-// prochmi's HMI layer is blended on top. The Atlas-VI display composites
-// graphics layers with a black colorkey (libsvg-layer's per-layer
-// ColorKey.Enable/Value - no guest ever calls svgSetLayerColorkey, the
-// display stack owns it), which is why prochmi is allowed to clear its GL
-// surface to fully opaque black: pure-black pixels are the "hole" through
-// which the map layer shows, and only the widget pixels occlude it. Pixels
-// with partial alpha still go through a straight alpha blend.
+// prochmi's HMI layer is blended on top using its own per-pixel alpha only.
+// Fully transparent HMI pixels let the map through, partial alpha blends,
+// opaque pixels (including intentionally black widgets) occlude the map.
 fn composite_hmi_over_map(backend: &mut Backend) {
     unsafe {
         gl::BindFramebuffer(gl::FRAMEBUFFER, backend.hmi_framebuffer);
@@ -919,7 +915,6 @@ fn composite_hmi_over_map(backend: &mut Backend) {
     let mut opaque_count = 0u32;
     let mut transparent_count = 0u32;
     let mut mixed_count = 0u32;
-    let mut keyed_count = 0u32;
     for px in backend
         .hmi_pixels
         .chunks_exact_mut(4)
@@ -928,13 +923,6 @@ fn composite_hmi_over_map(backend: &mut Backend) {
         let (hmi, map) = (px.0, px.1);
         let a = hmi[3] as u16;
         if a == 255 {
-            if hmi[0] | hmi[1] | hmi[2] == 0 {
-                keyed_count += 1;
-                hmi[0] = map[0];
-                hmi[1] = map[1];
-                hmi[2] = map[2];
-                continue;
-            }
             opaque_count += 1;
             continue;
         }
@@ -956,10 +944,9 @@ fn composite_hmi_over_map(backend: &mut Backend) {
     let count = HMI_COMPOSITE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if count < 20 {
         log::info!(
-            "GPU: HMI composite frame={} opaque={} keyed_black={} transparent={} mixed={} map_first_px={}",
+            "GPU: HMI composite frame={} opaque={} transparent={} mixed={} map_first_px={}",
             count,
             opaque_count,
-            keyed_count,
             transparent_count,
             mixed_count,
             if backend.map_pixels.len() >= 4 {
