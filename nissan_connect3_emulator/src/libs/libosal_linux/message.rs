@@ -230,16 +230,6 @@ fn handle_queue_api(
                     api_name,
                     decoded.name
                 );
-            } else {
-                let elf_path = unicorn.get_data().elf_path.clone();
-                synthesize_ail_power_startup_sequence(
-                    unicorn,
-                    api_name,
-                    &decoded.name,
-                    r1,
-                    synthetic_stack_timeout,
-                    &elf_path,
-                );
             }
         }
     }
@@ -506,7 +496,11 @@ fn log_osal_message_bytes(
 }
 
 fn is_synthetic_periodic_queue(name: &str) -> bool {
-    name == "mbx_1024" || name == "mbx_265" || name == "mbx_7"
+    // Synthetic power-message injection has been removed. Real IPC now
+    // carries power state changes. Keep the helper for future debugging;
+    // returning false disables the timeout-shortening crutch.
+    let _ = name;
+    false
 }
 
 fn shorten_native_wait_timeout(unicorn: &mut Unicorn<'_, Context>) -> bool {
@@ -1354,7 +1348,7 @@ fn suppress_synthetic_message_delete(
             return;
         }
     }
-    let synthetic_contents = [
+    let _synthetic_contents = [
         SYNTH_PWR_START_CONF_CONTENT.load(Ordering::Relaxed),
         SYNTH_PWR_STATE_REQ_CONTENT.load(Ordering::Relaxed),
         SYNTH_PWR_CVM_SIGNAL_CHANGED_CONTENT.load(Ordering::Relaxed),
@@ -1362,9 +1356,9 @@ fn suppress_synthetic_message_delete(
         SYNTH_MAP_PWR_STATE_REQ_CONTENT.load(Ordering::Relaxed),
         SYNTH_MAP_PWR_CVM_SIGNAL_CHANGED_CONTENT.load(Ordering::Relaxed),
     ];
-    if !synthetic_contents.contains(&content) {
-        return;
-    }
+    // Synthetic power-message injection has been disabled. Never treat a
+    // live OSAL message as a synthetic one that should escape deletion.
+    return;
 
     let thread = unicorn.get_data().inner.thread_id();
     log::info!(
