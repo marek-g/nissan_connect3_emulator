@@ -131,6 +131,16 @@ const AIL_EN_POST_MESSAGE_RECEIVER_QUEUE_CALL: u32 = 0x0066_1c2c - ORIGINAL_BASE
 const AIL_EN_POST_MESSAGE_POST_RESULT: u32 = 0x0066_1c48 - ORIGINAL_BASE;
 const AIL_EN_POST_MESSAGE_DELETE_PATH: u32 = 0x0066_1b9c - ORIGINAL_BASE;
 const MAP_TRIGGER_PIXMAP_RENDER: u32 = 0x0053_b36c - ORIGINAL_BASE;
+// Diagnostic PLT-site trace points inside rl_tclWindow_ContextHandler_Platform::bCreateWindow
+// (procmap+0x581938). These are the instructions immediately after each `bl <svg-plt>` so
+// r0 carries the returned handle. Pure logging; does not alter control flow.
+const B_CREATE_WINDOW_ENTRY: u32 = 0x0058_1938 - ORIGINAL_BASE;
+const B_CREATE_WINDOW_RES_SURFACE_1_RESULT: u32 = 0x0058_2160 - ORIGINAL_BASE;
+const B_CREATE_WINDOW_RES_SURFACE_2_RESULT: u32 = 0x0058_2178 - ORIGINAL_BASE;
+const B_CREATE_WINDOW_RES_SURFACE_3_RESULT: u32 = 0x0058_2190 - ORIGINAL_BASE;
+const B_CREATE_WINDOW_LAYER_TRIPLE_RESULT: u32 = 0x0058_21b4 - ORIGINAL_BASE;
+const B_CREATE_WINDOW_EGL_WINDOW_SURFACE_ENTRY: u32 = 0x0058_1f80 - ORIGINAL_BASE;
+const B_CREATE_WINDOW_APPLY_IN_SYNC_RESULT: u32 = 0x0058_1d50 - ORIGINAL_BASE;
 const MAP_RENDER_VIEW_ID: u32 = 1;
 const MAP_RENDER_TRIGGER_INTERVAL: u32 = 20;
 const OSAL_THREAD_WAIT: u32 = 0x4851_4fa8;
@@ -365,6 +375,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         add_port_control_trace_hooks(unicorn, base_address);
         add_map_engine_init_trace_hooks(unicorn, base_address);
         add_render_control_trace_hooks(unicorn, base_address);
+        add_b_create_window_trace_hooks(unicorn, base_address);
         add_ail_power_trace_hooks(unicorn, base_address);
         add_cca_trace_hooks(unicorn, base_address);
     }
@@ -2502,6 +2513,138 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
                 }
             },
         )
+        .unwrap();
+}
+
+fn add_b_create_window_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    static B_CREATE_WINDOW_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+    let entry_addr = base_address + B_CREATE_WINDOW_ENTRY;
+    unicorn
+        .add_code_hook(entry_addr as u64, entry_addr as u64, move |uc, _, _| {
+            let count = B_CREATE_WINDOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count >= 20 {
+                return;
+            }
+            let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let settings = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let view_type = read_u32_or_invalid(uc, settings);
+            let w = read_u32_or_invalid(uc, settings + 8);
+            let h = read_u32_or_invalid(uc, settings + 0xc);
+            log::info!(
+                "PROCMAPENGINE bCreateWindow trace entry at {:#x}: this={:#x} view_type={:#x} settings_w={} settings_h={}",
+                entry_addr,
+                this,
+                view_type,
+                w,
+                h
+            );
+        })
+        .unwrap();
+
+    for (name, offset, store_off) in [
+        (
+            "svgCreateResourceSurface #1 -> this+0x70",
+            B_CREATE_WINDOW_RES_SURFACE_1_RESULT,
+            0x70u32,
+        ),
+        (
+            "svgCreateResourceSurface #2 -> this+0x74",
+            B_CREATE_WINDOW_RES_SURFACE_2_RESULT,
+            0x74,
+        ),
+        (
+            "svgCreateResourceSurface #3 -> this+0x78",
+            B_CREATE_WINDOW_RES_SURFACE_3_RESULT,
+            0x78,
+        ),
+    ] {
+        let addr = base_address + offset;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = B_CREATE_WINDOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count >= 60 {
+                    return;
+                }
+                let this = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let w = read_u32_or_invalid(uc, this + 8);
+                let h = read_u32_or_invalid(uc, this + 0xc);
+                log::info!(
+                    "PROCMAPENGINE bCreateWindow trace {} at {:#x}: this={:#x} r0={:#x} w={} h={}",
+                    name,
+                    addr,
+                    this,
+                    r0,
+                    w,
+                    h
+                );
+                let _ = store_off;
+            })
+            .unwrap();
+    }
+
+    let layer_result = base_address + B_CREATE_WINDOW_LAYER_TRIPLE_RESULT;
+    unicorn
+        .add_code_hook(layer_result as u64, layer_result as u64, move |uc, _, _| {
+            let count = B_CREATE_WINDOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count >= 60 {
+                return;
+            }
+            let this = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let w = read_u32_or_invalid(uc, this + 8);
+            let h = read_u32_or_invalid(uc, this + 0xc);
+            log::info!(
+                "PROCMAPENGINE bCreateWindow trace svgCreateLayerContextTriple at {:#x}: this={:#x} layer={:#x} w={} h={}",
+                layer_result,
+                this,
+                r0,
+                w,
+                h
+            );
+        })
+        .unwrap();
+
+    let egl_window_addr = base_address + B_CREATE_WINDOW_EGL_WINDOW_SURFACE_ENTRY;
+    unicorn
+        .add_code_hook(egl_window_addr as u64, egl_window_addr as u64, move |uc, _, _| {
+            let count = B_CREATE_WINDOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count >= 40 {
+                return;
+            }
+            let this = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+            let display = read_u32_or_invalid(uc, this + 0x4c);
+            let config = read_u32_or_invalid(uc, this + 0x50);
+            let layer = read_u32_or_invalid(uc, this + 0x7c);
+            let w = read_u32_or_invalid(uc, this + 8);
+            let h = read_u32_or_invalid(uc, this + 0xc);
+            log::info!(
+                "PROCMAPENGINE bCreateWindow trace eglCreateWindowSurface branch at {:#x}: display={:#x} config={:#x} layer={:#x} w={} h={}",
+                egl_window_addr,
+                display,
+                config,
+                layer,
+                w,
+                h
+            );
+        })
+        .unwrap();
+
+    let apply_addr = base_address + B_CREATE_WINDOW_APPLY_IN_SYNC_RESULT;
+    unicorn
+        .add_code_hook(apply_addr as u64, apply_addr as u64, move |uc, _, _| {
+            let count = B_CREATE_WINDOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count >= 40 {
+                return;
+            }
+            let this = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+            log::info!(
+                "PROCMAPENGINE bCreateWindow trace svgApplyLayerInSync returned at {:#x}: this={:#x} layer={:#x}",
+                apply_addr,
+                this,
+                read_u32_or_invalid(uc, this + 0x7c)
+            );
+        })
         .unwrap();
 }
 
