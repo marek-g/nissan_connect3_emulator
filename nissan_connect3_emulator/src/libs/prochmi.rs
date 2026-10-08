@@ -57,6 +57,17 @@ const GUI_GL_LAYER_SYNC_COPY_LAYER: u32 = 0x0134_359c - ORIGINAL_BASE;
 const GUI_GL_LAYER_SYNC_GET_LAYERS: u32 = 0x0134_2e38 - ORIGINAL_BASE;
 const GUI_GL_LAYER_COPY_COPY: u32 = 0x0134_2b98 - ORIGINAL_BASE;
 const GUI_GL_LAYER_COPY_PERFORM_COPY: u32 = 0x0134_2754 - ORIGINAL_BASE;
+const GUI_GL_LAYER_SYNC_S_INITIALIZE: u32 = 0x0134_3e44 - ORIGINAL_BASE;
+const GUI_GL_LAYER_SYNC_ON_SET_LAYER_NAMES: u32 = 0x0134_342c - ORIGINAL_BASE;
+const GUI_GL_LAYER_SYNC_APPLY_PENDING: u32 = 0x0134_2dc0 - ORIGINAL_BASE;
+const GUI_GL_LAYER_SYNC_REQUEST_VIEW_STATUS: u32 = 0x0134_3b50 - ORIGINAL_BASE;
+const GUI_GL_LAYER_SYNC_ON_VIEW_STATUS_CHANGED: u32 = 0x0134_3d14 - ORIGINAL_BASE;
+const GUI_GL_LAYER_SYNC_GET_VIEW_STATUS: u32 = 0x0134_2d0c - ORIGINAL_BASE;
+const GUI_DM_EA_MANAGER_REQUEST_EA_SHOW: u32 = 0x0133_eef4 - ORIGINAL_BASE;
+const GUI_DM_EA_MANAGER_REQUEST_EA_STATE_CHANGE: u32 = 0x0133_f1d0 - ORIGINAL_BASE;
+const GUI_DM_EA_MANAGER_ON_VIEW_STATUS_CHANGED: u32 = 0x0133_e9b8 - ORIGINAL_BASE;
+const GUI_DM_EA_MANAGER_REQUEST_EA_HIDE: u32 = 0x0133_e378 - ORIGINAL_BASE;
+const GUI_DM_EA_MANAGER_REQUEST_DISPLAY_MODE_CHANGE: u32 = 0x0133_f778 - ORIGINAL_BASE;
 
 const GUI_GL_TEXTURE_CONSTRUCTOR: u32 = 0x0134_a844 - ORIGINAL_BASE;
 const GUI_GL_OPENGL_MIX_LAYERS: u32 = 0x0134_6bb0 - ORIGINAL_BASE;
@@ -149,6 +160,24 @@ static HMI_MNGR_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
 static SVG_FAKE_HANDLE: AtomicU32 = AtomicU32::new(0);
 static SVG_BYPASS_LOGGED: AtomicBool = AtomicBool::new(false);
 static SVG_HOOK_HIT_COUNT: AtomicU32 = AtomicU32::new(0);
+// Staged emulation of procmapengine's LayerSync CCA replies. prochmi's
+// GUI_GL_LayerSync::requestViewStatus(EA=0) asks the map application for
+// its view; on real hardware procmap answers over the DAPI/FI transport
+// with a serialized message burst on the GUI message queue (see
+// GUI_MessageBoxGUI/System::sendGuiLSync* senders in prochmi_out.out):
+//   type 3    SetLayerNames(ea, "MAP_View1", "")   -> onSetLayerNames
+//   type 2    ViewStatusChanged(ea, VISIBLE=2)     -> onViewStatusChanged
+//   type 1002 SetView(ea, visible, x, y, w, h)     -> setLayersVisible path
+// The stages advance one message per clGUIWidgetEngine::bCheckMsgBox tick;
+// 9 means the burst completed.
+static LSYNC_MAP_STAGE: AtomicU32 = AtomicU32::new(0);
+// GUI_DM_EAManager singleton and the active EAWStatus entry captured from
+// GUI_DM_EAManager::updateEAShow calls (r0 = manager, r1 = entry with
+// +0x00 covering widget, +0x08 EA, +0x24 state machine).
+static LSYNC_EA_MANAGER: AtomicU32 = AtomicU32::new(0);
+static LSYNC_EA_ENTRY: AtomicU32 = AtomicU32::new(0);
+static LSYNC_HIDE_TICKS: AtomicU32 = AtomicU32::new(0);
+static LSYNC_MSGBOX_TICKS: AtomicU32 = AtomicU32::new(0);
 static GL_LAYER_COPY_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 static HMI_MAINLOOP_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -580,7 +609,11 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
 
     let check_msgbox = base_address + CL_GUI_CHECK_MSGBOX;
     unicorn
-        .add_code_hook(check_msgbox as u64, check_msgbox as u64, |uc, _, _| {
+        .add_code_hook(check_msgbox as u64, check_msgbox as u64, |uc, address, _| {
+            let msgbox_ticks = LSYNC_MSGBOX_TICKS.fetch_add(1, Ordering::Relaxed);
+            if msgbox_ticks % 2000 == 1 {
+                log::info!("PROCHMI: bCheckMsgBox tick {}", msgbox_ticks);
+            }
             if GUI_UTIL_STARTUP_STATUS_POSTED.load(Ordering::Relaxed) == 0
                 && post_gui_util_startup_anim_status(uc, 1)
             {
@@ -588,6 +621,13 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 log::info!(
                     "PROCHMI: injected startup animation status before GUI message box poll"
                 );
+            }
+            // Stages >=10 mutate registers via guest calls; they must not run
+            // from this hook because the stub return re-enters bCheckMsgBox's
+            // own code hook. They run from the DisplayManager::update hook
+            // with original_pc = caller LR.
+            if LSYNC_MAP_STAGE.load(Ordering::Relaxed) < 10 {
+                post_lsync_map_announcement(uc, address as u32);
             }
         })
         .unwrap();
@@ -1178,6 +1218,171 @@ fn post_gui_internal_events(unicorn: &mut Unicorn<'_, Context>) {
     }
 }
 
+// Appends one serialized GUI_UTIL_Queue message (payload already encoded in
+// GUI_UTIL_QueueWriter format: consecutive u32 ints, strings as u32 length
+// followed by length+1 raw bytes) to the GUI message box queue prochmi polls
+// from clGUIWidgetEngine::bCheckMsgBox. Message framing matches
+// GUI_UTIL_QueueReader::messageBegin: a u32 next-message offset header
+// followed by the payload.
+fn post_gui_util_message(unicorn: &mut Unicorn<'_, Context>, payload: &[u8], label: &str) -> bool {
+    let queue = GUI_UTIL_MSGBOX_QUEUE.load(Ordering::Relaxed);
+    if queue == 0 {
+        return false;
+    }
+
+    let buffer = read_u32(unicorn, queue + 4);
+    let read = read_u32(unicorn, queue + 8);
+    let write = read_u32(unicorn, queue + 0xc);
+    let max = read_u32(unicorn, queue + 0x14);
+    let msg_size = 4 + payload.len() as u32;
+
+    if buffer == 0 || max < msg_size {
+        return false;
+    }
+
+    let mut offset = write;
+    if max.saturating_sub(offset) < msg_size {
+        if offset < read || read <= msg_size {
+            return false;
+        }
+        let _ = write_u32(unicorn, queue + 0x10, offset);
+        offset = 0;
+    }
+    if max.saturating_sub(offset) < msg_size {
+        return false;
+    }
+
+    let next = offset + msg_size;
+    if unicorn
+        .mem_write((buffer + offset) as u64, &next.to_le_bytes())
+        .is_err()
+        || unicorn
+            .mem_write((buffer + offset + 4) as u64, payload)
+            .is_err()
+    {
+        return false;
+    }
+    let _ = write_u32(unicorn, queue + 0xc, next);
+
+    log::info!(
+        "PROCHMI: posted GUI_UTIL {} queue={:#x} buffer={:#x} read={} write={} next={}",
+        label,
+        queue,
+        buffer,
+        read,
+        write,
+        next
+    );
+    true
+}
+
+fn push_u32(buf: &mut Vec<u8>, value: u32) {
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_string(buf: &mut Vec<u8>, value: &str) {
+    push_u32(buf, value.len() as u32);
+    buf.extend_from_slice(value.as_bytes());
+    buf.push(0);
+}
+
+// Advances one stage of the emulated procmap LayerSync reply burst per call.
+fn post_lsync_map_announcement(unicorn: &mut Unicorn<'_, Context>, original_pc: u32) {
+    match LSYNC_MAP_STAGE.load(Ordering::Relaxed) {
+        0 => {}
+        1 => {
+            // type 3: GUI_MessageBoxGUI::sendGuiLSyncSetLayerNames(ea=0, names)
+            let mut payload = Vec::new();
+            push_u32(&mut payload, 3);
+            push_u32(&mut payload, 0);
+            push_string(&mut payload, "MAP_View1");
+            push_string(&mut payload, "");
+            if post_gui_util_message(unicorn, &payload, "lsync SetLayerNames(MAP_View1)") {
+                LSYNC_MAP_STAGE.store(2, Ordering::Relaxed);
+            }
+        }
+        2 => {
+            // type 2: GUI_MessageBoxGUI::sendGuiLSyncViewStatusChanged(ea=0, VISIBLE)
+            let mut payload = Vec::new();
+            push_u32(&mut payload, 2);
+            push_u32(&mut payload, 0);
+            push_u32(&mut payload, 2);
+            if post_gui_util_message(unicorn, &payload, "lsync ViewStatusChanged(VISIBLE)") {
+                LSYNC_MAP_STAGE.store(3, Ordering::Relaxed);
+            }
+        }
+        3 => {
+            // type 1002: GUI_MessageBoxSystem::sendGuiLSyncSetView(ea=0, visible, 0,0,800,480)
+            let mut payload = Vec::new();
+            push_u32(&mut payload, 1002);
+            push_u32(&mut payload, 0);
+            push_u32(&mut payload, 1);
+            push_u32(&mut payload, 0);
+            push_u32(&mut payload, 0);
+            push_u32(&mut payload, 800);
+            push_u32(&mut payload, 480);
+            if post_gui_util_message(unicorn, &payload, "lsync SetView(fullscreen)") {
+                LSYNC_MAP_STAGE.store(10, Ordering::Relaxed);
+                log::info!("PROCHMI: emulated procmap LayerSync reply burst complete");
+            }
+        }
+        // On the real unit the HMI hides the map view as soon as a blocking
+        // popup takes over; EAManager then snapshots the map layer into
+        // EAManager's GUI_GL_LayerCopy (updateEAHide state 5 ->
+        // LayerSync::copyLayer). Drive that hide request ourselves once the
+        // emulated show flow has completed.
+        10 => {
+            let entry = LSYNC_EA_ENTRY.load(Ordering::Relaxed);
+            let manager = LSYNC_EA_MANAGER.load(Ordering::Relaxed);
+            if entry != 0 && manager != 0 && read_u32(unicorn, entry + 0x24) == 3 {
+                // Equivalent of requestEAHide(): mark the EAWStatus slot's
+                // command field (slot base = entry - 0xc, +0x2c) as HIDE and
+                // dirty the manager. A guest call into requestEAHide proved
+                // fatal for the GUI thread, so poke the state directly.
+                let _ = write_u32(unicorn, entry + 0x20, 1);
+                let _ = write_u8(unicorn, manager + 0x12c, 1);
+                LSYNC_MAP_STAGE.store(11, Ordering::Relaxed);
+                log::info!(
+                    "PROCHMI: flagged EA0 hide for map snapshot manager={:#x} entry={:#x}",
+                    manager,
+                    entry
+                );
+            }
+        }
+        // EAManager::update keeps being pumped by the natural GUI main loop;
+        // only the clTimerHelper hide expiry is missing under emulation.
+        // Emulate timer event 1 (state 4 -> 5), whose updateEAHide case 5
+        // runs LayerSync::copyLayer to snapshot the map layer.
+        11 => {
+            let entry = LSYNC_EA_ENTRY.load(Ordering::Relaxed);
+            let manager = LSYNC_EA_MANAGER.load(Ordering::Relaxed);
+            let ticks = LSYNC_HIDE_TICKS.fetch_add(1, Ordering::Relaxed);
+            if manager == 0 {
+                LSYNC_MAP_STAGE.store(99, Ordering::Relaxed);
+                log::info!("PROCHMI: EA hide monitor gave up (no manager)");
+            } else if read_u32(unicorn, manager + 0x130) != 0 {
+                LSYNC_MAP_STAGE.store(99, Ordering::Relaxed);
+                log::info!(
+                    "PROCHMI: map layer snapshot texture ready manager={:#x} ticks={}",
+                    manager,
+                    ticks
+                );
+            } else if ticks > 2000 {
+                LSYNC_MAP_STAGE.store(99, Ordering::Relaxed);
+                log::info!("PROCHMI: EA hide monitor timed out ticks={}", ticks);
+            } else if read_u32(unicorn, entry + 0x24) == 4 && ticks > 20 {
+                let _ = write_u32(unicorn, entry + 0x24, 5);
+                let _ = write_u8(unicorn, manager + 0x12c, 1);
+                log::info!(
+                    "PROCHMI: emulated EA hide timer expiry; copyLayer snapshot armed entry={:#x}",
+                    entry
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 fn post_gui_util_startup_anim_status(unicorn: &mut Unicorn<'_, Context>, status: u32) -> bool {
     let queue = GUI_UTIL_MSGBOX_QUEUE.load(Ordering::Relaxed);
     if queue == 0 {
@@ -1750,6 +1955,56 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
             "GUI_GL_LayerSync::getLayers",
         ),
         (GUI_GL_LAYER_SYNC_COPY_LAYER, "GUI_GL_LayerSync::copyLayer"),
+        (
+            GUI_GL_LAYER_SYNC_S_INITIALIZE,
+            "GUI_GL_LayerSync::s_initialize",
+        ),
+        (
+            GUI_GL_LAYER_SYNC_ON_SET_LAYER_NAMES,
+            "GUI_GL_LayerSync::onSetLayerNames",
+        ),
+        (
+            GUI_GL_LAYER_SYNC_APPLY_PENDING,
+            "GUI_GL_LayerSync::applyPendingLayerSettings",
+        ),
+        (
+            GUI_GL_LAYER_SYNC_REQUEST_VIEW_STATUS,
+            "GUI_GL_LayerSync::requestViewStatus",
+        ),
+        (
+            GUI_GL_LAYER_SYNC_ON_VIEW_STATUS_CHANGED,
+            "GUI_GL_LayerSync::onViewStatusChanged",
+        ),
+        (
+            GUI_GL_LAYER_SYNC_GET_VIEW_STATUS,
+            "GUI_GL_LayerSync::getViewStatus",
+        ),
+        (
+            GUI_DM_EA_MANAGER_REQUEST_EA_SHOW,
+            "GUI_DM_EAManager::requestEAShow",
+        ),
+        (
+            GUI_DM_EA_MANAGER_REQUEST_EA_STATE_CHANGE,
+            "GUI_DM_EAManager::requestEAStateChange",
+        ),
+        (
+            GUI_DM_EA_MANAGER_ON_VIEW_STATUS_CHANGED,
+            "GUI_DM_EAManager::onViewStatusChanged",
+        ),
+        (
+            GUI_DM_EA_MANAGER_REQUEST_EA_HIDE,
+            "GUI_DM_EAManager::requestEAHide",
+        ),
+        (GUI_DM_EA_MANAGER_HIDE, "GUI_DM_EAManager::updateEAHide"),
+        (
+            GUI_DM_EA_MANAGER_REQUEST_DISPLAY_MODE_CHANGE,
+            "GUI_DM_EAManager::requestDisplayModeChange",
+        ),
+        (
+            GUI_DM_EA_MANAGER_SHOW,
+            "GUI_DM_EAManager::updateEAShow",
+        ),
+        (GUI_DM_EA_MANAGER_UPDATE, "GUI_DM_EAManager::update"),
         (GUI_GL_LAYER_COPY_COPY, "GUI_GL_LayerCopy::copy"),
         (
             GUI_GL_LAYER_COPY_PERFORM_COPY,
@@ -1768,24 +2023,45 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
     ] {
         let addr = base_address + offset;
         unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, address, _| {
+            .            add_code_hook(addr as u64, addr as u64, move |uc, address, _| {
                 if name == "GUI_DM_DisplayManager thread entry" {
                     force_hmi_mainloop_display_update(uc);
                 }
                 if name == "GUI_DM_DisplayManager::update" {
                     trace_hmi_view_draw_contexts(uc);
+                    if LSYNC_MAP_STAGE.load(Ordering::Relaxed) >= 10 {
+                        let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                        post_lsync_map_announcement(uc, lr);
+                    }
+                }
+                if name == "GUI_DM_EAManager::updateEAShow" {
+                    LSYNC_EA_MANAGER.store(uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32, Ordering::Relaxed);
+                    LSYNC_EA_ENTRY.store(uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32, Ordering::Relaxed);
+                }
+                if name == "GUI_GL_LayerSync::requestViewStatus"
+                    && uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 == 0
+                    && LSYNC_MAP_STAGE
+                        .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    log::info!(
+                        "PROCHMI: prochmi asked EA0 view status; scheduling emulated procmap LayerSync reply"
+                    );
                 }
 
                 let count = GL_LAYER_COPY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-                if count < 40 {
+                if count < 400 {
                     log::info!(
-                        "PROCHMI: GL composition {} count={} r0={:#x} r1={:#x} r2={:#x} r3={:#x}",
+                        "PROCHMI: GL composition {} count={} r0={:#x} r1={:#x} r2={:#x} r3={:#x} lr={:#x}",
                         name,
                         count,
                         uc.reg_read(RegisterARM::R0).unwrap_or(0),
                         uc.reg_read(RegisterARM::R1).unwrap_or(0),
                         uc.reg_read(RegisterARM::R2).unwrap_or(0),
                         uc.reg_read(RegisterARM::R3).unwrap_or(0),
+                        uc.reg_read(RegisterARM::LR)
+                            .unwrap_or(0)
+                            .wrapping_sub(base_address as u64),
                     );
                 }
             })
@@ -1856,10 +2132,40 @@ fn write_svg_surface_status(unicorn: &mut Unicorn<'_, Context>, status: u32) {
     let Some(base) = crate::gpu::write_map_surface_to_guest(unicorn) else {
         return;
     };
+    {
+        let mut probe = [0u8; 16];
+        let _ = unicorn.mem_read((base + 200 * SVG_MAP_PITCH as u32 + 400 * 4) as u64, &mut probe);
+        let mut nonblack = 0usize;
+        let mut max_alpha = 0u8;
+        let mut row = vec![0u8; (SVG_MAP_WIDTH as usize) * 4];
+        if unicorn
+            .mem_read((base + 240 * SVG_MAP_PITCH as u32) as u64, &mut row)
+            .is_ok()
+        {
+            for px in row.chunks(4) {
+                if px[0] | px[1] | px[2] != 0 {
+                    nonblack += 1;
+                }
+                max_alpha = max_alpha.max(px[3]);
+            }
+        }
+        log::info!(
+            "PROCHMI: svg map surface probe base={:#x} midpx={:02x?} row240_nonblack={} max_alpha={:#x}",
+            base,
+            &probe[..4],
+            nonblack,
+            max_alpha
+        );
+    }
+    // SVGSurfaceStatus layout recovered from GUI_GL_LayerCopy::performCopy:
+    // +0x00 pixel base pointer, +0x08 u16 row pitch in bytes (used as
+    // y_start * pitch + base), +0x0c format enum (1 = RGBA, 5 = RGB565),
+    // +0x10 u16 row pitch again - performCopy divides it by 4 to obtain the
+    // texture width in pixels.
     let mut data = vec![0u8; 0x40];
     write_u32_at(&mut data, 0x00, base);
     write_u32_at(&mut data, 0x04, 0);
-    write_u16_at(&mut data, 0x08, SVG_MAP_WIDTH);
+    write_u16_at(&mut data, 0x08, SVG_MAP_PITCH);
     write_u16_at(&mut data, 0x0a, 4);
     write_u32_at(&mut data, 0x0c, 1);
     write_u16_at(&mut data, 0x10, SVG_MAP_PITCH);

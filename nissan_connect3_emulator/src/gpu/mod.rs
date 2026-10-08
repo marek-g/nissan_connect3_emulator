@@ -1400,6 +1400,12 @@ fn force_gl_error(unicorn: &Unicorn<'_, Context>) {
     clear_host_gl_errors(unicorn);
 }
 
+fn gpu_trace_all() -> bool {
+    std::env::var("EMU_GPU_TRACE_ALL")
+        .map(|value| value != "0")
+        .unwrap_or(false)
+}
+
 fn log_api(unicorn: &mut Unicorn<'_, Context>, prefix: &str, name: &str) {
     set_gpu_target_for_elf(&unicorn.get_data().elf_path);
     let count = API_LOG_COUNT.with(|count| {
@@ -1412,7 +1418,7 @@ fn log_api(unicorn: &mut Unicorn<'_, Context>, prefix: &str, name: &str) {
             name,
             "glClear" | "glClearColor" | "glViewport" | "eglSwapBuffers"
         );
-    if important || count < 3000 {
+    if important || count < 3000 || gpu_trace_all() {
         log::info!(
             "GPU: {} {} process={} r0={:x} r1={:x} r2={:x} r3={:x}",
             prefix,
