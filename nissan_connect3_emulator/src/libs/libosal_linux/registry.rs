@@ -166,6 +166,8 @@ fn io_control(unicorn: &mut Unicorn<'_, Context>) -> u32 {
 
     match command {
         1 | 4 => query_value(unicorn, info.path(), info.flags(), buffer),
+        2 => enumerate_next_value(unicorn, info.path(), info.flags(), buffer),
+        5 | 0x3eb => enumerate_next_subkey(unicorn, info.path(), info.flags(), buffer),
         10 => lookup_app_path(unicorn, info.path(), info.flags(), buffer),
         0xb => lookup_service_path(unicorn, info.path(), info.flags(), buffer),
         _ => {
@@ -249,6 +251,88 @@ fn query_value(unicorn: &mut Unicorn<'_, Context>, path: &str, flags: u32, buffe
         }
         None => ERROR_NOT_FOUND,
     }
+}
+
+fn enumerate_next_subkey(
+    unicorn: &mut Unicorn<'_, Context>,
+    path: &str,
+    flags: u32,
+    buffer: u32,
+) -> u32 {
+    enumerate_next_item(unicorn, path, flags, buffer, true)
+}
+
+fn enumerate_next_value(
+    unicorn: &mut Unicorn<'_, Context>,
+    path: &str,
+    flags: u32,
+    buffer: u32,
+) -> u32 {
+    enumerate_next_item(unicorn, path, flags, buffer, false)
+}
+
+fn enumerate_next_item(
+    unicorn: &mut Unicorn<'_, Context>,
+    path: &str,
+    flags: u32,
+    buffer: u32,
+    subkey: bool,
+) -> u32 {
+    if !readable(flags) || buffer == 0 {
+        return if !readable(flags) {
+            ERROR_FLAGS
+        } else {
+            ERROR_PARAM
+        };
+    }
+
+    let state = match read_u32(unicorn, buffer + 4) {
+        Some(state) => state,
+        None => return ERROR_PARAM,
+    };
+    let current = if state == 0 {
+        String::new()
+    } else {
+        match read_cstr(unicorn, buffer + 8, 0x100) {
+            Some(current) => current,
+            None => return ERROR_PARAM,
+        }
+    };
+
+    let name = {
+        let namespace = unicorn.get_data().namespace.lock().unwrap();
+        if subkey {
+            namespace.registry.next_subkey(path, &current)
+        } else {
+            namespace.registry.next_value_name(path, &current)
+        }
+    };
+
+    let name = match name {
+        Some(name) => name,
+        None => {
+            log::trace!(
+                "REGISTRY enumerate {} path={} current={} -> end",
+                if subkey { "subkey" } else { "value" },
+                path,
+                current
+            );
+            return ERROR_NOT_FOUND;
+        }
+    };
+
+    log::trace!(
+        "REGISTRY enumerate {} path={} current={} -> {}",
+        if subkey { "subkey" } else { "value" },
+        path,
+        current,
+        name
+    );
+
+    if !write_name(unicorn, buffer + 8, 0x100, &name) || !write_u32(unicorn, buffer + 4, 1) {
+        return ERROR_PARAM;
+    }
+    SUCCESS
 }
 
 fn lookup_app_path(unicorn: &mut Unicorn<'_, Context>, path: &str, flags: u32, buffer: u32) -> u32 {
@@ -404,6 +488,17 @@ fn write_cstr(unicorn: &mut Unicorn<'_, Context>, addr: u32, length: u32, text: 
     let max = (length as usize).saturating_sub(1);
     let len = text.len().min(max);
     data[..len].copy_from_slice(&text.as_bytes()[..len]);
+    unicorn.mem_write(addr as u64, &data).is_ok()
+}
+
+fn write_name(unicorn: &mut Unicorn<'_, Context>, addr: u32, max_len: u32, text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() >= max_len as usize {
+        return false;
+    }
+    let mut data = Vec::with_capacity(bytes.len() + 1);
+    data.extend_from_slice(bytes);
+    data.push(0);
     unicorn.mem_write(addr as u64, &data).is_ok()
 }
 

@@ -29,11 +29,18 @@ static SYNTH_MAP_PWR_STATE_REQ_SENT: AtomicBool = AtomicBool::new(false);
 static SYNTH_MAP_PWR_STATE_REQ_CONTENT: AtomicU32 = AtomicU32::new(0);
 static SYNTH_MAP_PWR_CVM_SIGNAL_CHANGED_SENT: AtomicBool = AtomicBool::new(false);
 static SYNTH_MAP_PWR_CVM_SIGNAL_CHANGED_CONTENT: AtomicU32 = AtomicU32::new(0);
+static SYNTH_DAPI_PWR_START_CONF_SENT: AtomicBool = AtomicBool::new(false);
+static SYNTH_DAPI_PWR_START_CONF_CONTENT: AtomicU32 = AtomicU32::new(0);
+static SYNTH_DAPI_PWR_STATE_REQ_SENT: AtomicBool = AtomicBool::new(false);
+static SYNTH_DAPI_PWR_STATE_REQ_CONTENT: AtomicU32 = AtomicU32::new(0);
+static SYNTH_DAPI_PWR_CVM_SIGNAL_CHANGED_SENT: AtomicBool = AtomicBool::new(false);
+static SYNTH_DAPI_PWR_CVM_SIGNAL_CHANGED_CONTENT: AtomicU32 = AtomicU32::new(0);
 
 
 thread_local! {
     static SYNTH_PWR_PERIODIC_NEXT: Cell<Option<Instant>> = const { Cell::new(None) };
     static SYNTH_MAP_PWR_PERIODIC_NEXT: Cell<Option<Instant>> = const { Cell::new(None) };
+    static SYNTH_DAPI_PWR_PERIODIC_NEXT: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
 /// Message-queue observation and OSAL service bridge hooks.
@@ -499,7 +506,7 @@ fn log_osal_message_bytes(
 }
 
 fn is_synthetic_periodic_queue(name: &str) -> bool {
-    name == "mbx_1024" || name == "mbx_265"
+    name == "mbx_1024" || name == "mbx_265" || name == "mbx_7"
 }
 
 fn shorten_native_wait_timeout(unicorn: &mut Unicorn<'_, Context>) -> bool {
@@ -526,6 +533,17 @@ fn synthesize_ail_power_startup_sequence(
     if name == "mbx_1024" {
         return elf_path.contains("procmapengine")
             && synthesize_map_power_startup_sequence(
+                unicorn,
+                api_name,
+                name,
+                buf,
+                stack_timeout,
+            );
+    }
+
+    if name == "mbx_7" {
+        return elf_path.contains("DAPIAPP")
+            && synthesize_dapi_power_startup_sequence(
                 unicorn,
                 api_name,
                 name,
@@ -977,6 +995,229 @@ fn synthesize_periodic_map_power_state_req(unicorn: &mut Unicorn<'_, Context>, b
         content
     );
     SYNTH_MAP_PWR_PERIODIC_NEXT.with(|cell| cell.set(Some(now + Duration::from_millis(1000))));
+    return_to_caller(unicorn, 8);
+    true
+}
+
+fn synthesize_dapi_power_startup_sequence(
+    unicorn: &mut Unicorn<'_, Context>,
+    api_name: &str,
+    name: &str,
+    buf: u32,
+    stack_timeout: u32,
+) -> bool {
+    const DAPI_APP_ID: u16 = 7;
+
+    for message in [
+        (
+            3u16,
+            0u32,
+            0u32,
+            "DAPI PWR_PROXY_START_CONF",
+            &SYNTH_DAPI_PWR_START_CONF_SENT as &AtomicBool,
+            &SYNTH_DAPI_PWR_START_CONF_CONTENT as &AtomicU32,
+        ),
+        (
+            0x10,
+            3,
+            0,
+            "DAPI PWR_STATE_CHANGE_REQ",
+            &SYNTH_DAPI_PWR_STATE_REQ_SENT,
+            &SYNTH_DAPI_PWR_STATE_REQ_CONTENT,
+        ),
+        (
+            0x50,
+            0,
+            0,
+            "DAPI PWR_CVM_SIGNAL_CHANGED",
+            &SYNTH_DAPI_PWR_CVM_SIGNAL_CHANGED_SENT,
+            &SYNTH_DAPI_PWR_CVM_SIGNAL_CHANGED_CONTENT,
+        ),
+    ] {
+        if synthesize_dapi_power_message(
+            unicorn,
+            api_name,
+            name,
+            buf,
+            stack_timeout,
+            DAPI_APP_ID,
+            message.0,
+            message.1,
+            message.2,
+            message.3,
+            message.4,
+            message.5,
+        ) {
+            return true;
+        }
+    }
+
+    if SYNTH_DAPI_PWR_START_CONF_SENT.load(Ordering::SeqCst)
+        && SYNTH_DAPI_PWR_STATE_REQ_SENT.load(Ordering::SeqCst)
+        && SYNTH_DAPI_PWR_CVM_SIGNAL_CHANGED_SENT.load(Ordering::SeqCst)
+    {
+        return synthesize_periodic_dapi_power_state_req(unicorn, buf);
+    }
+
+    false
+}
+
+fn synthesize_dapi_power_message(
+    unicorn: &mut Unicorn<'_, Context>,
+    api_name: &str,
+    name: &str,
+    buf: u32,
+    stack_timeout: u32,
+    target_app: u16,
+    power_type: u16,
+    power_data1: u32,
+    power_data2: u32,
+    message_name: &str,
+    sent: &AtomicBool,
+    content_slot: &AtomicU32,
+) -> bool {
+    const TARGET_QUEUE: &str = "mbx_7";
+    const CONTENT_LEN: u32 = 0x20;
+
+    if !matches!(
+        api_name,
+        "OSAL_s32MessageQueueWait" | "OSAL_s32MessageQueuePriorityWait"
+    ) {
+        return false;
+    }
+    if name != TARGET_QUEUE || stack_timeout != u32::MAX {
+        return false;
+    }
+    if buf == 0 || buf > 0xf000_0000 {
+        return false;
+    }
+
+    if power_type != 3 && !SYNTH_DAPI_PWR_START_CONF_SENT.load(Ordering::SeqCst) {
+        return false;
+    }
+    if sent
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut content = content_slot.load(Ordering::Relaxed);
+    if content == 0 || content > 0xf000_0000 {
+        let mmu_arc = unicorn.get_data().mmu.clone();
+        content = mmu_arc.lock().unwrap().heap_alloc(
+            unicorn,
+            CONTENT_LEN,
+            Prot::READ | Prot::WRITE,
+            "[synthetic-cca-dapi-power]",
+        );
+        if content == 0 {
+            return false;
+        }
+
+        let mut body = [0u8; CONTENT_LEN as usize];
+        body[0x00..0x02].copy_from_slice(&target_app.to_le_bytes());
+        body[0x04..0x08].copy_from_slice(&CONTENT_LEN.to_le_bytes());
+        body[0x08..0x0a].copy_from_slice(&0x0002u16.to_le_bytes());
+        body[0x0b] = 0x40;
+        body[0x0c..0x0e].copy_from_slice(&0x0001u16.to_le_bytes());
+        body[0x14..0x16].copy_from_slice(&power_type.to_le_bytes());
+        body[0x18..0x1c].copy_from_slice(&power_data1.to_le_bytes());
+        body[0x1c..0x20].copy_from_slice(&power_data2.to_le_bytes());
+
+        if unicorn.mem_write(content as u64, &body).is_err() {
+            return false;
+        }
+
+        content_slot.store(content, Ordering::Relaxed);
+    }
+
+    if unicorn.mem_write(buf as u64, &1u32.to_le_bytes()).is_err()
+        || unicorn
+            .mem_write((buf + 4) as u64, &content.to_le_bytes())
+            .is_err()
+    {
+        return false;
+    }
+
+    let thread = unicorn.get_data().inner.thread_id();
+    log::info!(
+        "[{}] [LIBOSAL] {}({}) answered with synthetic {} content=0x{:x}",
+        thread,
+        api_name,
+        name,
+        message_name,
+        content
+    );
+    return_to_caller(unicorn, 8);
+    true
+}
+
+fn synthesize_periodic_dapi_power_state_req(unicorn: &mut Unicorn<'_, Context>, buf: u32) -> bool {
+    const CONTENT_LEN: u32 = 0x20;
+    const TARGET_QUEUE: &str = "mbx_7";
+
+    if buf == 0 || buf > 0xf000_0000 {
+        return false;
+    }
+
+    let now = Instant::now();
+    let ready = SYNTH_DAPI_PWR_PERIODIC_NEXT.with(|cell| match cell.get() {
+        None => {
+            cell.set(Some(now + Duration::from_millis(1000)));
+            true
+        }
+        Some(next) => now >= next,
+    });
+    if !ready {
+        return false;
+    }
+
+    let mut content = SYNTH_DAPI_PWR_STATE_REQ_CONTENT.load(Ordering::Relaxed);
+    if content == 0 || content > 0xf000_0000 {
+        let mmu_arc = unicorn.get_data().mmu.clone();
+        content = mmu_arc.lock().unwrap().heap_alloc(
+            unicorn,
+            CONTENT_LEN,
+            Prot::READ | Prot::WRITE,
+            "[synthetic-cca-dapi-power-state]",
+        );
+        if content == 0 {
+            return false;
+        }
+
+        let mut body = [0_u8; CONTENT_LEN as usize];
+        body[0x00..0x02].copy_from_slice(&7u16.to_le_bytes());
+        body[0x04..0x08].copy_from_slice(&CONTENT_LEN.to_le_bytes());
+        body[0x08..0x0a].copy_from_slice(&0x0002u16.to_le_bytes());
+        body[0x0b] = 0x40;
+        body[0x0c..0x0e].copy_from_slice(&0x0001u16.to_le_bytes());
+        body[0x14..0x16].copy_from_slice(&0x10u16.to_le_bytes());
+        body[0x18..0x1c].copy_from_slice(&3u32.to_le_bytes());
+        body[0x1c..0x20].copy_from_slice(&0u32.to_le_bytes());
+
+        if unicorn.mem_write(content as u64, &body).is_err() {
+            return false;
+        }
+        SYNTH_DAPI_PWR_STATE_REQ_CONTENT.store(content, Ordering::Relaxed);
+    }
+
+    if unicorn.mem_write(buf as u64, &1u32.to_le_bytes()).is_err()
+        || unicorn
+            .mem_write((buf + 4) as u64, &content.to_le_bytes())
+            .is_err()
+    {
+        return false;
+    }
+
+    let thread = unicorn.get_data().inner.thread_id();
+    log::info!(
+        "[{}] [LIBOSAL] OSAL_s32MessageQueueWait({}) answered with periodic synthetic DAPI PWR_STATE_CHANGE_REQ content=0x{:x}",
+        thread,
+        TARGET_QUEUE,
+        content
+    );
+    SYNTH_DAPI_PWR_PERIODIC_NEXT.with(|cell| cell.set(Some(now + Duration::from_millis(1000))));
     return_to_caller(unicorn, 8);
     true
 }

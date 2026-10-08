@@ -289,6 +289,21 @@ impl Registry {
         }
     }
 
+    pub fn next_subkey(&self, path: &str, current: &str) -> Option<String> {
+        next_named_item(&self.subkeys(path), current)
+    }
+
+    pub fn next_value_name(&self, path: &str, current: &str) -> Option<String> {
+        next_named_item(
+            &self
+                .values(path)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            current,
+        )
+    }
+
     pub fn values(&self, path: &str) -> Vec<(String, RegistryValue)> {
         match self.find_node(path) {
             Some(node) => node
@@ -491,6 +506,19 @@ pub fn normalize_registry_path(path: &str) -> Vec<String> {
     };
 
     normalize_hive_path(path)
+}
+
+fn next_named_item(items: &[String], current: &str) -> Option<String> {
+    let current = current.trim();
+    if current.is_empty() {
+        return items.first().cloned();
+    }
+
+    let current = current.to_ascii_lowercase();
+    let index = items
+        .iter()
+        .position(|item| item.to_ascii_lowercase() == current)?;
+    items.get(index + 1).cloned()
 }
 
 fn normalize_section_path(section: &str) -> Vec<String> {

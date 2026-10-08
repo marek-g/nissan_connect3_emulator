@@ -160,6 +160,9 @@ static CCA_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static PORTCONTROL_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_INIT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static AIL_POWER_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static AIL_POWER_DISPATCH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static AIL_POWER_SWITCH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+const AIL_POWER_SWITCH_TRACE_LIMIT: u32 = 500;
 
 #[derive(Clone, Copy)]
 struct SavedCalleeRegs {
@@ -270,6 +273,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     PORTCONTROL_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_INIT_TRACE_COUNT.store(0, Ordering::Relaxed);
     AIL_POWER_TRACE_COUNT.store(0, Ordering::Relaxed);
+    AIL_POWER_DISPATCH_TRACE_COUNT.store(0, Ordering::Relaxed);
 
     let cca_dispatch_addr = base_address + CCA_DISPATCH;
     unicorn
@@ -303,6 +307,10 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         add_ail_power_trace_hooks(unicorn, base_address);
         add_cca_trace_hooks(unicorn, base_address);
     }
+    add_ail_power_dispatch_state_hook(unicorn, base_address);
+    add_procmap_switch_trace_hook(unicorn, base_address);
+    add_procmap_type3_state_hook(unicorn, base_address);
+    force_ail_ipc_post_success(unicorn, base_address);
 
     let repair_addr = base_address + PORTCONTROL_INIT_RESULT;
     let activate_after_init = std::env::var_os("EMU_PROCMAPENGINE_SKIP_INITIAL_RENDER_TRIGGER")
@@ -1952,7 +1960,6 @@ fn add_ail_power_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u
         ("hGetLpmInQueue result", AIL_HGET_LPM_IN_QUEUE_RESULT, 0u8),
         ("bSendCCAPowerMsg", AIL_SEND_CCA_POWER_MSG, 1u8),
         ("bSendCCAPowerMsg result", AIL_SEND_CCA_POWER_MSG_RESULT, 2u8),
-        ("bPostIpcMessage", AIL_POST_IPC_MESSAGE, 3u8),
     ] {
         let addr = base_address + original_addr;
         unicorn
@@ -1996,6 +2003,115 @@ fn add_ail_power_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u
     }
 }
 
+fn add_ail_power_dispatch_state_hook(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    let addr = base_address + (0x0066_7a8c - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            let count = AIL_POWER_DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count >= 200 {
+                return;
+            }
+            let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+            let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+            let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+            let object = read_u32_or_invalid(uc, r7);
+            let state = read_u32_or_invalid(uc, object + APP_STATE_OFFSET);
+            log::info!(
+                "PROCMAPENGINE power dispatch trace at {:#x}: object={:#x} state={:#x} type={:#x} data1={:#x} data2={:#x}",
+                addr,
+                object,
+                state,
+                r5,
+                r4,
+                r6
+            );
+        })
+        .unwrap();
+}
+
+fn force_ail_ipc_post_success(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    let addr = base_address + AIL_POST_IPC_MESSAGE;
+    unicorn
+        .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+            if uc.reg_write(RegisterARM::R0, 0x72000_u64).is_err()
+                || uc.reg_write(RegisterARM::PC, lr as u64).is_err()
+            {
+                return;
+            }
+            log::info!(
+                "PROCMAPENGINE stubbed bPostIpcMessage at {:#x} -> 0x72000",
+                addr
+            );
+        })
+        .unwrap();
+}
+
+fn add_procmap_switch_trace_hook(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    for (name, offset) in [
+        ("switch decision", 0x0066_7a94u32),
+        ("default path", 0x0066_7c5cu32),
+        ("type3 path", 0x0066_7cd8u32),
+    ] {
+        let addr = base_address + (offset - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = AIL_POWER_SWITCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count >= AIL_POWER_SWITCH_TRACE_LIMIT {
+                    return;
+                }
+                let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                let r3 = if name == "switch decision" {
+                    r5.wrapping_sub(3)
+                } else {
+                    0
+                };
+                let object = read_u32_or_invalid(uc, r7);
+                log::info!(
+                    "PROCMAPENGINE switch trace {} at {:#x}: object={:#x} state={:#x} r3={:#x} r4={:#x} r5={:#x} r6={:#x}",
+                    name,
+                    addr,
+                    object,
+                    read_u32_or_invalid(uc, object + APP_STATE_OFFSET),
+                    r3,
+                    r4,
+                    r5,
+                    r6
+                );
+            })
+            .unwrap();
+    }
+}
+
+fn add_procmap_type3_state_hook(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    for (name, offset) in [
+        ("bOnInit vcall result", 0x0066_7d00u32),
+        ("after state update", 0x0066_7d18u32),
+    ] {
+        let addr = base_address + (offset - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                let object = read_u32_or_invalid(uc, r7);
+                log::info!(
+                    "PROCMAPENGINE type3 trace {} at {:#x}: r0={:#x} object={:#x} state={:#x} state4={:#x}",
+                    name,
+                    addr,
+                    r0,
+                    object,
+                    read_u32_or_invalid(uc, object + APP_STATE_OFFSET),
+                    read_u32_or_invalid(uc, object + 0x34)
+                );
+            })
+            .unwrap();
+    }
+}
+
 fn add_cca_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     for (name, offset) in [
         ("cca-dispatch", CCA_DISPATCH),
@@ -2005,7 +2121,7 @@ fn add_cca_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
         unicorn
             .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
                 let count = CCA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-                if count >= 50 {
+                if count >= 500 {
                     return;
                 }
 
