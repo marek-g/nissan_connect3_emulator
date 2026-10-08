@@ -227,9 +227,43 @@ to avoid is reintroducing any direct read/write of another process' guest memory
     that owns `GUI_GL_LayerSync` and would populate its layer list from SVG.
     `clHmiNavServerHandler` was seen starting in `mode=1819239265` but the
     mode never progresses.
-  - Implement `svgMergeAllLayers` / `svgMergeAllLayersFB` (real hardware
-    composes SVG layers to `/dev/fb0` from inside libsvg-layer.so's
-    background `SVG_Layer_Thread`) in an emulator-owned libsvg-layer hook,
-    and route the merged output to the SDL window. This is composition at
-    the framebuffer level (outside both processes) - allowed by AGENTS.md.
+   - Implement `svgMergeAllLayers` / `svgMergeAllLayersFB` (real hardware
+     composes SVG layers to `/dev/fb0` from inside libsvg-layer.so's
+     background `SVG_Layer_Thread`) in an emulator-owned libsvg-layer hook,
+     and route the merged output to the SDL window. This is composition at
+     the framebuffer level (outside both processes) - allowed by AGENTS.md.
+
+## RESOLVED for the popup-background case (commit 782bbce + snapshot refresh)
+
+The gap closed differently than the two options above: prochmi does consume
+an external map through `GUI_GL_OpenGL::mixLayers(LayerCopy*)`, but only
+when its own `GUI_DM_EAManager` state machine runs a full EA show→hide
+cycle. The missing input was procmap's CCA/FI replies, which the emulator
+now injects onto the `GUI_UTIL_Queue` that `clGUIWidgetEngine::bCheckMsgBox`
+polls (`post_lsync_map_announcement` in prochmi.rs):
+SetLayerNames("MAP_View1") → ViewStatusChanged(VISIBLE) → SetView(0,0,800,480).
+That drives the natural `getLayers` → `svgGetLayerByName` (fake handle) →
+`setLayersVisible` flow. The snapshot itself is produced by the natural
+`updateEAHide` state 5 → `GUI_GL_LayerSync::copyLayer` →
+`GUI_GL_LayerCopy::copy`/`performCopy`, which builds a real 800×480 RGBA
+`GUI_GL_Texture` from the map surface copy (`write_svg_surface_status`
+layout: base@0, byte pitch@8 and @0x10 — performCopy divides +0x10 by 4 for
+the width — format enum 1=RGBA@0x0c). `mixLayers` then receives a non-null
+LayerCopy and draws the map under the GUI views; the window shows the map
+behind the popup (verified via `mapI_*`/`mapK_*` captures and
+`EMU_GPU_PROBE_ALPHAS=1`: base/widget layers are alpha-0 outside the art).
+Notes:
+- The emulated hide trigger pokes the EAWStatus slot command + timer-expiry
+  state directly; guest-calling `requestEAHide`/`EAManager::update` from the
+  bCheckMsgBox or DisplayManager::update hooks corrupts the GUI thread
+  (stub-return re-entrancy into an address that is itself hooked →
+  FETCH_PROT into vtable data). Do not reintroduce guest calls from those
+  hooks.
+- The snapshot is frozen after the hide completes; the mixLayers hook
+  re-uploads the live `MAP_SURFACE_BYTES` into the snapshot texture every
+  30 frames via `gpu::upload_rgba_texture`.
+- Remaining: the map is only visible where prochmi's base-layer art is
+  transparent (~5% of the FM-radio popup frame); the live scanout-level
+  compositing of a moving map in other HMI screens is still open, as is the
+  app-level stall where mixLayers stops after ~120-200 frames.
     It sidesteps the need for prochmi to know about the map layer at all.

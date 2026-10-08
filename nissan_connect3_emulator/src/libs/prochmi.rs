@@ -177,6 +177,7 @@ static LSYNC_MAP_STAGE: AtomicU32 = AtomicU32::new(0);
 static LSYNC_EA_MANAGER: AtomicU32 = AtomicU32::new(0);
 static LSYNC_EA_ENTRY: AtomicU32 = AtomicU32::new(0);
 static LSYNC_HIDE_TICKS: AtomicU32 = AtomicU32::new(0);
+static LSYNC_REFRESH_FRAMES: AtomicU32 = AtomicU32::new(0);
 static LSYNC_MSGBOX_TICKS: AtomicU32 = AtomicU32::new(0);
 static GL_LAYER_COPY_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
@@ -2037,6 +2038,29 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
                 if name == "GUI_DM_EAManager::updateEAShow" {
                     LSYNC_EA_MANAGER.store(uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32, Ordering::Relaxed);
                     LSYNC_EA_ENTRY.store(uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32, Ordering::Relaxed);
+                }
+                if name == "GUI_GL_OpenGL::mixLayers"
+                    && LSYNC_MAP_STAGE.load(Ordering::Relaxed) == 99
+                {
+                    // The LayerCopy map snapshot texture is taken once when
+                    // the map layer hides and never refreshed; keep it in sync
+                    // with procmap's live surface so the map animates behind
+                    // the HMI.
+                    let frames = LSYNC_REFRESH_FRAMES.fetch_add(1, Ordering::Relaxed);
+                    if frames % 30 == 0 {
+                        let manager = LSYNC_EA_MANAGER.load(Ordering::Relaxed);
+                        let layer_copy = read_u32(uc, manager + 0x130);
+                        let texture = read_u32(uc, layer_copy);
+                        let tex_name = read_u32(uc, texture);
+                        if let Some(bytes) = crate::gpu::map_surface_snapshot() {
+                            crate::gpu::upload_rgba_texture(
+                                tex_name,
+                                bytes,
+                                SVG_MAP_WIDTH as i32,
+                                SVG_MAP_HEIGHT as i32,
+                            );
+                        }
+                    }
                 }
                 if name == "GUI_GL_LayerSync::requestViewStatus"
                     && uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 == 0

@@ -698,6 +698,48 @@ fn hmi_capture_prefix() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+// Host-side RGBA re-upload of one HMI-context texture (used to keep the
+// LayerSync map snapshot in sync with procmap's live map surface, since the
+// snapshot is taken once when the map layer hides).
+pub fn upload_rgba_texture(name: u32, bytes: Vec<u8>, width: i32, height: i32) {
+    if name == 0 || bytes.len() != (width * height * 4) as usize {
+        return;
+    }
+    if !ensure_gpu_thread() {
+        return;
+    }
+    let Some(sender) = GPU_SENDER.get() else {
+        return;
+    };
+    let (reply_tx, _reply_rx) = mpsc::channel();
+    let _ = sender.send(GpuCommand {
+        target: GpuTarget::Hmi,
+        future: Box::new(move || {
+            unsafe {
+                gl::BindTexture(gl::TEXTURE_2D, name);
+                gl::TexSubImage2D(
+                    gl::TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    width,
+                    height,
+                    gl::RGBA,
+                    gl::UNSIGNED_BYTE,
+                    bytes.as_ptr() as *const _,
+                );
+                drain_host_gl_errors();
+            }
+            GpuOutput::default()
+        }),
+        reply: reply_tx,
+    });
+}
+
+pub fn map_surface_snapshot() -> Option<Vec<u8>> {
+    MAP_SURFACE_BYTES.lock().ok().map(|bytes| bytes.clone())
+}
+
 fn hmi_frame_is_non_black(pixels: &[u8]) -> bool {
     pixels
         .chunks_exact(4)
@@ -846,6 +888,43 @@ fn capture_raw_hmi_before_composite(backend: &mut Backend) {
     }
 }
 
+fn probe_layer_alphas(backend: &Backend) {
+    if std::env::var("EMU_GPU_PROBE_ALPHAS").map(|v| v != "1").unwrap_or(true) {
+        return;
+    }
+    static PROBE_COUNT: AtomicU32 = AtomicU32::new(0);
+    let n = PROBE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n > 600 || n % 60 != 0 {
+        return;
+    }
+    let mut prev = 0i32;
+    unsafe {
+        gl::GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut prev);
+        for guest in [2u32, 3] {
+            let host = resolve_guest_fbo(GpuTarget::Hmi, guest);
+            gl::BindFramebuffer(gl::FRAMEBUFFER, host);
+            for x in [20i32, 400] {
+                let mut px = [0u8; 4];
+                gl::ReadPixels(x, 240, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, px.as_mut_ptr() as *mut _);
+                log::info!(
+                    "GPU: alpha probe n={} hmi_fb={} host={} px({},{})={:02x?}",
+                    n,
+                    guest,
+                    host,
+                    x,
+                    240,
+                    px
+                );
+            }
+        }
+        gl::BindFramebuffer(gl::FRAMEBUFFER, backend.hmi_framebuffer);
+        let mut px = [0u8; 4];
+        gl::ReadPixels(20, 240, 1, 1, gl::RGBA, gl::UNSIGNED_BYTE, px.as_mut_ptr() as *mut _);
+        log::info!("GPU: alpha probe n={} composed default fb px(20,240)={:02x?}", n, px);
+        gl::BindFramebuffer(gl::FRAMEBUFFER, prev as u32);
+    }
+}
+
 fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
     // The swap bookkeeping below reads/renders via framebuffer objects the
     // guest never bound (host window FBO 0, the other target's pixels). Save
@@ -861,6 +940,7 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
             unsafe {
                 gl::Finish();
             }
+            probe_layer_alphas(backend);
             if backend.hmi_framebuffer != 0 {
                 if hmi_capture_prefix().is_some() {
                     capture_raw_hmi_before_composite(backend);
