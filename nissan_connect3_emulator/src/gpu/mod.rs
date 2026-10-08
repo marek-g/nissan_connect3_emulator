@@ -178,16 +178,13 @@ struct Backend {
     hmi_context: sys::SDL_GLContext,
     map_context: sys::SDL_GLContext,
     // Per-target private "default framebuffer" substitutes. Guests issue
-    // glBindFramebuffer(_*, 0) expecting their own surface; we redirect
-    // target==0 to these so nothing ever touches the SDL window except our
-    // final composite blit. Allocated in the matching per-target context so
-    // the IDs live in that target's namespace.
+    // glBindFramebuffer(_*, 0) expecting their own window surface; we bind
+    // these once as each context's initial framebuffer and rewrite guest
+    // binds of 0 to them (see `resolve_guest_fbo`), so nothing ever touches
+    // the SDL window except our final composite blit. Each is allocated in
+    // its own unshared context, so the IDs live in that guest's namespace.
     hmi_framebuffer: u32,
-    hmi_color_texture: u32,
-    hmi_depth_rb: u32,
     map_framebuffer: u32,
-    map_color_texture: u32,
-    map_depth_rb: u32,
     hmi_pixels: Vec<u8>,
     map_pixels: Vec<u8>,
     composite_program: u32,
@@ -477,10 +474,19 @@ fn init_backend() -> Result<Backend, String> {
     // Per-target private default framebuffers. Guests issue
     // glBindFramebuffer(_*, 0) intending "my window surface"; we redirect that
     // to these (see `gl_backend_api`). Rendering stays off-screen; we present a
-    // merged image to the visible SDL window ourselves.
-    let (map_framebuffer, map_color_texture, map_depth_rb) = unsafe {
+    // merged image to the visible SDL window ourselves. Each is also bound ONCE
+    // here as the initial framebuffer of its context - procmap never calls
+    // glBindFramebuffer at all and expects to draw into its window from the
+    // start. After this the backend never touches a guest's framebuffer
+    // binding on context switches; the unshared contexts keep each guest's
+    // binding state private across MakeCurrent, like real EGLDisplay's.
+    let (map_framebuffer, _, _) = unsafe {
         sys::SDL_GL_MakeCurrent(window_raw, map_context);
-        create_default_fbo(800, 480)
+        let default_fbo = create_default_fbo(800, 480);
+        if default_fbo.0 != 0 {
+            gl::BindFramebuffer(gl::FRAMEBUFFER, default_fbo.0);
+        }
+        default_fbo
     };
     if map_framebuffer == 0 {
         log::warn!("GPU: map default FBO incomplete, map compositing disabled");
@@ -490,7 +496,7 @@ fn init_backend() -> Result<Backend, String> {
     let map_pixels = vec![0u8; MAP_SURFACE_SIZE];
     let hmi_pixels = vec![0u8; MAP_SURFACE_SIZE];
 
-    let (hmi_framebuffer, hmi_color_texture, hmi_depth_rb) = unsafe {
+    let (hmi_framebuffer, _, _) = unsafe {
         sys::SDL_GL_MakeCurrent(window_raw, hmi_context);
         create_default_fbo(800, 480)
     };
@@ -585,6 +591,13 @@ fn init_backend() -> Result<Backend, String> {
     if visible {
         let _ = window.gl_swap_window();
     }
+    // Hand the HMI context back to its guest with its private window-surface
+    // stand-in bound (create_default_fbo unbinds to 0 on purpose).
+    if hmi_framebuffer != 0 {
+        unsafe {
+            gl::BindFramebuffer(gl::FRAMEBUFFER, hmi_framebuffer);
+        }
+    }
 
     log::info!(
         "GPU: dedicated SDL/GL backend thread started visible={} map_fbo={} hmi_fbo={} thread={:?}",
@@ -602,11 +615,7 @@ fn init_backend() -> Result<Backend, String> {
         hmi_context,
         map_context,
         hmi_framebuffer,
-        hmi_color_texture,
-        hmi_depth_rb,
         map_framebuffer,
-        map_color_texture,
-        map_depth_rb,
         hmi_pixels,
         map_pixels,
         composite_program,
@@ -672,18 +681,13 @@ fn make_target_current(backend: &mut Backend, target: GpuTarget) {
         return;
     }
 
-    unsafe {
-        match target {
-            GpuTarget::Hmi => {
-                if backend.hmi_framebuffer != 0 {
-                    gl::BindFramebuffer(gl::FRAMEBUFFER, backend.hmi_framebuffer);
-                } else {
-                    gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-                }
-            }
-            GpuTarget::Map => gl::BindFramebuffer(gl::FRAMEBUFFER, backend.map_framebuffer),
-        }
-    }
+    // Do NOT re-bind any framebuffer here. Each context is unshared and
+    // persists its own GL_*_FRAMEBUFFER_BINDING across MakeCurrent, exactly
+    // like the guests' real EGLDisplay contexts. The private default FBO was
+    // bound once at init as the context's initial "window surface"; re-binding
+    // it on every switch clobbered whatever offscreen FBO layer the guest had
+    // bound mid-frame whenever the other process's commands interleaved,
+    // which made the two layers bleed into each other nondeterministically.
     backend.current_target = Some(target);
 }
 
@@ -701,7 +705,7 @@ fn hmi_frame_is_non_black(pixels: &[u8]) -> bool {
 }
 
 fn should_capture_hmi_frame(frame: u32) -> bool {
-    frame < 5 || matches!(frame, 50 | 100 | 200 | 400 | 800)
+    frame < 5 || matches!(frame, 50 | 100 | 200 | 400 | 800 | 2000 | 4000 | 8000)
 }
 
 fn save_hmi_capture(prefix: &str, frame: u32, pixels: &[u8], width: i32, height: i32) {
@@ -1555,9 +1559,15 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             return 1;
         }
         "eglSwapBuffers" => {
+            // Block until the backend has actually presented this frame. The
+            // private default FBO is a single buffer (no double buffering
+            // behind it), so letting the guest run ahead would let its next
+            // frame's glClear land before our ReadPixels captured this one -
+            // a per-run nondeterministic tear. Blocking also paces swaps like
+            // the vsynced window on real hardware.
             let swapped = if ensure_gpu_thread() {
                 let sender = GPU_SENDER.get();
-                let (reply_tx, _reply_rx) = mpsc::channel();
+                let (reply_tx, reply_rx) = mpsc::channel();
                 sender
                     .map(|sender| {
                         sender
@@ -1570,6 +1580,7 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
                                 reply: reply_tx,
                             })
                             .is_ok()
+                            && reply_rx.recv().is_ok()
                     })
                     .unwrap_or(false)
             } else {
