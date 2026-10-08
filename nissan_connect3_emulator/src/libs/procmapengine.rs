@@ -8,7 +8,6 @@ use unicorn_engine::{RegisterARM, Unicorn};
 const ORIGINAL_BASE: u32 = 0x0000_8000;
 const AIL_VSTART_APP_ENTRY: u32 = 0x0065_d664 - ORIGINAL_BASE;
 const APP_NEW_STATE: u32 = 0x0039_0064 - ORIGINAL_BASE;
-const CREATE_DEFAULT_VIEW_FLAG: u32 = 0x0071_5519 - ORIGINAL_BASE;
 const INIT_APP_MAP_ENGINE: u32 = 0x0038_ab50 - ORIGINAL_BASE;
 const INIT_APP_REGISTRY_CHECK: u32 = 0x0038_abE4 - ORIGINAL_BASE;
 const INIT_APP_MAP_GLOBAL_CHECK: u32 = 0x0038_abf4 - ORIGINAL_BASE;
@@ -450,23 +449,6 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             if this == 0 {
                 log::warn!("PROCMAPENGINE: vStartAppEntry called with null app object");
                 return;
-            }
-
-            if !std::env::var_os("EMU_PROCMAPENGINE_CREATE_DEFAULT_VIEW")
-                .is_some_and(|value| value != "0" && !value.is_empty())
-            {
-                let flag = base_address + CREATE_DEFAULT_VIEW_FLAG;
-                if uc.mem_write(flag as u64, &[0u8]).is_ok() {
-                    log::info!(
-                        "PROCMAPENGINE: cleared g_bCreateDefaultView at {:#x} before map startup",
-                        flag
-                    );
-                } else {
-                    log::warn!(
-                        "PROCMAPENGINE: failed to clear g_bCreateDefaultView at {:#x}",
-                        flag
-                    );
-                }
             }
 
             if force_early_active && !APP_STATE_STARTED.swap(true, Ordering::Relaxed) {
