@@ -5,6 +5,7 @@ use sdl2::{sys, EventPump};
 use std::cell::Cell;
 use std::ffi::CString;
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Mutex, Once, OnceLock};
@@ -75,6 +76,7 @@ static GPU_FAILED: AtomicBool = AtomicBool::new(false);
 static GPU_MAKE_CURRENT_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
 static GPU_TARGET_SWITCH_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 static GL_ERROR_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+static HMI_CAPTURE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 struct Backend {
     _sdl: sdl2::Sdl,
@@ -375,12 +377,94 @@ fn make_target_current(backend: &mut Backend, target: GpuTarget) {
     backend.current_target = Some(target);
 }
 
+fn hmi_capture_prefix() -> Option<String> {
+    std::env::var("EMU_GPU_HMI_CAPTURE_PREFIX")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn hmi_frame_is_non_black(pixels: &[u8]) -> bool {
+    pixels
+        .chunks_exact(4)
+        .any(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0)
+}
+
+fn should_capture_hmi_frame(frame: u32) -> bool {
+    frame < 5 || matches!(frame, 50 | 100 | 200 | 400 | 800)
+}
+
+fn save_hmi_capture(prefix: &str, frame: u32, pixels: &[u8], width: i32, height: i32) {
+    let path = format!("{}{:04}.ppm", prefix, frame);
+    let mut file = match std::fs::File::create(&path) {
+        Ok(file) => file,
+        Err(err) => {
+            log::warn!("GPU: failed to create HMI capture {}: {}", path, err);
+            return;
+        }
+    };
+
+    if write!(file, "P6\n{} {}\n255\n", width, height).is_err() {
+        log::warn!("GPU: failed to write HMI capture header {}", path);
+        return;
+    }
+
+    let row_bytes = (width as usize) * 4;
+    for row in (0..height as usize).rev() {
+        for rgba in pixels[row * row_bytes..][..row_bytes].chunks_exact(4) {
+            if file.write_all(&rgba[..3]).is_err() {
+                log::warn!("GPU: failed to write HMI capture pixels {}", path);
+                return;
+            }
+        }
+    }
+    if file.flush().is_err() {
+        log::warn!("GPU: failed to flush HMI capture {}", path);
+        return;
+    }
+
+    log::info!(
+        "GPU: saved HMI capture {} non_black={}",
+        path,
+        hmi_frame_is_non_black(pixels)
+    );
+}
+
+fn capture_hmi_framebuffer(_backend: &mut Backend) {
+    let Some(prefix) = hmi_capture_prefix() else {
+        return;
+    };
+
+    let frame = HMI_CAPTURE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if !should_capture_hmi_frame(frame) {
+        return;
+    }
+
+    let width = MAP_SURFACE_WIDTH as i32;
+    let height = MAP_SURFACE_HEIGHT as i32;
+    let mut pixels = vec![0u8; (width as usize) * (height as usize) * 4];
+    unsafe {
+        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+        gl::ReadPixels(
+            0,
+            0,
+            width,
+            height,
+            gl::RGBA,
+            gl::UNSIGNED_BYTE,
+            pixels.as_mut_ptr() as *mut _,
+        );
+    }
+    save_hmi_capture(&prefix, frame, &pixels, width, height);
+}
+
 fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
     match target {
         GpuTarget::Hmi => {
             unsafe {
                 gl::Finish();
             }
+            capture_hmi_framebuffer(backend);
             let _ = backend.window.gl_swap_window();
         }
         GpuTarget::Map => unsafe {

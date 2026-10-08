@@ -152,6 +152,7 @@ static GL_LAYER_COPY_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static HMI_MAINLOOP_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
 static HMI_FIS_INIT_DONE: AtomicBool = AtomicBool::new(false);
 static HMI_VIEW_CLEAN_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
+static HMI_VIEW_DIRTY_FORCE_COUNT: AtomicU32 = AtomicU32::new(0);
 static HMI_MAINLOOP_TRACE_ARMED: AtomicBool = AtomicBool::new(false);
 static HMI_MAINLOOP_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
@@ -1641,7 +1642,11 @@ fn force_hmi_mainloop_display_update(unicorn: &mut Unicorn<'_, Context>) {
     }
 }
 
-fn suppress_hmi_view_dirty_regions(unicorn: &mut Unicorn<'_, Context>) {
+fn force_hmi_view_draw_regions(unicorn: &mut Unicorn<'_, Context>) {
+    if HMI_VIEW_DIRTY_FORCE_COUNT.load(Ordering::Relaxed) >= 120 {
+        return;
+    }
+
     let base = PROCHMI_BASE.load(Ordering::Relaxed);
     if base == 0 {
         return;
@@ -1651,18 +1656,27 @@ fn suppress_hmi_view_dirty_regions(unicorn: &mut Unicorn<'_, Context>) {
     if menu_manager == 0 {
         return;
     }
+
     for index in 0..4u32 {
         let widget = read_u32(unicorn, menu_manager + index * 4);
         let view = read_u32(unicorn, widget + 0x28);
         let draw_context = read_u32(unicorn, view + 0x40);
         if widget != 0 && view != 0 && draw_context != 0 {
-            let _ = write_u32(unicorn, draw_context + 0xb8, 0);
+            let _ = write_u8(unicorn, draw_context + 0x28, 0);
+            if read_u32(unicorn, draw_context + 0xb8) == 0 {
+                let _ = write_u32(unicorn, draw_context + 0xb8, 1);
+            }
         }
+    }
+
+    let forced = HMI_VIEW_DIRTY_FORCE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if forced < 10 {
+        log::info!("PROCHMI: forced HMI view draw regions count={}", forced);
     }
 }
 
 fn trace_hmi_view_draw_contexts(unicorn: &mut Unicorn<'_, Context>) {
-    suppress_hmi_view_dirty_regions(unicorn);
+    force_hmi_view_draw_regions(unicorn);
     let base = PROCHMI_BASE.load(Ordering::Relaxed);
     if base == 0 {
         return;
