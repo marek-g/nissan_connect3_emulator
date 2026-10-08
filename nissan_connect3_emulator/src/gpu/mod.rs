@@ -77,6 +77,98 @@ static GPU_MAKE_CURRENT_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
 static GPU_TARGET_SWITCH_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 static GL_ERROR_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 static HMI_CAPTURE_COUNT: AtomicU32 = AtomicU32::new(0);
+static HMI_RAW_CAPTURE_COUNT: AtomicU32 = AtomicU32::new(0);
+static HMI_COMPOSITE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+
+// IDs of the per-target private "default framebuffer" substitutes, published
+// by the backend thread once so the guest-side dispatch (running on guest
+// threads) can rewrite glBindFramebuffer(_*, 0) and shadow
+// glGetIntegerv(GL_FRAMEBUFFER_BINDING) without round-tripping a command.
+static HMI_DEFAULT_FBO: AtomicU32 = AtomicU32::new(0);
+static MAP_DEFAULT_FBO: AtomicU32 = AtomicU32::new(0);
+
+fn private_default_fbo(target: GpuTarget) -> u32 {
+    match target {
+        GpuTarget::Hmi => HMI_DEFAULT_FBO.load(Ordering::Acquire),
+        GpuTarget::Map => MAP_DEFAULT_FBO.load(Ordering::Acquire),
+    }
+}
+
+const GL_FRAMEBUFFER_BINDING: u32 = 0x8ca6;
+const GL_READ_FRAMEBUFFER_BINDING: u32 = 0x8caa;
+
+// Guest processes occasionally bind framebuffer names they never obtained
+// from glGenFramebuffers (prochmi binds fb 2, which is the same numeric name
+// as our HMI private default FBO). With unshared contexts the host would
+// happily hand that name to whichever guest binds it first, aliasing the two
+// tenants' objects. This table gives such a colliding guest name its own
+// fresh host object per target, so each process keeps a private ID space.
+fn fbo_aliases() -> &'static Mutex<HashMap<(u8, u32), u32>> {
+    static ALIASES: OnceLock<Mutex<HashMap<(u8, u32), u32>>> = OnceLock::new();
+    ALIASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn target_key(target: GpuTarget) -> u8 {
+    match target {
+        GpuTarget::Hmi => 0,
+        GpuTarget::Map => 1,
+    }
+}
+
+// Translate a guest framebuffer name to its host name. Runs on the backend
+// thread with the owning target's context current.
+unsafe fn resolve_guest_fbo(target: GpuTarget, guest_id: u32) -> u32 {
+    if guest_id == 0 {
+        let private = private_default_fbo(target);
+        return if private != 0 { private } else { 0 };
+    }
+    let key = (target_key(target), guest_id);
+    let private = private_default_fbo(target);
+    let mut aliases = match fbo_aliases().lock() {
+        Ok(map) => map,
+        Err(_) => return guest_id,
+    };
+    if let Some(host) = aliases.get(&key) {
+        return *host;
+    }
+    if guest_id == private {
+        let mut host = 0u32;
+        gl::GenFramebuffers(1, &mut host);
+        if host != 0 {
+            aliases.insert(key, host);
+            log::info!(
+                "GPU: fbo alias target={:?} guest={} host={}",
+                target,
+                guest_id,
+                host
+            );
+        }
+        return host;
+    }
+    guest_id
+}
+
+// Reverse map a host framebuffer binding back to what the owning guest
+// believes is bound (0 for the private default, the alias name when the bound
+// object stands in for a guessed guest name).
+fn guest_framebinding(target: GpuTarget, host_id: u32) -> u32 {
+    if host_id == 0 {
+        return 0;
+    }
+    let private = private_default_fbo(target);
+    if private != 0 && host_id == private {
+        return 0;
+    }
+    if let Ok(aliases) = fbo_aliases().lock() {
+        for ((key_target, guest_id), host) in aliases.iter() {
+            if *host == host_id && *key_target == target_key(target) {
+                return *guest_id;
+            }
+        }
+    }
+    host_id
+}
+
 
 struct Backend {
     _sdl: sdl2::Sdl,
@@ -85,9 +177,23 @@ struct Backend {
     window_raw: *mut sys::SDL_Window,
     hmi_context: sys::SDL_GLContext,
     map_context: sys::SDL_GLContext,
+    // Per-target private "default framebuffer" substitutes. Guests issue
+    // glBindFramebuffer(_*, 0) expecting their own surface; we redirect
+    // target==0 to these so nothing ever touches the SDL window except our
+    // final composite blit. Allocated in the matching per-target context so
+    // the IDs live in that target's namespace.
+    hmi_framebuffer: u32,
+    hmi_color_texture: u32,
+    hmi_depth_rb: u32,
     map_framebuffer: u32,
-    map_renderbuffer: u32,
+    map_color_texture: u32,
+    map_depth_rb: u32,
+    hmi_pixels: Vec<u8>,
     map_pixels: Vec<u8>,
+    composite_program: u32,
+    composite_texture: u32,
+    composite_vbo: u32,
+    composite_pos_loc: i32,
     current_target: Option<GpuTarget>,
     events: Option<EventPump>,
 }
@@ -206,6 +312,88 @@ fn publish_map_surface_pixels(pixels: &[u8]) {
     }
 }
 
+unsafe fn compile_helper_shader(kind: u32, src: *const u8) -> u32 {
+    let shader = gl::CreateShader(kind);
+    gl::ShaderSource(shader, 1, &src, core::ptr::null());
+    gl::CompileShader(shader);
+    let mut ok = 0i32;
+    gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut ok);
+    if ok != gl::TRUE as i32 {
+        let mut info = [0u8; 512];
+        gl::GetShaderInfoLog(shader, info.len() as i32, core::ptr::null_mut(), info.as_mut_ptr());
+        let msg = std::ffi::CStr::from_ptr(info.as_ptr() as *const core::ffi::c_char)
+            .to_string_lossy()
+            .into_owned();
+        log::warn!(
+            "GPU: composite shader compile failed kind={:#x}: {}",
+            kind,
+            msg.trim()
+        );
+        gl::DeleteShader(shader);
+        return 0;
+    }
+    shader
+}
+
+// Build an off-screen (RGBA8 colour texture + DEPTH_COMPONENT16 renderbuffer)
+// framebuffer. Used for both the HMI and Map private "default framebuffer"
+// substitutes; each lives in the owning target's context so IDs stay in that
+// guest's private namespace. Must be called with the target context current.
+unsafe fn create_default_fbo(width: i32, height: i32) -> (u32, u32, u32) {
+    let mut fbo = 0u32;
+    let mut color = 0u32;
+    let mut depth_rb = 0u32;
+    gl::GenFramebuffers(1, &mut fbo);
+    gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
+
+    gl::GenTextures(1, &mut color);
+    gl::BindTexture(gl::TEXTURE_2D, color);
+    gl::TexImage2D(
+        gl::TEXTURE_2D,
+        0,
+        gl::RGBA as i32,
+        width,
+        height,
+        0,
+        gl::RGBA,
+        gl::UNSIGNED_BYTE,
+        core::ptr::null(),
+    );
+    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::NEAREST as i32);
+    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::NEAREST as i32);
+    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
+    gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+    gl::FramebufferTexture2D(
+        gl::FRAMEBUFFER,
+        gl::COLOR_ATTACHMENT0,
+        gl::TEXTURE_2D,
+        color,
+        0,
+    );
+
+    gl::GenRenderbuffers(1, &mut depth_rb);
+    gl::BindRenderbuffer(gl::RENDERBUFFER, depth_rb);
+    gl::RenderbufferStorage(gl::RENDERBUFFER, gl::DEPTH_COMPONENT16, width, height);
+    gl::FramebufferRenderbuffer(
+        gl::FRAMEBUFFER,
+        gl::DEPTH_ATTACHMENT,
+        gl::RENDERBUFFER,
+        depth_rb,
+    );
+
+    gl::BindTexture(gl::TEXTURE_2D, 0);
+    gl::BindRenderbuffer(gl::RENDERBUFFER, 0);
+    if gl::CheckFramebufferStatus(gl::FRAMEBUFFER) != gl::FRAMEBUFFER_COMPLETE {
+        gl::DeleteFramebuffers(1, &fbo);
+        gl::DeleteTextures(1, &color);
+        gl::DeleteRenderbuffers(1, &depth_rb);
+        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+        return (0, 0, 0);
+    }
+    gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+    (fbo, color, depth_rb)
+}
+
 fn init_backend() -> Result<Backend, String> {
     let visible = gpu_backend_visible();
     let sdl = sdl2::init()?;
@@ -213,6 +401,13 @@ fn init_backend() -> Result<Backend, String> {
 
     {
         let attrs = video.gl_attr();
+        // Guests (procmap, prochmi) compile GLSL ES 1.00 shaders against
+        // GLES 2 semantics. NVIDIA's ES profile honours that; the desktop
+        // Compatibility profile accepts the source but changes precision and
+        // built-in behaviour, which visibly breaks prochmi's HMI (missing
+        // blue buttons, popups). Keep the ES profile and do the SVG-layer
+        // merge with a GLES-2 fullscreen-quad shader instead of the fixed-
+        // function glDrawPixels path (ES has no DrawPixels at all).
         attrs.set_context_profile(sdl2::video::GLProfile::GLES);
         attrs.set_context_version(2, 0);
     }
@@ -243,11 +438,35 @@ fn init_backend() -> Result<Backend, String> {
     }
     gl::load_with(|name| video.gl_get_proc_address(name) as *const _);
     let _ = video.gl_set_swap_interval(1);
+    unsafe {
+        let version = gl::GetString(gl::VERSION);
+        let renderer = gl::GetString(gl::RENDERER);
+        let v = if version.is_null() {
+            "<null>".to_string()
+        } else {
+            std::ffi::CStr::from_ptr(version as *const core::ffi::c_char)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let r = if renderer.is_null() {
+            "<null>".to_string()
+        } else {
+            std::ffi::CStr::from_ptr(renderer as *const core::ffi::c_char)
+                .to_string_lossy()
+                .into_owned()
+        };
+        log::info!("GPU: hmi_context GL version='{}' renderer='{}'", v, r);
+    }
 
     unsafe {
+        // Real target has two isolated EGLDisplay+context pairs (procmap owns
+        // one, prochmi owns another). Their GL object ID spaces do NOT
+        // overlap: procmap's FBO 3 and prochmi's FBO 3 are different objects.
+        // We must not share resources between our contexts either, otherwise
+        // glGen* returns IDs from a common pool and the two guests collide.
         sys::SDL_GL_SetAttribute(
             sys::SDL_GLattr::SDL_GL_SHARE_WITH_CURRENT_CONTEXT,
-            1,
+            0,
         );
     }
     let map_context = unsafe { sys::SDL_GL_CreateContext(window_raw) };
@@ -255,28 +474,103 @@ fn init_backend() -> Result<Backend, String> {
         return Err("SDL_GL_CreateContext(map) returned null".to_string());
     }
 
-    let mut map_framebuffer = 0u32;
-    let mut map_renderbuffer = 0u32;
-    unsafe {
+    // Per-target private default framebuffers. Guests issue
+    // glBindFramebuffer(_*, 0) intending "my window surface"; we redirect that
+    // to these (see `gl_backend_api`). Rendering stays off-screen; we present a
+    // merged image to the visible SDL window ourselves.
+    let (map_framebuffer, map_color_texture, map_depth_rb) = unsafe {
         sys::SDL_GL_MakeCurrent(window_raw, map_context);
-        gl::GenFramebuffers(1, &mut map_framebuffer);
-        gl::BindFramebuffer(gl::FRAMEBUFFER, map_framebuffer);
-        gl::GenRenderbuffers(1, &mut map_renderbuffer);
-        gl::BindRenderbuffer(gl::RENDERBUFFER, map_renderbuffer);
-        gl::RenderbufferStorage(gl::RENDERBUFFER, gl::RGBA8, 800, 480);
-        gl::FramebufferRenderbuffer(
-            gl::FRAMEBUFFER,
-            gl::COLOR_ATTACHMENT0,
-            gl::RENDERBUFFER,
-            map_renderbuffer,
-        );
-        if gl::CheckFramebufferStatus(gl::FRAMEBUFFER) != gl::FRAMEBUFFER_COMPLETE {
-            map_framebuffer = 0;
-        }
-        sys::SDL_GL_MakeCurrent(window_raw, hmi_context);
+        create_default_fbo(800, 480)
+    };
+    if map_framebuffer == 0 {
+        log::warn!("GPU: map default FBO incomplete, map compositing disabled");
     }
+    MAP_DEFAULT_FBO.store(map_framebuffer, Ordering::Release);
 
     let map_pixels = vec![0u8; MAP_SURFACE_SIZE];
+    let hmi_pixels = vec![0u8; MAP_SURFACE_SIZE];
+
+    let (hmi_framebuffer, hmi_color_texture, hmi_depth_rb) = unsafe {
+        sys::SDL_GL_MakeCurrent(window_raw, hmi_context);
+        create_default_fbo(800, 480)
+    };
+    if hmi_framebuffer == 0 {
+        log::warn!("GPU: hmi default FBO incomplete, HMI compositing disabled");
+    }
+    HMI_DEFAULT_FBO.store(hmi_framebuffer, Ordering::Release);
+
+    // GLES 2 composite pipeline: on every prochmi swap we upload the CPU
+    // merged (hmi-over-map) RGBA buffer as a texture and draw a fullscreen
+    // quad to the window. GLES 2 has no glDrawPixels and no fixed-function
+    // pipeline, so a minimal shader is required.
+    let mut composite_program = 0u32;
+    let mut composite_texture = 0u32;
+    let mut composite_vbo = 0u32;
+    let mut composite_pos_loc = -1i32;
+    unsafe {
+        sys::SDL_GL_MakeCurrent(window_raw, hmi_context);
+        let vs_src = b"attribute vec2 a_pos;\
+            varying vec2 v_uv;\
+            void main() { v_uv = a_pos * 0.5 + 0.5; \
+            gl_Position = vec4(a_pos, 0.0, 1.0); }\0";
+        let fs_src = b"precision mediump float;\
+            varying vec2 v_uv;\
+            uniform sampler2D u_tex;\
+            void main() { gl_FragColor = texture2D(u_tex, v_uv); }\0";
+        let vs = compile_helper_shader(gl::VERTEX_SHADER, vs_src.as_ptr());
+        let fs = compile_helper_shader(gl::FRAGMENT_SHADER, fs_src.as_ptr());
+        if vs != 0 && fs != 0 {
+            let prog = gl::CreateProgram();
+            gl::AttachShader(prog, vs);
+            gl::AttachShader(prog, fs);
+            gl::BindAttribLocation(prog, 0, b"a_pos\0".as_ptr());
+            gl::LinkProgram(prog);
+            let mut ok = 0i32;
+            gl::GetProgramiv(prog, gl::LINK_STATUS, &mut ok);
+            if ok == gl::TRUE as i32 {
+                composite_program = prog;
+                composite_pos_loc = 0;
+            } else {
+                log::warn!("GPU: composite shader link failed; HMI blit disabled");
+            }
+            gl::DeleteShader(vs);
+            gl::DeleteShader(fs);
+        } else {
+            log::warn!("GPU: composite shader compile failed; HMI blit disabled");
+        }
+        if composite_program != 0 {
+            gl::GenTextures(1, &mut composite_texture);
+            gl::BindTexture(gl::TEXTURE_2D, composite_texture);
+            gl::TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA as i32,
+                MAP_SURFACE_WIDTH as i32,
+                MAP_SURFACE_HEIGHT as i32,
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                core::ptr::null(),
+            );
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+            let quad: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+            gl::GenBuffers(1, &mut composite_vbo);
+            gl::BindBuffer(gl::ARRAY_BUFFER, composite_vbo);
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
+                (quad.len() * core::mem::size_of::<f32>()) as isize,
+                quad.as_ptr() as *const core::ffi::c_void,
+                gl::STATIC_DRAW,
+            );
+            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+        }
+        gl::BindTexture(gl::TEXTURE_2D, 0);
+        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+    }
+
     let events = if visible {
         Some(sdl.event_pump()?)
     } else {
@@ -293,9 +587,10 @@ fn init_backend() -> Result<Backend, String> {
     }
 
     log::info!(
-        "GPU: dedicated SDL/GL backend thread started visible={} map_fbo={} thread={:?}",
+        "GPU: dedicated SDL/GL backend thread started visible={} map_fbo={} hmi_fbo={} thread={:?}",
         visible,
         map_framebuffer,
+        hmi_framebuffer,
         std::thread::current().id()
     );
 
@@ -306,9 +601,18 @@ fn init_backend() -> Result<Backend, String> {
         window_raw,
         hmi_context,
         map_context,
+        hmi_framebuffer,
+        hmi_color_texture,
+        hmi_depth_rb,
         map_framebuffer,
-        map_renderbuffer,
+        map_color_texture,
+        map_depth_rb,
+        hmi_pixels,
         map_pixels,
+        composite_program,
+        composite_texture,
+        composite_vbo,
+        composite_pos_loc,
         current_target: Some(GpuTarget::Hmi),
         events,
     })
@@ -370,7 +674,13 @@ fn make_target_current(backend: &mut Backend, target: GpuTarget) {
 
     unsafe {
         match target {
-            GpuTarget::Hmi => gl::BindFramebuffer(gl::FRAMEBUFFER, 0),
+            GpuTarget::Hmi => {
+                if backend.hmi_framebuffer != 0 {
+                    gl::BindFramebuffer(gl::FRAMEBUFFER, backend.hmi_framebuffer);
+                } else {
+                    gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+                }
+            }
             GpuTarget::Map => gl::BindFramebuffer(gl::FRAMEBUFFER, backend.map_framebuffer),
         }
     }
@@ -458,11 +768,101 @@ fn capture_hmi_framebuffer(_backend: &mut Backend) {
     save_hmi_capture(&prefix, frame, &pixels, width, height);
 }
 
+// Diagnostic: read the HMI offscreen framebuffer (prochmi's raw draw) to a
+// `<prefix>_raw_<n>.ppm` before compositing, so we can see what prochmi
+// actually drew (including its alpha channel behaviour) versus what the
+// final composited window frame shows.
+fn capture_raw_hmi_before_composite(backend: &mut Backend) {
+    let Some(prefix) = hmi_capture_prefix() else {
+        return;
+    };
+    let frame = HMI_RAW_CAPTURE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if !should_capture_hmi_frame(frame) {
+        return;
+    }
+    unsafe {
+        gl::BindFramebuffer(gl::FRAMEBUFFER, backend.hmi_framebuffer);
+        gl::ReadPixels(
+            0,
+            0,
+            MAP_SURFACE_WIDTH as i32,
+            MAP_SURFACE_HEIGHT as i32,
+            gl::RGBA,
+            gl::UNSIGNED_BYTE,
+            backend.hmi_pixels.as_mut_ptr() as *mut _,
+        );
+        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+    }
+    let path = format!("{}_raw_{:04}.ppm", prefix, frame);
+    let count = frame;
+    if count < 5 {
+        let mut alpha_hist = [0u32; 8];
+        for rgba in backend.hmi_pixels.chunks_exact(4) {
+            let a = rgba[3];
+            let bucket = if a == 0 {
+                0
+            } else if a == 255 {
+                7
+            } else {
+                1 + ((a as usize - 1) * 6) / 254
+            };
+            alpha_hist[bucket] += 1;
+        }
+        log::info!(
+            "GPU: hmi_raw frame={} a0={} a1_63={} a64_127={} a128_191={} a192_254={} a255={}",
+            count,
+            alpha_hist[0],
+            alpha_hist[1],
+            alpha_hist[2],
+            alpha_hist[3],
+            alpha_hist[4] + alpha_hist[5],
+            alpha_hist[6] + alpha_hist[7],
+        );
+    }
+    let mut file = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    if write!(
+        file,
+        "P6\n{} {}\n255\n",
+        MAP_SURFACE_WIDTH, MAP_SURFACE_HEIGHT
+    )
+    .is_err()
+    {
+        return;
+    }
+    let row_bytes = (MAP_SURFACE_WIDTH as usize) * 4;
+    for row in (0..MAP_SURFACE_HEIGHT as usize).rev() {
+        for rgba in backend.hmi_pixels[row * row_bytes..][..row_bytes].chunks_exact(4) {
+            if file.write_all(&rgba[..3]).is_err() {
+                return;
+            }
+        }
+    }
+}
+
 fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
+    // The swap bookkeeping below reads/renders via framebuffer objects the
+    // guest never bound (host window FBO 0, the other target's pixels). Save
+    // whatever the guest had bound and hand it back untouched so its own
+    // GL_FRAMEBUFFER_BINDING state is unaffected by presenting a frame.
+    let mut guest_fbo_raw = 0i32;
+    unsafe {
+        gl::GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut guest_fbo_raw);
+    }
+    let guest_fbo = guest_fbo_raw as u32;
     match target {
         GpuTarget::Hmi => {
             unsafe {
                 gl::Finish();
+            }
+            if backend.hmi_framebuffer != 0 {
+                if hmi_capture_prefix().is_some() {
+                    capture_raw_hmi_before_composite(backend);
+                }
+                composite_hmi_over_map(backend);
+                blit_hmi_pixels_to_window(backend);
             }
             capture_hmi_framebuffer(backend);
             let _ = backend.window.gl_swap_window();
@@ -479,8 +879,151 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
                 backend.map_pixels.as_mut_ptr() as *mut _,
             );
             publish_map_surface_pixels(&backend.map_pixels);
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
         },
+    }
+    unsafe {
+        gl::BindFramebuffer(gl::FRAMEBUFFER, guest_fbo);
+    }
+}
+
+// Merge SVG layers into the HMI frame the way libsvg-layer's
+// svgMergeAllLayersFB does on real hardware: procmap's map layer sits below,
+// prochmi's HMI layer is blended on top. The Atlas-VI display composites
+// graphics layers with a black colorkey (libsvg-layer's per-layer
+// ColorKey.Enable/Value - no guest ever calls svgSetLayerColorkey, the
+// display stack owns it), which is why prochmi is allowed to clear its GL
+// surface to fully opaque black: pure-black pixels are the "hole" through
+// which the map layer shows, and only the widget pixels occlude it. Pixels
+// with partial alpha still go through a straight alpha blend.
+fn composite_hmi_over_map(backend: &mut Backend) {
+    unsafe {
+        gl::BindFramebuffer(gl::FRAMEBUFFER, backend.hmi_framebuffer);
+        gl::ReadPixels(
+            0,
+            0,
+            MAP_SURFACE_WIDTH as i32,
+            MAP_SURFACE_HEIGHT as i32,
+            gl::RGBA,
+            gl::UNSIGNED_BYTE,
+            backend.hmi_pixels.as_mut_ptr() as *mut _,
+        );
+        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+    }
+    if backend.map_pixels.len() != backend.hmi_pixels.len() {
+        return;
+    }
+    let mut opaque_count = 0u32;
+    let mut transparent_count = 0u32;
+    let mut mixed_count = 0u32;
+    let mut keyed_count = 0u32;
+    for px in backend
+        .hmi_pixels
+        .chunks_exact_mut(4)
+        .zip(backend.map_pixels.chunks_exact(4))
+    {
+        let (hmi, map) = (px.0, px.1);
+        let a = hmi[3] as u16;
+        if a == 255 {
+            if hmi[0] | hmi[1] | hmi[2] == 0 {
+                keyed_count += 1;
+                hmi[0] = map[0];
+                hmi[1] = map[1];
+                hmi[2] = map[2];
+                continue;
+            }
+            opaque_count += 1;
+            continue;
+        }
+        if a == 0 {
+            transparent_count += 1;
+            hmi[0] = map[0];
+            hmi[1] = map[1];
+            hmi[2] = map[2];
+            hmi[3] = 255;
+            continue;
+        }
+        mixed_count += 1;
+        let inv = 255 - a;
+        for c in 0..3 {
+            hmi[c] = ((a * hmi[c] as u16 + inv * map[c] as u16) / 255) as u8;
+        }
+        hmi[3] = 255;
+    }
+    let count = HMI_COMPOSITE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < 20 {
+        log::info!(
+            "GPU: HMI composite frame={} opaque={} keyed_black={} transparent={} mixed={} map_first_px={}",
+            count,
+            opaque_count,
+            keyed_count,
+            transparent_count,
+            mixed_count,
+            if backend.map_pixels.len() >= 4 {
+                format!(
+                    "({},{},{},{})",
+                    backend.map_pixels[0],
+                    backend.map_pixels[1],
+                    backend.map_pixels[2],
+                    backend.map_pixels[3]
+                )
+            } else {
+                "<empty>".to_string()
+            },
+        );
+    }
+}
+
+// Present the CPU-composited 800x480 RGBA `backend.hmi_pixels` to the SDL
+// window. GLES 2 has no glDrawPixels / fixed-function pipeline, so we upload
+// the pixels to a texture and draw a fullscreen quad with our helper shader.
+fn blit_hmi_pixels_to_window(backend: &mut Backend) {
+    if backend.composite_program == 0 {
+        return;
+    }
+    let mut draw_w = 800i32;
+    let mut draw_h = 480i32;
+    unsafe {
+        sys::SDL_GL_GetDrawableSize(backend.window_raw, &mut draw_w, &mut draw_h);
+    }
+    unsafe {
+        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+        gl::Viewport(0, 0, draw_w.max(1), draw_h.max(1));
+        gl::Disable(gl::BLEND);
+        gl::Disable(gl::DEPTH_TEST);
+        gl::Disable(gl::CULL_FACE);
+        gl::UseProgram(backend.composite_program);
+        gl::ActiveTexture(gl::TEXTURE0);
+        gl::BindTexture(gl::TEXTURE_2D, backend.composite_texture);
+        gl::TexImage2D(
+            gl::TEXTURE_2D,
+            0,
+            gl::RGBA as i32,
+            MAP_SURFACE_WIDTH as i32,
+            MAP_SURFACE_HEIGHT as i32,
+            0,
+            gl::RGBA,
+            gl::UNSIGNED_BYTE,
+            backend.hmi_pixels.as_ptr() as *const core::ffi::c_void,
+        );
+        let loc = gl::GetUniformLocation(backend.composite_program, b"u_tex\0".as_ptr());
+        if loc >= 0 {
+            gl::Uniform1i(loc, 0);
+        }
+        gl::BindBuffer(gl::ARRAY_BUFFER, backend.composite_vbo);
+        gl::EnableVertexAttribArray(backend.composite_pos_loc as u32);
+        gl::VertexAttribPointer(
+            backend.composite_pos_loc as u32,
+            2,
+            gl::FLOAT,
+            gl::FALSE,
+            0,
+            core::ptr::null(),
+        );
+        gl::DrawArrays(gl::TRIANGLE_STRIP, 0, 4);
+        gl::DisableVertexAttribArray(backend.composite_pos_loc as u32);
+        gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+        gl::BindTexture(gl::TEXTURE_2D, 0);
+        gl::UseProgram(0);
     }
 }
 
@@ -1491,6 +2034,53 @@ fn route_gen(unicorn: &mut Unicorn<'_, Context>, kind: GenKind) -> u32 {
     0
 }
 
+fn route_delete_framebuffers(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+    let count = ureg(unicorn, RegisterARM::R0).min(4096) as i32;
+    let ptr = ureg(unicorn, RegisterARM::R1);
+    if count <= 0 || ptr == 0 {
+        return 0;
+    }
+    let ids = read_u32_array(unicorn, ptr, count as usize);
+    let gpu_target = current_gpu_target();
+    gpu_void_clear(move || unsafe {
+        let key_target = target_key(gpu_target);
+        let private = private_default_fbo(gpu_target);
+        let mut host_ids: Vec<u32> = Vec::with_capacity(ids.len());
+        let mut dropped: Vec<(u8, u32)> = Vec::new();
+        for guest_id in ids {
+            if guest_id == 0 {
+                continue;
+            }
+            let key = (key_target, guest_id);
+            let host = if let Ok(aliases) = fbo_aliases().lock() {
+                aliases.get(&key).copied()
+            } else {
+                None
+            };
+            match host {
+                Some(host) => {
+                    host_ids.push(host);
+                    dropped.push(key);
+                }
+                None => {
+                    if guest_id != private {
+                        host_ids.push(guest_id);
+                    }
+                }
+            }
+        }
+        if let Ok(mut aliases) = fbo_aliases().lock() {
+            for key in dropped {
+                aliases.remove(&key);
+            }
+        }
+        if !host_ids.is_empty() {
+            gl::DeleteFramebuffers(host_ids.len() as i32, host_ids.as_ptr());
+        }
+    });
+    0
+}
+
 fn route_delete(unicorn: &mut Unicorn<'_, Context>, kind: DeleteKind) -> u32 {
     let count = ureg(unicorn, RegisterARM::R0).min(4096) as i32;
     let ptr = ureg(unicorn, RegisterARM::R1);
@@ -1725,11 +2315,13 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
             return Some(0);
         }
         "glBindFramebuffer" => {
-            gpu_void_v2(
-                gl::BindFramebuffer,
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-            );
+            let fbo_target = ureg(unicorn, RegisterARM::R0);
+            let guest_fb = ureg(unicorn, RegisterARM::R1);
+            let gpu_target = current_gpu_target();
+            gpu_void_clear(move || unsafe {
+                let host_fb = resolve_guest_fbo(gpu_target, guest_fb);
+                gl::BindFramebuffer(fbo_target, host_fb);
+            });
             return Some(0);
         }
         "glBindRenderbuffer" => {
@@ -1956,7 +2548,7 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
         "glGenRenderbuffers" => return Some(route_gen(unicorn, GenKind::Renderbuffer)),
         "glGenTextures" => return Some(route_gen(unicorn, GenKind::Texture)),
         "glDeleteBuffers" => return Some(route_delete(unicorn, DeleteKind::Buffer)),
-        "glDeleteFramebuffers" => return Some(route_delete(unicorn, DeleteKind::Framebuffer)),
+        "glDeleteFramebuffers" => return Some(route_delete_framebuffers(unicorn)),
         "glDeleteRenderbuffers" => return Some(route_delete(unicorn, DeleteKind::Renderbuffer)),
         "glDeleteTextures" => return Some(route_delete(unicorn, DeleteKind::Texture)),
         "glGetAttribLocation" => {
@@ -1985,6 +2577,16 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
             let pname = ureg(unicorn, RegisterARM::R0);
             let out = ureg(unicorn, RegisterARM::R1);
             if let Some(value) = gpu_get_integerv(pname) {
+                // Keep the "default framebuffer is name 0" illusion intact:
+                // a bind the guest made as 0 landed on its private default
+                // FBO, and a guessed name may have been re-pointed at a fresh
+                // host object. Report what the guest thinks it bound.
+                let value = match pname {
+                    GL_FRAMEBUFFER_BINDING | GL_READ_FRAMEBUFFER_BINDING => {
+                        guest_framebinding(current_gpu_target(), value)
+                    }
+                    _ => value,
+                };
                 write_u32(unicorn, out, value);
             }
             return Some(0);

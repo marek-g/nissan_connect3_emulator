@@ -111,7 +111,44 @@ to avoid is reintroducing any direct read/write of another process' guest memory
   libosal hooks. Real libail handles everything once the queue has the right
   messages on it.
 
-## SVG layer composition between procmapengine and prochmi is not wired
+## GPU display model composites the Map and HMI layers (fixed)
+
+- **Locations:** `nissan_connect3_emulator/src/gpu/mod.rs`.
+- **Problem (fixed):** both guests ran against two *shared* GL contexts
+  (`SDL_GL_SHARE_WITH_CURRENT_CONTEXT=1`), so `glGen*` handed IDs out of one
+  common pool and prochmi's and procmap's objects were interchangeable. The
+  HMI drew straight into the SDL window (framebuffer 0 of the shared
+  namespace) while the Map target got an FBO bound only at context-switch
+  time; any explicit `glBindFramebuffer(_*, 0)` from a guest escaped to the
+  window and trampled the other layer. Nothing was ever composed.
+- **Fix:** the two contexts are created unshared, so each guest has a private
+  ID space (both now legitimately own e.g. FBO 1). Each target gets its own
+  private off-screen "default framebuffer" (RGBA8 colour texture +
+  DEPTH_COMPONENT16 renderbuffer); `glBindFramebuffer(_*, 0)` from a guest is
+  rewritten to that target's private FBO, and
+  `glGetIntegerv(GL_*_FRAMEBUFFER_BINDING)` reports 0 back so guests keep the
+  illusion of a default surface. Guest names that collide with the private
+  FBO's numeric ID are re-pointed at a fresh host object through a per-target
+  alias table (`glBindFramebuffer`/`glDeleteFramebuffers` translate). On
+  eglSwapBuffers the GPU backend keeps each target's pixels private: Map
+  swaps ReadPixels the Map surface into `MAP_SURFACE_BYTES`; HMI swaps
+  ReadPixels the HMI surface, CPU-composites it over the latest Map pixels,
+  and presents the merged 800x480 image to the SDL window with a GLES-2
+  fullscreen-quad shader (ES has no glDrawPixels). The merge treats exact
+  black HMI pixels as a colorkey hole (the Atlas-VI display composites
+  graphics layers with the per-layer ColorKey that libsvg-layer dumps show;
+  no guest calls `svgSetLayerColorkey`, the display stack owns it - which is
+  why prochmi legally clears to opaque black), partial alpha still blends.
+  Result: at boot the window shows procmapengine's map layer with prochmi's
+  compass/scale-strip widgets on top.
+- **Remaining gap:** this composes at the emulator display level. The
+  libsvg-layer registry is still not shared between processes and prochmi's
+  `GUI_GL_OpenGL::mixLayers` layer list still does not know about
+  `MAP_View1`; if prochmi later starts drawing its map-widget placeholder
+  (opaque grey) the colorkey hole will need to become a real region/layer
+  model. Historical notes on that gap follow.
+
+## SVG layer composition between procmapengine and prochmi is not wired (historical)
 
 - **Locations:** `nissan_connect3_emulator/src/libs/prochmi.rs:1549`
   (`install_svg_map_surface_hooks`), `nissan_connect3_emulator/src/gpu/mod.rs:70`
