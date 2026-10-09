@@ -1302,6 +1302,15 @@ fn emulate_message_create(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_ad
         }
     };
 
+    if allocated == 0 {
+        allocated = state_arc
+            .lock()
+            .unwrap()
+            .osal_messages
+            .take_freed(size)
+            .unwrap_or(0);
+    }
+
     if allocated == 0 && size > 0x1000 {
         let mmu_arc = unicorn.get_data().mmu.clone();
         allocated = mmu_arc.lock().unwrap().heap_alloc(
@@ -1310,7 +1319,11 @@ fn emulate_message_create(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_ad
             Prot::READ | Prot::WRITE,
             "[osal-msg-large]",
         );
-        state_arc.lock().unwrap().osal_messages.mark_dynamic(allocated);
+        state_arc
+            .lock()
+            .unwrap()
+            .osal_messages
+            .mark_dynamic(allocated, size);
     }
 
     if allocated == 0 {
@@ -1321,7 +1334,11 @@ fn emulate_message_create(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_ad
             Prot::READ | Prot::WRITE,
             "[osal-msg-dynamic]",
         );
-        state_arc.lock().unwrap().osal_messages.mark_dynamic(allocated);
+        state_arc
+            .lock()
+            .unwrap()
+            .osal_messages
+            .mark_dynamic(allocated, size);
     }
 
     if allocated == 0 {
@@ -1452,13 +1469,32 @@ fn inject_pwr_proxy_pending_message(
         return false;
     };
 
-    let mmu_arc = unicorn.get_data().mmu.clone();
-    let content = mmu_arc.lock().unwrap().heap_alloc(
-        unicorn,
-        pwr_proxy::POWER_MESSAGE_LEN as u32,
-        Prot::READ | Prot::WRITE,
-        "[pwr-proxy-power-message]",
-    );
+    let size = pwr_proxy::POWER_MESSAGE_LEN as u32;
+    let content = {
+        let state_arc = unicorn.get_data().sys_calls_state.clone();
+        let mut state = state_arc.lock().unwrap();
+        match state.osal_messages.take_freed(size) {
+            Some(content) => content,
+            None => {
+                drop(state);
+                let mmu_arc = unicorn.get_data().mmu.clone();
+                let content = mmu_arc.lock().unwrap().heap_alloc(
+                    unicorn,
+                    size,
+                    Prot::READ | Prot::WRITE,
+                    "[pwr-proxy-power-message]",
+                );
+                unicorn
+                    .get_data()
+                    .sys_calls_state
+                    .lock()
+                    .unwrap()
+                    .osal_messages
+                    .mark_dynamic(content, size);
+                content
+            }
+        }
+    };
     if content == 0 || content > 0xf000_0000 {
         return false;
     }
@@ -1471,14 +1507,7 @@ fn inject_pwr_proxy_pending_message(
     // path finds it and returns success. Without this the caller trips
     // `OSAL_vAssertFunction("ALWAYS", "amt_MMObj.cpp", ...)` which aborts the
     // process. See bDelete at procmap 0x00388ef0.
-    {
-        let state_arc = unicorn.get_data().sys_calls_state.clone();
-        state_arc
-            .lock()
-            .unwrap()
-            .osal_messages
-            .mark_dynamic(content);
-    }
+    // (Already registered as dynamic by the branch above.)
     // The guest's `ail_bIpcMessageWait` expects an 8-byte OSAL message
     // reference: `[type_flag, content_ptr]`. Type flag 1 means "direct
     // pointer to content" (see `OSAL_pu8MessageContentGet`); the historical
@@ -1734,6 +1763,21 @@ fn bridge_mbx_queue(
                 accepted
             };
             if accepted {
+                // Ownership of an OSAL message transfers to the queue on a
+                // successful Post; the recipient gets a materialized copy,
+                // so the poster's buffer can be recycled right away. Without
+                // this the sender's pool slots (and eventually fresh heap
+                // sections) leak with every CCA message, tripping QEMU's
+                // 4096-section assertion on chatty services like DAPIAPP's
+                // periodic ServiceStatus publications.
+                unicorn
+                    .get_data()
+                    .sys_calls_state
+                    .lock()
+                    .unwrap()
+                    .osal_messages
+                    .release(content);
+                post_app_info_companion(unicorn, name, &body);
                 return_to_caller(unicorn, 0);
             }
             accepted
@@ -1800,6 +1844,76 @@ fn bridge_mbx_queue(
         }
         _ => false,
     }
+}
+
+/// The CCA directory that normally answers `bRegisterAsync`'s
+/// ApplicationInfoRegister probe lives on the TE side and never replies
+/// here, so a client's registration request is deferred forever. Synthe-
+/// size the ApplicationInfoStatus the directory would have broadcast for
+/// the server app: procmap's handler then marks the server known, runs
+/// the deferred registration and fires the client-state observer which
+/// triggers the natural re-registration. Emitted once per server app.
+pub(crate) fn post_app_info_status(unicorn: &mut Unicorn<'_, Context>, server_app: u32) -> bool {
+    use std::sync::atomic::AtomicU32;
+    static APP_INFO_SENT_FOR: AtomicU32 = AtomicU32::new(0xffff_ffff);
+
+    if server_app == 0 || server_app == 0xffff {
+        return false;
+    }
+    if APP_INFO_SENT_FOR
+        .compare_exchange(0xffff_ffff, server_app, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut info = vec![0u8; 0x20];
+    let info_len = info.len() as u32;
+    info[0..2].copy_from_slice(&(server_app as u16).to_le_bytes());
+    info[2..4].copy_from_slice(&0x0400u16.to_le_bytes());
+    info[4..8].copy_from_slice(&info_len.to_le_bytes());
+    info[8..10].copy_from_slice(&2u16.to_le_bytes());
+    info[0xb] = 0x50;
+    info[0x14..0x16].copy_from_slice(&(server_app as u16).to_le_bytes());
+    // ail ApplicationInfoStatus states: 0=UNAVAILABLE 1=AVAILABLE
+    // 2=UNKNOWN 3=ERROR 4=DOES_NOT_EXIST. Only 1 flips the deferred
+    // registration entry to AVAILABLE and runs bRegisterAsyncExecute.
+    info[0x16] = 1;
+
+    let mut blob = Vec::with_capacity(8 + info.len());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(info.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&info);
+    let accepted = {
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
+        let queue_id = OsalQueueService::ensure_queue(&mut state.mq, "mbx_1024");
+        state.mq.grow_msgsize(queue_id, blob.len() as i64);
+        let accepted = OsalQueueService::guest_post(&mut state.mq, "mbx_1024", blob, 0);
+        if accepted {
+            state.notify_waiters();
+        }
+        accepted
+    };
+    log::info!(
+        "[LIBOSAL-MBX] synthesized ApplicationInfoStatus(app 0x{:04x}, state 4) into mbx_1024: {}",
+        server_app,
+        accepted
+    );
+    accepted
+}
+
+/// Companion trigger: a client that actually posts a ServiceRegister
+/// (wire class 0x42) needs the directory's ApplicationInfoStatus for the
+/// server app to complete the deferred registration.
+fn post_app_info_companion(unicorn: &mut Unicorn<'_, Context>, queue_name: &str, body: &[u8]) {
+    if queue_name == "mbx_0" || body.len() < 0x14 {
+        return;
+    }
+    if body[0xb] != 0x42 {
+        return;
+    }
+    let server_app = u16::from_le_bytes([body[2], body[3]]) as u32;
+    post_app_info_status(unicorn, server_app);
 }
 
 /// Resolve the content pointer of an 8-byte OSAL message reference while
@@ -1878,25 +1992,36 @@ pub(crate) fn deliver_snapshot_message(
     let content_len = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
     let body = blob.get(8..8 + content_len)?;
 
-    let mmu_arc = unicorn.get_data().mmu.clone();
-    let content = mmu_arc.lock().unwrap().heap_alloc(
-        unicorn,
-        (content_len as u32).max(8),
-        Prot::READ | Prot::WRITE,
-        "[mbx-snapshot]",
-    );
+    let size = (content_len as u32).max(8);
+    let content = {
+        let state_arc = unicorn.get_data().sys_calls_state.clone();
+        let mut state = state_arc.lock().unwrap();
+        match state.osal_messages.take_freed(size) {
+            Some(content) => content,
+            None => {
+                drop(state);
+                let mmu_arc = unicorn.get_data().mmu.clone();
+                let content = mmu_arc.lock().unwrap().heap_alloc(
+                    unicorn,
+                    size,
+                    Prot::READ | Prot::WRITE,
+                    "[mbx-snapshot]",
+                );
+                unicorn
+                    .get_data()
+                    .sys_calls_state
+                    .lock()
+                    .unwrap()
+                    .osal_messages
+                    .mark_dynamic(content, size);
+                content
+            }
+        }
+    };
     if content == 0 || content > 0xf000_0000 {
         return None;
     }
     unicorn.mem_write(content as u64, body).ok()?;
-    {
-        let state_arc = unicorn.get_data().sys_calls_state.clone();
-        state_arc
-            .lock()
-            .unwrap()
-            .osal_messages
-            .mark_dynamic(content);
-    }
     unicorn.mem_write(buf as u64, &1u32.to_le_bytes()).ok()?;
     unicorn
         .mem_write((buf + 4) as u64, &content.to_le_bytes())

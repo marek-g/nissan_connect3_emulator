@@ -104,6 +104,8 @@ const MAP_DATA_DAPI_GET_BLOCK_IDS_CALL: u32 = 0x0053_a274 - ORIGINAL_BASE;
 const MAP_DATA_DAPI_GET_BLOCK_IDS_ENTRY: u32 = 0x0038_f918 - ORIGINAL_BASE;
 const MAP_DATA_CCA_GET_BLOCK_IDS_VCALL: u32 = 0x0053_ddc8 - ORIGINAL_BASE;
 const MAP_DATA_CCA_SEND_REQUEST_ENTRY: u32 = 0x0059_1af0 - ORIGINAL_BASE;
+const MAP_DATA_CLIENT_VREGISTER_SERVICE: u32 = 0x0059_0668 - ORIGINAL_BASE;
+const MAP_DATA_DAPI_SERVICE_ID: u32 = 0x26;
 const MAP_DATA_SEND_REQUEST_CONSTRUCTOR_RESULT: u32 = 0x0059_1b68 - ORIGINAL_BASE;
 const MAP_DATA_SEND_SERVICE_VCALL: u32 = 0x0059_05ec - ORIGINAL_BASE;
 const MAP_DATA_SEND_SERVICE_RESULT: u32 = 0x0059_05f0 - ORIGINAL_BASE;
@@ -212,6 +214,9 @@ static AIL_MAIL_VALIDITY_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static AIL_MAIL_VALIDITY_RESULT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static AIL_POST_MESSAGE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_DATA_CLIENT_SERVICE_REF_NODE: AtomicU32 = AtomicU32::new(0);
+/// True while a DAPI client REGISTER has been fired but no RegisterConf
+/// (handler register-id still 0xffff) has come back yet.
+static MAP_DATA_DAPI_REGISTER_PENDING: AtomicBool = AtomicBool::new(false);
 static MAP_DATA_MEDIUM_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static MAP_DATA_MEDIUM_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
 static CCA_BODY_FORWARD_SUPPRESSED: AtomicU32 = AtomicU32::new(0);
@@ -356,6 +361,19 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         .add_code_hook(cca_dispatch_addr as u64, cca_dispatch_addr as u64, |uc, _, _| {
             let queue = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
             if queue == u32::MAX {
+                return;
+            }
+
+            // Keep-on-entry-thread suppression is only wanted for the
+            // power/START_CONF handshake messages; CCA service traffic
+            // (register, register-conf, service-status, service-data) must
+            // keep its forward target or the receiving loop exits and
+            // crashes with a stale dispatch state. The message class byte
+            // lives at wire offset 0xb.
+            let wrapper = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let header = read_u32_or_invalid(uc, wrapper.wrapping_add(4));
+            let msg_class = read_u16_or_invalid(uc, header.wrapping_add(0xb)) & 0xff;
+            if matches!(msg_class, 0x42..=0x45) {
                 return;
             }
 
@@ -1950,10 +1968,37 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         )
         .unwrap();
     let send_request_entry = base_address + MAP_DATA_CCA_SEND_REQUEST_ENTRY;
+    add_dapi_register_diag_hooks(unicorn, base_address);
     unicorn
         .add_code_hook(send_request_entry as u64, send_request_entry as u64, move |uc, _, _| {
+            // The unit's CCA directory (TE side) never answers the register
+            // handshake, so the map engine's DAPI client handler stays
+            // unregistered and every ServiceData request is rejected with
+            // error id 6. Kick the natural registration once per un-
+            // registered state: vRegisterService posts the REGISTER to mbx_7
+            // and the reply's RegisterConf fills in the handler register-id.
+            let handler = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let handler_service = read_u16_or_invalid(uc, handler + 4) & 0xffff;
+            let register_id = read_u16_or_invalid(uc, handler + 0xc) & 0xffff;
+            let mut register_fired = false;
+            if handler_service == MAP_DATA_DAPI_SERVICE_ID {
+                if register_id != 0xffff {
+                    MAP_DATA_DAPI_REGISTER_PENDING.store(false, Ordering::Relaxed);
+                } else if !MAP_DATA_DAPI_REGISTER_PENDING.swap(true, Ordering::Relaxed) {
+                    let function = base_address + MAP_DATA_CLIENT_VREGISTER_SERVICE;
+                    if call_guest_function(uc, send_request_entry, function, [handler, 0, 0, 0]) {
+                        log::info!(
+                            "PROCMAPENGINE: fired DAPI client service registration for handler {:#x}",
+                            handler
+                        );
+                        register_fired = true;
+                    } else {
+                        MAP_DATA_DAPI_REGISTER_PENDING.store(false, Ordering::Relaxed);
+                    }
+                }
+            }
             let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if count < 200 {
+            if count < 200 && !register_fired {
                 let handler = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let message_vtable = read_u32_or_invalid(uc, message);
@@ -2950,6 +2995,80 @@ fn ensure_guest_call_stub(unicorn: &mut Unicorn<'_, Context>) -> Option<u32> {
     Some(addr)
 }
 
+/// Traces every early-return decision of
+/// `ail_tclAppInterfaceRestricted::u16RegisterService` so a DAPI client
+/// registration that silently fails can be pinned to its bail-out branch.
+fn add_dapi_register_diag_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::AtomicU32 as AU32;
+    static DIAG_COUNT: AU32 = AU32::new(0);
+
+    let sites: [(u32, &str); 9] = [
+        (0x0059_0668 - ORIGINAL_BASE, "vRegisterService-entry (r0=handler)"),
+        (0x0059_06e4 - ORIGINAL_BASE, "vRegisterService-registering (lr=appintf r5=p5)"),
+        (0x0066_2d24 - ORIGINAL_BASE, "u16RegisterService-entry (r9=svc r7=server)"),
+        (0x0066_2d4c - ORIGINAL_BASE, "after-WhoAmI (r4=owner r0=whoami r7=server)"),
+        (0x0066_2d54 - ORIGINAL_BASE, "sync-list-nonnull (r3=[+0x5c])"),
+        (0x0066_2dc0 - ORIGINAL_BASE, "serverid-0xffff-resolve"),
+        (0x0066_2dd8 - ORIGINAL_BASE, "after-GetAppIdFromServiceId (r0 r7)"),
+        (0x0066_2d84 - ORIGINAL_BASE, "after-semaphore (r0)"),
+        (0x0066_2e10 - ORIGINAL_BASE, "posting-path (r2=sync-answer r9=svc r7=server)"),
+    ];
+    for (offset, label) in sites {
+        let address = base_address + offset;
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+                let count = DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count >= 30 {
+                    return;
+                }
+                let handler = if label.contains("entry") {
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32
+                } else {
+                    uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32
+                };
+                if label.contains("registering")
+                    && (read_u16_or_invalid(uc, handler.wrapping_add(4)) & 0xffff)
+                        == MAP_DATA_DAPI_SERVICE_ID
+                {
+                    // bRegisterAsync defers the REGISTER until the TE-side
+                    // directory reports the server app as running - which it
+                    // never does here. Feed it the ApplicationInfoStatus so
+                    // the deferred execute posts the real REGISTER to mbx_7.
+                    crate::libs::libosal_linux::message::post_app_info_status(uc, 7);
+                }
+                let app_interface = read_u32_or_invalid(uc, handler.wrapping_add(0x10));
+                let vtable = read_u32_or_invalid(uc, app_interface);
+                let target = read_u32_or_invalid(uc, vtable.wrapping_add(0x58));
+                let regid = read_u16_or_invalid(uc, handler.wrapping_add(0xc)) & 0xffff;
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                let r9 = uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE DAPI-register diag [{}] {} r0={:#x} r2={:#x} r3={:#x} r4={:#x} r6(handler)={:#x} regid={:#x} appintf={:#x} vtable={:#x} vt58={:#x} r7={:#x} r9={:#x} lr={:#x}",
+                    uc.get_data().inner.thread_id(),
+                    label,
+                    r0,
+                    r2,
+                    r3,
+                    r4,
+                    handler,
+                    regid,
+                    app_interface,
+                    vtable,
+                    target,
+                    r7,
+                    r9,
+                    lr
+                );
+            })
+            .unwrap();
+    }
+}
+
 fn call_guest_function(
     unicorn: &mut Unicorn<'_, Context>,
     original_pc: u32,
@@ -3104,7 +3223,10 @@ fn synthesize_client_service_reference(
     write_u32(unicorn, node + 4, 0);
     write_u16(unicorn, node + 8, service_id);
     write_u16(unicorn, node + 10, server_app_id);
-    write_u16(unicorn, node + 12, 0);
+    // Register-id wildcard: requests go out with 0xffff (accepted by the
+    // server's registry scan regardless of the id assigned to our client
+    // entry) and the RegisterConf lookup on this list matches on wildcard.
+    write_u16(unicorn, node + 12, 0xffff);
     write_u8(unicorn, node + 14, 0);
     write_u8(unicorn, node + 15, 0);
     write_u16(unicorn, node + 16, dataset_id);

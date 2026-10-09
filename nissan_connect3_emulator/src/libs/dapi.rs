@@ -200,4 +200,209 @@ pub fn dapiapp_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     }
     hook_power_dispatch_state(unicorn, base_address);
     hook_power_ack_call(unicorn, base_address);
+    hook_service_registration(unicorn, base_address);
+    hook_service_register_handler(unicorn, base_address);
+    hook_service_data_errors(unicorn, base_address);
+    hook_service_data_scan(unicorn, base_address);
+}
+
+/// Trace the registry scan inside `ail_bHandleMsgServiceData` that decides
+/// error id 6: the register-id taken from the request, the registry list
+/// head (app+0x58), and every `ail_tclServiceRegistry::bIsDataSet` compare
+/// with the entry's five u16 key fields.
+fn hook_service_data_scan(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SCAN_COUNT: AtomicU32 = AtomicU32::new(0);
+    static CMP_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    for (address, name, is_scan) in [
+        (0x00b4_3218, "scan-begin (r6=request-register-id, r1=registry-head)", true),
+        (0x00b4_61c8, "registry bIsDataSet compare", false),
+    ] {
+        // (register-id wildcard patch is installed separately below)
+        let address = base_address + (address - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+                let counter = if is_scan { &SCAN_COUNT } else { &CMP_COUNT };
+                let count = counter.fetch_add(1, Ordering::Relaxed);
+                if count >= 40 {
+                    return;
+                }
+                let read = |reg| uc.reg_read(reg).unwrap_or(0) as u32;
+                let r0 = read(RegisterARM::R0);
+                let r1 = read(RegisterARM::R1);
+                let r2 = read(RegisterARM::R2);
+                let r3 = read(RegisterARM::R3);
+                let mut extra = [0u8; 4];
+                let sp = read(RegisterARM::SP);
+                let stack_arg = if uc.mem_read(sp as u64, &mut extra).is_ok() {
+                    u32::from_le_bytes(extra)
+                } else {
+                    0
+                };
+                let mut fields = Vec::with_capacity(4);
+                if !is_scan {
+                    let mut buf = [0u8; 2];
+                    for offset in (0..8u32).step_by(2) {
+                        let value = if uc.mem_read(r0.wrapping_add(offset) as u64, &mut buf).is_ok()
+                        {
+                            u16::from_le_bytes(buf)
+                        } else {
+                            0xffff
+                        };
+                        fields.push(value);
+                    }
+                }
+                let r6 = read(RegisterARM::R6);
+                log::warn!(
+                    "DAPI {} [{}] {} addr={:#x} r0={:#x} r1={:#x} r2={:#x} r3={:#x} stack0={:#x} r6={:#x} entry_u16s={:04x?}",
+                    uc.get_data().elf_path,
+                    uc.get_data().inner.thread_id(),
+                    name,
+                    addr,
+                    r0,
+                    r1,
+                    r2,
+                    r3,
+                    stack_arg,
+                    r6,
+                    fields
+                );
+            })
+            .unwrap();
+    }
+
+}
+
+/// Track server-side CCA service registration: DAPI answers client requests
+/// only for services present in the app's own service-registry list. An
+/// empty list makes `ail_bHandleMsgServiceData` answer error id 6.
+fn hook_service_registration(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    for (address, name) in [
+        (0x0082_8158, "dap_tclDataManager::u16RegisterServices"),
+        (0x00b6_2630, "dap_tclSrvCrtl::u16AddService"),
+        (0x00b3_b368, "ail::u16RegisterService"),
+        (0x00b5_2d3c, "dap_tclCommunicationContext::u16RegisterService"),
+    ] {
+        let address = base_address + (address - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+                let count = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 60 {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                    let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                    log::warn!(
+                        "DAPI {} [{}] {} addr={:#x} r0={:#x} r1={:#x} r2={:#x} r3={:#x} lr={:#x}",
+                        uc.get_data().elf_path,
+                        uc.get_data().inner.thread_id(),
+                        name,
+                        addr,
+                        r0,
+                        r1,
+                        r2,
+                        r3,
+                        lr
+                    );
+                }
+            })
+            .unwrap();
+    }
+}
+
+/// `ail_bHandleMsgServiceRegister` decides whether a client REGISTER gets a
+/// registry entry + positive RegisterConf. Trace its entry, both vtable
+/// checks and the three negative-conf branches so the observed status-4
+/// confirmation (impossible for this handler) can be attributed.
+fn hook_service_register_handler(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    for (address, name) in [
+        (0x00b4_39c4, "ServiceRegister entry (r0=wrapper)"),
+        (0x00b4_3a70, "ServiceRegister after-version-check (r0=ver ok)"),
+        (0x00b4_3ad0, "ServiceRegister after-service-check (r0=1 ok)"),
+        (0x00b4_3e40, "ServiceRegister conf status=2 service-rejected"),
+        (0x00b4_3e64, "ServiceRegister conf status=3 version-rejected"),
+        (0x00b4_3e88, "ServiceRegister conf status=0 list-access-failed"),
+        (0x00b4_35b8, "ServiceRegisterConf handler entry"),
+    ] {
+        let address = base_address + (address - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+                let count = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count >= 40 {
+                    return;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r9 = uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32;
+                let r10 = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
+                let r11 = uc.reg_read(RegisterARM::R11).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                log::warn!(
+                    "DAPI {} [{}] {} addr={:#x} r0={:#x} r9(srcApp)={:#x} r10(svc)={:#x} r11(sub)={:#x} lr={:#x}",
+                    uc.get_data().elf_path,
+                    uc.get_data().inner.thread_id(),
+                    name,
+                    addr,
+                    r0,
+                    r9,
+                    r10,
+                    r11,
+                    lr
+                );
+            })
+            .unwrap();
+    }
+}
+
+/// `ail_bHandleMsgServiceData` builds `amt_tclServiceDataError` with error
+/// id 6 (unknown register-id: registry has no matching entry) or 0xb
+/// (service known but not available). Dump the offending request header so
+/// the missing register-id is visible.
+fn hook_service_data_errors(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    for (address, name) in [
+        (0x00b4_32fc, "ServiceDataError id=6 unknown-register"),
+        (0x00b4_33f4, "ServiceDataError id=0xb temp-unavailable"),
+    ] {
+        let address = base_address + (address - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+                let count = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 20 {
+                    let service_data = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let mut buf = [0u8; 4];
+                    let mut read_u32 = |address: u32| {
+                        if uc.mem_read(address as u64, &mut buf).is_ok() {
+                            u32::from_le_bytes(buf)
+                        } else {
+                            0
+                        }
+                    };
+                    let message = read_u32(service_data);
+                    let mut dump = Vec::with_capacity(8);
+                    for offset in (0..0x20u32).step_by(4) {
+                        dump.push(read_u32(message.wrapping_add(offset)));
+                    }
+                    log::warn!(
+                        "DAPI {} [{}] {} addr={:#x} request_message={:#x} header={:08x?}",
+                        uc.get_data().elf_path,
+                        uc.get_data().inner.thread_id(),
+                        name,
+                        addr,
+                        message,
+                        dump
+                    );
+                }
+            })
+            .unwrap();
+    }
 }

@@ -34,7 +34,8 @@ pub struct OsalMessagePool {
     chunk: u32,
     slots: u32,
     used: Vec<bool>,
-    dynamic: HashSet<u32>,
+    dynamic: HashMap<u32, u32>,
+    freed: Vec<(u32, u32)>,
 }
 
 impl SysCallsState {
@@ -58,7 +59,8 @@ impl OsalMessagePool {
             chunk: OSAL_MESSAGE_POOL_CHUNK,
             slots: OSAL_MESSAGE_POOL_SLOTS,
             used: Vec::new(),
-            dynamic: HashSet::new(),
+            dynamic: HashMap::new(),
+            freed: Vec::new(),
         }
     }
 
@@ -99,12 +101,29 @@ impl OsalMessagePool {
         Some(index as u32)
     }
 
-    pub fn mark_dynamic(&mut self, content: u32) {
-        self.dynamic.insert(content);
+    pub fn mark_dynamic(&mut self, content: u32, size: u32) {
+        self.dynamic.insert(content, size);
+    }
+
+    /// Hand back a previously released emulated-message block that can hold
+    /// `size` bytes. Reusing the already-mapped guest block keeps QEMU's
+    /// memory-section count flat under sustained CCA traffic (each fresh
+    /// `heap_alloc` maps a new section and QEMU aborts past 4096).
+    pub fn take_freed(&mut self, size: u32) -> Option<u32> {
+        let index = self
+            .freed
+            .iter()
+            .position(|(_, freed)| *freed >= size)?;
+        let (content, _) = self.freed.remove(index);
+        self.dynamic.insert(content, size);
+        Some(content)
     }
 
     pub fn release(&mut self, content: u32) -> bool {
-        if self.dynamic.remove(&content) {
+        if let Some(size) = self.dynamic.remove(&content) {
+            if self.freed.len() < 1024 {
+                self.freed.push((content, size));
+            }
             return true;
         }
 
