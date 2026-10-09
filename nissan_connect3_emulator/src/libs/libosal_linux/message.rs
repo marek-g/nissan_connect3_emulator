@@ -1850,6 +1850,15 @@ fn bridge_mbx_queue(
                     name,
                     message.data.len()
                 );
+                if name == "mbx_1024" {
+                    let dump: Vec<String> = message
+                        .data
+                        .iter()
+                        .take(0x24)
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    log::info!("[{}] [LIBOSAL-MBX] mbx_1024 blob: {}", thread, dump.join(" "));
+                }
                 let _ = result;
                 return true;
             }

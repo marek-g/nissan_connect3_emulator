@@ -426,6 +426,13 @@ fn hook_device_manager_init(unicorn: &mut Unicorn<'_, Context>, base_address: u3
 pub static MAP_MEDIUM_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Wall-clock origin for the boot-timing traces (first use, i.e. early boot).
+pub static EMU_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+pub fn emu_t0_elapsed_ms() -> u128 {
+    (*EMU_T0.get_or_init(std::time::Instant::now)).elapsed().as_millis()
+}
+
 fn hook_service_state_setter(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     use std::sync::atomic::Ordering;
     use std::sync::atomic::AtomicU32;
@@ -449,7 +456,11 @@ fn hook_service_state_setter(unicorn: &mut Unicorn<'_, Context>, base_address: u
                 && u16::from_le_bytes([key[2], key[3]]) == 0x26
             {
                 MAP_MEDIUM_ACTIVE.store(true, Ordering::SeqCst);
-                log::info!("DAPI map-data medium ACTIVE (internal svc-0x26 entry {:#x})", entry);
+                log::info!(
+                    "DAPI map-data medium ACTIVE at t={}ms (internal svc-0x26 entry {:#x})",
+                    emu_t0_elapsed_ms(),
+                    entry
+                );
             }
             log::warn!(
                 "DAPI {} [{}] registry vSetServiceState entry={:#x} new_state={:#x} lr={:#x}",
@@ -487,6 +498,80 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     read(RegisterARM::R9),
                     read(RegisterARM::R10),
                     read(RegisterARM::R11),
+                );
+            })
+            .unwrap();
+    }
+
+    // Service-data success path: after the registry scan + state gate passes,
+    // `ail_bHandleMsgServiceData` tail-calls the app vtable slot +0x20 at
+    // 0xb4357c. Log the resolved handler target, and also the return-0
+    // fall-through at 0xb43518 (dispatch skipped).
+    {
+        let dispatch = base_address + (0x00b4_3578u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(dispatch as u64, dispatch as u64, move |uc, _, _| {
+                static D_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if D_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
+                    return;
+                }
+                let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+                let r0 = read(RegisterARM::R0);
+                let r1 = read(RegisterARM::R1);
+                let vtable = read(RegisterARM::R3);
+                let mut buf = [0u8; 4];
+                let target = match uc.mem_read((vtable + 0x20) as u64, &mut buf) {
+                    Ok(()) => u32::from_le_bytes(buf),
+                    Err(_) => 0,
+                };
+                log::warn!(
+                    "DAPI svcdata-DISPATCH addr={:#x} r0(obj)={:#x} r1(msg)={:#x} vtable={:#x} target(vt+0x20)={:#x} lr={:#x}",
+                    dispatch,
+                    r0,
+                    r1,
+                    vtable,
+                    target,
+                    read(RegisterARM::LR),
+                );
+            })
+            .unwrap();
+
+        // The dispatch decision itself: `cmp r9,#0xfffe` at 0xb434e0 picks
+        // between the generic service handler (vtable+0x20) and the
+        // app-info/no-op fall-through.
+        let decide = base_address + (0x00b4_34d4u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(decide as u64, decide as u64, move |uc, _, _| {
+                static P_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if P_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
+                    return;
+                }
+                let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+                log::warn!(
+                    "DAPI svcdata-PATH r7(msg)={:#x} r9={:#x} r10={:#x}",
+                    read(RegisterARM::R7),
+                    read(RegisterARM::R9),
+                    read(RegisterARM::R10),
+                );
+            })
+            .unwrap();
+
+        let skip = base_address + (0x00b4_3518u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(skip as u64, skip as u64, move |uc, _, _| {
+                static S_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if S_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
+                    return;
+                }
+                let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+                log::warn!(
+                    "DAPI svcdata-SKIP-DISPATCH r9={:#x} r10={:#x} r4={:#x}",
+                    read(RegisterARM::R9),
+                    read(RegisterARM::R10),
+                    read(RegisterARM::R4),
                 );
             })
             .unwrap();

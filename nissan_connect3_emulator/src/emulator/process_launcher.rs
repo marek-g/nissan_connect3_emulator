@@ -34,26 +34,50 @@ pub fn spawn_process(app_name: &str, filename: &str, cmdline: &str) -> Result<()
 
     let elf_path = resolve_process_path(filename);
     let args = process_args(&elf_path, cmdline);
-    // The real head unit's boot timing has DAPIAPP's map medium (CRYPTNAV)
-    // already ACTIVE before the map engine's DAPI service registration runs.
-    // The registration's registry entry permanently snapshots the service
-    // state at that moment and the client never re-registers, so an early
-    // map engine start stamps it REGISTERED and every later request fails
-    // temp-unavailable. Hold the spawn (this is the OSAL spawn boundary the
-    // real procbaselx drives) until the medium is genuinely up.
-    if elf_path.contains("procmapengine") {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(70);
-        while !crate::libs::dapi::MAP_MEDIUM_ACTIVE
-            .load(std::sync::atomic::Ordering::SeqCst)
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        log::info!(
-            "OSAL: map-engine spawn released (map medium active: {})",
-            crate::libs::dapi::MAP_MEDIUM_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
-        );
+    // The real head unit boots with the CRYPTNAV map medium already ACTIVE
+    // before the map engine registers its DAPI service: the registration
+    // snapshots the service state and a request answered while the entry is
+    // still REGISTERED makes DAPIAPP drop the registration. Emulate that
+    // procbaselx-style staggering by deferring the map-engine spawn on a host
+    // thread until DAPIAPP's device manager reports the medium active. The
+    // guest must never be blocked here - the emulator is serialized, so a
+    // host-side sleep inside the guest call would freeze every process (the
+    // medium could then never come up at all).
+    if elf_path.contains("procmapengine")
+        && !crate::libs::dapi::MAP_MEDIUM_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        let launcher = launcher.clone();
+        std::thread::Builder::new()
+            .name("map-engine-spawn".into())
+            .spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                while !crate::libs::dapi::MAP_MEDIUM_ACTIVE
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                log::info!(
+                    "OSAL: deferred map-engine spawn starting at t={}ms (map medium active: {})",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    crate::libs::dapi::MAP_MEDIUM_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+                );
+                if let Err(err) = launch(&launcher, "map-engine", &elf_path, args) {
+                    log::warn!("OSAL: deferred map-engine spawn failed: {err}");
+                }
+            })
+            .map_err(|err| err.to_string())?;
+        return Ok(());
     }
+    launch(launcher, app_name, &elf_path, args)
+}
+
+fn launch(
+    launcher: &ProcessLauncher,
+    app_name: &str,
+    elf_path: &str,
+    args: Vec<String>,
+) -> Result<(), String> {
     log::info!(
         "OSAL: spawning process app='{}' path={} args={:?}",
         app_name,
