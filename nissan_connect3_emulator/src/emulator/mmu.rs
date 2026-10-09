@@ -66,6 +66,10 @@ impl Mmu {
         }
     }
 
+    pub fn region_count(&self) -> usize {
+        self.regions.len()
+    }
+
     pub fn map(
         &mut self,
         unicorn: &mut Unicorn<'_, Context>,

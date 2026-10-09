@@ -49,3 +49,14 @@ Hot-path problems: per-syscall allocations, O(n) lookups, redundant FFI calls, r
 - **Location:** `nissan_connect3_emulator/src/os/syscalls/mman.rs:169-180`
 - **Problem:** Five separate lock+unwrap sequences for a single mmap syscall.
 - **Fix:** single lock scope covering the whole operation.
+
+## RESOLVED: glVertexAttribPointer client-array churn leaked driver memory
+
+- **Location:** `nissan_connect3_emulator/src/gpu/mod.rs` (`route_vertex_attrib_pointer`)
+- **Problem:** Every guest `glVertexAttribPointer` with a client pointer read a fresh
+  64 KB `Vec` and minted a throwaway host VBO (`GenBuffers` + `BufferData`, never
+  deleted) ~15x per HMI swap. This leaked driver-side buffers and churned the host
+  allocator, growing process RSS ~200 KB/swap (~190 MB/10 min).
+- **Fix:** one reusable scratch read buffer + one dedicated host VBO per distinct
+  guest pointer (content-hashed; unchanged geometry skips `BufferData` entirely).
+  RSS now flat over multi-minute runs (`GPU: resource telemetry` watchdog).

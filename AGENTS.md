@@ -11,3 +11,10 @@ You can keep track of any issues (adding and removing them) with the following f
 - `docs/issues/design.md`
 
 Commit to git frequently. Every time you make a meaningful change that you believe moves the emulator forward (a fix, a new hook, a new syscall, a working feature slice), commit it. Small, focused commits make it easy to bisect regressions later. Do not commit work-in-progress that does not build.
+
+## Running/killing the emulator
+
+The emulator process does not reliably terminate on SIGTERM (`timeout` alone often
+leaves it stuck holding GPU memory). Always kill it with
+`pkill -9 -x nissan_connect3` (the comm name is truncated to 15 chars; `pkill -f`
+on the full name can match your own shell and kill the session).

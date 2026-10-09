@@ -191,6 +191,21 @@ pub fn run_process_loop(
         crate::gpu::tick(unicorn);
         crate::libs::prochmi::tick(unicorn);
 
+        // memory-leak watchdog: guest heap/brk growth per process
+        {
+            static LOOP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if LOOP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8192 == 0 {
+                let mmu = unicorn.get_data().mmu.lock().unwrap();
+                log::info!(
+                    "SCHED: heap telemetry process={} heap_end={:#x} brk_end={:#x} regions={}",
+                    unicorn.get_data().elf_path,
+                    mmu.heap_mem_end,
+                    mmu.brk_mem_end,
+                    mmu.region_count(),
+                );
+            }
+        }
+
         // re-evaluate blocked guest threads: complete the ones whose IPC object is
         // now ready or whose deadline passed (memory work happens here, in this
         // process' own VM, so cross-process delivery never touches foreign memory)

@@ -47,6 +47,13 @@ pub enum GpuTarget {
     Map,
 }
 
+pub(crate) static GL_LIVE_TEXTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GL_LIVE_FRAMEBUFFERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GL_LIVE_RENDERBUFFERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GL_LIVE_BUFFERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GL_LIVE_SHADERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GL_LIVE_PROGRAMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct GpuCommand {
     target: GpuTarget,
     future: GpuFuture,
@@ -68,6 +75,17 @@ const MAP_SURFACE_HANDLE: u32 = 0x5f4d4150;
 
 static MAP_SURFACE_DIRTY: AtomicBool = AtomicBool::new(false);
 static MAP_SURFACE_BYTES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+// Client-array emulation for glVertexAttribPointer: guest vertices live in
+// guest RAM and are re-specified every frame with the SAME pointers. One
+// scratch read buffer + one host VBO per distinct pointer (with a content
+// hash so unchanged geometry skips BufferData entirely) keeps this steady
+// state allocation-free. The old path malloc'd a 64 KB Vec and minted a
+// throwaway VBO per call (~15x/swap), leaking driver buffers and growing the
+// process RSS watermark by ~200 MB per 10 minutes (the "GPU memory leak").
+static VAP_SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+static VAP_CACHE: std::sync::LazyLock<Mutex<std::collections::HashMap<u32, (u32, u64)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 static MAP_SURFACE_GUEST_BASES: OnceLock<Mutex<HashMap<u32, u32>>> = OnceLock::new();
 
 static GPU_SENDER: OnceLock<mpsc::Sender<GpuCommand>> = OnceLock::new();
@@ -303,6 +321,27 @@ pub fn map_surface_guest_base(unicorn: &Unicorn<'_, Context>) -> Option<u32> {
 }
 
 fn publish_map_surface_pixels(pixels: &[u8]) {
+    static PUBLISH_COUNT: AtomicU32 = AtomicU32::new(0);
+    let n = PUBLISH_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 5 || n % 60 == 0 {
+        let mut nonblack = 0usize;
+        let mut nonblack_visible = 0usize;
+        for px in pixels.chunks(4) {
+            if px[0] | px[1] | px[2] != 0 {
+                nonblack += 1;
+                if px[3] != 0 {
+                    nonblack_visible += 1;
+                }
+            }
+        }
+        log::info!(
+            "GPU: map surface publish n={} nonblack={} visible={} sample={:02x?}",
+            n,
+            nonblack,
+            nonblack_visible,
+            &pixels[(240 * 800 + 400) * 4..(240 * 800 + 400) * 4 + 4]
+        );
+    }
     if let Ok(mut host) = MAP_SURFACE_BYTES.lock() {
         *host = pixels.to_vec();
         MAP_SURFACE_DIRTY.store(true, Ordering::Release);
@@ -698,11 +737,14 @@ fn hmi_capture_prefix() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-// Host-side RGBA re-upload of one HMI-context texture (used to keep the
-// LayerSync map snapshot in sync with procmap's live map surface, since the
-// snapshot is taken once when the map layer hides).
-pub fn upload_rgba_texture(name: u32, bytes: Vec<u8>, width: i32, height: i32) {
-    if name == 0 || bytes.len() != (width * height * 4) as usize {
+// Host-side re-upload of one HMI-context texture from the shared map surface
+// (used to keep the LayerSync map snapshot in sync with procmap's live map
+// surface, since the snapshot is taken once when the map layer hides). The
+// closure reads the global pixels on the GPU thread itself: copying 1.5 MB
+// per refresh through a channel-captured Vec churned the allocator and grew
+// the RSS watermark indefinitely (GPU memory "leak").
+pub fn refresh_texture_from_map_surface(name: u32, width: i32, height: i32) {
+    if name == 0 {
         return;
     }
     if !ensure_gpu_thread() {
@@ -715,31 +757,31 @@ pub fn upload_rgba_texture(name: u32, bytes: Vec<u8>, width: i32, height: i32) {
     let _ = sender.send(GpuCommand {
         target: GpuTarget::Hmi,
         future: Box::new(move || {
-            unsafe {
-                gl::BindTexture(gl::TEXTURE_2D, name);
-                gl::TexSubImage2D(
-                    gl::TEXTURE_2D,
-                    0,
-                    0,
-                    0,
-                    width,
-                    height,
-                    gl::RGBA,
-                    gl::UNSIGNED_BYTE,
-                    bytes.as_ptr() as *const _,
-                );
-                drain_host_gl_errors();
+            let Ok(bytes) = MAP_SURFACE_BYTES.lock() else {
+                return GpuOutput::default();
+            };
+            if bytes.len() == (width * height * 4) as usize {
+                unsafe {
+                    gl::BindTexture(gl::TEXTURE_2D, name);
+                    gl::TexSubImage2D(
+                        gl::TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        width,
+                        height,
+                        gl::RGBA,
+                        gl::UNSIGNED_BYTE,
+                        bytes.as_ptr() as *const _,
+                    );
+                    drain_host_gl_errors();
+                }
             }
             GpuOutput::default()
         }),
         reply: reply_tx,
     });
 }
-
-pub fn map_surface_snapshot() -> Option<Vec<u8>> {
-    MAP_SURFACE_BYTES.lock().ok().map(|bytes| bytes.clone())
-}
-
 fn hmi_frame_is_non_black(pixels: &[u8]) -> bool {
     pixels
         .chunks_exact(4)
@@ -888,6 +930,32 @@ fn capture_raw_hmi_before_composite(backend: &mut Backend) {
     }
 }
 
+// Host GL object leak watchdog: counts guest-side Gen/Delete and logs the
+// live totals plus process RSS periodically.
+fn gpu_resource_telemetry() {
+    static SWAPS: AtomicU32 = AtomicU32::new(0);
+    let n = SWAPS.fetch_add(1, Ordering::Relaxed);
+    if n % 120 != 0 {
+        return;
+    }
+    let rss_kb = std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|p| p.parse::<u64>().ok()))
+        .map(|pages| pages * 4)
+        .unwrap_or(0);
+    log::info!(
+        "GPU: resource telemetry swap={} textures={} fbos={} rbos={} buffers={} shaders={} programs={} rss_kb={}",
+        n,
+        GL_LIVE_TEXTURES.load(Ordering::Relaxed),
+        GL_LIVE_FRAMEBUFFERS.load(Ordering::Relaxed),
+        GL_LIVE_RENDERBUFFERS.load(Ordering::Relaxed),
+        GL_LIVE_BUFFERS.load(Ordering::Relaxed),
+        GL_LIVE_SHADERS.load(Ordering::Relaxed),
+        GL_LIVE_PROGRAMS.load(Ordering::Relaxed),
+        rss_kb,
+    );
+}
+
 fn probe_layer_alphas(backend: &Backend) {
     if std::env::var("EMU_GPU_PROBE_ALPHAS").map(|v| v != "1").unwrap_or(true) {
         return;
@@ -941,6 +1009,7 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
                 gl::Finish();
             }
             probe_layer_alphas(backend);
+            gpu_resource_telemetry();
             if backend.hmi_framebuffer != 0 {
                 if hmi_capture_prefix().is_some() {
                     capture_raw_hmi_before_composite(backend);
@@ -1954,6 +2023,12 @@ fn gpu_gen_ids(kind: GenKind, count: i32) -> Option<Vec<u32>> {
     if count <= 0 {
         return Some(Vec::new());
     }
+    match kind {
+        GenKind::Buffer => GL_LIVE_BUFFERS.fetch_add(count as u64, Ordering::Relaxed),
+        GenKind::Framebuffer => GL_LIVE_FRAMEBUFFERS.fetch_add(count as u64, Ordering::Relaxed),
+        GenKind::Renderbuffer => GL_LIVE_RENDERBUFFERS.fetch_add(count as u64, Ordering::Relaxed),
+        GenKind::Texture => GL_LIVE_TEXTURES.fetch_add(count as u64, Ordering::Relaxed),
+    };
     gpu_call(move || {
         let mut ids = vec![0u32; count as usize];
         unsafe {
@@ -1974,6 +2049,15 @@ fn gpu_gen_ids(kind: GenKind, count: i32) -> Option<Vec<u32>> {
 }
 
 fn gpu_delete_ids(kind: DeleteKind, count: i32, ids: Vec<u32>) -> bool {
+    let count = count.max(0);
+    match kind {
+        DeleteKind::Buffer => GL_LIVE_BUFFERS.fetch_sub(count as u64, Ordering::Relaxed),
+        DeleteKind::Framebuffer => GL_LIVE_FRAMEBUFFERS.fetch_sub(count as u64, Ordering::Relaxed),
+        DeleteKind::Renderbuffer => {
+            GL_LIVE_RENDERBUFFERS.fetch_sub(count as u64, Ordering::Relaxed)
+        }
+        DeleteKind::Texture => GL_LIVE_TEXTURES.fetch_sub(count as u64, Ordering::Relaxed),
+    };
     let count = count.max(0);
     if count == 0 || ids.is_empty() {
         return true;
@@ -2296,13 +2380,95 @@ fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
         .max(4)
         .min(256);
     let max_verts = 4096usize;
-    let requested = per_vertex.saturating_mul(max_verts);
-    let Some((_, data)) = read_best_effort_bytes(unicorn, pointer, requested) else {
+    let requested = per_vertex.saturating_mul(max_verts).min(MAX_TEXTURE_BYTES);
+
+    // Read the client array into the reusable scratch (never a fresh Vec),
+    // shrinking the length until the read succeeds (best effort).
+    let mut scratch = match VAP_SCRATCH.lock() {
+        Ok(scratch) => scratch,
+        Err(_) => return 0,
+    };
+    let mut len = requested.max(4);
+    let mut readable = false;
+    while len >= 4 {
+        if scratch.len() < len {
+            scratch.resize(len, 0);
+        }
+        if unicorn.mem_read(pointer as u64, &mut scratch[..len]).is_ok() {
+            readable = true;
+            break;
+        }
+        len /= 2;
+    }
+    if !readable {
         gpu_vertex_attrib_pointer(index, size, kind, normalized, stride, pointer, Vec::new());
         return 0;
-    };
+    }
 
-    gpu_vertex_attrib_pointer(index, size, kind, normalized, stride, pointer, data);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&scratch[..len], &mut hasher);
+    let hash = std::hash::Hasher::finish(&hasher);
+
+    let cached = VAP_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&pointer).copied())
+        .filter(|(_, cached_hash)| *cached_hash == hash)
+        .map(|(buffer, _)| buffer);
+
+    if let Some(buffer) = cached {
+        // Unchanged geometry: just point the attribute at the existing VBO.
+        gpu_void_clear(move || unsafe {
+            let mut previous = 0i32;
+            gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut previous);
+            gl::BindBuffer(gl::ARRAY_BUFFER, buffer);
+            gl::VertexAttribPointer(index, size, kind, normalized, stride, std::ptr::null());
+            gl::BindBuffer(gl::ARRAY_BUFFER, previous as u32);
+        });
+        return 0;
+    }
+
+    // New or changed geometry at this pointer: (re)specify its dedicated VBO.
+    let data = scratch[..len].to_vec();
+    let output = gpu_call(move || {
+        let mut buffer = VAP_CACHE
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&pointer).copied())
+            .map(|(buffer, _)| buffer)
+            .unwrap_or(0);
+        let mut previous = 0i32;
+        unsafe {
+            gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut previous);
+            if buffer == 0 {
+                gl::GenBuffers(1, &mut buffer);
+                if buffer == 0 {
+                    buffer = next_fallback_id();
+                }
+            }
+            gl::BindBuffer(gl::ARRAY_BUFFER, buffer);
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
+                data.len() as isize,
+                data.as_ptr() as *const _,
+                gl::STATIC_DRAW,
+            );
+            gl::VertexAttribPointer(index, size, kind, normalized, stride, std::ptr::null());
+            gl::BindBuffer(gl::ARRAY_BUFFER, previous as u32);
+            drain_host_gl_errors();
+        }
+        GpuOutput {
+            out_u32: vec![buffer],
+            ..Default::default()
+        }
+    });
+    if let Some(output) = output {
+        if let Some(&buffer) = output.out_u32.first() {
+            if let Ok(mut cache) = VAP_CACHE.lock() {
+                cache.insert(pointer, (buffer, hash));
+            }
+        }
+    }
     0
 }
 
@@ -2607,9 +2773,11 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
             return Some(0);
         }
         "glCreateShader" => {
+            GL_LIVE_SHADERS.fetch_add(1, Ordering::Relaxed);
             return gpu_ret_u1(gl::CreateShader, ureg(unicorn, RegisterARM::R0));
         }
         "glCreateProgram" => {
+            GL_LIVE_PROGRAMS.fetch_add(1, Ordering::Relaxed);
             return gpu_ret_u0(gl::CreateProgram);
         }
         "glCompileShader" => {

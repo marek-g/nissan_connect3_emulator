@@ -150,6 +150,16 @@ static HMI_GUI_POINTER: AtomicU32 = AtomicU32::new(0);
 static GUI_MESSAGING_POINTER: AtomicU32 = AtomicU32::new(0);
 static GUI_INTERNAL_EVENT_SENT_COUNT: AtomicU32 = AtomicU32::new(0);
 static GUI_UTIL_STARTUP_STATUS_POSTED: AtomicU32 = AtomicU32::new(0);
+// The startup animation status (GUI message type 6) that a real boot
+// animation process reports over the message queue. Injecting it makes
+// prochmi treat the startup animation as started (its GUI svg layer stays
+// visible via clGUIWidgetEngine::onGuiStartupAnimStatus). Off by default;
+// set EMU_GUI_STARTUP_ANIM=1 to re-enable.
+fn gui_startup_anim_enabled() -> bool {
+    std::env::var("EMU_GUI_STARTUP_ANIM")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+}
 static GUI_UTIL_MSGBOX_QUEUE: AtomicU32 = AtomicU32::new(0);
 static GUI_ENGINE_ADDRESS: AtomicU32 = AtomicU32::new(0);
 static HMI_EVENT_OBJECT: AtomicU32 = AtomicU32::new(0);
@@ -616,6 +626,7 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 log::info!("PROCHMI: bCheckMsgBox tick {}", msgbox_ticks);
             }
             if GUI_UTIL_STARTUP_STATUS_POSTED.load(Ordering::Relaxed) == 0
+                && gui_startup_anim_enabled()
                 && post_gui_util_startup_anim_status(uc, 1)
             {
                 GUI_UTIL_STARTUP_STATUS_POSTED.store(1, Ordering::Relaxed);
@@ -1464,6 +1475,7 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
 
     if GUI_ENGINE_ADDRESS.load(Ordering::Relaxed) != 0
         && GUI_UTIL_STARTUP_STATUS_POSTED.load(Ordering::Relaxed) < 1
+        && gui_startup_anim_enabled()
     {
         if post_gui_util_startup_anim_status(unicorn, 1) {
             GUI_UTIL_STARTUP_STATUS_POSTED.fetch_add(1, Ordering::Relaxed);
@@ -2052,14 +2064,11 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
                         let layer_copy = read_u32(uc, manager + 0x130);
                         let texture = read_u32(uc, layer_copy);
                         let tex_name = read_u32(uc, texture);
-                        if let Some(bytes) = crate::gpu::map_surface_snapshot() {
-                            crate::gpu::upload_rgba_texture(
-                                tex_name,
-                                bytes,
-                                SVG_MAP_WIDTH as i32,
-                                SVG_MAP_HEIGHT as i32,
-                            );
-                        }
+                        crate::gpu::refresh_texture_from_map_surface(
+                            tex_name,
+                            SVG_MAP_WIDTH as i32,
+                            SVG_MAP_HEIGHT as i32,
+                        );
                     }
                 }
                 if name == "GUI_GL_LayerSync::requestViewStatus"
