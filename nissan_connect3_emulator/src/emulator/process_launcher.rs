@@ -34,6 +34,26 @@ pub fn spawn_process(app_name: &str, filename: &str, cmdline: &str) -> Result<()
 
     let elf_path = resolve_process_path(filename);
     let args = process_args(&elf_path, cmdline);
+    // The real head unit's boot timing has DAPIAPP's map medium (CRYPTNAV)
+    // already ACTIVE before the map engine's DAPI service registration runs.
+    // The registration's registry entry permanently snapshots the service
+    // state at that moment and the client never re-registers, so an early
+    // map engine start stamps it REGISTERED and every later request fails
+    // temp-unavailable. Hold the spawn (this is the OSAL spawn boundary the
+    // real procbaselx drives) until the medium is genuinely up.
+    if elf_path.contains("procmapengine") {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(70);
+        while !crate::libs::dapi::MAP_MEDIUM_ACTIVE
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        log::info!(
+            "OSAL: map-engine spawn released (map medium active: {})",
+            crate::libs::dapi::MAP_MEDIUM_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
     log::info!(
         "OSAL: spawning process app='{}' path={} args={:?}",
         app_name,

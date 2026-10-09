@@ -323,6 +323,21 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     if uc.mem_read(flags_addr as u64, &mut flags).is_ok() {
                         flags[0] |= 5;
                         let _ = uc.mem_write(flags_addr as u64, &flags);
+                        // s32DNFS_IO_Open gates /dev/cryptcard opens on the
+                        // media-present short `0x2f9fa` (prm_vInit leaves it at
+                        // 1 = absent) and on the crypt-device root pointer
+                        // `0x2f9c0` being non-null before it falls through to
+                        // the real LFS open. A detected card sets both; mimic
+                        // that so DAPIAPP's bRegPRMNotifications open of
+                        // /dev/cryptcard reaches the mounted node instead of
+                        // failing with 0x7201f. The arena is host-shared across
+                        // processes, so this runs once (in procbaselx's PRM
+                        // recognition loop) and every process observes it.
+                        let _ = uc.mem_write((table + 0x2f9fa) as u64, &4u8.to_le_bytes());
+                        let _ = uc.mem_write(
+                            (table + 0x2f9c0) as u64,
+                            &1u32.to_le_bytes(),
+                        );
                         log::warn!(
                             "libosal {} [{}] forced DNL SD card ready addr={:#x} handle={:#x} table={:#x} flags={:#x}",
                             uc.get_data().elf_path,

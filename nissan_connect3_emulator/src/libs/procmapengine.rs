@@ -3026,14 +3026,18 @@ fn add_dapi_register_diag_hooks(unicorn: &mut Unicorn<'_, Context>, base_address
                 } else {
                     uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32
                 };
-                if label.contains("registering")
-                    && (read_u16_or_invalid(uc, handler.wrapping_add(4)) & 0xffff)
-                        == MAP_DATA_DAPI_SERVICE_ID
-                {
+                if label.contains("registering") || label.contains("u16RegisterService-entry") {
                     // bRegisterAsync defers the REGISTER until the TE-side
                     // directory reports the server app as running - which it
                     // never does here. Feed it the ApplicationInfoStatus so
                     // the deferred execute posts the real REGISTER to mbx_7.
+                    // Injecting at the first u16RegisterService entry (init
+                    // time, not only the map-data one) matters: the deferred
+                    // execute runs when the AE thread next waits on its
+                    // mailbox, and if the REGISTER reaches DAPIAPP after the
+                    // first GetBlockIDs request, DAPIAPP answers error id 6,
+                    // procmap's error path posts UNREGISTER, and the freshly
+                    // created client entry is torn down before it is usable.
                     crate::libs::libosal_linux::message::post_app_info_status(uc, 7);
                 }
                 let app_interface = read_u32_or_invalid(uc, handler.wrapping_add(0x10));

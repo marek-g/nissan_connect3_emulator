@@ -253,7 +253,7 @@ impl OsFileSystem {
             return None;
         }
 
-        Some(normalized)
+        Some(case_insensitive_resolve(&self.host_path, &normalized))
     }
 
     fn get_open_options(&self, flags: OpenFileFlags) -> OpenOptions {
@@ -287,4 +287,53 @@ fn normalize_path(path: &std::path::Path) -> PathBuf {
         }
     }
     result
+}
+
+/// Resolve `path` (already normalized, under `root`) on disk, falling back to
+/// case-insensitive component matching when the exact path does not exist.
+/// SD-card media ships uppercase names (DATA/, MEDIUM.CFG) while the guest
+/// sometimes builds lower-case paths (/data/DATASET.CFG); the unit's own
+/// filesystem tolerates neither, but since we serve the card off a
+/// case-sensitive host this recovers the intended entries. Exact matches
+/// always win, so the only behavior change is on previously-failing opens;
+/// a component that matches nothing keeps its original spelling (so opens
+/// with O_CREAT can still create new files).
+fn case_insensitive_resolve(root: &std::path::Path, path: &std::path::Path) -> PathBuf {
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    let rel = match path.strip_prefix(root) {
+        Ok(rel) => rel,
+        Err(_) => return path.to_path_buf(),
+    };
+    let mut current = root.to_path_buf();
+    for (index, component) in rel.components().enumerate() {
+        let name = component.as_os_str();
+        let exact = current.join(name);
+        if exact.exists() {
+            current = exact;
+            continue;
+        }
+        let lowered = name.to_string_lossy().to_lowercase();
+        let mut matched = None;
+        if let Ok(entries) = std::fs::read_dir(&current) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().to_lowercase() == lowered {
+                    matched = Some(entry.path());
+                    break;
+                }
+            }
+        }
+        match matched {
+            Some(hit) => current = hit,
+            None => {
+                // nothing to fold onto: keep the remaining components verbatim
+                for rest in rel.components().skip(index) {
+                    current = current.join(rest.as_os_str());
+                }
+                return current;
+            }
+        }
+    }
+    current
 }

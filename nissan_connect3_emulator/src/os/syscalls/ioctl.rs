@@ -31,6 +31,14 @@ pub fn ioctl(mut unicorn: &mut Unicorn<'_, Context>, fd: u32, request: u32, addr
     }
 
     let res = match path.as_deref() {
+        // SD card control device. OSAL_s32IOControl(0x7ffffffc) asks for the
+        // media status bit-mask consumed by DAPIAPP bRegPRMNotifications:
+        // bit0 medium inserted, bit2 medium ready, and the *inverted* bits
+        // ~bit1 device-ok, ~bit3 device-access, ~bit4 temperature ok.
+        Some("/dev/cryptcard") if request == 0x7ffffffc => {
+            log::info!("ioctl /dev/cryptcard: media status request -> inserted|ready|ok");
+            5
+        }
         Some("/dev/svg_resource") => {
             crate::os::dev::svg_resource::ioctl(&mut unicorn, request, addr) as u32
         }

@@ -204,6 +204,293 @@ pub fn dapiapp_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     hook_service_register_handler(unicorn, base_address);
     hook_service_data_errors(unicorn, base_address);
     hook_service_data_scan(unicorn, base_address);
+    hook_service_state_setter(unicorn, base_address);
+    hook_registry_guard(unicorn, base_address);
+    hook_service_status_handler(unicorn, base_address);
+    hook_device_manager_init(unicorn, base_address);
+    hook_device_manager_flow(unicorn, base_address);
+}
+
+/// Coarse trace of the DAPDEVM task once it is running: which messages the
+/// device manager receives/dispatches and how far the device/medium
+/// evaluation and the config/resource-notification jobs of its scheduler
+/// get, to find where the PRM device registration chain stops.
+fn hook_device_manager_flow(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    for (address, name) in [
+        (0x0082_d6a4, "DeviceManager::vReceiveMsg"),
+        (0x0082_db58, "DeviceManager::vDispatchSystemMsg"),
+        (0x0082_cd38, "DeviceManager::vDispatchFunctionalityMsg"),
+        (0x0082_d02c, "DeviceManager::vProcessingAvailChangeJob"),
+        (0x0082_d78c, "DeviceManager::vInitDevices"),
+        (0x0082_e1a4, "DeviceManager::C1"),
+        (0x0083_1710, "Scheduler::vProcessJob"),
+        (0x0083_1560, "Scheduler::vProcessDeviceJob"),
+        (0x0083_0598, "Scheduler::vProcessInfoJob"),
+        (0x0082_f570, "Scheduler::vProcessConfigEvaluation"),
+        (0x0082_f1dc, "Scheduler::vProcessConfigUpdate"),
+        (0x0082_f81c, "Scheduler::vProcessResourceNotific"),
+        (0x0083_0d40, "Scheduler::vProcessDeviceResult"),
+        (0x0083_17cc, "Scheduler::vInitializeDevHandler"),
+        (0x008b_4c40, "DeviceTableWorker::bRegPRMNotifications"),
+    ] {
+        let address = base_address + (address - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+                let count = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count >= 800 {
+                    return;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                log::warn!(
+                    "DAPI-flow {} [{}] {} addr={:#x} r0={:#x} r1={:#x} r2={:#x}",
+                    uc.get_data().elf_path,
+                    uc.get_data().inner.thread_id(),
+                    name,
+                    addr,
+                    r0,
+                    r1,
+                    r2,
+                );
+            })
+            .unwrap();
+    }
+
+    // bRegPRMNotifications media-status ioctl: at 0x8b4d7c r5 holds the fd
+    // returned by OSAL_IOOpen(ctrl-dev) and r1=0x7ffffffc; 0x8b4d84 receives
+    // the returned status bit-mask (or -1). Log both to see whether the
+    // control device open succeeded and what status the emulator gave back.
+    // OSAL_IOOpen wrapper 0x813144 (bRegPRMNotifications calls it via bl):
+    // log path+flags at entry, then tap the return address (lr) once to
+    // capture the returned fd.
+    {
+        let open_entry = base_address + (0x0081_3180u32 - ORIGINAL_BASE);
+        let res = unicorn.add_code_hook(open_entry as u64, open_entry as u64, {
+            let base = base_address;
+            move |uc, _addr, _| {
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                let path = crate::emulator::utils::read_string(uc, r0);
+                log::warn!(
+                    "DAPI-flow {} [{}] OSAL_IOOpen enter path={} flags={:#x} lr={:#x}",
+                    uc.get_data().elf_path,
+                    uc.get_data().inner.thread_id(),
+                    path,
+                    r1,
+                    lr
+                );
+                let _ = base;
+            }
+        });
+        if res.is_err() {
+            log::debug!("dapi: could not hook OSAL_IOOpen wrapper");
+        }
+    }
+
+    for (address, name) in [
+        (0x008b_4d7c, "bRegPRM ioctl-before (fd in r5)"),
+        (0x008b_4d84, "bRegPRM ioctl-after (r0=result)"),
+        (0x008b_5094, "bRegPRM open-failed path (800)"),
+        (0x008b_50c0, "bRegPRM empty-path path (0x218)"),
+    ] {
+        let address = base_address + (address - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+                let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                log::warn!(
+                    "DAPI-flow {} [{}] {} addr={:#x} r5={:#x} r0={:#x}",
+                    uc.get_data().elf_path,
+                    uc.get_data().inner.thread_id(),
+                    name,
+                    addr,
+                    r5,
+                    r0,
+                );
+            })
+            .unwrap();
+    }
+}
+
+/// ServiceStatus consumer (unanalyzed region, entered at 0xb3a448):
+/// (app, regId, new_state) -> scans the app's registry and applies the
+/// message's state byte to the entry with a matching register-id. Trace its
+/// parameters so the synthesized AVAILABLE status can be validated.
+fn hook_service_status_handler(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    for (address, name) in [
+        (0x00b3_a448, "status-consumer entry"),
+        (0x00b3_a4b0, "status-consumer matched-set"),
+        (0x00b3_a4c8, "status-consumer second-branch"),
+    ] {
+        let address = base_address + (address - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+                let count = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count >= 4000 {
+                    return;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let r8 = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+                let r10 = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
+                log::warn!(
+                    "DAPI {} [{}] {} addr={:#x} r0={:#x} r1={:#x} r2={:#x} r8={:#x} r10={:#x}",
+                    uc.get_data().elf_path,
+                    uc.get_data().inner.thread_id(),
+                    name,
+                    addr,
+                    r0,
+                    r1,
+                    r2,
+                    r8,
+                    r10,
+                );
+            })
+            .unwrap();
+    }
+}
+
+/// `dap_dev_tclDeviceManager::u16Init` registers the "DAP_DEVICEMANAGER_THREAD"
+/// notification client (commcon vtable+0x14, regId lands in object+0xc8) and
+/// then subscribes to event 8 (media state, vtable+0x10). Its return value is
+/// what makes `dap_tclDataServer::u16Init` fail with 0xffff, which keeps the
+/// map medium permanently unavailable. Trace both call results.
+fn hook_device_manager_init(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::AtomicBool;
+    static PRM_INFO_SENT: AtomicBool = AtomicBool::new(false);
+
+    for (address, name) in [
+        (0x0082_de04, "DeviceManager register-notification result (r0=regid/0xfffe)"),
+        (0x0082_de54, "DeviceManager subscribe-event8 result"),
+    ] {
+        let address = base_address + (address - ORIGINAL_BASE);
+        let notify_at = address;
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                let mut buf = [0u8; 4];
+                let target_app = if uc.mem_read((r5 + 0x1c) as u32 as u64, &mut buf).is_ok() {
+                    u32::from_le_bytes(buf)
+                } else {
+                    0
+                };
+                log::warn!(
+                    "DAPI {} [{}] {} addr={:#x} r0={:#x} r1={:#x} obj={:#x} target_app={:#x}",
+                    uc.get_data().elf_path,
+                    uc.get_data().inner.thread_id(),
+                    name,
+                    addr,
+                    r0,
+                    r1,
+                    r5,
+                    target_app,
+                );
+                // The notification registration defers inside bRegisterAsync
+                // waiting for an ApplicationInfoStatus that would announce
+                // the PRM server (app 0x0a, the peripheral manager inside
+                // procbaselx). Feed it to DAPI's own mailbox so the deferred
+                // registration runs, bRegPRMNotifications executes and the
+                // media-state event 8 subscription becomes live.
+                if addr == notify_at as u64 && r0 != 0xfffe {
+                    crate::libs::libosal_linux::message::post_app_info_status_to(
+                        uc,
+                        0x000a,
+                        7,
+                        &PRM_INFO_SENT,
+                    );
+                }
+            })
+            .unwrap();
+    }
+}
+
+/// Trace every write to a service-registry entry's state byte (entry+0x8):
+/// the ServiceData accept gate rejects opcode-2 requests while the matched
+/// client entry is not ACTIVE (0), so we need to know who leaves it at 1.
+/// True once DAPIAPP's own (internal, regid 0xffff) svc-0x26 registry entry
+/// has been set ACTIVE by the medium-up path (DAPDEVM thread). The real unit
+/// orders process startup so the map engine's service registration happens
+/// after this; procmap's client entry copies this state at REGISTER time,
+/// and a copied 1 makes every later request fail with error 0xb.
+pub static MAP_MEDIUM_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn hook_service_state_setter(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::Ordering;
+    use std::sync::atomic::AtomicU32;
+    static SET_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    let address = base_address + (0x00b4_6228 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+            let count = SET_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count >= 300 {
+                return;
+            }
+            let read = |reg| uc.reg_read(reg).unwrap_or(0) as u32;
+            // Watch for the internal svc-0x26 entry going ACTIVE (state 0).
+            let entry = read(RegisterARM::R0);
+            let new_state = read(RegisterARM::R1) & 0xff;
+            let mut key = [0u8; 4];
+            if new_state == 0
+                && uc.mem_read(entry as u64, &mut key).is_ok()
+                && u16::from_le_bytes([key[0], key[1]]) == 0xffff
+                && u16::from_le_bytes([key[2], key[3]]) == 0x26
+            {
+                MAP_MEDIUM_ACTIVE.store(true, Ordering::SeqCst);
+                log::info!("DAPI map-data medium ACTIVE (internal svc-0x26 entry {:#x})", entry);
+            }
+            log::warn!(
+                "DAPI {} [{}] registry vSetServiceState entry={:#x} new_state={:#x} lr={:#x}",
+                uc.get_data().elf_path,
+                uc.get_data().inner.thread_id(),
+                read(RegisterARM::R0),
+                read(RegisterARM::R1) & 0xff,
+                read(RegisterARM::LR),
+            );
+        })
+        .unwrap();
+}
+
+/// Traces DAPIAPP's ServiceRegister handler: the service-conf lookup result
+/// (vt+0xd8) and the register-id assignment result (vt+0x24), to verify the
+/// client's own registrations reach and pass the handler.
+fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    // Register-handler conf-getter (vt+0xd8) result at the
+    // `cmp r0,#0` - shows whether a REGISTER passes the service-conf lookup.
+    for (off, tag) in [(0x00b4_3a70u32, "conf-result"), (0x00b4_3ad0u32, "assign-result")] {
+        let address = base_address + (off - ORIGINAL_BASE);
+        let tag: &'static str = tag;
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+                static HOOK_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if HOOK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
+                    return;
+                }
+                let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+                log::warn!(
+                    "DAPI reg-handler {} r0={:#x} r9={:#x} r10={:#x} r11={:#x}",
+                    tag,
+                    read(RegisterARM::R0),
+                    read(RegisterARM::R9),
+                    read(RegisterARM::R10),
+                    read(RegisterARM::R11),
+                );
+            })
+            .unwrap();
+    }
 }
 
 /// Trace the registry scan inside `ail_bHandleMsgServiceData` that decides
@@ -215,9 +502,40 @@ fn hook_service_data_scan(unicorn: &mut Unicorn<'_, Context>, base_address: u32)
     static SCAN_COUNT: AtomicU32 = AtomicU32::new(0);
     static CMP_COUNT: AtomicU32 = AtomicU32::new(0);
 
+    // Watch writes to the fwl_List header at app+0x58 (0xf614c8: head/tail/
+    // count): entries are added correctly then vanish, so something rewrites
+    // the header (or splices the chain) outside the add/remove API.
+    {
+        use unicorn_engine::unicorn_const::HookType;
+        let hdr_lo = 0x00f6_14c8u64;
+        let hdr_hi = 0x00f6_14d8u64;
+        let res = unicorn.add_mem_hook(HookType::MEM_WRITE, hdr_lo, hdr_hi, move |uc, _t, address, size, value| {
+            static HDR_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if HDR_COUNT.fetch_add(1, Ordering::Relaxed) >= 500 {
+                return true;
+            }
+            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+            log::warn!(
+                "DAPI {} [{}] HDR-WRITE addr={:#x} size={} value={:#x} pc={:#x}",
+                uc.get_data().elf_path,
+                uc.get_data().inner.thread_id(),
+                address,
+                size,
+                value,
+                pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+            );
+            true
+        });
+        log::warn!("DAPI registry hdr write-hook installed: {}", res.is_ok());
+    }
+
     for (address, name, is_scan) in [
         (0x00b4_3218, "scan-begin (r6=request-register-id, r1=registry-head)", true),
         (0x00b4_61c8, "registry bIsDataSet compare", false),
+        (0x00b4_3c00, "registry-list ADD notfound-entry (r0=list r1=sp+0x64)", false),
+        (0x00b4_3c30, "registry-list ADD found-entry (r0=list r1=sp+0x74)", false),
+        (0x00b3_69b0, "registry-list REMOVE (r0=list r1=&entry)", false),
+        (0x00b3_5ec0, "registry-list NODE-DEL (r0=list r1=&iter)", false),
     ] {
         // (register-id wildcard patch is installed separately below)
         let address = base_address + (address - ORIGINAL_BASE);
@@ -225,7 +543,7 @@ fn hook_service_data_scan(unicorn: &mut Unicorn<'_, Context>, base_address: u32)
             .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
                 let counter = if is_scan { &SCAN_COUNT } else { &CMP_COUNT };
                 let count = counter.fetch_add(1, Ordering::Relaxed);
-                if count >= 40 {
+                if count >= 600 {
                     return;
                 }
                 let read = |reg| uc.reg_read(reg).unwrap_or(0) as u32;
@@ -240,11 +558,24 @@ fn hook_service_data_scan(unicorn: &mut Unicorn<'_, Context>, base_address: u32)
                 } else {
                     0
                 };
-                let mut fields = Vec::with_capacity(4);
+                let mut fields = Vec::with_capacity(5);
+                let entry_at_r1 = name.contains("ADD") || name.contains("REMOVE");
+                let base = if name.contains("NODE-DEL") {
+                    let mut nb = [0u8; 4];
+                    if uc.mem_read(r1 as u64, &mut nb).is_ok() {
+                        u32::from_le_bytes(nb).wrapping_add(8)
+                    } else {
+                        0
+                    }
+                } else if entry_at_r1 {
+                    r1
+                } else {
+                    r0
+                };
                 if !is_scan {
                     let mut buf = [0u8; 2];
                     for offset in (0..8u32).step_by(2) {
-                        let value = if uc.mem_read(r0.wrapping_add(offset) as u64, &mut buf).is_ok()
+                        let value = if uc.mem_read(base.wrapping_add(offset) as u64, &mut buf).is_ok()
                         {
                             u16::from_le_bytes(buf)
                         } else {
@@ -252,10 +583,91 @@ fn hook_service_data_scan(unicorn: &mut Unicorn<'_, Context>, base_address: u32)
                         };
                         fields.push(value);
                     }
+                    let mut state = [0u8; 1];
+                    fields.push(
+                        if uc.mem_read(base.wrapping_add(8) as u64, &mut state).is_ok() {
+                            state[0] as u16
+                        } else {
+                            0xff
+                        },
+                    );
                 }
                 let r6 = read(RegisterARM::R6);
+                let lr = read(RegisterARM::LR);
+                if entry_at_r1 {
+                    // fwl_List header: [4]=head [8]=tail [0xc]=count. vAdd
+                    // silently no-ops when count!=0 && tail==0.
+                    let mut hdr = [0u8; 12];
+                    let (head, tail, count) = if uc.mem_read(r0 as u64, &mut hdr).is_ok() {
+                        (
+                            u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) & 0,
+                            u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]),
+                            u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]),
+                        )
+                    } else {
+                        (0, 0, 0)
+                    };
+                    let _ = head;
+                    let mut vt = [0u8; 12];
+                    let slots = if uc
+                        .mem_read(
+                            base_address.wrapping_add(0x00e7_2770 - ORIGINAL_BASE) as u64,
+                            &mut vt,
+                        )
+                        .is_ok()
+                    {
+                        [
+                            u32::from_le_bytes([vt[0], vt[1], vt[2], vt[3]]),
+                            u32::from_le_bytes([vt[4], vt[5], vt[6], vt[7]]),
+                            u32::from_le_bytes([vt[8], vt[9], vt[10], vt[11]]),
+                        ]
+                    } else {
+                        [0; 3]
+                    };
+                    log::warn!(
+                        "DAPI {} [{}] ADD live-vtable=[{:08x},{:08x},{:08x}] tail-node={:#x} prev={:#x} next={:#x}",
+                        uc.get_data().elf_path,
+                        uc.get_data().inner.thread_id(),
+                        slots[0],
+                        slots[1],
+                        slots[2],
+                        tail,
+                        {
+                            let mut p = [0u8; 8];
+                            if uc.mem_read(tail as u64, &mut p).is_ok() {
+                                u32::from_le_bytes([p[0], p[1], p[2], p[3]])
+                            } else {
+                                0
+                            }
+                        },
+                        {
+                            let mut p = [0u8; 8];
+                            if uc.mem_read(tail.wrapping_add(4) as u64, &mut p).is_ok() {
+                                u32::from_le_bytes([p[0], p[1], p[2], p[3]])
+                            } else {
+                                0
+                            }
+                        },
+                    );
+                    log::warn!(
+                        "DAPI {} [{}] ADD list={:#x} head(+8)={:#x} tail(+c)={:#x} count+8={:#x}",
+                        uc.get_data().elf_path,
+                        uc.get_data().inner.thread_id(),
+                        r0,
+                        tail,
+                        count,
+                        {
+                            let mut c = [0u8; 4];
+                            if uc.mem_read(r0.wrapping_add(0xc) as u64, &mut c).is_ok() {
+                                u32::from_le_bytes(c)
+                            } else {
+                                0xffffffff
+                            }
+                        },
+                    );
+                }
                 log::warn!(
-                    "DAPI {} [{}] {} addr={:#x} r0={:#x} r1={:#x} r2={:#x} r3={:#x} stack0={:#x} r6={:#x} entry_u16s={:04x?}",
+                    "DAPI {} [{}] {} addr={:#x} r0={:#x} r1={:#x} r2={:#x} r3={:#x} stack0={:#x} r6={:#x} lr={:#x} entry_u16s+state={:04x?}",
                     uc.get_data().elf_path,
                     uc.get_data().inner.thread_id(),
                     name,
@@ -266,8 +678,90 @@ fn hook_service_data_scan(unicorn: &mut Unicorn<'_, Context>, base_address: u32)
                     r3,
                     stack_arg,
                     r6,
+                    lr - base_address + ORIGINAL_BASE,
                     fields
                 );
+                if is_scan {
+                    // Walk the ail_tclServiceRegistry list at r1 (app+0x58):
+                    // node = [prev, next, entry{u16 key0..3, u8 state, ...}]
+                    let r7 = read(RegisterARM::R7);
+                    let mut app = [0u8; 4];
+                    let app_id = if uc.mem_read(r7 as u64, &mut app).is_ok() {
+                        u32::from_le_bytes(app)
+                    } else {
+                        0
+                    };
+                    let mut hdr = [0u8; 16];
+                    let (w0, head, tail, count) = if uc.mem_read(r1 as u64, &mut hdr).is_ok() {
+                        (
+                            u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]),
+                            u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]),
+                            u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]),
+                            u32::from_le_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]),
+                        )
+                    } else {
+                        (0, 0, 0, 0)
+                    };
+                    log::warn!(
+                        "DAPI {} [{}] scan-list app+0x10={:04x} app+0x58={:#x} hdr=[{:08x},{:08x},{:08x},{:08x}] tuple=({:04x},{:04x},{:04x},{:04x})",
+                        uc.get_data().elf_path,
+                        uc.get_data().inner.thread_id(),
+                        app_id & 0xffff,
+                        r1,
+                        w0,
+                        head,
+                        tail,
+                        count,
+                        r6,
+                        read(RegisterARM::R9),
+                        read(RegisterARM::R8),
+                        read(RegisterARM::R11),
+                    );
+                    let mut node = {
+                        let mut b = [0u8; 4];
+                        if uc.mem_read(r1.wrapping_add(4) as u64, &mut b).is_ok() {
+                            u32::from_le_bytes(b)
+                        } else {
+                            0
+                        }
+                    };
+                    let mut steps = 0;
+                    while node != 0 && steps < 40 {
+                        steps += 1;
+                        let mut buf = [0u8; 2];
+                        let mut nf = Vec::with_capacity(5);
+                        for offset in (0..8u32).step_by(2) {
+                            nf.push(if uc.mem_read(node.wrapping_add(8 + offset) as u64, &mut buf).is_ok() {
+                                u16::from_le_bytes(buf)
+                            } else {
+                                0xffff
+                            });
+                        }
+                        let mut st = [0u8; 1];
+                        nf.push(if uc.mem_read(node.wrapping_add(16) as u64, &mut st).is_ok() {
+                            st[0] as u16
+                        } else {
+                            0xff
+                        });
+                        let nx = {
+                            let mut b = [0u8; 4];
+                            if uc.mem_read(node.wrapping_add(4) as u64, &mut b).is_ok() {
+                                u32::from_le_bytes(b)
+                            } else {
+                                0
+                            }
+                        };
+                        log::warn!(
+                            "DAPI {} [{}]   node={:#x} entry={:04x?} next={:#x}",
+                            uc.get_data().elf_path,
+                            uc.get_data().inner.thread_id(),
+                            node,
+                            nf,
+                            nx
+                        );
+                        node = nx;
+                    }
+                }
             })
             .unwrap();
     }
@@ -333,6 +827,7 @@ fn hook_service_register_handler(unicorn: &mut Unicorn<'_, Context>, base_addres
         (0x00b4_35b8, "ServiceRegisterConf handler entry"),
     ] {
         let address = base_address + (address - ORIGINAL_BASE);
+        let inject_at = address;
         unicorn
             .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
                 let count = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -356,6 +851,7 @@ fn hook_service_register_handler(unicorn: &mut Unicorn<'_, Context>, base_addres
                     r11,
                     lr
                 );
+                let _ = inject_at;
             })
             .unwrap();
     }

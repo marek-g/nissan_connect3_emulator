@@ -1743,9 +1743,43 @@ fn bridge_mbx_queue(
             let Some(content) = resolve_osal_ref_content(unicorn, base_address, msg_ptr) else {
                 return false;
             };
-            let Some(body) = snapshot_content_bytes(unicorn, content) else {
+            let Some(mut body) = snapshot_content_bytes(unicorn, content) else {
                 return false;
             };
+            // DAPIAPP's ServiceRegister handler initializes a new registry
+            // entry's state to ACTIVE (0) only when the request's sourceSubID
+            // (u32 @ +0xc) equals the "no sub-id" sentinel 0xFFFE; any other
+            // value leaves the entry REGISTERED (1), which then rejects
+            // data requests (opcode 2) with ServiceDataError 0xb
+            // "temporarily unavailable". procmap's libosal leaves the field
+            // uninitialized, so normalize it for traffic into DAPI's mailbox.
+            if name == "mbx_7" && body.len() >= 0x10 && (body[0xb] == 0x41 || body[0xb] == 0x45) {
+                body[0xc..0x10].copy_from_slice(&0x0000_fffeu32.to_le_bytes());
+            }
+            if body.len() >= 0x18
+                && u16::from_le_bytes([body[0], body[1]]) == 0x0400
+                && matches!(body[0xb], 0x41 | 0x42 | 0x44 | 0x45)
+            {
+                if body[0xb] == 0x42 {
+                    log::info!(
+                        "[LIBOSAL-MBX] REGISTER body: {}",
+                        body.iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
+                log::info!(
+                    "[LIBOSAL-MBX] from-procmap q={} dst={:#06x} class={:#04x} svc={:#06x} regid={:#06x} sub12={:#06x} sub14={:#06x}",
+                    name,
+                    u16::from_le_bytes([body[2], body[3]]),
+                    body[0xb],
+                    u16::from_le_bytes([body[0x14], body[0x15]]),
+                    u16::from_le_bytes([body[0x16], body[0x17]]),
+                    u16::from_le_bytes([body[0xc], body[0xd]]),
+                    u16::from_le_bytes([body[0xe], body[0xf]]),
+                );
+            }
             let mut blob = Vec::with_capacity(8 + body.len());
             blob.extend_from_slice(&1u32.to_le_bytes());
             blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -1850,27 +1884,28 @@ fn bridge_mbx_queue(
 /// ApplicationInfoRegister probe lives on the TE side and never replies
 /// here, so a client's registration request is deferred forever. Synthe-
 /// size the ApplicationInfoStatus the directory would have broadcast for
-/// the server app: procmap's handler then marks the server known, runs
+/// the server app: the client's handler then marks the server known, runs
 /// the deferred registration and fires the client-state observer which
-/// triggers the natural re-registration. Emitted once per server app.
-pub(crate) fn post_app_info_status(unicorn: &mut Unicorn<'_, Context>, server_app: u32) -> bool {
-    use std::sync::atomic::AtomicU32;
-    static APP_INFO_SENT_FOR: AtomicU32 = AtomicU32::new(0xffff_ffff);
-
+/// triggers the natural re-registration. Emitted once per (server, target)
+/// pair via the caller-suppressed guard.
+pub(crate) fn post_app_info_status_to(
+    unicorn: &mut Unicorn<'_, Context>,
+    server_app: u32,
+    client_app: u32,
+    once: &std::sync::atomic::AtomicBool,
+) -> bool {
     if server_app == 0 || server_app == 0xffff {
         return false;
     }
-    if APP_INFO_SENT_FOR
-        .compare_exchange(0xffff_ffff, server_app, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
+    if once.swap(true, Ordering::Relaxed) {
         return false;
     }
 
+    let queue_name = format!("mbx_{}", client_app);
     let mut info = vec![0u8; 0x20];
     let info_len = info.len() as u32;
     info[0..2].copy_from_slice(&(server_app as u16).to_le_bytes());
-    info[2..4].copy_from_slice(&0x0400u16.to_le_bytes());
+    info[2..4].copy_from_slice(&(client_app as u16).to_le_bytes());
     info[4..8].copy_from_slice(&info_len.to_le_bytes());
     info[8..10].copy_from_slice(&2u16.to_le_bytes());
     info[0xb] = 0x50;
@@ -1886,20 +1921,28 @@ pub(crate) fn post_app_info_status(unicorn: &mut Unicorn<'_, Context>, server_ap
     blob.extend_from_slice(&info);
     let accepted = {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
-        let queue_id = OsalQueueService::ensure_queue(&mut state.mq, "mbx_1024");
+        let queue_id = OsalQueueService::ensure_queue(&mut state.mq, &queue_name);
         state.mq.grow_msgsize(queue_id, blob.len() as i64);
-        let accepted = OsalQueueService::guest_post(&mut state.mq, "mbx_1024", blob, 0);
+        let accepted = OsalQueueService::guest_post(&mut state.mq, &queue_name, blob, 0);
         if accepted {
             state.notify_waiters();
         }
         accepted
     };
     log::info!(
-        "[LIBOSAL-MBX] synthesized ApplicationInfoStatus(app 0x{:04x}, state 4) into mbx_1024: {}",
+        "[LIBOSAL-MBX] synthesized ApplicationInfoStatus(app 0x{:04x}, state 1) into {}: {}",
         server_app,
+        queue_name,
         accepted
     );
     accepted
+}
+
+pub(crate) fn post_app_info_status(unicorn: &mut Unicorn<'_, Context>, server_app: u32) -> bool {
+    use std::sync::atomic::AtomicBool;
+    static APP_INFO_SENT: AtomicBool = AtomicBool::new(false);
+    // procmap (app 0x400) is the intended client for this emission.
+    post_app_info_status_to(unicorn, server_app, 0x400, &APP_INFO_SENT)
 }
 
 /// Companion trigger: a client that actually posts a ServiceRegister
@@ -1914,6 +1957,53 @@ fn post_app_info_companion(unicorn: &mut Unicorn<'_, Context>, queue_name: &str,
     }
     let server_app = u16::from_le_bytes([body[2], body[3]]) as u32;
     post_app_info_status(unicorn, server_app);
+}
+
+/// DAPIAPP only publishes ServiceStatus(svc 0x26, regid 1, state 1)
+/// "registered but not available" because its map medium (CRYPTNAV via
+/// DAPDEVM) never comes up in the emulator. Its ServiceStatus consumer
+/// copies the message's state byte into every registry entry with a
+/// matching register-id, and the ServiceData gate rejects GetBlockIDs
+/// while that entry is not ACTIVE (0). Synthesize the AVAILABLE status the
+/// unit would emit once the medium is present, delivered to DAPI's own
+/// mailbox so the client entry flips to 0. Emitted once.
+pub(crate) fn post_dapi_status_available(unicorn: &mut Unicorn<'_, Context>) -> bool {
+    use std::sync::atomic::AtomicBool;
+    static STATUS_SENT: AtomicBool = AtomicBool::new(false);
+    if STATUS_SENT.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+
+    let mut status = vec![0u8; 0x20];
+    let status_len = status.len() as u32;
+    status[0..2].copy_from_slice(&7u16.to_le_bytes());
+    status[2..4].copy_from_slice(&7u16.to_le_bytes());
+    status[4..8].copy_from_slice(&status_len.to_le_bytes());
+    status[8..10].copy_from_slice(&2u16.to_le_bytes());
+    status[0xb] = 0x44; // wire class: ServiceStatus
+    status[0x14..0x16].copy_from_slice(&0x0026u16.to_le_bytes());
+    status[0x16..0x18].copy_from_slice(&1u16.to_le_bytes()); // register-id from the conf
+    status[0x18] = 0; // state: ACTIVE
+
+    let mut blob = Vec::with_capacity(8 + status.len());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(status.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&status);
+    let accepted = {
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
+        let queue_id = OsalQueueService::ensure_queue(&mut state.mq, "mbx_7");
+        state.mq.grow_msgsize(queue_id, blob.len() as i64);
+        let accepted = OsalQueueService::guest_post(&mut state.mq, "mbx_7", blob, 0);
+        if accepted {
+            state.notify_waiters();
+        }
+        accepted
+    };
+    log::info!(
+        "[LIBOSAL-MBX] synthesized ServiceStatus(svc 0x26, regid 1, state 0) into mbx_7: {}",
+        accepted
+    );
+    accepted
 }
 
 /// Resolve the content pointer of an 8-byte OSAL message reference while

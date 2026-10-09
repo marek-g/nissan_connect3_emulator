@@ -82,7 +82,20 @@
 "READ_ERROR_DOC_DEVICE"="/tmp"
 "RAW_LOAD_PACKAGE"=dword:00000001
 
+; Device table for the DAPI device manager (vEvalDeviceConfig). The real unit
+; gets this from an encrypted region file (ni2k_eur/DAPIAPP.ERG). Paths are
+; limited to 29 chars by dap_tclDevPath. DEVICE_NAV_1 is the navigation SD
+; card addressed through the OSAL dispatcher, i.e. its device path doubles as
+; the data mount prefix (/dev/cryptnav/CFG/... for the DB files) and is what
+; bRegPRMNotifications hands to OSAL_s32IOControl(0x7ffffffc), which strcmps it
+; against libosal's PRM table names (/dev/cryptnav). _PRM is the control
+; device whose open+ioctl register the PRM media-status callback.
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\PROCDAPI\DAPIAPP\APP_CONFIG\DEVICES]
+"DEFAULT_DEV"="/dev/cryptnav"
+"CHECK_SIGNATURE"=dword:00000000
+"DEVICE_NAV_1"="/dev/cryptnav"
+"DEVICE_NAV_1_PRM"="/dev/cryptcard"
+"DEVICE_NAV_1_MAX_NUM_FD"=dword:00000002
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\PROCDAPI\DAPIAPP\APP_CONFIG\RNW]
 "DB_TILE_COUNT"=dword:00001000
