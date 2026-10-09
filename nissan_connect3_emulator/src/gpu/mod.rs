@@ -195,6 +195,13 @@ struct Backend {
     window_raw: *mut sys::SDL_Window,
     hmi_context: sys::SDL_GLContext,
     map_context: sys::SDL_GLContext,
+    // Private host-compositor context: the ONLY context that ever renders to
+    // (and swaps) the SDL window. Guests rely on GL state (bound TEXTURE_2D,
+    // current program, enabled attrib arrays) persisting between their own GL
+    // calls across swaps - mixLayers draws without binding textures/programs.
+    // Running our window blit on the HMI context trashed exactly that state
+    // and made the whole HMI layer render black.
+    comp_context: sys::SDL_GLContext,
     // Per-target private "default framebuffer" substitutes. Guests issue
     // glBindFramebuffer(_*, 0) expecting their own window surface; we bind
     // these once as each context's initial framebuffer and rewrite guest
@@ -510,6 +517,13 @@ fn init_backend() -> Result<Backend, String> {
         return Err("SDL_GL_CreateContext(map) returned null".to_string());
     }
 
+    // Host-only compositor context (unshared like the others; its private
+    // texture/program/VBO IDs never touch guest namespaces).
+    let comp_context = unsafe { sys::SDL_GL_CreateContext(window_raw) };
+    if comp_context.is_null() {
+        return Err("SDL_GL_CreateContext(compositor) returned null".to_string());
+    }
+
     // Per-target private default framebuffers. Guests issue
     // glBindFramebuffer(_*, 0) intending "my window surface"; we redirect that
     // to these (see `gl_backend_api`). Rendering stays off-screen; we present a
@@ -553,7 +567,7 @@ fn init_backend() -> Result<Backend, String> {
     let mut composite_vbo = 0u32;
     let mut composite_pos_loc = -1i32;
     unsafe {
-        sys::SDL_GL_MakeCurrent(window_raw, hmi_context);
+        sys::SDL_GL_MakeCurrent(window_raw, comp_context);
         let vs_src = b"attribute vec2 a_pos;\
             varying vec2 v_uv;\
             void main() { v_uv = a_pos * 0.5 + 0.5; \
@@ -623,6 +637,7 @@ fn init_backend() -> Result<Backend, String> {
     };
 
     unsafe {
+        sys::SDL_GL_MakeCurrent(window_raw, comp_context);
         gl::Viewport(0, 0, 800, 480);
         gl::ClearColor(0.0, 0.0, 0.0, 1.0);
         gl::Clear(gl::COLOR_BUFFER_BIT | gl::DEPTH_BUFFER_BIT);
@@ -632,6 +647,9 @@ fn init_backend() -> Result<Backend, String> {
     }
     // Hand the HMI context back to its guest with its private window-surface
     // stand-in bound (create_default_fbo unbinds to 0 on purpose).
+    unsafe {
+        sys::SDL_GL_MakeCurrent(window_raw, hmi_context);
+    }
     if hmi_framebuffer != 0 {
         unsafe {
             gl::BindFramebuffer(gl::FRAMEBUFFER, hmi_framebuffer);
@@ -653,6 +671,7 @@ fn init_backend() -> Result<Backend, String> {
         window_raw,
         hmi_context,
         map_context,
+        comp_context,
         hmi_framebuffer,
         map_framebuffer,
         hmi_pixels,
@@ -730,6 +749,16 @@ fn make_target_current(backend: &mut Backend, target: GpuTarget) {
     backend.current_target = Some(target);
 }
 
+fn vap_legacy() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("EMU_VAP_LEGACY").is_ok())
+}
+
+fn probe_clears() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("EMU_GPU_PROBE_CLEARS").is_ok())
+}
+
 fn hmi_capture_prefix() -> Option<String> {
     std::env::var("EMU_GPU_HMI_CAPTURE_PREFIX")
         .ok()
@@ -762,6 +791,8 @@ pub fn refresh_texture_from_map_surface(name: u32, width: i32, height: i32) {
             };
             if bytes.len() == (width * height * 4) as usize {
                 unsafe {
+                    let mut previous_tex = 0i32;
+                    gl::GetIntegerv(gl::TEXTURE_BINDING_2D, &mut previous_tex);
                     gl::BindTexture(gl::TEXTURE_2D, name);
                     gl::TexSubImage2D(
                         gl::TEXTURE_2D,
@@ -774,7 +805,53 @@ pub fn refresh_texture_from_map_surface(name: u32, width: i32, height: i32) {
                         gl::UNSIGNED_BYTE,
                         bytes.as_ptr() as *const _,
                     );
+                    gl::BindTexture(gl::TEXTURE_2D, previous_tex as u32);
                     drain_host_gl_errors();
+                }
+            }
+            if probe_layer_alphas_enabled() {
+                static PROBE_FBO: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                unsafe {
+                    let mut fbo = PROBE_FBO.load(Ordering::Relaxed);
+                    if fbo == 0 {
+                        gl::GenFramebuffers(1, &mut fbo);
+                        PROBE_FBO.store(fbo, Ordering::Relaxed);
+                    }
+                    let mut previous = 0i32;
+                    let mut previous_tex = 0i32;
+                    gl::GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut previous);
+                    gl::GetIntegerv(gl::TEXTURE_BINDING_2D, &mut previous_tex);
+                    gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
+                    gl::BindTexture(gl::TEXTURE_2D, name);
+                    gl::FramebufferTexture2D(
+                        gl::FRAMEBUFFER,
+                        gl::COLOR_ATTACHMENT0,
+                        gl::TEXTURE_2D,
+                        name,
+                        0,
+                    );
+                    let mut out = [0u8; 3 * 4];
+                    for (i, (x, y)) in [(400, 240), (20, 240), (700, 100)].iter().enumerate() {
+                        gl::ReadPixels(
+                            *x,
+                            *y,
+                            1,
+                            1,
+                            gl::RGBA,
+                            gl::UNSIGNED_BYTE,
+                            out.as_mut_ptr().add(i * 4) as *mut _,
+                        );
+                    }
+                    gl::BindFramebuffer(gl::FRAMEBUFFER, previous as u32);
+                    gl::BindTexture(gl::TEXTURE_2D, previous_tex as u32);
+                    log::info!(
+                        "GPU: snapshot-readback tex={} center={:02x?} left={:02x?} right={:02x?}",
+                        name,
+                        &out[0..4],
+                        &out[4..8],
+                        &out[8..12]
+                    );
                 }
             }
             GpuOutput::default()
@@ -869,6 +946,8 @@ fn capture_raw_hmi_before_composite(backend: &mut Backend) {
         return;
     }
     unsafe {
+        let mut previous = 0i32;
+        gl::GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut previous);
         gl::BindFramebuffer(gl::FRAMEBUFFER, backend.hmi_framebuffer);
         gl::ReadPixels(
             0,
@@ -879,7 +958,7 @@ fn capture_raw_hmi_before_composite(backend: &mut Backend) {
             gl::UNSIGNED_BYTE,
             backend.hmi_pixels.as_mut_ptr() as *mut _,
         );
-        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+        gl::BindFramebuffer(gl::FRAMEBUFFER, previous as u32);
     }
     let path = format!("{}_raw_{:04}.ppm", prefix, frame);
     let count = frame;
@@ -956,6 +1035,11 @@ fn gpu_resource_telemetry() {
     );
 }
 
+fn probe_layer_alphas_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("EMU_GPU_PROBE_ALPHAS").is_ok())
+}
+
 fn probe_layer_alphas(backend: &Backend) {
     if std::env::var("EMU_GPU_PROBE_ALPHAS").map(|v| v != "1").unwrap_or(true) {
         return;
@@ -1015,10 +1099,20 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
                     capture_raw_hmi_before_composite(backend);
                 }
                 composite_hmi_over_map(backend);
+                // Present on the private compositor context so guests never
+                // see our program/texture/attrib state.
+                unsafe {
+                    sys::SDL_GL_MakeCurrent(backend.window_raw, backend.comp_context);
+                }
+                backend.current_target = None;
                 blit_hmi_pixels_to_window(backend);
+                let _ = backend.window.gl_swap_window();
+                unsafe {
+                    sys::SDL_GL_MakeCurrent(backend.window_raw, backend.hmi_context);
+                }
+                backend.current_target = Some(GpuTarget::Hmi);
             }
             capture_hmi_framebuffer(backend);
-            let _ = backend.window.gl_swap_window();
         }
         GpuTarget::Map => unsafe {
             gl::BindFramebuffer(gl::FRAMEBUFFER, backend.map_framebuffer);
@@ -1046,6 +1140,8 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
 // opaque pixels (including intentionally black widgets) occlude the map.
 fn composite_hmi_over_map(backend: &mut Backend) {
     unsafe {
+        let mut previous = 0i32;
+        gl::GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut previous);
         gl::BindFramebuffer(gl::FRAMEBUFFER, backend.hmi_framebuffer);
         gl::ReadPixels(
             0,
@@ -1056,7 +1152,7 @@ fn composite_hmi_over_map(backend: &mut Backend) {
             gl::UNSIGNED_BYTE,
             backend.hmi_pixels.as_mut_ptr() as *mut _,
         );
-        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+        gl::BindFramebuffer(gl::FRAMEBUFFER, previous as u32);
     }
     if backend.map_pixels.len() != backend.hmi_pixels.len() {
         return;
@@ -2382,6 +2478,15 @@ fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let max_verts = 4096usize;
     let requested = per_vertex.saturating_mul(max_verts).min(MAX_TEXTURE_BYTES);
 
+    if vap_legacy() {
+        let Some((_, data)) = read_best_effort_bytes(unicorn, pointer, requested) else {
+            gpu_vertex_attrib_pointer(index, size, kind, normalized, stride, pointer, Vec::new());
+            return 0;
+        };
+        gpu_vertex_attrib_pointer(index, size, kind, normalized, stride, pointer, data);
+        return 0;
+    }
+
     // Read the client array into the reusable scratch (never a fresh Vec),
     // shrinking the length until the read succeeds (best effort).
     let mut scratch = match VAP_SCRATCH.lock() {
@@ -2621,6 +2726,26 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
             return Some(0);
         }
         "glClear" => {
+            if probe_clears() {
+                let mask = ureg(unicorn, RegisterARM::R0);
+                gpu_void_clear(move || unsafe {
+                    let mut color = [0f32; 4];
+                    let mut fbo = 0i32;
+                    gl::GetFloatv(0x0B22 /* GL_CURRENT_COLOR = clear color */, color.as_mut_ptr());
+                    gl::GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut fbo);
+                    log::info!(
+                        "GPU: CLEAR probe mask={:#x} fbo={} color=({:.3},{:.3},{:.3},{:.3})",
+                        mask,
+                        fbo,
+                        color[0],
+                        color[1],
+                        color[2],
+                        color[3]
+                    );
+                    gl::Clear(mask);
+                });
+                return Some(0);
+            }
             gpu_void_v1(gl::Clear, ureg(unicorn, RegisterARM::R0));
             return Some(0);
         }
