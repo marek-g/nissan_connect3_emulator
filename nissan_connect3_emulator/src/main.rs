@@ -102,6 +102,18 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
             },
             is_read_only: false,
         },
+        // DAPIAPP reads the cryptnav configuration tree (POI_MAPPING.DAT and
+        // friends) from the internal navdata flash; on the unit that tree is
+        // populated from the navigation SD card. Serve it straight from the
+        // card's CRYPTNAV volume so DAPDEVM can validate the dataset.
+        MountPoint {
+            mount_point: "/var/opt/bosch/navdata/cryptnav".to_string(),
+            file_system: Box::new(OsFileSystem::new(PathBuf::from(format!(
+                "{}/CRYPTNAV",
+                map_card_path
+            )))),
+            is_read_only: true,
+        },
         // volatile temp-fs
         MountPoint {
             mount_point: "/var/volatile".to_string(),

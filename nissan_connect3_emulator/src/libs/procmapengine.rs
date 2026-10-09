@@ -108,6 +108,11 @@ const MAP_DATA_SEND_REQUEST_CONSTRUCTOR_RESULT: u32 = 0x0059_1b68 - ORIGINAL_BAS
 const MAP_DATA_SEND_SERVICE_VCALL: u32 = 0x0059_05ec - ORIGINAL_BASE;
 const MAP_DATA_SEND_SERVICE_RESULT: u32 = 0x0059_05f0 - ORIGINAL_BASE;
 const MAP_DATA_CCA_GET_BLOCK_IDS_RESULT: u32 = 0x0053_ddcc - ORIGINAL_BASE;
+const MAP_DATA_VHANDLE_GET_BLOCK_IDS_ENTRY: u32 = 0x0053_e7ac - ORIGINAL_BASE;
+const MAP_DATA_VHANDLE_OPEN_FMC_ENTRY: u32 = 0x0053_e4bc - ORIGINAL_BASE;
+const MAP_DATA_VHANDLE_DEFAULT_DATASET_ENTRY: u32 = 0x0053_eb30 - ORIGINAL_BASE;
+const MAP_DATA_VHANDLE_LOAD_BLOCKS_ENTRY: u32 = 0x0053_f378 - ORIGINAL_BASE;
+const MAP_DATA_VHANDLE_DATABLOCKS_CHANGED_ENTRY: u32 = 0x0053_f6f4 - ORIGINAL_BASE;
 const MAP_DATA_DAPI_GET_BLOCK_IDS_RESULT: u32 = 0x0053_a278 - ORIGINAL_BASE;
 const MAP_DATA_DAPI_LOAD_BLOCKS_CALL: u32 = 0x0053_a230 - ORIGINAL_BASE;
 const MAP_DATA_DAPI_LOAD_BLOCKS_RESULT: u32 = 0x0053_a234 - ORIGINAL_BASE;
@@ -2147,6 +2152,42 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             },
         )
         .unwrap();
+
+    for (name, offset) in [
+        (
+            "vHandleOpenFastMapChannel",
+            MAP_DATA_VHANDLE_OPEN_FMC_ENTRY,
+        ),
+        ("vHandleGetBlockIDs", MAP_DATA_VHANDLE_GET_BLOCK_IDS_ENTRY),
+        ("vHandleDefaultDataSet", MAP_DATA_VHANDLE_DEFAULT_DATASET_ENTRY),
+        ("vHandleLoadBlocks", MAP_DATA_VHANDLE_LOAD_BLOCKS_ENTRY),
+        (
+            "vHandleDatablocksChanged",
+            MAP_DATA_VHANDLE_DATABLOCKS_CHANGED_ENTRY,
+        ),
+    ] {
+        let addr = base_address + offset;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 200 {
+                    let service_data = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let inner = read_u32_or_invalid(uc, service_data + 4);
+                    let opcode = read_u32_or_invalid(uc, inner + 0x1a) & 0xff;
+                    let mdm_ref = read_u16_or_invalid(uc, inner + 0x1c);
+                    log::info!(
+                        "PROCMAPENGINE map-data trace {} entry at {:#x}: service_data={:#x} inner={:#x} opcode={:#x} mdm_ref={:#x}",
+                        name,
+                        addr,
+                        service_data,
+                        inner,
+                        opcode,
+                        mdm_ref
+                    );
+                }
+            })
+            .unwrap();
+    }
 
     for (name, call_offset, result_offset) in [
         (

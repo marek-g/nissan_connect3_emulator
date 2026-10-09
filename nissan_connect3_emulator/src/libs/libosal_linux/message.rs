@@ -231,6 +231,26 @@ fn handle_queue_api(
                 return;
             }
 
+            if bridge_mbx_queue(
+                unicorn,
+                api_name,
+                base_address,
+                &decoded.name,
+                r1,
+                r2,
+                r3,
+                synthetic_stack_timeout,
+            ) {
+                log::info!(
+                    "0x{:x} [{}] [LIBOSAL-MBX] {} handled name={}",
+                    addr - base_address + 0x484d8000,
+                    thread,
+                    api_name,
+                    decoded.name
+                );
+                return;
+            }
+
             if bridge_guest_osal_queue(
                 unicorn,
                 api_name,
@@ -1641,11 +1661,253 @@ fn bridge_guest_osal_queue(
                 msg_len,
                 prio_ptr,
                 deadline_from_osal_timeout(timeout),
+                false,
             );
             true
         }
         _ => false,
     }
+}
+
+/// Post/Wait bridge for the `mbx_<app_id>` application mailbox queues.
+///
+/// The 8-byte payload queued on an mbx is an OSAL message *reference*
+/// `[type, content_ptr]` whose content pointer addresses the **sender's**
+/// guest VM. Every process has its own Unicorn address space, so handing
+/// that pointer to a cross-process recipient makes it dereference garbage
+/// (observed: DAPIAPP's CCA dispatch tripped an assertion on procmap's
+/// GetBlockIDs request and aborted its AE thread). We therefore snapshot
+/// the content while the sender's VM is live at post time, and re-create
+/// it in the recipient's own VM at delivery time, registering the new
+/// pointer as a dynamic OSAL message so the eventual `OSAL_s32MessageDelete`
+/// frees it.
+///
+/// Snapshot blob layout stored in the host queue:
+/// `[u32 type_flag(1), u32 content_len, content bytes...]`.
+fn bridge_mbx_queue(
+    unicorn: &mut Unicorn<'_, Context>,
+    api_name: &str,
+    base_address: u32,
+    name: &str,
+    msg_ptr: u32,
+    msg_len: u32,
+    prio_or_prio_ptr: u32,
+    timeout: u32,
+) -> bool {
+    if !name.starts_with("mbx_") || name == "mbx_0" {
+        return false;
+    }
+    if !matches!(
+        api_name,
+        "OSAL_s32MessageQueuePost"
+            | "OSAL_s32MessageQueueWait"
+            | "OSAL_s32MessageQueuePriorityWait"
+    ) {
+        return false;
+    }
+
+    match api_name {
+        "OSAL_s32MessageQueuePost" => {
+            if msg_ptr == 0 || msg_ptr > 0xf000_0000 || msg_len < 8 {
+                return false;
+            }
+            let Some(content) = resolve_osal_ref_content(unicorn, base_address, msg_ptr) else {
+                return false;
+            };
+            let Some(body) = snapshot_content_bytes(unicorn, content) else {
+                return false;
+            };
+            let mut blob = Vec::with_capacity(8 + body.len());
+            blob.extend_from_slice(&1u32.to_le_bytes());
+            blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            blob.extend_from_slice(&body);
+
+            let accepted = {
+                let mut state = unicorn.get_data().namespace.lock().unwrap();
+                let queue_id = OsalQueueService::ensure_queue(&mut state.mq, name);
+                state.mq.grow_msgsize(queue_id, blob.len() as i64);
+                let accepted =
+                    OsalQueueService::guest_post(&mut state.mq, name, blob, prio_or_prio_ptr);
+                if accepted {
+                    state.notify_waiters();
+                }
+                accepted
+            };
+            if accepted {
+                return_to_caller(unicorn, 0);
+            }
+            accepted
+        }
+        "OSAL_s32MessageQueueWait" | "OSAL_s32MessageQueuePriorityWait" => {
+            let buf = msg_ptr;
+            let buf_len = msg_len;
+            let prio_ptr = prio_or_prio_ptr;
+            if buf == 0 || buf > 0xf000_0000 || buf_len < 8 {
+                return false;
+            }
+            let (queue_id, message) = {
+                let mut state = unicorn.get_data().namespace.lock().unwrap();
+                let queue_id = OsalQueueService::ensure_queue(&mut state.mq, name);
+                let message = OsalQueueService::pop_guest_message(&mut state.mq, queue_id, usize::MAX);
+                if message.is_some() {
+                    state.notify_waiters();
+                }
+                (queue_id, message)
+            };
+
+            if let Some(message) = message {
+                let Some(result) =
+                    deliver_snapshot_message(unicorn, &message.data, buf, prio_ptr, message.priority)
+                else {
+                    log::warn!(
+                        "[LIBOSAL-MBX] failed to materialize snapshot for Wait({})",
+                        name
+                    );
+                    return false;
+                };
+                let thread = unicorn.get_data().inner.thread_id();
+                log::info!(
+                    "[{}] [LIBOSAL-MBX] Wait({}) delivered materialized snapshot blob_len={}",
+                    thread,
+                    name,
+                    message.data.len()
+                );
+                let _ = result;
+                return true;
+            }
+
+            if timeout == 0 {
+                return_to_caller(unicorn, 0);
+                return true;
+            }
+
+            let thread = unicorn.get_data().inner.thread_id();
+            log::info!(
+                "[{}] [LIBOSAL-MBX] mbx wait blocking name={}",
+                thread,
+                name
+            );
+            block_guest_osal_wait(
+                unicorn,
+                queue_id,
+                buf,
+                buf_len,
+                prio_ptr,
+                deadline_from_osal_timeout(timeout),
+                true,
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Resolve the content pointer of an 8-byte OSAL message reference while
+/// the *poster's* VM is accessible. Type 1 references are direct pointers;
+/// type 2 references index the poster's message pool (same resolution the
+/// logging helper performs).
+fn resolve_osal_ref_content(
+    unicorn: &Unicorn<'_, Context>,
+    base_address: u32,
+    ref_addr: u32,
+) -> Option<u32> {
+    let raw_type = read_u32_or_invalid(unicorn, ref_addr);
+    let raw_handle = read_u32_or_invalid(unicorn, ref_addr + 4);
+    match raw_type & 0xff {
+        1 if raw_handle != 0 && raw_handle < 0xf000_0000 => Some(raw_handle),
+        2 => {
+            const MSG_POOL_CONTENT_BASE: u32 = 0x4856_f800;
+            const MSG_POOL_BLOCK_BASE: u32 = 0x4856_f7f4;
+            const MSG_POOL_ENTRY_SIZE: u32 = 12;
+            let block_base =
+                read_u32_or_invalid(unicorn, base_address + (MSG_POOL_BLOCK_BASE - ORIGINAL_BASE));
+            let content_base = read_u32_or_invalid(
+                unicorn,
+                base_address + (MSG_POOL_CONTENT_BASE - ORIGINAL_BASE),
+            );
+            let valid_base =
+                |addr: u32| addr != 0 && addr != 0xffff_ffff && addr < 0xf000_0000;
+            for base in [content_base, block_base] {
+                if !valid_base(base) {
+                    continue;
+                }
+                let content =
+                    base.wrapping_add((raw_handle.wrapping_add(1) * MSG_POOL_ENTRY_SIZE) + 0x18);
+                if content < 0xf000_0000 {
+                    return Some(content);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Snapshot the referenced content out of the sender's VM. The shared
+/// amt/ail message header stores its total length as a u32 at offset 4;
+/// anything implausible falls back to a fixed conservative window.
+fn snapshot_content_bytes(
+    unicorn: &Unicorn<'_, Context>,
+    content: u32,
+) -> Option<Vec<u8>> {
+    const FALLBACK_LEN: usize = 0x40;
+    const MAX_LEN: usize = 0x2_0000;
+    let header_len = read_u32_or_invalid(unicorn, content + 4);
+    let len = if (8..=MAX_LEN as u32).contains(&header_len) {
+        header_len as usize
+    } else {
+        FALLBACK_LEN
+    };
+    read_guest_buffer(unicorn, content, len).or_else(|| {
+        read_guest_buffer(unicorn, content, FALLBACK_LEN)
+    })
+}
+
+/// Write a snapshot blob's content into the recipient's own VM and hand it
+/// an 8-byte direct-reference. Returns the Wait return value (8 bytes).
+pub(crate) fn deliver_snapshot_message(
+    unicorn: &mut Unicorn<'_, Context>,
+    blob: &[u8],
+    buf: u32,
+    prio_ptr: u32,
+    priority: u32,
+) -> Option<u32> {
+    if blob.len() < 8 {
+        return None;
+    }
+    let content_len = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]) as usize;
+    let body = blob.get(8..8 + content_len)?;
+
+    let mmu_arc = unicorn.get_data().mmu.clone();
+    let content = mmu_arc.lock().unwrap().heap_alloc(
+        unicorn,
+        (content_len as u32).max(8),
+        Prot::READ | Prot::WRITE,
+        "[mbx-snapshot]",
+    );
+    if content == 0 || content > 0xf000_0000 {
+        return None;
+    }
+    unicorn.mem_write(content as u64, body).ok()?;
+    {
+        let state_arc = unicorn.get_data().sys_calls_state.clone();
+        state_arc
+            .lock()
+            .unwrap()
+            .osal_messages
+            .mark_dynamic(content);
+    }
+    unicorn.mem_write(buf as u64, &1u32.to_le_bytes()).ok()?;
+    unicorn
+        .mem_write((buf + 4) as u64, &content.to_le_bytes())
+        .ok()?;
+    if prio_ptr != 0 {
+        unicorn
+            .mem_write(prio_ptr as u64, &pack_u32(priority))
+            .ok()?;
+    }
+    return_to_caller(unicorn, 8);
+    Some(8)
 }
 
 fn start_proc_path_from_callback(data: &[u8]) -> Option<&str> {
@@ -1821,6 +2083,7 @@ fn block_guest_osal_wait(
     msg_len: u32,
     prio_ptr: u32,
     deadline: Option<Instant>,
+    materialize: bool,
 ) {
     return_to_caller(unicorn, 0);
 
@@ -1835,6 +2098,7 @@ fn block_guest_osal_wait(
                 msg_len,
                 prio_ptr,
                 deadline,
+                materialize,
             });
         }
     }

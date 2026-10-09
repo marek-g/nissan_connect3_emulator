@@ -96,6 +96,9 @@ pub enum BlockReason {
         msg_len: u32,
         prio_ptr: u32,
         deadline: Option<Instant>,
+        /// the queued blob is a cross-VM message snapshot that must be
+        /// re-materialized in the recipient's own guest VM on delivery
+        materialize: bool,
     },
     /// waiting in iosc_enter_mutex for the IOSC mutex to be released
     IoscMutex {

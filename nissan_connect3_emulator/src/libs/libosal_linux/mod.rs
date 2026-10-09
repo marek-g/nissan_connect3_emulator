@@ -1,7 +1,7 @@
 mod event;
 mod init;
 mod io;
-mod message;
+pub(crate) mod message;
 mod prm;
 mod process;
 mod registry;

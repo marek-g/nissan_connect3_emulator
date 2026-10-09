@@ -28,6 +28,7 @@ pub(crate) fn finish_guest_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, no
         msg_len,
         prio_ptr,
         deadline,
+        materialize,
     }) = reason
     else {
         return;
@@ -35,8 +36,11 @@ pub(crate) fn finish_guest_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, no
 
     let message = {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
-        let message =
-            OsalQueueService::pop_guest_message(&mut state.mq, queue_id, msg_len as usize);
+        let message = OsalQueueService::pop_guest_message(
+            &mut state.mq,
+            queue_id,
+            if materialize { usize::MAX } else { msg_len as usize },
+        );
         if message.is_some() || deadline.map(|deadline| deadline <= now).unwrap_or(false) {
             state.mq.remove_waiter(queue_id, tid);
         }
@@ -44,6 +48,33 @@ pub(crate) fn finish_guest_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, no
     };
 
     match message {
+        Some(message) if materialize => {
+            match crate::libs::libosal_linux::message::deliver_snapshot_message(
+                unicorn,
+                &message.data,
+                msg_ptr,
+                prio_ptr,
+                message.priority,
+            ) {
+                Some(result) => {
+                    log::info!(
+                        "[{}] [LIBOSAL-MBX] OSAL queue wait woke queue_id={} with materialized snapshot len={}",
+                        tid,
+                        queue_id,
+                        message.data.len()
+                    );
+                    set_runnable_with_result(unicorn, tid, result);
+                }
+                None => {
+                    log::warn!(
+                        "[{}] [LIBOSAL-MBX] failed to materialize snapshot for queue_id={} blob_len={}",
+                        tid,
+                        queue_id,
+                        message.data.len()
+                    );
+                }
+            }
+        }
         Some(message) => {
             log::info!(
                 "[{}] [LIBOSAL] OSAL queue wait woke queue_id={} len={} data={:02x?}",

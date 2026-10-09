@@ -278,6 +278,16 @@ impl MqState {
             .unwrap_or(false)
     }
 
+    /// Raise a queue's per-message size limit so larger host-snapshotted
+    /// payloads (cross-VM OSAL message refs) can be stored. Never shrinks.
+    pub fn grow_msgsize(&mut self, queue_id: u32, msgsize: i64) {
+        if let Some(queue) = self.queues.get_mut(&queue_id) {
+            if queue.msgsize < msgsize {
+                queue.msgsize = msgsize;
+            }
+        }
+    }
+
     pub fn queue_nonblock(&self, queue_id: u32) -> bool {
         self.queues
             .get(&queue_id)
