@@ -314,3 +314,25 @@ Notes:
   (its queue/device reads). Note: never block inside a guest hook; the
   in-line spawn wait that used to "wait for the medium" froze the whole
   emulator - the medium only comes up while DAPIAPP keeps running.
+
+### Update (register-id and message ordering)
+
+- The worker does answer, with an error: `dap_map_tclWorker::enProcessJob`
+  (0x84b5c8) reads the register-id from the request (message +0x16, job +0x12)
+  and returns error 6 "unknown register" for the wildcard 0xffff
+  (`dap_map_tclWorker::vReportError` 0x844e78, dap_map_worker.cpp line 374).
+  procmapengine's emulated client reference therefore now remembers the handle
+  taken from the conf, and the bridge re-posts a wildcard request that it held
+  back behind the registration with the handle filled in.
+- **Still stopping on:** DAPIAPP processes a request before the REGISTER of the
+  same service was handled, and before the *stale* deregistration procmapengine
+  replays for a handle from a previous session. `fwl_List<ail_tclServiceRegistry>::nRemove`
+  (0xb369b0) matches through `ail_tclServiceRegistry::operator!=`, i.e. not by
+  handle, so that late deregistration deletes the entry created moments earlier
+  and every later request is answered with `id=6 unknown-register`. Simply
+  dropping the stale deregistration is worse: procmapengine only registers the
+  service in reaction to it, so no REGISTER is emitted at all.
+- **Open question:** whether `operator!=` compares the register-id after all
+  (then delivering the stale deregistration *after* the conf would be a no-op
+  and correct), or whether the deregistration has to be answered locally in the
+  emulated ail layer without ever reaching DAPIAPP.
