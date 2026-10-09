@@ -220,6 +220,12 @@ static MAP_DATA_CLIENT_SERVICE_REF_NODE: AtomicU32 = AtomicU32::new(0);
 /// register", so the emulated client reference must remember it.
 static MAP_DATA_REGISTER_ID: AtomicU32 = AtomicU32::new(0xffff);
 
+/// Register-id the emulated client currently holds for the map-data service,
+/// or 0xffff while nothing is known.
+pub fn map_data_register_id() -> u16 {
+    (MAP_DATA_REGISTER_ID.load(Ordering::Relaxed) & 0xffff) as u16
+}
+
 /// Called by the OSAL mailbox bridge when a ServiceRegister conf for a CCA
 /// service is delivered to procmapengine.
 pub fn note_dapi_register_conf(service: u16, register_id: u16) {
