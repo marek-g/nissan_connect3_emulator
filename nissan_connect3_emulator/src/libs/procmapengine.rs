@@ -214,6 +214,20 @@ static AIL_MAIL_VALIDITY_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static AIL_MAIL_VALIDITY_RESULT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static AIL_POST_MESSAGE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_DATA_CLIENT_SERVICE_REF_NODE: AtomicU32 = AtomicU32::new(0);
+/// Register-id DAPIAPP assigned to the map-data (CCA svc 0x26) client
+/// registration, taken from its ServiceRegister conf. DAPI's map worker
+/// rejects requests carrying the wildcard 0xffff with error 6 "unknown
+/// register", so the emulated client reference must remember it.
+static MAP_DATA_REGISTER_ID: AtomicU32 = AtomicU32::new(0xffff);
+
+/// Called by the OSAL mailbox bridge when a ServiceRegister conf for a CCA
+/// service is delivered to procmapengine.
+pub fn note_dapi_register_conf(service: u16, register_id: u16) {
+    if service as u32 == MAP_DATA_DAPI_SERVICE_ID && register_id != 0xffff {
+        MAP_DATA_REGISTER_ID.store(register_id as u32, Ordering::Relaxed);
+        log::info!("PROCMAPENGINE: DAPI register conf svc={service:#06x} register={register_id:#06x}");
+    }
+}
 /// True while a DAPI client REGISTER has been fired but no RegisterConf
 /// (handler register-id still 0xffff) has come back yet.
 static MAP_DATA_DAPI_REGISTER_PENDING: AtomicBool = AtomicBool::new(false);
@@ -3188,13 +3202,23 @@ fn synthesize_client_service_reference(
     }
 
     let existing = read_u32_or_invalid(unicorn, service_refs + 4);
-    if existing != 0 {
-        return Some(existing);
-    }
-
     let header = read_u32_or_invalid(unicorn, message + 4);
     if header == 0 || header == u32::MAX {
-        return None;
+        return (existing != 0).then_some(existing);
+    }
+
+    // The register-id DAPIAPP handed out in its ServiceRegister conf. Its map
+    // worker (`dap_map_tclWorker::enProcessJob`) refuses the wildcard with
+    // error 6 "unknown register", so stamp it into the reference every time we
+    // are asked for it - exactly what the real ail client library keeps from
+    // the conf it received.
+    let conf_register_id = (MAP_DATA_REGISTER_ID.load(Ordering::Relaxed) & 0xffff) as u16;
+
+    if existing != 0 {
+        if conf_register_id != 0xffff {
+            write_u16(unicorn, existing + 12, conf_register_id);
+        }
+        return Some(existing);
     }
 
     let service_id = (read_u16_or_invalid(unicorn, header + 20) & 0xffff) as u16;
@@ -3227,10 +3251,8 @@ fn synthesize_client_service_reference(
     write_u32(unicorn, node + 4, 0);
     write_u16(unicorn, node + 8, service_id);
     write_u16(unicorn, node + 10, server_app_id);
-    // Register-id wildcard: requests go out with 0xffff (accepted by the
-    // server's registry scan regardless of the id assigned to our client
-    // entry) and the RegisterConf lookup on this list matches on wildcard.
-    write_u16(unicorn, node + 12, 0xffff);
+    // Register-id from the conf (wildcard only until the conf arrives).
+    write_u16(unicorn, node + 12, conf_register_id);
     write_u8(unicorn, node + 14, 0);
     write_u8(unicorn, node + 15, 0);
     write_u16(unicorn, node + 16, dataset_id);
@@ -3243,12 +3265,13 @@ fn synthesize_client_service_reference(
     write_u32(unicorn, service_refs + 12, 1);
 
     log::info!(
-        "PROCMAPENGINE: synthesized DAPI client service ref node={:#x} list={:#x} service={:#x} server={:#x} dataset={:#x}",
+        "PROCMAPENGINE: synthesized DAPI client service ref node={:#x} list={:#x} service={:#x} server={:#x} dataset={:#x} register={:#x}",
         node,
         service_refs,
         service_id,
         server_app_id,
-        dataset_id
+        dataset_id,
+        conf_register_id,
     );
 
     Some(node)

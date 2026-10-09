@@ -636,6 +636,28 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
         // block cannot be opened the job is discarded and the client never
         // hears back. Log the list state so the failure mode is visible
         // (+0x30 = capacity, +0x34 = block-descriptor array).
+        // `dap_map_tclWorker::vReportError(code, file, line, func)`: every
+        // failure of the CCA map-data worker ends here.
+        let report = base_address + (0x0084_4e78u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(report as u64, report as u64, move |uc, _, _| {
+                static R_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if R_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
+                    return;
+                }
+                let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+                log::warn!(
+                    "DAPI map-worker vReportError code={:#x} line={} file={:#x} func={:#x}",
+                    read(RegisterARM::R1) & 0xffff,
+                    read(RegisterARM::R3),
+                    read(RegisterARM::R2),
+                    read(RegisterARM::R4),
+                );
+            })
+            .unwrap();
+
+        // `ActionList::bSetBlock` entry logging is installed below.
         let setblock = base_address + (0x00b6_b610u32 - ORIGINAL_BASE);
         unicorn
             .add_code_hook(setblock as u64, setblock as u64, move |uc, _, _| {

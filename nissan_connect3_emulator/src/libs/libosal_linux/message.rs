@@ -1855,10 +1855,20 @@ fn bridge_mbx_queue(
                     let dump: Vec<String> = message
                         .data
                         .iter()
-                        .take(0x24)
+                        .take(0x2c)
                         .map(|b| format!("{b:02x}"))
                         .collect();
                     log::info!("[{}] [LIBOSAL-MBX] mbx_1024 blob: {}", thread, dump.join(" "));
+                    // The blob carries an 8-byte OSAL prefix before the DAPI
+                    // message body. Record the register-id of a
+                    // ServiceRegister conf so procmapengine's emulated client
+                    // reference can stamp it into later requests.
+                    if message.data.len() >= 0x20 && message.data[0x13] == 0x43 {
+                        let service = u16::from_le_bytes([message.data[0x1c], message.data[0x1d]]);
+                        let register_id =
+                            u16::from_le_bytes([message.data[0x1e], message.data[0x1f]]);
+                        crate::libs::procmapengine::note_dapi_register_conf(service, register_id);
+                    }
                 }
                 let _ = result;
                 return true;
