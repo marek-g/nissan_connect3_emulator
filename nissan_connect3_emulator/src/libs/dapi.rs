@@ -575,6 +575,98 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                 );
             })
             .unwrap();
+
+        // `dap_tclCommunicationContext::vSendToTask`: a request whose target
+        // task index is 0 or whose connection-table entry is missing is
+        // dropped with status 0x213 and the client never gets an answer.
+        let send = base_address + (0x00b5_1ca8u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(send as u64, send as u64, move |uc, _, _| {
+                static T_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if T_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 4000 {
+                    return;
+                }
+                let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+                let jobpp = read(RegisterARM::R4);
+                let mut buf = [0u8; 4];
+                let job = uc
+                    .mem_read(jobpp as u64, &mut buf)
+                    .map(|_| u32::from_le_bytes(buf))
+                    .unwrap_or(0);
+                let job_type = uc
+                    .mem_read((job + 0x20) as u64, &mut buf)
+                    .map(|_| buf[0])
+                    .unwrap_or(0xff);
+                // Job type 4 is the CCA map-data service (svc 0x26); the rest
+                // is startup noise that would flood the log.
+                if job_type != 4 {
+                    return;
+                }
+                log::warn!(
+                    "DAPI vSendToTask jobtype={} thread-idx={} task={:#x} job={:#x}",
+                    job_type,
+                    read(RegisterARM::R7),
+                    read(RegisterARM::R0),
+                    job,
+                );
+            })
+            .unwrap();
+
+        let drop = base_address + (0x00b5_1cc8u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(drop as u64, drop as u64, move |uc, _, _| {
+                static X_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if X_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
+                    return;
+                }
+                let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+                log::warn!(
+                    "DAPI vSendToTask DROPPED (status 0x213) thread-idx={} job={:#x} lr={:#x}",
+                    read(RegisterARM::R7),
+                    read(RegisterARM::R4),
+                    read(RegisterARM::LR),
+                );
+            })
+            .unwrap();
+
+        // `dap_tclJob::u16AddAction` -> `dap_tclActionList::bSetBlock`: an
+        // external CCA request is turned into a job here; when the action
+        // block cannot be opened the job is discarded and the client never
+        // hears back. Log the list state so the failure mode is visible
+        // (+0x30 = capacity, +0x34 = block-descriptor array).
+        let setblock = base_address + (0x00b6_b610u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(setblock as u64, setblock as u64, move |uc, _, _| {
+                static A_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if A_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 60 {
+                    return;
+                }
+                let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+                let this = read(RegisterARM::R0);
+                let mut buf = [0u8; 4];
+                let cap = uc
+                    .mem_read((this + 0x30) as u64, &mut buf)
+                    .map(|_| u16::from_le_bytes([buf[0], buf[1]]))
+                    .unwrap_or(0xffff);
+                let blocks = uc
+                    .mem_read((this + 0x34) as u64, &mut buf)
+                    .map(|_| u32::from_le_bytes(buf))
+                    .unwrap_or(0);
+                log::warn!(
+                    "DAPI ActionList::bSetBlock this={:#x} name={:#x} size={:#x} idx={} capacity={} blocks={:#x} lr={:#x}",
+                    this,
+                    read(RegisterARM::R1),
+                    read(RegisterARM::R2),
+                    read(RegisterARM::R3),
+                    cap,
+                    blocks,
+                    read(RegisterARM::LR),
+                );
+            })
+            .unwrap();
     }
 }
 

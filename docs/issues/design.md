@@ -287,3 +287,30 @@ Notes:
 - **Remaining:** map visible only in the small left strip (map-window region);
   "Starting navigation." popup never dismissed (procmap waits on something -
   likely an IRMC/GPS event).
+
+## OPEN: procmapengine's CCA GetBlockIDs (svc 0x26) reaches DAPI's map task but gets no answer
+
+- **Goal:** `CcaGetBlockIDs` must return 0 so the "Starting navigation." popup
+  is dismissed and the map renders behind the HMI.
+- **What works now (verified in /tmp/opencode/run_r75.log):**
+  - procmap's own `ServiceRegister` (class 0x42) is processed by DAPIAPP
+    (`conf-result r0=1`, regid assigned, entry added with state ACTIVE when the
+    map medium is already up).
+  - The medium-ACTIVE flag comes from DAPIAPP's own status consumer
+    (`0xb3a448/0xb3a4c0`) and it *does* propagate to client entries
+    (`0xb3a50c`) - but only when a fresh status message arrives *after* the
+    registration, so a registration that lands before the flip stays REGISTERED
+    (state 1) and the request is refused with ServiceDataError 0xb.
+  - A request that passes the state gate is dispatched
+    (`0xb4357c`, vtable+0x20 = `dap_tclDapiApp::vOnNewMessage` 0x823998), turned
+    into a `dap_tclJob` (svc 0x26 -> job type 4 via
+    `enGetJobTypeFromCCAServiceId` 0xb53eac) and handed to DAPI's map task:
+    `vSendToTask thread-idx=5 task=0xfad... job=...` with no 0x213 drop.
+- **Where it stops:** nothing ever answers. procmap waits, times out, retries
+  (2nd/3rd attempts then hit `id=6 unknown-register` because DAPIAPP's error
+  funnel `FUN_00b43100` auto-unregisters the client on a failed request), and
+  `CcaGetBlockIDs` returns 1.
+- **Next step:** find DAPI's job-type-4 worker thread and what it blocks on
+  (its queue/device reads). Note: never block inside a guest hook; the
+  in-line spawn wait that used to "wait for the medium" froze the whole
+  emulator - the medium only comes up while DAPIAPP keeps running.

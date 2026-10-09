@@ -1760,9 +1760,10 @@ fn bridge_mbx_queue(
                 && u16::from_le_bytes([body[0], body[1]]) == 0x0400
                 && matches!(body[0xb], 0x41 | 0x42 | 0x44 | 0x45)
             {
-                if body[0xb] == 0x42 {
+                if matches!(body[0xb], 0x42 | 0x45) {
                     log::info!(
-                        "[LIBOSAL-MBX] REGISTER body: {}",
+                        "[LIBOSAL-MBX] class{:#04x} body: {}",
+                        body[0xb],
                         body.iter()
                             .map(|b| format!("{b:02x}"))
                             .collect::<Vec<_>>()
