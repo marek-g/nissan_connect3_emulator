@@ -4,6 +4,19 @@ The emulator has access to the firmware: `/home/marek/Ext/reverse_engineering/Ni
 
 Here you have Linux 2.6.34 source code: `/home/marek/Ext/reverse_engineering/NissanMaps/linux-2.6.32.14`. Every time you are fixing or creating a new syscall, first try to understand how the syscall works exactly in Linux 2.6.32.14. Remember that we are emulating ARM 32-bit architecture, which has its own `arch/arm` folder with files that override many generic values (for example `fcntl.h`).
 
+## Fidelity rule: never patch user-space applications
+Avoid touching Linux user-space *applications* (the Bosch process binaries:
+`DAPIAPP.OUT`, `procmapengine.out`, `prochmi_out.out`, `PROCNAV.OUT`,
+`procbaselx_out.out`, ...). Their code must run as-is: do not patch their
+instructions, force their registers/variables, or synthesize messages they are
+supposed to emit themselves. Patching *libraries* (`libosal_linux_so.so`,
+`libsvg-*.so`, ...), simulating devices/drivers (`/dev/cryptnav`, `/dev/prm`,
+...) and faking RTOS behaviour (spawn order, startup messages) is allowed and is
+the preferred place to work around missing hardware or unrealistic timing.
+Also: never block inside a hook that runs in guest context, and never hold a
+host lock across a sleep - the whole emulator is serialized on those, so a
+host-side "wait" freezes every process instead of staggering them.
+
 You can keep track of any issues (adding and removing them) with the following files:
 - `docs/issues/correctness.md`
 - `docs/issues/robustness.md`
