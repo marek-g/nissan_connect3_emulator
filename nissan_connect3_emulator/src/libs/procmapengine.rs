@@ -225,7 +225,7 @@ static MAP_DATA_REGISTER_ID: AtomicU32 = AtomicU32::new(0xffff);
 pub fn note_dapi_register_conf(service: u16, register_id: u16) {
     if service as u32 == MAP_DATA_DAPI_SERVICE_ID && register_id != 0xffff {
         MAP_DATA_REGISTER_ID.store(register_id as u32, Ordering::Relaxed);
-        log::info!("PROCMAPENGINE: DAPI register conf svc={service:#06x} register={register_id:#06x}");
+        log::info!("PROCMAPENGINE: DAPI register id svc={service:#06x} register={register_id:#06x}");
     }
 }
 /// True while a DAPI client REGISTER has been fired but no RegisterConf

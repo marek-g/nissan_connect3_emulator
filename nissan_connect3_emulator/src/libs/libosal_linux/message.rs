@@ -44,6 +44,44 @@ thread_local! {
     static SYNTH_DAPI_PWR_PERIODIC_NEXT: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
+/// Which thread is currently servicing a mailbox queue, and since when.
+///
+/// The head unit is single core, so a message handler runs to its next blocking
+/// point before the next waiter of the same queue is scheduled - the queue is
+/// effectively served by one consumer at a time. Our host threads interleave at
+/// instruction granularity, so two DAPIAPP handler threads waiting on `mbx_7`
+/// can take a ServiceUnregister and the ServiceRegister that follows it and
+/// finish them in reverse order, which deletes a registration that was just
+/// created. Marking the queue while a message is in service keeps that order.
+static MBX_IN_SERVICE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, (u32, Instant)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Longest time a queue stays blocked for its current servicer. A guest thread
+/// that takes a message and then blocks elsewhere must not stall the queue
+/// forever.
+const MBX_SERVICE_LIMIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Returns true when `queue` is being serviced by another thread. The same
+/// thread coming back for the next message means it finished processing.
+fn queue_busy_for_other(queue: &str, thread: u32) -> bool {
+    let mut guard = MBX_IN_SERVICE.lock().unwrap();
+    match guard.get(queue) {
+        Some((owner, since)) if *owner != thread && since.elapsed() < MBX_SERVICE_LIMIT => true,
+        Some((owner, _)) if *owner == thread => {
+            guard.insert(queue.to_string(), (thread, Instant::now()));
+            false
+        }
+        _ => false,
+    }
+}
+
+fn queue_serviced(queue: &str, thread: u32) {
+    MBX_IN_SERVICE
+        .lock()
+        .unwrap()
+        .insert(queue.to_string(), (thread, Instant::now()));
+}
+
 /// Message-queue observation and OSAL service bridge hooks.
 ///
 /// These hooks decode enough of the OSAL queue handle structure to log which
@@ -1770,6 +1808,15 @@ fn bridge_mbx_queue(
                             .join(" ")
                     );
                 }
+                if body[0xb] == 0x42 {
+                    // A registration tells us which handle procmapengine uses
+                    // for this service; the conf may arrive noticeably later,
+                    // while requests are already being built.
+                    crate::libs::procmapengine::note_dapi_register_conf(
+                        u16::from_le_bytes([body[0x14], body[0x15]]),
+                        u16::from_le_bytes([body[0x16], body[0x17]]),
+                    );
+                }
                 log::info!(
                     "[LIBOSAL-MBX] from-procmap q={} dst={:#06x} class={:#04x} svc={:#06x} regid={:#06x} sub12={:#06x} sub14={:#06x}",
                     name,
@@ -1824,15 +1871,26 @@ fn bridge_mbx_queue(
             if buf == 0 || buf > 0xf000_0000 || buf_len < 8 {
                 return false;
             }
+            // Keep one consumer per queue active at a time so a handler cannot
+            // overtake the message that was posted before it (see MBX_IN_SERVICE).
+            let servicer = unicorn.get_data().inner.thread_id();
+            let served_by_other = queue_busy_for_other(name, servicer);
             let (queue_id, message) = {
                 let mut state = unicorn.get_data().namespace.lock().unwrap();
                 let queue_id = OsalQueueService::ensure_queue(&mut state.mq, name);
-                let message = OsalQueueService::pop_guest_message(&mut state.mq, queue_id, usize::MAX);
+                let message = if served_by_other {
+                    None
+                } else {
+                    OsalQueueService::pop_guest_message(&mut state.mq, queue_id, usize::MAX)
+                };
                 if message.is_some() {
                     state.notify_waiters();
                 }
                 (queue_id, message)
             };
+            if message.is_some() {
+                queue_serviced(name, servicer);
+            }
 
             if let Some(message) = message {
                 let Some(result) =
