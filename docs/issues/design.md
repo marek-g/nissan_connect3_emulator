@@ -267,3 +267,23 @@ Notes:
   compositing of a moving map in other HMI screens is still open, as is the
   app-level stall where mixLayers stops after ~120-200 frames.
     It sidesteps the need for prochmi to know about the map layer at all.
+
+## RESOLVED: host-side GL work must never run on a guest context
+
+- **Symptom:** after the LayerSync snapshot paths were added, every post-hide
+  `GUI_GL_OpenGL::mixLayers` pass rendered pure black (whole HMI + popup gone).
+- **Root cause:** prochmi's mix pass draws quads *without* `glBindTexture` or
+  `glUseProgram` - on real hardware each process has its own EGL context and
+  its producer passes bound the texture/program earlier *in the same context*,
+  so the state persists. Our per-swap host work (window blit program/texture/
+  VBO, readbacks, snapshot refresh/probes) ran on the HMI context and clobbered
+  exactly that state.
+- **Fix:** dedicated unshared `comp_context` (sole renderer to the SDL window,
+  owns the composite program/texture/VBO); all helpers touching a guest
+  context save/restore framebuffer and TEXTURE_2D bindings. Rule going
+  forward: *never* leave any GL state changed on `hmi_context`/`map_context`.
+- **Result:** full HMI page renders (FM1, presets, Menu, compass) and the
+  "Starting navigation." popup shows center-screen.
+- **Remaining:** map visible only in the small left strip (map-window region);
+  "Starting navigation." popup never dismissed (procmap waits on something -
+  likely an IRMC/GPS event).
