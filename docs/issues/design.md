@@ -941,3 +941,17 @@ result. Their `r1` arguments (`0x103010b`, `0x63040a`, `0x101030b`) look like pa
 message ids, and the callee failing at `0x5ec554`/`0x5ecda0` reads a table at `[obj, #0x9c]`
 that nothing has filled - the registry/portal the real monitor's id-4 task table would have
 created at startup (`0x80009a6c`, the message pump) is what is still missing.
+
+The callee that fails is a static tail-call wrapper adding a static argument:
+
+```
+5f2aa0: ldr r2, [pc, #8]      ; r2 = &0x0122f578 (pool descriptor in .bss)
+5f2aa4: b   5f61ec            ; pool_alloc(obj, size, &descriptor)
+5f61ec: push {...} ; bic r7, r2, #7 ; ldr r0, [r7, #32]   ; pool root at 0x0122f598
+```
+
+so the table append at `0x5ec554` returns `-0x210000` because the *pool root word* at
+`0x0122f598` is still zero: PROCNAV's own allocator pools are never initialized. That is
+the same missing bootstrap as the monitor's id-4 task table (`0x80009a6c`), and it is the
+next thing to supply - either by running PROCNAV's pool-init routine or by handing it the
+backing memory it expects.
