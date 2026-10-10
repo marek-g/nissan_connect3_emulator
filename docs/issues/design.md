@@ -352,3 +352,24 @@ Notes:
 - **Next step:** the hook's register reading is unreliable there (code and
   "func" print the same value), so decode the real arguments of `vReportError`
   and find which check in the worker fails now that the request is valid.
+
+### Update (the real root cause is out-of-order processing, not ordering at post time)
+
+- Runs are not reproducible: in one the registration hold fires and the request
+  is accepted and dispatched (worker error follows), in the next run the same
+  binary never holds the registration and the request dies with `id=6` again.
+  The difference is *when DAPIAPP happens to process* the stale deregistration:
+  two DAPIAPP threads wait on `mbx_7`, take messages in FIFO order and finish
+  them in whatever order they like, so a deregistration queued before a
+  registration can still delete the entry that registration creates.
+- Holding a message at post time cannot fix that: the message is already in the
+  right order in the queue, it is the *processing* that is inverted. The
+  `MBX_IN_SERVICE` heuristic (same thread coming back to `Wait` means it is
+  done) does not hold, because DAPIAPP hands the message to another worker
+  thread and returns to `Wait` while processing continues.
+- `dap_map_tclWorker::vReportError` arguments are now decoded correctly:
+  `(this, code, text, line, func)`; the hook prints both strings.
+- **Open:** enforce one-at-a-time *processing* per mailbox queue (only release
+  the next message once the previous one's handling has visibly completed), or
+  find why DAPIAPP's deregistration handler keys the removal on its live entry
+  instead of the handle in the message.

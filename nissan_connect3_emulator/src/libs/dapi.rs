@@ -647,12 +647,33 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     return;
                 }
                 let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+                // vReportError(this, code, text, line, func): the text/func
+                // arguments are strings, so resolve whatever looks like one.
+                let text = |value: u32| -> String {
+                    if value < 0x00e0_0000 || value > 0x00f0_0000 {
+                        return String::from("-");
+                    }
+                    let mut byte = [0u8; 1];
+                    let mut out = String::new();
+                    for offset in 0..64u32 {
+                        if uc.mem_read((value + offset) as u64, &mut byte).is_err() || byte[0] == 0
+                        {
+                            break;
+                        }
+                        out.push(byte[0] as char);
+                    }
+                    out
+                };
                 log::warn!(
-                    "DAPI map-worker vReportError code={:#x} line={} file={:#x} func={:#x}",
-                    read(RegisterARM::R1) & 0xffff,
-                    read(RegisterARM::R3),
+                    "DAPI map-worker vReportError this={:#x} code={:#x} r2={:#x} \"{}\" line={} r4={:#x} \"{}\" lr={:#x}",
+                    read(RegisterARM::R0),
+                    read(RegisterARM::R1),
                     read(RegisterARM::R2),
+                    text(read(RegisterARM::R2)),
+                    read(RegisterARM::R3),
                     read(RegisterARM::R4),
+                    text(read(RegisterARM::R4)),
+                    read(RegisterARM::LR),
                 );
             })
             .unwrap();
