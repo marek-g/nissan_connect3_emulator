@@ -1128,3 +1128,81 @@ Result: PROCNAV completes its OSAL bring-up (spawns Timer/MAXCB_Timer/AE_109,
 opens `mbx_265`/`mbx_0`) and parks on a `MonitorYield` instead of dying at
 `0x5f5af8`. The `0x64` (queue) and `0x6e` objects its peers then drive are the
 next decode surface; they currently fall to the status-0 catch-all.
+
+### Corrected svc #6 object model (Ghidra pass): 0x12 is the message service, 0x13/0x6e are sem/event banks, 0x64 is a loadable overlay
+
+A full dispatch/registration sweep of `triton_mid_raw.bin` corrects the earlier
+"object 0x0a is the queue" reading and settles the reuse question:
+
+- **Dispatch (CONFIRMED).** `0x80037184 -> 0x800371b4 -> 0x8003c2b8`. Only
+  consumer of CB `0x80511634`; there is **no second id table**. `CB+0` = max id
+  (>= 0x77 at runtime), `CB+8` = table base (`kmalloc`'d at boot by `0x8003b214`,
+  all zero in the image). Entry = `base + (id-1)*0x38`; **handler = `entry+0x18`**
+  (the prior-pass "entry+0x04" was off by one slot; `0x8004ef9c` proves the
+  layout: +0x08 id, +0x0c prio, +0x10 aux buf, +0x14 last-ret, +0x18 handler).
+  Handler contract (via `0x8010cf4c`): `f(r0=req block, r1=full id, r2=cont,
+  r3=0x60 scratch)`, `r0`=status; outputs written through the request block via
+  `0x8002f69c(ptr,size,dir,tid)` (dir 4 read guest, dir 6 write guest).
+  Generic multiplexer `0x8003b060/0x8003b130` = a 64-entry vector at `obj+0x14`
+  (count `obj+0x18`) keyed on `id>>16`.
+
+- **Object 0x12 = the real message service (CONFIRMED).** Handler `0x80042c40`,
+  registered `0x800439f0` (keys `TEV_MsgEvt/TEV_MsgBrk/TotalMsgMax/MaxMsgSz`);
+  message FIFO lives in a per-process **kernel bank** (self bank via
+  `0x80043a7c(0,&obj)`), sorted list at `bank+0x6c`. Send = `0x000012`
+  (`0x800425e0`, wakes receiver via `0x8003cfec`); **blocking receive = `0x010012`**
+  (parks via `0x8003cdc8(mask,0xffffffff) -> 0x8003ed48`, timeout = infinite,
+  returns message type; `0xffcf0000` = timeout). Addressed by **integer type id
+  (1..0x1e) + 32-bit source mask**, never by name. `0x00050312` (what PROCNAV
+  calls at boot) is *unimplemented in this build* (falls to `0x800436a0`).
+
+- **Object 0x13 = semaphore bank (CONFIRMED), object 0x6e = event bank
+  (CONFIRMED from the guest).** Handler `0x800151ec` (0x13). PROCNAV's
+  `0x10030313` is a **blocking timed take** (rb[0]=handle, rb[1]=count,
+  rb[2]=timeout ticks; parks at `0x8003efb4`) -> that is the `object 19, <ticks>`
+  idle wait, NOT a message wait. `0x10220213` = give/release, `0x10000113` =
+  create, `0x10200113` = delete. The event bank 0x6e (`0x70000|idx`) is a pure
+  1-bit wakeup. Confirmed by `libosal_linux_so.so` `u32CreateMsgQueue`
+  (`0x4850bc90`): each OSAL queue is `event(0x6e) + semaphore(0x13) + slot idx`,
+  name kept in a 32-byte user-space field (251 slots), FIFO in user-space shared
+  pools (`s32MqueueTableCreate` `0x4850fa18`).
+
+- **Objects 0x64 and 0x6e have NO registration in the static image (NOT FOUND).**
+  Every xref of `0x8003b5a8`/`0x800db104` enumerated; no `mov r0,#0x64/#0x6e`
+  feeds a registrar. The image holds an overlay-name table
+  (`sysprogosal.uout`, `sysprogosalutil.uout`, `sysprogdnl.uout`, ... at
+  `0x80120ac8`) -> these kernel objects are installed when a `sysprog*` overlay
+  is loaded. PROCNAV's workhorse `0x64` (181 calls, cmds 0x2,0x3,0xa,0x16,0x17,
+  0x1b,0x43,0x48,0x4d...) is therefore the OSAL-utility overlay service. No
+  `sysprog*.uout` exists in the firmware tree or the SD card, so the handler
+  cannot be recovered statically; it must be read live from
+  `table_base + 0x64*0x38 + 0x18` in a run where the monitor's own init built
+  the table (our host-side interception never builds it).
+
+### Why the nav request still 0x305s, and the reuse fork it forces
+
+PROCNAV is now alive and sits in its main loop (timed take on a 0x13 semaphore);
+`mbx_0` accumulates posts with **zero waits** (116/0), DAPIAPP keeps logging
+`DAPI ServiceDataError code=0x305`. Cause: the two IPC worlds do not share a
+substrate:
+
+- libosal processes (DAPIAPP/prochmi/procmapengine) `OSAL_s32MessageQueue*` are
+  hooked to the host `common::queues::MqState` (`mbx_*`), keyed by **name**.
+- PROCNAV is statically linked with its own OSAL: queue FIFO in a **user-space
+  shared pool**, sync on kernel **0x6e event / 0x13 semaphore**, plus the 0x12
+  kernel **message bank** (keyed by type+mask) and the 0x64 overlay object. It
+  never touches `MqState`, so the DAPIAPP post is invisible to it.
+
+Reuse answer, sharpened: the shared `MqState` in `src/common` is the right
+substrate for the *libosal/name-keyed* queues, but it is NOT what PROCNAV's
+static OSAL reads. Making PROCNAV serve `0x305` needs one of:
+  (A) bridge PROCNAV's 0x12 bank send/receive (and the 0x6e/0x13 that wake it)
+      onto `MqState`, which requires the (name <-> bank/type/mask) mapping that
+      lives in PROCNAV's user-space OSAL table; or
+  (B) treat the OSAL queues as genuinely cross-process user-space shared memory
+      (the `s32MqueueTableCreate` pool), have libosal use it too, and use
+      0x6e/0x13 only to signal across processes - closer to the real design but
+      a larger change that also reworks the libosal hook.
+Both are blocked on first decoding PROCNAV's own OSAL queue table layout and
+object 0x64, which needs a live table dump (the monitor's real init) rather
+than static RE.
