@@ -53,6 +53,41 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         return;
     }
 
+    // Statically linked navigation processes (PROCNAV) reach the LX monitor
+    // through generated shims instead of a shared library:
+    //
+    //     push {r4, lr}
+    //     svc  #<call id>     <- the id is the instruction immediate
+    //     pop  {r4, pc}
+    //
+    // Linux code (glibc and our own stubs) always executes `svc #0` and keeps the
+    // number in R7, so a non-zero immediate with `push {r4, lr}` in front of it
+    // identifies these calls without touching normal syscall handling. PROCNAV
+    // exits with code 1 as soon as one of them is unanswered.
+    if let Some(call) = lx_monitor_call(unicorn, pc) {
+        let args = [
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+            unicorn.get_u32_arg(3),
+        ];
+        log::info!(
+            "[{}] LX monitor call #{} args {:#x} {:#x} {:#x} {:#x} (pc={:#x})",
+            unicorn.get_data().thread_id(),
+            call,
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+            pc
+        );
+        // Returning 0 makes PROCNAV exit with code 1 right after the last call,
+        // so the shim evidently wants a positive verdict; try that first.
+        unicorn.reg_write(RegisterARM::R0, 1).unwrap();
+        restore_callee_saved_regs(unicorn, saved_callee_saved);
+        return;
+    }
+
     // PROCNAV is statically linked, so none of the library-level traces cover it
     // and it looks silent while it is really sitting in a syscall we do not log.
     // Trace every syscall of that one process instead of guessing.
@@ -480,6 +515,23 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         ThreadAction::ExitThread(code) => exit_current_thread(unicorn, code),
         ThreadAction::ExitProcess(code) => exit_process(unicorn, code),
     }
+}
+
+/// Call id of the LX monitor shim whose `svc` instruction ends just before `pc`,
+/// or `None` when the interrupt did not come from such a shim.
+fn lx_monitor_call(unicorn: &mut Unicorn<'_, Context>, pc: u32) -> Option<u32> {
+    let mut words = [0u8; 8];
+    unicorn.mem_read((pc - 8) as u64, &mut words).ok()?;
+    let push = u32::from_le_bytes(words[0..4].try_into().ok()?);
+    let svc = u32::from_le_bytes(words[4..8].try_into().ok()?);
+    // ARM: push {r4, lr} = 0xE92D4010, svc #imm24 = 0xEF000000 | imm
+    if push == 0xE92D_4010 && svc >> 24 == 0xEF {
+        let id = svc & 0x00FF_FFFF;
+        if id != 0 {
+            return Some(id);
+        }
+    }
+    None
 }
 
 fn save_callee_saved_regs(unicorn: &mut Unicorn<'_, Context>) -> [u64; 7] {

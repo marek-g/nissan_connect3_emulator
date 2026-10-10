@@ -599,3 +599,33 @@ layer that statically linked processes use instead of `libtrace_dualos`), and it
 aborts as soon as that call is unanswered. Next step is to dump every distinct
 `svc #imm` in the image, find the table the immediate indexes, and answer those
 calls at syscall level (return a value, do not freeze on the first one).
+
+### Update: PROCNAV's blocker is the LX monitor call `svc #6`
+
+Answering the shim (see previous section) gets PROCNAV past the point where it used
+to exit, and shows what the call actually is. All five calls in a boot are `#6`,
+with `r0` pointing at a struct on the stack and `r1` a packed version:
+
+```
+#6 r0=0x7ff3ce10 r1=0x50312    r2=0x5e8ab4 r3=0x5e8bbc
+#6 r0=0x7ff3cdec r1=0x5c022a   r2=0x5ea67c r3=0x5ea668
+#6 r0=0x7ff3cdd8 r1=0x103010b  r2=0x60d674 r3=0x5f2a4c
+#6 r0=0x7ff3cde4 r1=0x63040a   r2=0x5ea6a0 r3=0x0
+#6 r0=0x7ff3cdc8 r1=0x101030b  r2=0x5f2a3c r3=0x0
+```
+
+The shims live in one block next to `DT_INIT`/`DT_FINI` (`0x5ea39c-0x5ea3d4`:
+`svc #5`, `svc #9`, `svc #9` - the second one entered after `orr r1, r1, #0x40000000` -
+and `svc #4`), so they are the statically linked replacement for `libtrace_dualos`
+and the call id is the instruction immediate, which is why they surfaced as
+"unimplemented syscall #0" (R7 happens to be 0).
+
+Return value does not matter for surviving the calls (0 and 1 both walk through all
+five), but with 1 the process then faults writing at `0x5ea818` (`WRITE_UNMAPPED`)
+and exits with code 1, while with 0 it exits immediately. That reads like `#6` is a
+"attach/allocate this resource" call whose result is a handle or a pointer the caller
+then writes through - returning a small integer is wrong either way. Next: answer
+`#6` with an address of a real mapped guest region, dump what PROCNAV stores there
+and let the struct layout tell us what the monitor is expected to provide; the
+`orr r1, #0x40000000` variant of `svc #9` is probably a feature query and will need
+the same treatment.
