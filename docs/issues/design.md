@@ -491,3 +491,33 @@ back, and DAPI re-sends it because no conf comes back (`dap_tclJob::u16GetErrorC
 returns the stored code for a job whose opcode byte is 8, and the CCA layer turns
 that into the re-sent `amt_tclServiceDataError`). Both sides stop as soon as the
 answer is a real result.
+
+### Update: 0x305 comes from a road-network request DAPIAPP has no peer for
+
+`dap_map_tclWorker::u16ProcessLoadRegProfOutlines` does not read the outlines
+itself: it checks the dataset id (`0x306` if the medium rejects it), then creates a
+sub-job (job type 6, action `0x84`) carrying `dap_rnwfi_tclMsgGetRegProfOutlineMethodStart`
+and forwards it through the worker's comm container; the `0x305` we see is the
+result of *that* request. DAPIAPP only contains the rnw *message types*
+(`dap_rnwfi_tclMsg...`), no worker that answers them, so the peer is another
+application.
+
+That application (PROCNAV.OUT) is not present anywhere in the firmware image: the
+dynamic partition's checksum list (`var/opt/bosch/dynamic/system/dynamic.md5`) covers
+`processes/DAPIAPP.OUT` but no PROCNAV, and `/opt/bosch/processes` has no such entry.
+The map card ships `CRYPTNAV/DNL/BIN/NAV/COMMON/PROCNAV.OUT`, but that file is not an
+ELF - it starts with the magic `ULI `, i.e. the card stores compressed/installed
+artefacts (its `VERSION.TXT` names the same build as ours, NAV_13.2C5P10), and the
+unit installs/decompresses them before running. Starting the card file directly gets
+a `spawn process pid=4` with no further activity, which is consistent with the loader
+rejecting the container.
+
+Related observation from the same run: the dynamic FFS is writable in our setup, yet
+every `datapool/*.dat` open fails even with `O_CREAT` (`.../datapool/fff0/DpInternData.dat
+flags=0xa4800 failed: NoSuchFileOrDirectory`), so process pools cannot be created.
+Independent of the nav chain, that is worth fixing.
+
+Next question, then, is how to satisfy the road-network side: either find the
+component that unpacks the card's `ULI` payload (and the install path it writes to),
+or emulate the road-network service on the DAPI level so the outline request is
+answered without PROCNAV.

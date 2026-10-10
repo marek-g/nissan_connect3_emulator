@@ -227,6 +227,18 @@ fn open_internal(
                     flags,
                     fd
                 );
+            } else if path_name.contains("navdata") {
+                // Everything the navdata (CRYPTNAV) tree serves the navigation
+                // database from; without this a successful read of the map data
+                // is invisible while a failed one is logged.
+                log::info!(
+                    "[{}] [SYSCALL] open {} flags={:#x} -> fd={} (elf={})",
+                    thread,
+                    path_name,
+                    flags,
+                    fd,
+                    elf_path
+                );
             }
             fd as u32
         }
