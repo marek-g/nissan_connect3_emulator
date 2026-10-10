@@ -986,6 +986,68 @@ fn hook_service_data_scan(unicorn: &mut Unicorn<'_, Context>, base_address: u32)
             .unwrap();
     }
 
+    // `ail_vAddRegistryEntryFromMessage` (0xb43b80) is reached from a handler
+    // table and adds entries to the application's service registry; the register
+    // handler itself starts at 0xb439c4. Log both entries with the key each one
+    // carries, to find out which message produces the client entry for
+    // procmapengine and whether the ServiceRegister reaches the handler at all.
+    for (address, name) in [
+        (0x00b4_39c4u32, "ail register handler"),
+        (0x00b4_3b80, "ail_vAddRegistryEntryFromMessage"),
+    ] {
+        let entry = base_address + (address - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(entry as u64, entry as u64, move |uc, _, _| {
+                static ADDER_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if ADDER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 60 {
+                    return;
+                }
+                let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+                let r0 = read(RegisterARM::R0);
+                let r1 = read(RegisterARM::R1);
+                let r2 = read(RegisterARM::R2);
+                let r3 = read(RegisterARM::R3);
+                let lr = read(RegisterARM::LR)
+                    .wrapping_sub(base_address)
+                    .wrapping_add(ORIGINAL_BASE);
+                // Whatever looks like a registry key (regid, service, client,
+                // sub) at the pointer arguments.
+                let key_at = |base: u32| -> Option<[u16; 4]> {
+                    if base < 0x0010_0000 || base > 0xf000_0000 {
+                        return None;
+                    }
+                    let mut buf = [0u8; 8];
+                    uc.mem_read(base as u64, &mut buf).ok()?;
+                    Some([
+                        u16::from_le_bytes([buf[0], buf[1]]),
+                        u16::from_le_bytes([buf[2], buf[3]]),
+                        u16::from_le_bytes([buf[4], buf[5]]),
+                        u16::from_le_bytes([buf[6], buf[7]]),
+                    ])
+                };
+                let k1 = key_at(r1);
+                let k2 = key_at(r2);
+                let k3 = key_at(r3);
+                log::warn!(
+                    "DAPI {} [{}] {} at {:#x}: r0={:#x} r1={:#x} r2={:#x} r3={:#x} key@r1={:04x?} key@r2={:04x?} key@r3={:04x?} lr={:#x}",
+                    uc.get_data().elf_path,
+                    uc.get_data().inner.thread_id(),
+                    name,
+                    entry,
+                    r0,
+                    r1,
+                    r2,
+                    r3,
+                    k1,
+                    k2,
+                    k3,
+                    lr,
+                );
+            })
+            .unwrap();
+    }
+
 }
 
 /// Track server-side CCA service registration: DAPI answers client requests
