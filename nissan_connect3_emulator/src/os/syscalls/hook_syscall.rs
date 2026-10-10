@@ -105,10 +105,12 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         // NX stack.
         lx_log_handoff(unicorn, args[0], args[2]);
         restore_callee_saved_regs(unicorn, saved_callee_saved);
-        if lx_invoke_monitor_callback(unicorn, pc, args[2], args) {
+        if lx_entry_continues_on_caller_stack(unicorn, args[2])
+            && lx_resume_at_continuation(unicorn, args[2])
+        {
             return;
         }
-        if lx_resume_at_continuation(unicorn, args[2]) {
+        if lx_invoke_monitor_callback(unicorn, pc, args[2], args) {
             return;
         }
         let scratch = lx_scratch_page(unicorn);
@@ -571,6 +573,19 @@ fn lx_scratch_page(unicorn: &mut Unicorn<'_, Context>) -> u32 {
 
 const LX_HANDOFF_STACK_SIZE: u32 = 0x10000;
 
+/// `ldr sp, [pc, #4] ; b <stub> ; nop ; <table>` - point the shared resume stub at a
+/// specific save table. The branch is PC-relative, so this must be assembled for the
+/// address it will actually run from.
+fn lx_trampoline(at: u32, stub: u32, table: u32) -> Vec<u8> {
+    let branch =
+        0xea00_0000u32 | ((((stub as i32) - (at as i32 + 12)) >> 2) as u32 & 0x00ff_ffff);
+    let mut code = Vec::with_capacity(16);
+    for word in [0xe59f_f004u32, branch, 0xe320_f000, table] {
+        code.extend_from_slice(&word.to_le_bytes());
+    }
+    code
+}
+
 /// Stub that finishes a monitor callback: it stores the callee's result into the
 /// saved R0 slot, then restores the caller's registers plus SP and resume address,
 /// so the detour through the callback is invisible apart from the result.
@@ -659,18 +674,7 @@ fn lx_resume_at_continuation(unicorn: &mut Unicorn<'_, Context>, continuation: u
     if unicorn.mem_read(continuation as u64, &mut word).is_err() {
         return false;
     }
-    // `cmp r0, #0`
-    if word[3] != 0xe3 || (word[2] & 0xf1) != 0x50 || word[1] != 0x00 || word[0] != 0x00 {
-        log::warn!(
-            "LX monitor continuation {:#x} is not a result check ({:02x} {:02x} {:02x} {:02x})",
-            continuation,
-            word[0],
-            word[1],
-            word[2],
-            word[3]
-        );
-        return false;
-    }
+
     let sp = unicorn.reg_read_i32(RegisterARM::R13).unwrap_or(0) as u32;
     // The body resumes mid-function and its epilogue pops its saved frame from the
     // caller's own stack, so the link it will branch to is already in memory. Check it
@@ -697,50 +701,43 @@ fn lx_resume_at_continuation(unicorn: &mut Unicorn<'_, Context>, continuation: u
     true
 }
 
-/// Byte offset from the entry SP to the saved `r4` / link that the entry's epilogue
-/// pops, decoded from its own code. Entries are mid-function addresses, so the frame
-/// size belongs to them and not to us: `add sp, sp, #imm` right before a
-/// `pop {..., pc}` names it. Falls back to `0x10` when nothing matches.
-fn lx_entry_frame_size(unicorn: &mut Unicorn<'_, Context>, entry: u32) -> u32 {
+/// Do the monitor's entries continue on the caller's stack? All the ones PROCNAV uses
+/// are addresses *inside* the yielding function (the control block hands over the
+/// caller's saved link), so they read `[sp, #imm]` and pop the caller's frame and must
+/// keep the caller's SP. An entry that pushes or calls first establishes its own frame
+/// and is the only kind that may be given a fresh stack.
+fn lx_entry_continues_on_caller_stack(unicorn: &mut Unicorn<'_, Context>, entry: u32) -> bool {
     use capstone::arch::arm::ArchMode;
     use capstone::prelude::*;
     use capstone::{Capstone, Endian};
 
     let mut code = [0u8; 256];
     if unicorn.mem_read(entry as u64, &mut code).is_err() {
-        return 0x10;
+        return false;
     }
     let Ok(cs) = Capstone::new().arm().mode(ArchMode::Arm).endian(Endian::Little).build()
     else {
-        return 0x10;
+        return false;
     };
     let Ok(insns) = cs.disasm_all(&code, entry as u64) else {
-        return 0x10;
+        return false;
     };
-    // The first instruction that commits to a stack discipline decides it: a `push`,
-    // a call or a tail jump means the entry brings its own frame (nothing to build),
-    // while touching `[sp, #imm]` or popping right away means the frame is ours.
-    let mut last_add_sp = None;
     for insn in insns.iter() {
         let mnemonic = insn.mnemonic().unwrap_or("");
         let ops = insn.op_str().unwrap_or("");
-        if mnemonic == "add" && ops.starts_with("sp, sp, #") {
-            if let Ok(value) = u32::from_str_radix(ops.rsplit('#').next().unwrap_or(""), 16) {
-                last_add_sp = Some(value);
-            }
-            continue;
+        // Conditional mnemonics keep their stem, so compare prefixes: `ldrge r0, [sp, #4]`
+        // and `str r0, [sp]` both touch the incoming frame.
+        if ops.contains("[sp") {
+            return mnemonic.starts_with("ldr")
+                || mnemonic.starts_with("str")
+                || mnemonic.starts_with("ldm")
+                || mnemonic.starts_with("stm");
         }
-        if mnemonic == "pop" && ops.contains("pc") {
-            return last_add_sp.unwrap_or(0x10);
-        }
-        // Conditional mnemonics keep their stem (`ldrge r0, [sp, #4]` still reads the
-        // incoming frame), so compare prefixes rather than exact names.
-        let reads_stack = ops.contains("[sp") && mnemonic.starts_with("ldr");
-        if !reads_stack && (matches!(mnemonic, "push" | "bl" | "bx") || ops.contains("[sp")) {
-            return 0;
+        if matches!(mnemonic, "push" | "bl" | "bx") {
+            return false;
         }
     }
-    0
+    false
 }
 
 /// Run `entry` the way the monitor would: the caller's state is saved aside, the
@@ -801,7 +798,7 @@ fn lx_invoke_monitor_callback(
     drop(alloc);
 
     let tramp = block;
-    let locals = lx_entry_frame_size(unicorn, entry);
+    let locals = 0x10u32;
     let body_sp =
         (body_stack + LX_HANDOFF_STACK_SIZE - 0x100 - locals) & !7;
     let table = block + 0x40;
@@ -845,18 +842,15 @@ fn lx_invoke_monitor_callback(
 
     // `ldr sp, [pc, #4] ; b <stub> ; nop ; <table>`: point the shared stub at
     // this handoff's save table.
-    let branch = 0xea00_0000u32 | ((((stub as i32) - (tramp as i32 + 12)) >> 2) as u32 & 0x00ff_ffff);
-    let mut trampoline = Vec::with_capacity(16);
-    for word in [0xe59f_f004u32, branch, 0xe320_f000, table] {
-        trampoline.extend_from_slice(&word.to_le_bytes());
-    }
-    if unicorn.mem_write(tramp as u64, &trampoline).is_err() {
+    if unicorn.mem_write(tramp as u64, &lx_trampoline(tramp, stub, table)).is_err() {
         return false;
     }
     // Same stub at the bottom of the coroutine stack: the epilogues that end a
     // coroutine branch to a landing address on that stack, and it must hand control
-    // back to the yielder instead of faulting.
-    if unicorn.mem_write(body_stack as u64, &trampoline).is_err() {
+    // back to the yielder instead of faulting. The branch is relative, so the copy has
+    // to be assembled for its own address.
+    let landing = lx_trampoline(body_stack, stub, table);
+    if unicorn.mem_write(body_stack as u64, &landing).is_err() {
         return false;
     }
 

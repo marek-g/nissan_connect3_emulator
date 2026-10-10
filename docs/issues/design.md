@@ -882,3 +882,27 @@ so its host thread is neither in `emu_start`, nor parked, nor terminating; it is
 somewhere between quanta (or on a host lock). Attaching gdb to confirm is blocked by
 `ptrace_scope`, so the next step is a host-side heartbeat inside `run_process_loop`
 (log the loop tick per process) to tell "stuck in a call" from "spinning in the loop".
+
+### Update: `svc #6` is a coroutine *switch* - map coroutines onto guest threads
+
+With quantum tracing per handoff, the handoff loop is fully explained. Two facts decide
+it:
+
+* Every entry resumes with the same `sp` and `lr = tramp`, and the slot its epilogue pops
+  contains the continuation's own address (`continuation 0x5ea67c resumes with
+  sp=0x90013eb0: pops r4=0x76573c pc=0x5ea67c`) or zero (`0x60d674: pops r4=0x0 pc=0x0`).
+  Resuming in place therefore re-enters the same body: an endless loop. Giving the body a
+  fresh stack only moves the loop into our pages (`pc` bouncing over the zero-filled
+  pages between the handoff block and the coroutine stack).
+* The monitor's id-6 handler does not return to the caller either: per the recovered
+  handler `0x80037184`, it stamps the timeout into `[TCB+0x20]` and **switches the stack to
+  the context frame at `[TCB+0xe0]`** before rescheduling. The popped `r4`/`pc` belong to
+  whoever resumes the coroutine, not to the caller.
+
+So `svc #6` neither calls a function nor returns - it suspends the current coroutine and
+transfers control, and the epilogue is the *exit path* used when the coroutine is resumed
+for the last time. Neither of our inline approximations can express that. The faithful
+mapping is available in the emulator already: create a **guest thread** per coroutine
+(entry `r2`, arguments `r0..r3`, its own stack, link = a coroutine-exit handler that wakes
+the parent with the child's result) and block the yielding thread on it, reusing the
+existing `Blocked`/`pending_result` machinery. That is the next step.

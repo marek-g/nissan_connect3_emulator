@@ -152,7 +152,7 @@ fn run_quantum(
         static QUANTA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let watched = unicorn.get_data().elf_path.contains("navbin");
         let tick = QUANTA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if watched && tick % 512 == 0 {
+        if watched {
             log::info!(
                 "[{}] quantum {}: pc={:#x} lr={:#x} sp={:#x}",
                 next_id,
@@ -263,7 +263,16 @@ pub fn run_process_loop(
     wake: &Wake,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
     let mut last_park_report: Option<String> = None;
+    let mut passes: u64 = 0;
     loop {
+        passes += 1;
+        if passes % 1024 == 0 {
+            log::info!(
+                "SCHED: heartbeat {} passes={}",
+                unicorn.get_data().elf_path,
+                passes
+            );
+        }
         crate::gpu::tick(unicorn);
         crate::libs::prochmi::tick(unicorn);
 
