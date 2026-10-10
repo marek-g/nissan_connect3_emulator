@@ -540,3 +540,29 @@ declares a `PTH` database (`'PTH' | '/RNW/' | '' | '1.2' | '1'`) next to `RNW`
 which is what "regulation profile outlines" refers to. The next thing to find is the
 check that rejects the medium before those files are ever opened (format version,
 region/profile lookup, or a signature/`CHECK_SIGNATURE` gate).
+
+### Update: signature/CID is not what produces 0x305; PROCNAV is loaded but silent
+
+Two things settled:
+
+* The SDX/signature chain never runs here. Nothing in a run issues the cryptcard
+  `0x410` CID ioctl, opens `SDX_META.DAT` or logs any `verify`/`BPCL`/`SDX` string,
+  so `0x305` cannot be a signature verdict. The CID substitution path is still worth
+  having (`ioctl.rs` answers `0x410` on `/dev/cryptcard[2]` with the card's real CID
+  from `cid.txt`, `5d5342303031364712e055a86c013301`) - it is the honest way to make
+  the partition signature pass when the chain does start, instead of the known
+  "Map modification enabler" patch of `BPCL_EC_DSA_Verify`.
+* PROCNAV is the road-network server (its image contains `dap_rnw_if_tclloader.cpp`,
+  `fi_tcl_RegProfOutline`, `dap_rnwfi_tclMsgGetMapBlocksMethodStart/Result`) and it
+  now loads: mapped at its prelinked base `0x8000-0x1476fff`, `Start program` with
+  entry `0x5ea418`, ld.so resolves its `libiosclib_so.so`. It is statically linked
+  (no `DT_NEEDED`), so our libosal hooks do not apply to it - only syscall-level
+  emulation does.
+  It nevertheless performs no IPC: no `mq_open`, no `/dev/registry`, no `/dev/iosc`
+  open, nothing attributed to its image after the mapping. So the `0x305` path is
+  still unhandled, and the request that has no reader is visible in the queue
+  statistics: `mbx_0` gets 58 posts and 0 waits, and one of the payloads carries
+  `f60a80`, the same object DAPI logs as its svcdata dispatch target.
+  First thing to find next: what PROCNAV's main thread waits on before it opens its
+  mailboxes (it is silent in a way that futex/poll waits, which we do not log, would
+  explain - add temporary logging there rather than guessing).
