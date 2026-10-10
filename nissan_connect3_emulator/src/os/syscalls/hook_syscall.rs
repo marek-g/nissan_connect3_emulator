@@ -103,6 +103,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         // caller's context and return the callee's result: only the callee fills the
         // link slot the shim pops next, so skipping the call sends PROCNAV into the
         // NX stack.
+        lx_log_handoff(unicorn, args[0], args[2]);
         restore_callee_saved_regs(unicorn, saved_callee_saved);
         if lx_resume_at_continuation(unicorn, args[2]) {
             return;
@@ -600,6 +601,49 @@ fn lx_call_stub(unicorn: &mut Unicorn<'_, Context>) -> Option<u32> {
     log::info!("LX monitor call stub at {:#x}", addr);
     *LX_CALL_STUB.lock().unwrap() = Some(addr);
     Some(addr)
+}
+
+/// Log the handoff control block the wrapper builds (`mov r0, sp`) and the frame
+/// geometry the entry expects, decoded from the entry's own code, so the resume can be
+/// driven from the record instead of from whatever the stack slot happens to hold.
+fn lx_log_handoff(unicorn: &mut Unicorn<'_, Context>, block: u32, entry: u32) {
+    let mut words = [0u8; 32];
+    if unicorn.mem_read(block.wrapping_sub(8) as u64, &mut words).is_ok() {
+        let cells: Vec<String> = words
+            .chunks(4)
+            .map(|c| format!("{:#010x}", u32::from_le_bytes(c.try_into().unwrap())))
+            .collect();
+        log::info!(
+            "LX handoff block {:#x} (r0={:#x}): {}",
+            block.wrapping_sub(8),
+            block,
+            cells.join(" ")
+        );
+    }
+
+    let mut code = [0u8; 64];
+    if unicorn.mem_read(entry as u64, &mut code).is_err() {
+        return;
+    }
+    use capstone::arch::arm::ArchMode;
+    use capstone::prelude::*;
+    use capstone::{Capstone, Endian};
+
+    let Ok(cs) = Capstone::new().arm().mode(ArchMode::Arm).endian(Endian::Little).build()
+    else {
+        return;
+    };
+    let Ok(insns) = cs.disasm_all(&code, entry as u64) else {
+        return;
+    };
+    for insn in insns.iter().take(10) {
+        log::info!(
+            "  LX entry {:#x}: {} {}",
+            insn.address(),
+            insn.mnemonic().unwrap_or(""),
+            insn.op_str().unwrap_or("")
+        );
+    }
 }
 
 /// The entry point handed to the monitor starts with `cmp r0, #0`, so it is a

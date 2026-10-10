@@ -815,3 +815,29 @@ complete the handshake and PROCNAV still ends in `0x305` with the `mbx_1024` flo
 ~1M. Next step is to model the control block: parse `[r0 + 0x00..0x20]`, keep a per-block
 coroutine record in the emulator, and make the *record* drive the resume instead of
 trusting whatever the stack slot happens to contain.
+
+### Update: the coroutine's resume stub lives on the app stack (NX stack is the blocker)
+
+Dumping the control block and decoding each entry gives the full picture. The words
+around `r0` are just the caller's frame (no fixed layout), but they contain the address
+the epilogue will branch to:
+
+```
+site 1  r0=0x7ff3ce10: .. [r0+0x0c]=0x5e8ab4 (epilogue) .. [r0+0x14]=0x7ff3cfe0
+        0x5e8ab4: cmp r0,#0 / ldrge r0,[sp,#4] / strge r0,[r4,#0x18] / pop-equivalent
+site 2  r0=0x7ff3cdd4: [r0+0x08]=0x5ea67c: str r0,[sp] ; bl 0x5f2a50 ; subs r4,r0,#0 ...
+site 3  r0=0x90003000: [r0-0x04]=0x60c9e8 ; [r0+0x04]=0x60d674: cmp r0,#0 ... add sp,#0x10 ; pop {r4,pc}
+```
+
+`r2` is the *caller's saved link*, and the code there is the yielder function's epilogue -
+i.e. the app tail-yields: ending the coroutine is a normal return to a landing stub the
+monitor put on the coroutine's stack. At site 1 that landing stub is `0x7ff3cfe0`, a
+**stack address**, which matches the `FETCH_PROT` at `0x7ff3cfe0` seen long ago: the real
+LX system has executable coroutine stacks and the monitor writes its resume/exit trampoline
+into the frame before starting the coroutine, while our stacks are mapped NX.
+
+Concrete next step, no guessing left: at each handoff, write our resume trampoline
+(`ldr sp,[pc,#4] ; b <stub> ; nop ; <save table>`) into the landing slot the frame points
+at, make that page executable (add PROT_EXEC to the stack mapping, or map a small
+executable landing area and point the slot at it), and enter the epilogue with the
+caller's SP as it already is - no synthesized frame at all.
