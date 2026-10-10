@@ -426,6 +426,14 @@ fn hook_device_manager_init(unicorn: &mut Unicorn<'_, Context>, base_address: u3
 pub static MAP_MEDIUM_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Register-id DAPIAPP currently holds a client registration for, for the map
+/// data service and client application 0x0400, or 0xffff when it has none.
+/// Maintained by the service registry list hooks (see
+/// `ail_vPostServiceDataError6AndUnregister`, which removes the entry it finds
+/// rather than the one a message names).
+pub static MAP_DATA_LIVE_REGISTER_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0xffff);
+
 /// Wall-clock origin for the boot-timing traces (first use, i.e. early boot).
 pub static EMU_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
@@ -811,6 +819,19 @@ fn hook_service_data_scan(unicorn: &mut Unicorn<'_, Context>, base_address: u32)
                             0xff
                         },
                     );
+                }
+                // Which register-id DAPIAPP currently has registered for the map
+                // data service (0xffff when none). The mailbox bridge uses this
+                // to drop a deregistration naming a different handle: the
+                // handler for that message removes the entry it *finds* by
+                // service and client and answers error 6, which destroys the
+                // registration procmapengine actually uses.
+                if !is_scan && fields.len() == 5 && fields[1] == 0x0026 && fields[2] == 0x0400 {
+                    if name.contains("ADD") {
+                        MAP_DATA_LIVE_REGISTER_ID.store(fields[0] as u32, Ordering::Relaxed);
+                    } else if name.contains("REMOVE") || name.contains("NODE-DEL") {
+                        MAP_DATA_LIVE_REGISTER_ID.store(0xffff, Ordering::Relaxed);
+                    }
                 }
                 let r6 = read(RegisterARM::R6);
                 let lr = read(RegisterARM::LR);

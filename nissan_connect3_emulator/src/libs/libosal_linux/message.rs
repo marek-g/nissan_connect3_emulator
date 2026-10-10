@@ -1944,6 +1944,35 @@ fn bridge_mbx_queue(
                     u16::from_le_bytes([body[0xe], body[0xf]]),
                 );
             }
+            // procmapengine replays a deregistration for a handle from an
+            // earlier session. DAPIAPP answers that with error 6 and removes the
+            // entry it finds for the service and client, which is the live
+            // registration - so a deregistration naming any other handle is
+            // dropped here, the way a server that knows no such handle would
+            // have nothing to remove.
+            if name == "mbx_7"
+                && body.len() >= 0x18
+                && body[0xb] == 0x41
+                && body[0x14..0x16] == 0x26u16.to_le_bytes()
+            {
+                let register_id = u16::from_le_bytes([body[0x16], body[0x17]]);
+                let live = (crate::libs::dapi::MAP_DATA_LIVE_REGISTER_ID.load(Ordering::Relaxed)
+                    & 0xffff) as u16;
+                if live != 0xffff && register_id != live {
+                    log::info!(
+                        "[LIBOSAL-MBX] dropped deregistration of svc 0x0026 handle {register_id:#06x}: DAPIAPP holds {live:#06x}"
+                    );
+                    unicorn
+                        .get_data()
+                        .sys_calls_state
+                        .lock()
+                        .unwrap()
+                        .osal_messages
+                        .release(content);
+                    return_to_caller(unicorn, 0);
+                    return true;
+                }
+            }
             let mut blob = Vec::with_capacity(8 + body.len());
             blob.extend_from_slice(&1u32.to_le_bytes());
             blob.extend_from_slice(&(body.len() as u32).to_le_bytes());

@@ -430,3 +430,19 @@ dispatch object is not in state INITIALIZED, and the same path unregisters the
 client on the way out. Next question: what leaves DAPIAPP's interface state short
 of INITIALIZED here, since that would explain both the unmatchable register-id and
 the teardown, without any message ordering being wrong at all.
+
+### Update: neither holding nor dropping the deregistration at post time helps
+
+The bridge now drops a deregistration of the map-data service whose handle
+differs from the one DAPIAPP has registered (`MAP_DATA_LIVE_REGISTER_ID`, taken
+from the registry list hooks), which is the destructive case identified in
+`ail_vPostServiceDataError6AndUnregister`. In the run it never fires: the
+deregistration is posted while DAPIAPP has no registration of the service yet, so
+the bridge cannot know that the message will be processed only after one exists.
+Both post-time strategies (hold while an entry is live, drop when the handle does
+not match) fail for that one reason.
+
+What is left is to keep the *registration* from being processed before the pending
+deregistration was dealt with, which needs a reliable observation of "the
+deregistration has been answered" rather than the conf-based heuristic that armed
+wrongly before (a conf of an unrelated registration cleared it).
