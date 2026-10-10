@@ -373,3 +373,15 @@ Notes:
   the next message once the previous one's handling has visibly completed), or
   find why DAPIAPP's deregistration handler keys the removal on its live entry
   instead of the handle in the message.
+
+### Update: the ApplicationInfoStatus synthesis is load-bearing, not the culprit
+
+`bRegisterAsync` defers the ServiceRegister until the process directory reports
+the server application as running, and no process tells procmapengine that about
+DAPIAPP, so we inject one `ApplicationInfoStatus(app 0x0007)`. Suppressing it
+(EMU_NO_APP_INFO_SYNTH=1) removes not only the duplicate registration but the
+whole CCA exchange: no ServiceRegister, no deregistration, no GetBlockIDs and no
+error-reply flood at all - procmapengine never registers the map-data service.
+The synthesis therefore cannot simply be deleted; the flood is downstream of the
+failing answer, and one status message cannot explain a second registration.
+Removing our syntheses is not the way out of this one.

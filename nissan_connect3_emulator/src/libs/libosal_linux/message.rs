@@ -2187,6 +2187,12 @@ pub(crate) fn post_app_info_status_to(
 pub(crate) fn post_app_info_status(unicorn: &mut Unicorn<'_, Context>, server_app: u32) -> bool {
     use std::sync::atomic::AtomicBool;
     static APP_INFO_SENT: AtomicBool = AtomicBool::new(false);
+    // A client that has to be told "the server application is running" before it
+    // dares to register is us feeding its own state machine. EMU_NO_APP_INFO_SYNTH
+    // suppresses it to see how much of the CCA trouble is self-inflicted.
+    if std::env::var_os("EMU_NO_APP_INFO_SYNTH").is_some() {
+        return false;
+    }
     // procmap (app 0x400) is the intended client for this emission.
     post_app_info_status_to(unicorn, server_app, 0x400, &APP_INFO_SENT)
 }
