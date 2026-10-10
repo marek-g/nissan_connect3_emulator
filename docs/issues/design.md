@@ -629,3 +629,45 @@ then writes through - returning a small integer is wrong either way. Next: answe
 and let the struct layout tell us what the monitor is expected to provide; the
 `orr r1, #0x40000000` variant of `svc #9` is probably a feature query and will need
 the same treatment.
+
+### Update: monitor SWI ABI and what call #6 actually has to do
+
+The monitor image (`Firmware/D605/triton_mid.bin`, stripped 64-byte `triton_dualos`
+header, based at `0x80000000`) starts with an ARM vector table whose SWI entry is
+`0x800eaa04`:
+
+```
+mrs  ip, spsr ; tst ip, #0x20        ; Thumb or ARM?
+ldrhne ip, [lr, #-2] ; bicne ip, ip, #0xff00      ; Thumb: id = imm8
+ldreq  ip, [lr, #-4] ; biceq ip, ip, #0xff000000  ; ARM:   id = imm24
+cmp  ip, #4 ; blt  out_of_range
+cmp  ip, #0x1b ; bgt out_of_range
+ldr  lr, [table_ptr] ; ldr lr, [lr, ip, lsl #2] ; cmp lr,#0 ; bxne lr
+```
+
+So ids `0..3` stay with the OS and `4..0x1b` are monitor services - exactly the
+`#4/#5/#6/#9` shims in PROCNAV. The table pointer itself lives in RAM beyond the
+image (`0x80531ff0`, filled at init), so the individual handlers are not reachable
+statically from the file image.
+
+Handing the guest a real mapped page as the result (instead of 0/1) proves the
+result is not an output buffer: the page stays all zero, and PROCNAV feeds the
+returned value back as `r3` on the next call:
+
+```
+#6 r0=0x7ff3ce10 r1=0x50312   r2=0x5e8ab4 r3=0x5e8bbc
+#6 r0=0x7ff3ce18 r1=0x3010a   r2=0x5e8b38 r3=0x5e8bbc
+#6 r0=0x7ff3ce18 r1=0x60112   r2=0x5e8b44 r3=0x90002000   <- our handle echoed back
+#6 r0=0x7ff3ce10 r1=0x50312   r2=0x5f2824 r3=0x90002000   <- then FETCH_PROT
+```
+
+The fourth call dies with `PC = 0x7ff3cfe0` (the stack, NX) and `LR = 0x5e8bd8`,
+which is the shape of `pop {r4, pc}` restoring a link slot the callee never wrote.
+That is the signature of a *callback* service: the monitor is expected to execute
+`r2` (component entry point, `r1` = its version, `r0` = its argument struct) in the
+caller's context and return what that function returns. We currently return without
+invoking anything, so the caller's frame is left half-filled.
+
+Next step is therefore not more guessing about the return value but calling `r2` as a
+guest function, which the emulator can do with the same call-stub machinery
+`prochmi.rs` uses (`heap_alloc` + a stub that restores registers and jumps back).

@@ -71,6 +71,24 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
             unicorn.get_u32_arg(2),
             unicorn.get_u32_arg(3),
         ];
+        // Whatever the previous call handed back, PROCNAV has written through it
+        // by now; dumping it here is what reveals the expected result structure.
+        let scratch = LX_SCRATCH.lock().unwrap().unwrap_or(0);
+        if scratch != 0 {
+            let mut page = [0u8; 64];
+            if unicorn.mem_read(scratch as u64, &mut page).is_ok() {
+                log::info!(
+                    "[{}] LX scratch at {:#x} before call #{}: {}",
+                    unicorn.get_data().thread_id(),
+                    scratch,
+                    call,
+                    page.iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
+        }
         log::info!(
             "[{}] LX monitor call #{} args {:#x} {:#x} {:#x} {:#x} (pc={:#x})",
             unicorn.get_data().thread_id(),
@@ -81,9 +99,11 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
             args[3],
             pc
         );
-        // Returning 0 makes PROCNAV exit with code 1 right after the last call,
-        // so the shim evidently wants a positive verdict; try that first.
-        unicorn.reg_write(RegisterARM::R0, 1).unwrap();
+        // Returning 0 makes PROCNAV exit with code 1 right after the last call and
+        // returning 1 makes it write through the result (WRITE_UNMAPPED at
+        // 0x5ea818), so the result has to be a usable address.
+        let scratch = lx_scratch_page(unicorn);
+        unicorn.reg_write(RegisterARM::R0, scratch as u64).unwrap();
         restore_callee_saved_regs(unicorn, saved_callee_saved);
         return;
     }
@@ -515,6 +535,30 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         ThreadAction::ExitThread(code) => exit_current_thread(unicorn, code),
         ThreadAction::ExitProcess(code) => exit_process(unicorn, code),
     }
+}
+
+/// Guest page handed back as the result of an LX monitor call, so the caller has
+/// somewhere to write what it expects the monitor to fill in.
+static LX_SCRATCH: std::sync::LazyLock<std::sync::Mutex<Option<u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+fn lx_scratch_page(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+    if let Some(page) = *LX_SCRATCH.lock().unwrap() {
+        return page;
+    }
+    let mmu_arc = {
+        let data = unicorn.get_data();
+        data.mmu.clone()
+    };
+    let page = mmu_arc.lock().unwrap().heap_alloc(
+        unicorn,
+        0x1000,
+        unicorn_engine::unicorn_const::Prot::READ | unicorn_engine::unicorn_const::Prot::WRITE,
+        "[lx-monitor-scratch]",
+    );
+    log::info!("LX monitor scratch page at {:#x}", page);
+    *LX_SCRATCH.lock().unwrap() = Some(page);
+    page
 }
 
 /// Call id of the LX monitor shim whose `svc` instruction ends just before `pc`,
