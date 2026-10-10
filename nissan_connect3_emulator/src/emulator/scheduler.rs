@@ -425,6 +425,16 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
 
     for (tid, reason) in blocked {
         match reason {
+            BlockReason::MonitorYield { object, deadline } => {
+                if deadline.map(|until| until <= now).unwrap_or(false) {
+                    log::debug!(
+                        "[{}] monitor: yield on object {} expired, resuming",
+                        tid,
+                        object
+                    );
+                    set_runnable(unicorn, tid, Some(0));
+                }
+            }
             BlockReason::SleepUntil(until) => {
                 if until <= now {
                     set_runnable(unicorn, tid, None);
@@ -545,6 +555,7 @@ fn park_duration(unicorn: &Unicorn<'_, Context>) -> Duration {
             BlockReason::IoscMutex { deadline, .. }
             | BlockReason::IoscEvent { deadline, .. }
             | BlockReason::IoscSemaphore { deadline, .. }
+            | BlockReason::MonitorYield { deadline, .. }
             | BlockReason::InotifyRead { deadline, .. }
             | BlockReason::SocketRead { deadline, .. }
             | BlockReason::SignalWait { deadline, .. },

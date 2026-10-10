@@ -16,7 +16,7 @@
 use crate::emulator::mmu::Mmu;
 use crate::emulator::context::Context;
 use crate::emulator::memory_map::MQ_NOTIFY_EXIT_STUB;
-use crate::emulator::thread::{GuestThread, ThreadStatus};
+use crate::emulator::thread::{block_current_thread, BlockReason, GuestThread, ThreadStatus};
 use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -96,6 +96,32 @@ pub const SVC_YIELD: u32 = 6;
 pub const SVC_SYSTEM_TASK: u32 = 4;
 pub const TCB_YIELD_REASON: u32 = 0x20;
 pub const TCB_CONTEXT_FRAME: u32 = 0xe0;
+
+/// Handlers the monitor's own late registration (`FUN_8002b848`) would have installed for
+/// the ids the Linux side uses. That registration never runs here because it happens after
+/// the boot phase the image is stuck in, and the dispatcher treats an empty slot as
+/// "unimplemented" and returns -26, so the emulator fills the slots with the addresses the
+/// image itself contains. See the id -> handler table in
+/// `docs/reverse_engineering/triton_mid_swi_services.md`.
+pub const SERVICE_HANDLERS: &[(u32, u32)] = &[
+    (0x00, 0x8000_05dc),
+    (0x03, 0x8003_3514),
+    (0x04, 0x8000_0640),
+    (0x05, 0x8000_bf74),
+    (0x06, 0x8003_7184),
+    (0x07, 0x8003_70d8),
+    (0x08, 0x8003_6c78),
+    (0x09, 0x8003_73a8),
+    (0x0a, 0x8000_bfc8),
+    (0x1e, 0x8002_03e8),
+];
+
+/// Ids the SWI dispatcher accepts; anything else takes its "not implemented" path.
+pub const SERVICE_ID_MIN: u32 = 4;
+pub const SERVICE_ID_MAX: u32 = 0x1b;
+
+/// Table the id-6 handler branches through: `ldr r2, [0x800750dc + (r1 >> 16) * 4]`.
+pub const WORKER_TABLE: u32 = 0x8007_50dc;
 
 /// The monitor image with the uImage header stripped, read once per process.
 pub fn image() -> Option<&'static [u8]> {
@@ -188,6 +214,13 @@ pub fn attach(unicorn: &mut Unicorn<'_, Context>) -> bool {
     ] {
         if write_word(unicorn, address, value).is_err() {
             log::warn!("monitor: cannot seed the word at {:#x}", address);
+            return false;
+        }
+    }
+
+    for (id, handler) in SERVICE_HANDLERS {
+        if write_word(unicorn, SERVICE_TABLE + 4 * id, *handler).is_err() {
+            log::warn!("monitor: cannot register handler {:#x} for id {}", handler, id);
             return false;
         }
     }
@@ -355,6 +388,107 @@ fn cp15_action(mnemonic: &str, ops: &str) -> Option<(u32, Cp15)> {
         ("c13", "4", true) => Some((destination, Cp15::Indirect(TIB + 4))),
         _ => Some((destination, Cp15::Nop)),
     }
+}
+
+/// Emulate the effect of a monitor yield (`svc #6` with a positive R1).
+///
+/// The real handler (`0x800371b4`) takes `R1 & 0xff` as the number of a monitor kernel
+/// object - created by the kernel object manager while the monitor initialises - pushes
+/// `R1` into the yielding thread's slot and blocks it on that object; `R1 >> 16` is the
+/// timeout in ticks. The objects cannot be reconstructed from the image because nothing
+/// here runs the code that creates them, so the blocking half is what the emulator
+/// reproduces: the thread waits for the object or for the deadline, whichever comes
+/// first. Returns whether the thread was parked.
+pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, reason: u32) -> bool {
+    const TICK: std::time::Duration = std::time::Duration::from_millis(1);
+
+    let object = reason & 0xff;
+    let ticks = reason >> 16;
+    let deadline = if ticks == 0 {
+        None
+    } else {
+        Some(std::time::Instant::now() + TICK * ticks)
+    };
+    log::info!(
+        "monitor: thread [{}] yields on object {} for {} ticks",
+        unicorn.get_data().thread_id(),
+        object,
+        ticks
+    );
+    block_current_thread(
+        unicorn,
+        BlockReason::MonitorYield { object, deadline },
+    );
+    true
+}
+
+/// Enter the monitor's own SWI dispatcher for `svc #id`, the way the ARM vector would.
+///
+/// Unicorn reports the trap with PC already past the instruction and without touching the
+/// saved program status, so the return address is the reported PC and the saved status is
+/// the current one without the interrupt mask. The dispatcher expects the five words the
+/// vector trampoline left below the caller's stack: `R3`, the saved status, `R3` again,
+/// `R12` and the link register, and it finishes with a multiple load that ends in the
+/// program counter, which lands on that link register.
+///
+/// Returns whether the monitor took the call over.
+pub fn enter(unicorn: &mut Unicorn<'_, Context>, id: u32, return_address: u32) -> bool {
+    if !(SERVICE_ID_MIN..=SERVICE_ID_MAX).contains(&id) || !attach(unicorn) {
+        return false;
+    }
+
+    let args1 = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+    let Ok(status) = unicorn.reg_read(RegisterARM::CPSR) else {
+        return false;
+    };
+    let status = (status as u32) & !0x80;
+    let r3 = unicorn.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+    let r12 = unicorn.reg_read(RegisterARM::R12).unwrap_or(0) as u32;
+    let Ok(sp) = unicorn.reg_read(RegisterARM::SP) else {
+        return false;
+    };
+    let frame = (sp as u32).wrapping_sub(0x14) & !7;
+
+    for (offset, word) in [
+        (0u32, r3),
+        (4, status),
+        (8, r3),
+        (0xc, r12),
+        (0x10, return_address),
+    ] {
+        if write_word(unicorn, frame + offset, word).is_err() {
+            log::warn!("monitor: cannot build the trap frame at {:#x}", frame + offset);
+            return false;
+        }
+    }
+
+    for (register, value) in [
+        (RegisterARM::R14 as i32, return_address as u64),
+        (RegisterARM::R13 as i32, frame as u64),
+        (RegisterARM::PC as i32, SWI_HANDLER as u64),
+    ] {
+        if unicorn.reg_write(register, value).is_err() {
+            return false;
+        }
+    }
+
+    let index = args1.wrapping_shr(16);
+    let worker = read_word(unicorn, WORKER_TABLE + 4 * index).unwrap_or(0);
+    log::info!(
+        "monitor: id {} r1={:#x} index={:#x} worker={:#x} handler={:#x}",
+        id,
+        args1,
+        index,
+        worker,
+        read_word(unicorn, SERVICE_TABLE + 4 * id).unwrap_or(0)
+    );
+    log::trace!(
+        "monitor: id {} entering the dispatcher at {:#x} with the frame at {:#x}",
+        id,
+        SWI_HANDLER,
+        frame
+    );
+    true
 }
 
 /// Start the monitor's system tasks as ordinary guest threads, the way `svc #4` would:

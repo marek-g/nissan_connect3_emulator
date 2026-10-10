@@ -138,6 +138,14 @@ pub enum BlockReason {
         child: u32,
         deadline: Option<Instant>,
     },
+    /// LX monitor yield (`svc #6` with a positive reason): the thread blocks on a monitor
+    /// kernel object until that object signals it or the tick deadline in the reason
+    /// expires. The monitor keeps the thread on the object's wait queue and resumes it
+    /// from there; the emulator uses the host clock for the deadline.
+    MonitorYield {
+        object: u32,
+        deadline: Option<Instant>,
+    },
 }
 
 /// Action requested by a syscall handler; consumed by the syscall hook wrapper.

@@ -133,6 +133,21 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         // The `svc` vector belongs to the Triton monitor, so the first service call of a
         // process maps it into this address space; everything below is served by host
         // code until the monitor's own handlers can be dispatched.
+        // The vector belongs to the Triton monitor, so hand the trap to its own
+        // dispatcher: it validates the id, indexes its service table and returns through
+        // the frame built below the caller. Only ids it does not accept are left to the
+        // host.
+        // The yield is the one service whose object table cannot exist here, so it is
+        // parked on the host clock; everything else the monitor can serve, it serves
+        // itself.
+        if call == crate::rtos::monitor::SVC_YIELD
+            && crate::rtos::monitor::yield_thread(unicorn, args[1])
+        {
+            return;
+        }
+        if crate::rtos::monitor::enter(unicorn, call, pc) {
+            return;
+        }
         crate::rtos::monitor::attach(unicorn);
         // A monitor service that is handed an entry point has to run it in the
         // caller's context and return the callee's result: only the callee fills the
