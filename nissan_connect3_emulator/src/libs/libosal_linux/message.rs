@@ -100,17 +100,22 @@ struct HeldMessage {
 ///   answers error 6, and that error path unregisters the client again - after
 ///   which no request can ever succeed. The request is held and re-posted
 ///   directly behind the registration.
-/// * `HELD_DEREGISTRATION`: procmapengine starts by deregistering handles left
+/// * `HELD_REGISTRATION`: procmapengine starts by deregistering handles left
 ///   over from a previous session. DAPIAPP builds the removal key from its own
-///   live entry rather than from the message, so a deregistration that is
-///   processed after a registration deletes the entry created moments before. It
-///   is held until DAPIAPP has no live client entry of the service, which is the
-///   state in which the device leaves it a harmless no-op.
+///   live entry rather than from the message, so if that deregistration is
+///   still around when the new registration is processed it deletes the entry
+///   created moments before. The registration waits until the conf of the
+///   pending deregistration has been delivered, leaving DAPIAPP a no-op.
 const HELD_DATA_REQUEST: usize = 0;
-const HELD_DEREGISTRATION: usize = 1;
+const HELD_REGISTRATION: usize = 1;
 
-static HELD_MESSAGES: std::sync::LazyLock<std::sync::Mutex<[Option<HeldMessage>; 2]>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new([None, None]));
+static HELD_MESSAGES: std::sync::LazyLock<
+    std::sync::Mutex<[Option<HeldMessage>; 2]>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new([None, None]));
+
+/// A deregistration of the map-data service whose conf has not come back yet.
+static MAP_DATA_DEREGISTRATION_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Set once a registration of the map-data service has been queued, so that a
 /// later data request is posted normally.
@@ -167,7 +172,11 @@ fn flush_held_message(unicorn: &mut Unicorn<'_, Context>, slot: usize, reason: &
         held.what,
         queue = held.queue
     );
-    if !accepted {
+    if accepted {
+        if slot == HELD_REGISTRATION {
+            registration_queued(unicorn);
+        }
+    } else {
         HELD_MESSAGES.lock().unwrap()[slot] = Some(held);
     }
 }
@@ -1870,24 +1879,13 @@ fn bridge_mbx_queue(
         return false;
     }
 
-    // A held message must not be lost if its prerequisite never shows up. A
-    // held deregistration goes out as soon as DAPIAPP has no live client entry
-    // of the service any more, where it cannot destroy anything.
-    for slot in [HELD_DATA_REQUEST, HELD_DEREGISTRATION] {
-        let reason = {
-            let guard = HELD_MESSAGES.lock().unwrap();
-            match guard[slot].as_ref() {
-                Some(held) if held.held_at.elapsed() >= HELD_MESSAGE_LIMIT => Some("timeout"),
-                Some(_) if slot == HELD_DEREGISTRATION
-                    && !crate::libs::dapi::MAP_DATA_CLIENT_ENTRY_LIVE.load(Ordering::Relaxed) =>
-                {
-                    Some("the service has no live registration")
-                }
-                _ => None,
-            }
-        };
-        if let Some(reason) = reason {
-            flush_held_message(unicorn, slot, reason);
+    // A held message must not be lost if its prerequisite never shows up.
+    for slot in [HELD_DATA_REQUEST, HELD_REGISTRATION] {
+        let expired = HELD_MESSAGES.lock().unwrap()[slot]
+            .as_ref()
+            .is_some_and(|held| held.held_at.elapsed() >= HELD_MESSAGE_LIMIT);
+        if expired {
+            flush_held_message(unicorn, slot, "timeout");
         }
     }
 
@@ -1961,14 +1959,19 @@ fn bridge_mbx_queue(
                         body[0x16..0x18] == 0xffffu16.to_le_bytes()
                             && !MAP_DATA_REGISTRATION_QUEUED.load(Ordering::Relaxed)
                     }
-                    0x41 => crate::libs::dapi::MAP_DATA_CLIENT_ENTRY_LIVE.load(Ordering::Relaxed),
+                    0x42 => MAP_DATA_DEREGISTRATION_PENDING.load(Ordering::Relaxed),
                     _ => false,
                 };
             if hold {
-                let (what, slot) = if body[0xb] == 0x45 {
-                    ("map-data request", HELD_DATA_REQUEST)
+                let what = if body[0xb] == 0x45 {
+                    "map-data request"
                 } else {
-                    ("service deregistration", HELD_DEREGISTRATION)
+                    "service registration"
+                };
+                let slot = if body[0xb] == 0x45 {
+                    HELD_DATA_REQUEST
+                } else {
+                    HELD_REGISTRATION
                 };
                 hold_message(slot, name, blob, prio_or_prio_ptr, what);
                 unicorn
@@ -1994,8 +1997,12 @@ fn bridge_mbx_queue(
                 accepted
             };
             if accepted {
-                if is_map_data && body[0xb] == 0x42 {
-                    registration_queued(unicorn);
+                if is_map_data {
+                    match body[0xb] {
+                        0x41 => MAP_DATA_DEREGISTRATION_PENDING.store(true, Ordering::Relaxed),
+                        0x42 => registration_queued(unicorn),
+                        _ => {}
+                    }
                 }
                 // Ownership of an OSAL message transfers to the queue on a
                 // successful Post; the recipient gets a materialized copy,
@@ -2078,6 +2085,15 @@ fn bridge_mbx_queue(
                         let register_id =
                             u16::from_le_bytes([message.data[0x1e], message.data[0x1f]]);
                         crate::libs::procmapengine::note_dapi_register_conf(service, register_id);
+                        if service == 0x0026
+                            && MAP_DATA_DEREGISTRATION_PENDING.swap(false, Ordering::Relaxed)
+                        {
+                            flush_held_message(
+                                unicorn,
+                                HELD_REGISTRATION,
+                                "the pending deregistration was answered",
+                            );
+                        }
                     }
                 }
                 let _ = result;

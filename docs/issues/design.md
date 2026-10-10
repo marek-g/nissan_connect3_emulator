@@ -385,18 +385,3 @@ error-reply flood at all - procmapengine never registers the map-data service.
 The synthesis therefore cannot simply be deleted; the flood is downstream of the
 failing answer, and one status message cannot explain a second registration.
 Removing our syntheses is not the way out of this one.
-
-### Update: holding the deregistration at post time is not enough
-
-The bridge now tracks whether DAPIAPP holds a live client registration of the
-map-data service (`MAP_DATA_CLIENT_ENTRY_LIVE`, maintained by the registry list
-hooks) and holds a deregistration while that is true. It never fires: the
-deregistration is posted at 4980, the registration is only processed at 5028, so
-the message is already on its way while the entry the bridge would protect does
-not exist yet. Whether the deregistration destroys that entry is decided by the
-order in which DAPIAPP *finishes* the two messages, not by when they are posted -
-exactly the inversion the bridge cannot see at post time.
-
-Also unexplained: a client entry for svc 0x26 is added at 5028 although the only
-ServiceRegister we observe for it is posted at 5288. Whatever created the earlier
-entry did not pass the bridge, and should be identified.
