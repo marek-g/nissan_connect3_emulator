@@ -727,3 +727,14 @@ same as before and not a single spin-watch sample appears: thread 18 is never in
 `emu_start`. PROCNAV therefore sits in our own `Blocked` state after the three `svc #6`
 handoffs - it is waiting on an emulator-side object whose wake side we do not implement,
 which is also why it never reaches `mq_open` or the registry device.
+
+### Update: PROCNAV neither parks nor is inside a bounded run
+
+With the park report added, the log shows park lines only for DAPIAPP, procbaselx,
+prochmi and procmapengine - never for `/opt/bosch/navbin/PROCNAV.OUT`. Together with the
+spin watch (`EMU_QUANTUM_TIMEOUT_US=500000`) producing no sample either, PROCNAV's host
+thread is neither parked in the scheduler nor stopped by a wall-clock budget inside
+`emu_start`: its loop keeps getting `run_quantum == true` while the quantum itself
+finishes essentially instantly, so the thread stays `Runnable` and nothing is ever
+logged. That is a host-side livelock, not a guest spin loop and not a blocked thread,
+and it is what has to be chased next (log the PC at quantum entry for that process).

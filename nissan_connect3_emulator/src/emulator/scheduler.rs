@@ -219,6 +219,7 @@ pub fn run_process_loop(
     unicorn: &mut Unicorn<'_, Context>,
     wake: &Wake,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    let mut last_park_report: Option<String> = None;
     loop {
         crate::gpu::tick(unicorn);
         crate::libs::prochmi::tick(unicorn);
@@ -257,6 +258,37 @@ pub fn run_process_loop(
 
         if run_quantum(unicorn, timeslice)? {
             continue;
+        }
+
+        // Report why the process has nothing to run, but only when the situation
+        // changed, so a permanently stuck process does not flood the log.
+        let thread_state: String = {
+            let data = unicorn.get_data();
+            data.threads
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|t| match t.status {
+                    ThreadStatus::Blocked(reason) => format!("{}:blocked({:?})", t.id, reason),
+                    ThreadStatus::Exited(code) => format!("{}:exited({})", t.id, code),
+                    ThreadStatus::Runnable => format!("{}:runnable", t.id),
+                    ThreadStatus::Running => format!("{}:running", t.id),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        // Deadline values tick every pass, so compare the situation without them.
+        let park_report: String = thread_state
+            .chars()
+            .filter(|c| !c.is_ascii_digit())
+            .collect::<String>();
+        if last_park_report.as_deref() != Some(park_report.as_str()) {
+            log::info!(
+                "SCHED: parked {}, threads: {}",
+                unicorn.get_data().elf_path,
+                park_report
+            );
+            last_park_report = Some(park_report);
         }
 
         // nothing runnable: park until a peer rings our doorbell, the nearest
