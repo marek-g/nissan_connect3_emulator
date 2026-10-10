@@ -1013,3 +1013,29 @@ current decoder missing that:
 Fix: take the *outermost* epilogue (the pop whose list matches the `push {..., lr}` that
 starts the function containing the completion) and add the issuing wrapper's frame size,
 decoded from the wrapper at `lr - 8` of the `svc`.
+
+### Measured geometry of the two service idioms
+
+`EMU`-style stack dump taken at the `svc` (window starts at `sp - 0x20`):
+
+```text
+# wrapper 0x60c9d0 (create pool), works today
+service 0x103010b block=0x7ff3cdbc sp=0x7ff3cdb4 lr=0x60c9e8 slot=0x7ff3cdd0
+  sp+0x00 0x122f578   descriptor        sp+0x04 0x60c9e8   lr
+  sp+0x08 0x7ff3cdc8  = block (K = 8)   sp+0x0c 0x60d674   completion
+  sp+0x10..0x1c 0 0 0 0                 sp+0x20 0x47376a9c canary
+# wrapper 0x5f51e0 (id 0x5c022a), the one that ends in FETCH_PROT
+service 0x5c022a block=0x7ff3cddc sp=0x7ff3cdd0 lr=0x5f51f8 slot=0x7ff3cdf0
+  sp+0x00 0x47376a9c canary             sp+0x04 0x5f51f8   lr
+  sp+0x08 0                            sp+0x0c 0x121b884
+  sp+0x14 0x76573c  sp+0x18 0x5ea67c  sp+0x1c 0x5ea668  sp+0x20 0x47376a9c
+  sp+0x24 0x5ea418  ...  sp+0x38 0x5e8ad8 0x1 0x5ea41c 0x0 0x5e8ab4 0x2
+```
+
+`R2` (the completion) is `0x5ea67c`, *not* the `[block + 4]` value `0x5f51f8`, and `0x5ea67c`
+is the middle of a function whose epilogue pops ten registers. So the two idioms differ:
+the create-pool wrapper's completion is the function whose frame ends right above the
+block, while `0x5ea67c` belongs to a function whose frame is far below (`0x5ea418` /
+`0x5e8ad8` / `0x5e8ab4` entries are its own saved registers, still on the stack). Resuming
+there with `sp = block` makes its `pop {r3..fp, pc}` read the wrong slots by four bytes -
+which is what produces the branch to `0x122f560`.

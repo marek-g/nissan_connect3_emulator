@@ -815,6 +815,26 @@ fn lx_coroutine_yield(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> boo
     // through the same SP (`cmp r0, #0` / `ldrge r0, [sp, #4]`) and it needs the
     // yielder's registers, so it starts from a full copy of them. R0 carries the service
     // status, which the consuming code branches on.
+    // Measure before mutating: where SP and LR were, and what the app itself left in the
+    // slot we are about to overwrite. That tells whether the decoded slot is the epilogue's
+    // pop slot (then the word there is a code address) or someone else's data.
+    let sp_at_svc = unicorn.reg_read_i32(RegisterARM::R13).unwrap_or(0) as u32;
+    let lr_at_svc = unicorn.reg_read_i32(RegisterARM::R14).unwrap_or(0) as u32;
+    let mut slot_word = 0u32;
+    if unicorn
+        .mem_read((block + slot) as u64, &mut raw)
+        .is_ok()
+    {
+        slot_word = u32::from_le_bytes(raw);
+    }
+    let mut window = Vec::with_capacity(24);
+    for index in 0..24u32 {
+        let at = sp_at_svc.wrapping_sub(0x20) + 4 * index;
+        if unicorn.mem_read(at as u64, &mut raw).is_ok() {
+            window.push(format!("{:#x}", u32::from_le_bytes(raw)));
+        }
+    }
+
     let Ok(parent_context) = unicorn.context_init() else {
         log::warn!("LX: cannot snapshot the yielding context");
         return false;
@@ -853,10 +873,15 @@ fn lx_coroutine_yield(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> boo
 
     let yielder = unicorn.get_data().thread_id();
     log::info!(
-        "LX: service {:#x} block={:#x} return_slot={:#x} words={} -> completion [{}] at {:#x}, yielder [{}] parks",
+        "LX: service {:#x} block={:#x} sp={:#x} lr={:#x} slot={:#x} slot_was={:#x} stack[{:#x}..]={} words={} -> completion [{}] at {:#x}, yielder [{}] parks",
         id,
         block,
+        sp_at_svc,
+        lr_at_svc,
         block + slot,
+        slot_word,
+        sp_at_svc.wrapping_sub(0x20),
+        window.join(" "),
         words
             .iter()
             .map(|w| format!("{:#x}", w))
@@ -866,7 +891,6 @@ fn lx_coroutine_yield(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> boo
         resume,
         yielder
     );
-    // Safety net only: a completion that never finishes must not strand the process.
     block_current_thread(
         unicorn,
         BlockReason::CoroutineExit {
