@@ -198,6 +198,7 @@ fn run_quantum(
     };
 
     // ---- switch out: save the CPU state back to the thread record
+    let mut exited_with: Option<i32> = None;
     let mut saved_context = unicorn.context_alloc().map_err(map_uc_error)?;
     unicorn
         .context_save(&mut saved_context)
@@ -209,6 +210,7 @@ fn run_quantum(
         if let Some(thread) = threads.iter_mut().find(|t| t.id == next_id) {
             // a syscall handler may have already changed the status
             // (blocked / exited); otherwise decide based on the run result
+            let was_running = thread.status == ThreadStatus::Running;
             if thread.status == ThreadStatus::Running {
                 if fault_handled {
                     // resumed at the signal handler / post-sigreturn PC
@@ -227,9 +229,40 @@ fn run_quantum(
             // trace, which makes a vanished process very hard to diagnose)
             if let ThreadStatus::Exited(code) = &thread.status {
                 log::warn!("[{}] thread exited with code {}", next_id, code);
+                if was_running {
+                    exited_with = Some(*code);
+                }
             }
             thread.cpu_context = Some(saved_context);
             thread.pc = pc;
+        }
+    }
+
+    if let Some(code) = exited_with {
+        // A terminated LX coroutine hands its final R0 back to whoever yielded into it.
+        let parents: Vec<u32> = {
+            let data = unicorn.get_data();
+            let threads = data.threads.lock().unwrap();
+            threads
+                .iter()
+                .filter_map(|t| match t.status {
+                    ThreadStatus::Blocked(BlockReason::CoroutineExit { child, .. })
+                        if child == next_id =>
+                    {
+                        Some(t.id)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        for parent in parents {
+            log::info!(
+                "LX: coroutine [{}] finished with {:#x}, resuming yielder [{}]",
+                next_id,
+                code as u32,
+                parent
+            );
+            set_runnable(unicorn, parent, Some(code as u32));
         }
     }
 
@@ -431,6 +464,23 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
             | BlockReason::IoscSemaphore { .. } => {
                 crate::os::dev::iosc::finish_iosc_wait(unicorn, tid, now);
             }
+            BlockReason::CoroutineExit { child, deadline } => {
+                let child_done = threads.lock().unwrap().iter().any(|t| {
+                    t.id == child && matches!(t.status, ThreadStatus::Exited(_))
+                });
+                if child_done {
+                    // the exit hook above resumes it with the child's result; this only
+                    // catches a child that was already gone before this thread parked
+                    set_runnable(unicorn, tid, Some(0));
+                } else if deadline.map(|d| d <= now).unwrap_or(false) {
+                    log::warn!(
+                        "LX: coroutine [{}] yielder [{}] timed out waiting",
+                        child,
+                        tid
+                    );
+                    set_runnable(unicorn, tid, Some(0));
+                }
+            }
             BlockReason::InotifyRead { deadline, .. } => {
                 if deadline.map(|d| d <= now).unwrap_or(false) {
                     set_runnable(unicorn, tid, Some(-11i32 as u32)); // -EAGAIN
@@ -475,6 +525,7 @@ fn park_duration(unicorn: &Unicorn<'_, Context>) -> Duration {
     let threads = data.threads.lock().unwrap();
 
     let next = threads.iter().find_map(|t| match &t.status {
+        ThreadStatus::Blocked(BlockReason::CoroutineExit { deadline, .. }) => *deadline,
         ThreadStatus::Blocked(BlockReason::FutexWait { deadline, .. }) => *deadline,
         ThreadStatus::Blocked(BlockReason::FutexWaitShared { deadline, .. }) => *deadline,
         ThreadStatus::Blocked(BlockReason::SleepUntil(until)) => Some(*until),

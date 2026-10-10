@@ -1,6 +1,8 @@
 use crate::emulator::context::Context;
+use crate::emulator::memory_map::MQ_NOTIFY_EXIT_STUB;
 use crate::emulator::thread::{
-    block_current_thread, exit_current_thread, exit_process, ThreadAction,
+    block_current_thread, exit_current_thread, exit_process, BlockReason, GuestThread,
+    ThreadAction, ThreadStatus,
 };
 use crate::os::syscalls::{
     fcntl, futex, ioctl, linux, mman, mqueue, prctl, resource, sched, signal, socket, stat, time,
@@ -105,12 +107,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         // NX stack.
         lx_log_handoff(unicorn, args[0], args[2]);
         restore_callee_saved_regs(unicorn, saved_callee_saved);
-        if lx_entry_continues_on_caller_stack(unicorn, args[2])
-            && lx_resume_at_continuation(unicorn, args[2])
-        {
-            return;
-        }
-        if lx_invoke_monitor_callback(unicorn, pc, args[2], args) {
+        if lx_coroutine_yield(unicorn, args) {
             return;
         }
         let scratch = lx_scratch_page(unicorn);
@@ -701,43 +698,95 @@ fn lx_resume_at_continuation(unicorn: &mut Unicorn<'_, Context>, continuation: u
     true
 }
 
-/// Do the monitor's entries continue on the caller's stack? All the ones PROCNAV uses
-/// are addresses *inside* the yielding function (the control block hands over the
-/// caller's saved link), so they read `[sp, #imm]` and pop the caller's frame and must
-/// keep the caller's SP. An entry that pushes or calls first establishes its own frame
-/// and is the only kind that may be given a fresh stack.
-fn lx_entry_continues_on_caller_stack(unicorn: &mut Unicorn<'_, Context>, entry: u32) -> bool {
-    use capstone::arch::arm::ArchMode;
-    use capstone::prelude::*;
-    use capstone::{Capstone, Endian};
-
-    let mut code = [0u8; 256];
-    if unicorn.mem_read(entry as u64, &mut code).is_err() {
+/// `svc #6` hands control to a coroutine entry and suspends the caller. The entry is an
+/// address inside the yielding function (or a sibling body) whose epilogue pops a frame
+/// that only exists once *another* coroutine resumes it, so it can neither be called inline
+/// nor resumed in place. Map it onto what the emulator already schedules: the continuation
+/// becomes a guest thread, the caller parks until that thread returns, and the thread's
+/// final R0 is the result the caller's shim pops next.
+fn lx_coroutine_yield(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool {
+    let entry = args[2];
+    if entry < 0x1000 || entry & 1 != 0 {
+        log::warn!("LX: coroutine entry {:#x} unusable", entry);
         return false;
     }
-    let Ok(cs) = Capstone::new().arm().mode(ArchMode::Arm).endian(Endian::Little).build()
-    else {
+
+    let tid = unicorn
+        .get_data()
+        .next_thread_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mmu_arc = unicorn.get_data().mmu.clone();
+    let stack_base = mmu_arc.lock().unwrap().heap_alloc(
+        unicorn,
+        LX_HANDOFF_STACK_SIZE,
+        unicorn_engine::unicorn_const::Prot::READ
+            | unicorn_engine::unicorn_const::Prot::WRITE
+            | unicorn_engine::unicorn_const::Prot::EXEC,
+        "[lx-coroutine]",
+    );
+    if unicorn
+        .mem_write(stack_base as u64, &vec![0u8; LX_HANDOFF_STACK_SIZE as usize])
+        .is_err()
+    {
+        log::warn!("LX: coroutine stack at {:#x} not writable", stack_base);
+        return false;
+    }
+
+    // Build the child's CPU state from the caller's, the way mq_notify does: the vCPU is
+    // shared, so snapshot, overwrite, snapshot, restore.
+    let Ok(parent_context) = unicorn.context_init() else {
+        log::warn!("LX: cannot snapshot the yielding context");
         return false;
     };
-    let Ok(insns) = cs.disasm_all(&code, entry as u64) else {
-        return false;
-    };
-    for insn in insns.iter() {
-        let mnemonic = insn.mnemonic().unwrap_or("");
-        let ops = insn.op_str().unwrap_or("");
-        // Conditional mnemonics keep their stem, so compare prefixes: `ldrge r0, [sp, #4]`
-        // and `str r0, [sp]` both touch the incoming frame.
-        if ops.contains("[sp") {
-            return mnemonic.starts_with("ldr")
-                || mnemonic.starts_with("str")
-                || mnemonic.starts_with("ldm")
-                || mnemonic.starts_with("stm");
-        }
-        if matches!(mnemonic, "push" | "bl" | "bx") {
+    for (register, value) in [
+        (RegisterARM::SP, stack_base + LX_HANDOFF_STACK_SIZE - 0x100),
+        (RegisterARM::R0, args[0]),
+        (RegisterARM::R1, args[1]),
+        (RegisterARM::R2, entry),
+        (RegisterARM::R3, args[3]),
+        (RegisterARM::R14, MQ_NOTIFY_EXIT_STUB),
+        (RegisterARM::PC, entry),
+    ] {
+        if unicorn.reg_write(register as i32, value as u64).is_err() {
             return false;
         }
     }
-    false
+    let Ok(child_context) = unicorn.context_init() else {
+        log::warn!("LX: cannot snapshot the coroutine context");
+        return false;
+    };
+    if unicorn.context_restore(&parent_context).is_err() {
+        return false;
+    }
+
+    let threads = unicorn.get_data().threads.clone();
+    threads.lock().unwrap().push(GuestThread {
+        id: tid,
+        status: ThreadStatus::Runnable,
+        cpu_context: Some(child_context),
+        pc: entry,
+        pending_result: None,
+        clear_child_tid: None,
+    });
+
+    let yielder = unicorn.get_data().thread_id();
+    log::info!(
+        "LX: coroutine [{}] started at {:#x} with r0={:#x} r1={:#x}, yielder [{}] parks",
+        tid,
+        entry,
+        args[0],
+        args[1],
+        yielder
+    );
+    // Safety net only: a coroutine that never returns must not strand the process.
+    block_current_thread(
+        unicorn,
+        BlockReason::CoroutineExit {
+            child: tid,
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(2)),
+        },
+    );
+    true
 }
 
 /// Run `entry` the way the monitor would: the caller's state is saved aside, the

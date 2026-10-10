@@ -131,6 +131,13 @@ pub enum BlockReason {
         set: u64,
         deadline: Option<Instant>,
     },
+    /// LX monitor coroutine yield (`svc #6`): the yielding coroutine is suspended and
+    /// its continuation runs as `child`. The final R0 of that thread becomes the result
+    /// of the yield. `deadline` is a safety net, not application timing.
+    CoroutineExit {
+        child: u32,
+        deadline: Option<Instant>,
+    },
 }
 
 /// Action requested by a syscall handler; consumed by the syscall hook wrapper.

@@ -917,3 +917,27 @@ set to a coroutine-exit stub; the yielding thread parks until that child termina
 takes the child's final `R0` as the result of the yield. Check `BlockReason` for a
 join/child-exit variant (only futex/sleep/mq/signal variants were seen so far) - if there
 is none, add one and complete it in `advance_blocked` when the child thread is `Exited`.
+
+#### Coroutines as guest threads: what it revealed
+
+Mapping `svc #6` onto a spawned `GuestThread` (+ `BlockReason::CoroutineExit`, resumed from
+the exit hook with the child's final R0) replaced the endless in-place loop with visible
+structure: 22 coroutines spawned, 7 yielders resumed, no safety timeouts. The remaining
+failure is now a single instruction, reached from an OSAL async-IO path (the containing
+function is `OSAL_s32IOReturnAsync`):
+
+```
+5ea804: bl  5ecda0        ; second init/complete call
+5ea808: subs r4, r0, #0   ; r4 = its return value
+5ea810: bge 5ea824        ; success path
+5ea814: mov r0, #0
+5ea818: str r4, [r0]      ; <-- WRITE_UNMAPPED: stores the error code through NULL
+```
+
+Two facts to chase next: the coroutine bodies finish with `0x1` without making a *single*
+syscall, and their epilogue pops a zero link (`[31] cannot resume at pc=0x0`), so they are
+mid-function continuations of the yielder that expect the yielder's frame and a *success*
+result. Their `r1` arguments (`0x103010b`, `0x63040a`, `0x101030b`) look like packed OSAL
+message ids, and the callee failing at `0x5ec554`/`0x5ecda0` reads a table at `[obj, #0x9c]`
+that nothing has filled - the registry/portal the real monitor's id-4 task table would have
+created at startup (`0x80009a6c`, the message pump) is what is still missing.
