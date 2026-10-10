@@ -3213,6 +3213,10 @@ fn synthesize_client_service_reference(
         return (existing != 0).then_some(existing);
     }
 
+    let service_id = (read_u16_or_invalid(unicorn, header + 20) & 0xffff) as u16;
+    let server_app_id = (read_u16_or_invalid(unicorn, header + 2) & 0xffff) as u16;
+    let dataset_id = (read_u16_or_invalid(unicorn, header + 12) & 0xffff) as u16;
+
     // The register-id DAPIAPP handed out in its ServiceRegister conf. Its map
     // worker (`dap_map_tclWorker::enProcessJob`) refuses the wildcard with
     // error 6 "unknown register", so stamp it into the reference every time we
@@ -3220,16 +3224,30 @@ fn synthesize_client_service_reference(
     // the conf it received.
     let conf_register_id = (MAP_DATA_REGISTER_ID.load(Ordering::Relaxed) & 0xffff) as u16;
 
+    // A client only holds a reference to a service once the server has
+    // confirmed the registration. While no conf is in yet there is nothing to
+    // look up, so the mail check must fail: the request then fails inside
+    // procmapengine and is retried, instead of being sent with the wildcard
+    // register-id, which the server answers with an error that also tears the
+    // registration down again.
+    if service_id as u32 == MAP_DATA_DAPI_SERVICE_ID && conf_register_id == 0xffff {
+        if existing != 0 {
+            write_u32(unicorn, service_refs + 4, 0);
+            write_u32(unicorn, service_refs + 8, 0);
+            write_u32(unicorn, service_refs + 12, 0);
+        }
+        log::info!(
+            "PROCMAPENGINE: no client reference for svc {service_id:#06x} yet (conf outstanding)"
+        );
+        return None;
+    }
+
     if existing != 0 {
         if conf_register_id != 0xffff {
             write_u16(unicorn, existing + 12, conf_register_id);
         }
         return Some(existing);
     }
-
-    let service_id = (read_u16_or_invalid(unicorn, header + 20) & 0xffff) as u16;
-    let server_app_id = (read_u16_or_invalid(unicorn, header + 2) & 0xffff) as u16;
-    let dataset_id = (read_u16_or_invalid(unicorn, header + 12) & 0xffff) as u16;
 
     let node = MAP_DATA_CLIENT_SERVICE_REF_NODE.load(Ordering::Relaxed);
     let node = if node != 0 {
