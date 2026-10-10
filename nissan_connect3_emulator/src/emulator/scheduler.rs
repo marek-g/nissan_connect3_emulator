@@ -295,6 +295,14 @@ pub fn run_process_loop(
     unicorn: &mut Unicorn<'_, Context>,
     wake: &Wake,
 ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+    // A process that never calls mmap() (a static executable whose segments were all
+    // mapped by the loader) would never get its library hooks installed, because the only
+    // other call site is mmap.
+    {
+        let mmu_arc = unicorn.get_data().mmu.clone();
+        mmu_arc.lock().unwrap().update_library_hooks(unicorn);
+    }
+
     let mut last_park_report: Option<String> = None;
     let mut passes: u64 = 0;
     loop {

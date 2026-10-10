@@ -955,3 +955,29 @@ so the table append at `0x5ec554` returns `-0x210000` because the *pool root wor
 the same missing bootstrap as the monitor's id-4 task table (`0x80009a6c`), and it is the
 next thing to supply - either by running PROCNAV's pool-init routine or by handing it the
 backing memory it expects.
+
+### `svc #6` resolved: asynchronous service call with a monitor-built return slot
+
+Reading the shims together with the code they hand over settles the ABI:
+
+```text
+60c9d0: push {r3, lr} ; ldr r1, [pc]      ; r1 = service id (0x0103010b, 0x0010000a, ...)
+        str r0, [sp]  ; ldr r2, [sp, #4]  ; r0 = argument block, r2 = completion address
+        add r0, sp, #0; bl 62ef88         ; svc #6
+60d674: cmp r0, #0 ; ldrge r0, [sp, #4]   ; status, then the out-parameter from the block
+        strge r0, [r4, #24]               ; ... stored into the OSAL object being created
+        add sp, sp, #0x10 ; movge r0, #0 ; pop {r4, pc}
+```
+
+So `r0` is the argument block (the result travels back through it), `r1` is a packed
+service id, `r2` is the completion that consumes the result, and the completion's epilogue
+pops its return address from `block + N + 4*skipped`, where `N` is the `add sp, sp, #N` it
+performs and `skipped` the registers before `pc` in its pop list. That slot is the monitor's
+to fill; putting the thread-exit trap there is what ends the coroutine instead of unwinding
+back into the shim that yielded (which hands the same completion back forever). The
+completion keeps the yielding frame and the yielder's registers, and the yielder parks.
+
+Result: PROCNAV's syscall count `navsys` went from 6 to 12 and the execution errors from
+10 to 2 - `0x5ea818` (`str r4, [0]`, an error path inside a completion that called
+something still unimplemented) and `0x122f560` (`FETCH_PROT`, one completion whose return
+address is taken by something other than a pop).

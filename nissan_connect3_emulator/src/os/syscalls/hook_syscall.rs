@@ -704,10 +704,136 @@ fn lx_resume_at_continuation(unicorn: &mut Unicorn<'_, Context>, continuation: u
 /// nor resumed in place. Map it onto what the emulator already schedules: the continuation
 /// becomes a guest thread, the caller parks until that thread returns, and the thread's
 /// final R0 is the result the caller's shim pops next.
+/// Offset from the argument block to the slot a completion pops its return address from.
+/// The shim hands the block over in R0 and the completion ends by unwinding its own frame
+/// and popping a register list that ends in PC, e.g.
+///
+/// ```text
+/// 60d680: add sp, sp, #0x10
+/// 60d684: movge r0, #0
+/// 60d688: pop {r4, pc}      ; return slot = block + 0x10 + 4
+/// ```
+///
+/// which is where the monitor puts the address the coroutine lands on when it is done.
+/// Getting this wrong makes the completion branch into whatever the app left in an
+/// unrelated slot - seen as a branch into a data page or a null PC.
+fn lx_completion_return_offset(unicorn: &mut Unicorn<'_, Context>, resume: u32) -> u32 {
+    use capstone::arch::arm::ArchMode;
+    use capstone::prelude::*;
+    use capstone::{Capstone, Endian};
+
+    let mut code = [0u8; 192];
+    if unicorn.mem_read(resume as u64, &mut code).is_err() {
+        return 0x14;
+    }
+    let Ok(cs) = Capstone::new().arm().mode(ArchMode::Arm).endian(Endian::Little).build()
+    else {
+        return 0x14;
+    };
+    let Ok(insns) = cs.disasm_all(&code, resume as u64) else {
+        return 0x14;
+    };
+
+    let mut unwound = 0u32;
+    for insn in insns.iter() {
+        let mnemonic = insn.mnemonic().unwrap_or("");
+        let ops = insn.op_str().unwrap_or("");
+        if mnemonic.starts_with("add") && ops.starts_with("sp, sp, #") {
+            unwound += parse_arm_immediate(ops.split("#").nth(1).unwrap_or("0"));
+            continue;
+        }
+        // `pop {..., pc}`, `ldmia sp!, {..., pc}` and `ldr pc, [sp], #4` all take the
+        // return address off the stack; anything else that ends the function (a branch
+        // through a register) does not, so the block is not the frame here.
+        let pops_pc = (matches!(mnemonic, "pop" | "ldm") && ops.contains("pc"))
+            || (mnemonic == "ldr" && ops.starts_with("pc,"));
+        if pops_pc {
+            let skipped = ops
+                .trim_matches(|c| c == '{' || c == '}')
+                .split(',')
+                .take_while(|item| item.trim() != "pc")
+                .count() as u32;
+            return unwound + 4 * skipped;
+        }
+        if matches!(mnemonic, "bx" | "mov") && ops.contains("pc") {
+            break;
+        }
+    }
+    0x14
+}
+
+/// ARM immediates are printed as decimal or hex depending on the value.
+fn parse_arm_immediate(text: &str) -> u32 {
+    let text = text.trim();
+    match text.strip_prefix("#0x").or_else(|| text.strip_prefix("0x")) {
+        Some(hex) => u32::from_str_radix(hex, 16).unwrap_or(0),
+        None => text.strip_prefix('#').unwrap_or(text).parse().unwrap_or(0),
+    }
+}
+
 fn lx_coroutine_yield(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool {
-    let entry = args[2];
-    if entry < 0x1000 || entry & 1 != 0 {
-        log::warn!("LX: coroutine entry {:#x} unusable", entry);
+    let (block, id, resume) = (args[0], args[1], args[2]);
+    if block < 0x1000 || resume < 0x1000 || resume & 1 != 0 {
+        log::warn!(
+            "LX: completion {:#x} or argument block {:#x} unusable",
+            resume,
+            block
+        );
+        return false;
+    }
+
+    let mut words = [0u32; 8];
+    let mut raw = [0u8; 4];
+    for (index, word) in words.iter_mut().enumerate() {
+        if unicorn
+            .mem_read((block + 4 * index as u32) as u64, &mut raw)
+            .is_ok()
+        {
+            *word = u32::from_le_bytes(raw);
+        }
+    }
+
+    // Build the resume frame the monitor would leave at `block + 0x10`: the completion's
+    // epilogue is `add sp, #0x10 ; pop {r4, pc}`, so it pops its saved r4 and its return
+    // address from there. The return address is the thread-exit trap, because finishing a
+    // completion ends that coroutine - returning would unwind into the shim that yielded
+    // and hand the very same completion back again.
+    let slot = lx_completion_return_offset(unicorn, resume);
+    if unicorn
+        .mem_write((block + slot) as u64, &MQ_NOTIFY_EXIT_STUB.to_le_bytes())
+        .is_err()
+    {
+        log::warn!(
+            "LX: cannot build the resume frame at {:#x} for completion {:#x}",
+            block + slot,
+            resume
+        );
+        return false;
+    }
+
+    // The completion runs on the yielding frame: it reads its result and out-parameter
+    // through the same SP (`cmp r0, #0` / `ldrge r0, [sp, #4]`) and it needs the
+    // yielder's registers, so it starts from a full copy of them. R0 carries the service
+    // status, which the consuming code branches on.
+    let Ok(parent_context) = unicorn.context_init() else {
+        log::warn!("LX: cannot snapshot the yielding context");
+        return false;
+    };
+    for (register, value) in [
+        (RegisterARM::R13, block),
+        (RegisterARM::R0, 0u32),
+        (RegisterARM::R14, MQ_NOTIFY_EXIT_STUB),
+        (RegisterARM::PC, resume),
+    ] {
+        if unicorn.reg_write(register as i32, value as u64).is_err() {
+            return false;
+        }
+    }
+    let Ok(child_context) = unicorn.context_init() else {
+        log::warn!("LX: cannot snapshot the completion context");
+        return false;
+    };
+    if unicorn.context_restore(&parent_context).is_err() {
         return false;
     }
 
@@ -715,70 +841,32 @@ fn lx_coroutine_yield(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> boo
         .get_data()
         .next_thread_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mmu_arc = unicorn.get_data().mmu.clone();
-    let stack_base = mmu_arc.lock().unwrap().heap_alloc(
-        unicorn,
-        LX_HANDOFF_STACK_SIZE,
-        unicorn_engine::unicorn_const::Prot::READ
-            | unicorn_engine::unicorn_const::Prot::WRITE
-            | unicorn_engine::unicorn_const::Prot::EXEC,
-        "[lx-coroutine]",
-    );
-    if unicorn
-        .mem_write(stack_base as u64, &vec![0u8; LX_HANDOFF_STACK_SIZE as usize])
-        .is_err()
-    {
-        log::warn!("LX: coroutine stack at {:#x} not writable", stack_base);
-        return false;
-    }
-
-    // Build the child's CPU state from the caller's, the way mq_notify does: the vCPU is
-    // shared, so snapshot, overwrite, snapshot, restore.
-    let Ok(parent_context) = unicorn.context_init() else {
-        log::warn!("LX: cannot snapshot the yielding context");
-        return false;
-    };
-    for (register, value) in [
-        (RegisterARM::SP, stack_base + LX_HANDOFF_STACK_SIZE - 0x100),
-        (RegisterARM::R0, args[0]),
-        (RegisterARM::R1, args[1]),
-        (RegisterARM::R2, entry),
-        (RegisterARM::R3, args[3]),
-        (RegisterARM::R14, MQ_NOTIFY_EXIT_STUB),
-        (RegisterARM::PC, entry),
-    ] {
-        if unicorn.reg_write(register as i32, value as u64).is_err() {
-            return false;
-        }
-    }
-    let Ok(child_context) = unicorn.context_init() else {
-        log::warn!("LX: cannot snapshot the coroutine context");
-        return false;
-    };
-    if unicorn.context_restore(&parent_context).is_err() {
-        return false;
-    }
-
     let threads = unicorn.get_data().threads.clone();
     threads.lock().unwrap().push(GuestThread {
         id: tid,
         status: ThreadStatus::Runnable,
         cpu_context: Some(child_context),
-        pc: entry,
+        pc: resume,
         pending_result: None,
         clear_child_tid: None,
     });
 
     let yielder = unicorn.get_data().thread_id();
     log::info!(
-        "LX: coroutine [{}] started at {:#x} with r0={:#x} r1={:#x}, yielder [{}] parks",
+        "LX: service {:#x} block={:#x} return_slot={:#x} words={} -> completion [{}] at {:#x}, yielder [{}] parks",
+        id,
+        block,
+        block + slot,
+        words
+            .iter()
+            .map(|w| format!("{:#x}", w))
+            .collect::<Vec<_>>()
+            .join(" "),
         tid,
-        entry,
-        args[0],
-        args[1],
+        resume,
         yielder
     );
-    // Safety net only: a coroutine that never returns must not strand the process.
+    // Safety net only: a completion that never finishes must not strand the process.
     block_current_thread(
         unicorn,
         BlockReason::CoroutineExit {
