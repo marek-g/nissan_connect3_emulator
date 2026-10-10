@@ -410,3 +410,23 @@ a region Ghidra has no function for, so name it and look at the callers).
 reason than assumed there: it is not a scratch list, but it also cannot help,
 because the message that must be kept away from the entry is posted before the
 entry exists.
+
+### Update: the error is emitted from the ADMIN_OPERATION_LOCKED branch
+
+`ail_bHandleMsgServiceRegister` (0xb439c4) is now fully read: it looks the service
+up in its own list (`vt+0xd8`), assigns a register-id (`vt+0x24`), takes the list
+lock, and then adds two entries to `this+0x58` - its own `(0xffff, service, 0x0007,
+0xffff)` if missing, with state `service != 0xfffe`, and the client entry
+`(assigned-id, service, client-app, client-sub)` whose state is *copied* from the
+found own entry. Only then does it post the success conf. So the `vAdd` we watched
+is the client entry being created, and the state copy is what makes a client entry
+born "not available" when the medium is down.
+
+The `REMOVE` of that entry comes from `ail_vPostServiceDataError6AndUnregister`
+(fragment at 0xb40400, `nRemove` call at 0xb404e4), whose trace strings say
+`ADMIN_OPERATION_LOCKED` and `(InterfaceState!=INITIALIZED) couldn't send
+AMT_C_U16_ERROR_UNKNOWN_REG_ID`. The error we chase is therefore raised while the
+dispatch object is not in state INITIALIZED, and the same path unregisters the
+client on the way out. Next question: what leaves DAPIAPP's interface state short
+of INITIALIZED here, since that would explain both the unmatchable register-id and
+the teardown, without any message ordering being wrong at all.
