@@ -697,3 +697,20 @@ component, and the two shapes need different answers:
 => resume in place, otherwise invoke through the `[lx-monitor-call-stub]` page). Calling
 everything, or resuming everything, leaves PROCNAV dead; with the split, thread 18 no
 longer exits with code 1 during bootstrap at all.
+
+### Update: recovered monitor SWI table (PROCNAV stays the RNW data source)
+
+The monitor's own service table is now recovered (see
+`docs/reverse_engineering/triton_mid_swi_services.md`): the table base is `0x8052f678`
+behind the variable at `0x80531ff0` (sole writer `0x80008a08`), registered through
+`FUN_8002077c(id, handler)`. `svc #6` is handler `0x80037184`, a **yield**: it stamps the
+timeout taken from `r1` into `[TCB+0x20]` and tails into the reschedule entry; `svc #9`
+(`0x800373a8`) is a per-thread array access, and ids `0xb..0x1b` are never registered by
+this image (they belong to the other core/components).
+
+So the `svc #6` sites in PROCNAV are coroutine handoffs: the wrapper at `0x62ef94` passes
+its own frame in `r0`, a timeout in `r1` and a coroutine body/continuation in `r2`. We do
+not switch a TCB, we run that body inline (host scheduler does the switching), which is
+why the entry-point shape decides between resuming in place and calling through a stub.
+PROCNAV stays the RNW data source - replacing it with a service simulator is off the
+table, because we need the real binary for diagnostics once we start editing map data.
