@@ -123,10 +123,31 @@ pub const SERVICE_ID_MAX: u32 = 0x1b;
 /// Table the id-6 handler branches through: `ldr r2, [0x800750dc + (r1 >> 16) * 4]`.
 pub const WORKER_TABLE: u32 = 0x8007_50dc;
 
-/// Continuation of the request that creates a monitor memory pool: the caller of the
-/// wrapper at `0x60c9d0` resumes here and stores the block's first word into the
-/// descriptor it is initialising (`cmp r0, #0` / `ldrge r0, [sp, #4]` / `strge r0, [r4, #0x18]`).
-pub const CONTINUATION_CREATE_POOL: u32 = 0x60d674;
+/// Service id literals, taken from the literals the `tkse_*` wrappers load into R1 next to
+/// themselves. The low byte is the monitor kernel object to wait on, the rest identifies
+/// the request.
+pub const SERVICE_CREATE_POOL: u32 = 0x0103_010b;
+pub const SERVICE_POOL_SIBLING: u32 = 0x0101_030b;
+pub const SERVICE_GET_TID: u32 = 0x0010_000a;
+pub const SERVICE_GET_CFN: u32 = 0x0300_030a;
+
+/// Offset in the request block of the pointer to where the result belongs. The wrapper
+/// stores the caller's argument - which is the caller's own result slot, e.g. `add r0, sp, #4`
+/// in `0x60d630` - into the first word of the block, and the continuation then reads the
+/// result back from that slot (`ldrge r0, [sp, #4]` in `0x60d674`, `ldrge r0, [sp]` in
+/// `0x5f2a3c`). Both are the same word: the first block word points at it.
+pub const REQUEST_RESULT_POINTER: u32 = 0x0;
+
+/// Offset in the request block of the pool size the caller asked for. The caller of the
+/// wrapper at `0x60c9b0` builds its arguments with `mov r0, #0x1000000` (16 MB) and the
+/// size ends up as the third word of the block.
+pub const REQUEST_SIZE: u32 = 0x8;
+
+/// Smallest and largest pool the emulator is willing to back. The caller sizes its pool in
+/// megabytes, and the allocator links blocks across the whole of it, so a token region
+/// makes the allocator write past the end of what was mapped.
+const POOL_MIN: u32 = 0x1000;
+const POOL_MAX: u32 = 0x1000_0000;
 
 /// Bytes handed out with each emulated pool. The allocator that uses the descriptor only
 /// reaches for the pool when its limit word is non-zero, so this is padding against
@@ -412,26 +433,28 @@ fn cp15_action(mnemonic: &str, ops: &str) -> Option<(u32, Cp15)> {
 pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool {
     const TICK: std::time::Duration = std::time::Duration::from_millis(1);
 
-    let (block, reason, continuation) = (args[0], args[1], args[2]);
-    let object = reason & 0xff;
-    let ticks = reason >> 16;
+    let (block, service, continuation) = (args[0], args[1], args[2]);
+    let object = service & 0xff;
+    let ticks = service >> 16;
     let deadline = if ticks == 0 {
         None
     } else {
         Some(std::time::Instant::now() + TICK * ticks)
     };
     log::info!(
-        "monitor: thread [{}] yields on object {} for {} ticks (block {:#x}, continuation {:#x})",
+        "monitor: thread [{}] yields on service {:#x} (object {}, {} ticks, block {:#x}, continuation {:#x}) with {}",
         unicorn.get_data().thread_id(),
+        service,
         object,
         ticks,
         block,
-        continuation
+        continuation,
+        describe(unicorn, block)
     );
     block_current_thread(
         unicorn,
         BlockReason::MonitorYield {
-            object,
+            service,
             block,
             continuation,
             deadline,
@@ -440,42 +463,101 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool 
     true
 }
 
+/// The request block as hex and as far as it reads like text, because some requests carry
+/// a name inline.
+fn describe(unicorn: &mut Unicorn<'_, Context>, block: u32) -> String {
+    let mut words = [0u32; 8];
+    let mut raw = [0u8; 4];
+    for (index, word) in words.iter_mut().enumerate() {
+        if unicorn
+            .mem_read((block.wrapping_add(4 * index as u32)) as u64, &mut raw)
+            .is_ok()
+        {
+            *word = u32::from_le_bytes(raw);
+        }
+    }
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let text: String = bytes
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() || *byte == b' ' {
+                *byte as char
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    format!(
+        "words {} | {}",
+        words
+            .iter()
+            .map(|word| format!("{:#x}", word))
+            .collect::<Vec<_>>()
+            .join(" "),
+        text
+    )
+}
+
 /// Hand a yielded request back, the way the thread that owns the monitor object would
 /// when it completes the request: whatever the caller expects lands in its request
 /// block, and R0 carries the status the continuation branches on (`cmp r0, #0` with the
 /// out-parameter read for `r0 >= 0`).
-pub fn complete(unicorn: &mut Unicorn<'_, Context>, continuation: u32, block: u32) -> u32 {
-    match continuation {
-        // The request that creates a memory pool: the caller stores what it finds in the
-        // block into the descriptor's handle field and hands the descriptor to the
-        // allocator, which falls back to libc when the pool limit stays zero.
-        CONTINUATION_CREATE_POOL => {
+pub fn complete(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) -> u32 {
+    match service {
+        // `0x60c9d0` creates a memory pool. Its caller resumes at `0x60d674` and reads the
+        // result with `ldrge r0, [sp, #4]` from its own frame, which is four past the word
+        // the wrapper pushed its link register onto, so the result belongs at
+        // `block + 0xc`. The caller stores it into the descriptor it is initialising and
+        // hands the descriptor to the allocator, which falls back to libc while the pool
+        // limit stays zero.
+        SERVICE_CREATE_POOL | SERVICE_POOL_SIBLING => {
             let mmu = {
                 let data = unicorn.get_data();
                 data.mmu.clone()
             };
+            let asked = read_word(unicorn, block + REQUEST_SIZE).unwrap_or(0);
+            let size = asked.clamp(POOL_MIN, POOL_MAX);
             let pool = mmu.lock().unwrap().heap_alloc(
                 unicorn,
-                POOL_SLACK,
+                size,
                 Prot::READ | Prot::WRITE,
                 "[monitor-pool]",
             );
-            if pool == 0 || write_word(unicorn, block, pool).is_err() {
-                log::warn!("monitor: cannot hand out a pool for the request at {:#x}", block);
+            let slot = match read_word(unicorn, block + REQUEST_RESULT_POINTER) {
+                Ok(slot) if slot != 0 => slot,
+                _ => {
+                    log::warn!(
+                        "monitor: service {:#x} request at {:#x} has no result slot",
+                        service,
+                        block
+                    );
+                    return 0xfff6_0000;
+                }
+            };
+            if pool == 0 || write_word(unicorn, slot, pool).is_err() {
+                log::warn!(
+                    "monitor: cannot write the pool for the request at {:#x} into {:#x}",
+                    block,
+                    slot
+                );
                 return 0xfff6_0000;
             }
             log::info!(
-                "monitor: request at {:#x} completed with pool {:#x}",
+                "monitor: service {:#x} request at {:#x} completed with pool {:#x} size {:#x} into {:#x}",
+                service,
                 block,
-                pool
+                pool,
+                size,
+                slot
             );
             0
         }
         other => {
-            log::debug!(
-                "monitor: request at {:#x} for continuation {:#x} completed without a result",
+            log::info!(
+                "monitor: service {:#x} request at {:#x} completed without a result: {}",
+                other,
                 block,
-                other
+                describe(unicorn, block)
             );
             0
         }

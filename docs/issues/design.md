@@ -1039,3 +1039,30 @@ block, while `0x5ea67c` belongs to a function whose frame is far below (`0x5ea41
 `0x5e8ad8` / `0x5e8ab4` entries are its own saved registers, still on the stack). Resuming
 there with `sp = block` makes its `pop {r3..fp, pc}` read the wrong slots by four bytes -
 which is what produces the branch to `0x122f560`.
+
+### The request block: first word points at the caller's own result slot
+
+The `tkse_*` wrappers all look like
+
+```text
+60c9d0: push {r3, lr}
+        ldr  r1, [pc, #16]      ; service id literal next to the wrapper
+        str  r0, [sp]           ; block[0] = the argument the caller passed
+        ldr  r2, [sp, #4]       ; block[4] = return address into the caller = continuation
+        add  r0, sp, #0         ; block
+        bl   62ef88             ; svc #6
+        pop  {r3, pc}
+```
+
+and their callers hand over a pointer into their own frame, e.g. `0x60d630` does
+`add r0, sp, #4` before `bl 0x60c9d0`, then reads the result with `ldrge r0, [sp, #4]`.
+So `block[0]` *is* the address the continuation loads: the service writes its result to
+`*[block]`, not into the block. `0x5f2a3c` confirms it from the other side - it passes
+`sp` itself and reads back with `ldrge r0, [sp]`, and indeed `block[0] == block + 8`
+there. Sizes come along in `block[8]` (`0x1000000` = the 16 MB pool `0x5f2a5c` asks for).
+
+Handing out a block of the requested size moved PROCNAV past `0x5ea818` into the
+allocator's own list linking at `0x5f5ed4`, which computes
+`r1 = r7 * [desc + 0x24] + (block - 8)` and stores there. The descriptor's stride and
+limit words (`+0x24`, `+0x20`) are only zeroed by `0x60d630`, so the pool service has to
+initialise the descriptor rather than only hand back a pointer.

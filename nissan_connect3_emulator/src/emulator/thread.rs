@@ -143,10 +143,12 @@ pub enum BlockReason {
     /// expires. The monitor keeps the thread on the object's wait queue and resumes it
     /// from there; the emulator uses the host clock for the deadline.
     MonitorYield {
-        object: u32,
+        /// whole reason word (R1): the TKSE service id, whose low byte is also the
+        /// monitor kernel object the thread waits on
+        service: u32,
         /// request block the yielding wrapper left on its own stack (R0 at the call)
         block: u32,
-        /// what the caller asked for, identified by the continuation it handed over (R2)
+        /// where the caller resumes, which says what it expects back (R2)
         continuation: u32,
         deadline: Option<Instant>,
     },
