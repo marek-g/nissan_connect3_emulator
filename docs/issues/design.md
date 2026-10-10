@@ -671,3 +671,29 @@ invoking anything, so the caller's frame is left half-filled.
 Next step is therefore not more guessing about the return value but calling `r2` as a
 guest function, which the emulator can do with the same call-stub machinery
 `prochmi.rs` uses (`heap_alloc` + a stub that restores registers and jumps back).
+
+### Update: `#6` is a completion handoff, and PROCNAV now survives bootstrap
+
+The `svc #6` sites are reached through a wrapper (`0x62ef94`):
+
+```
+push {r4, lr}
+ldr  r1, [pc, #0xc]   ; component version
+ldr  r2, [sp, #4]     ; entry point supplied by the caller
+mov  r0, sp           ; pointer to the caller's own frame
+bl   0x62ef88         ; push {r4, lr} ; svc #6 ; pop {r4, pc}
+```
+
+so `r2` is caller-supplied and `r0` is its stack frame. What `r2` points at differs per
+component, and the two shapes need different answers:
+
+* `0x5e8ab4`, `0x60d674` start with `cmp r0, #0` and then store `[sp, #4]` into
+  `[r4, #0x18]` - a *completion* path that consumes the service result, so the monitor
+  has to resume there in place with the result in `R0` (success = 0).
+* `0x5ea67c` starts with `str r0, [sp]` - an ordinary function body, so it has to be
+  called with the caller state saved and returned through a stub.
+
+`hook_syscall.rs` now distinguishes them by decoding the first instruction (`cmp r0,#0`
+=> resume in place, otherwise invoke through the `[lx-monitor-call-stub]` page). Calling
+everything, or resuming everything, leaves PROCNAV dead; with the split, thread 18 no
+longer exits with code 1 during bootstrap at all.

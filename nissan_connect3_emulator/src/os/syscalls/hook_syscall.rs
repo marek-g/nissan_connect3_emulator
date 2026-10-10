@@ -99,12 +99,19 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
             args[3],
             pc
         );
-        // Returning 0 makes PROCNAV exit with code 1 right after the last call and
-        // returning 1 makes it write through the result (WRITE_UNMAPPED at
-        // 0x5ea818), so the result has to be a usable address.
+        // A monitor service that is handed an entry point has to run it in the
+        // caller's context and return the callee's result: only the callee fills the
+        // link slot the shim pops next, so skipping the call sends PROCNAV into the
+        // NX stack.
+        restore_callee_saved_regs(unicorn, saved_callee_saved);
+        if lx_resume_at_continuation(unicorn, args[2]) {
+            return;
+        }
+        if lx_invoke_monitor_callback(unicorn, pc, args[2], args) {
+            return;
+        }
         let scratch = lx_scratch_page(unicorn);
         unicorn.reg_write(RegisterARM::R0, scratch as u64).unwrap();
-        restore_callee_saved_regs(unicorn, saved_callee_saved);
         return;
     }
 
@@ -559,6 +566,140 @@ fn lx_scratch_page(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     log::info!("LX monitor scratch page at {:#x}", page);
     *LX_SCRATCH.lock().unwrap() = Some(page);
     page
+}
+
+/// Stub that finishes a monitor callback: it stores the callee's result into the
+/// saved R0 slot, then restores the caller's registers plus SP and resume address,
+/// so the detour through the callback is invisible apart from the result.
+static LX_CALL_STUB: std::sync::LazyLock<std::sync::Mutex<Option<u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+fn lx_call_stub(unicorn: &mut Unicorn<'_, Context>) -> Option<u32> {
+    if let Some(stub) = *LX_CALL_STUB.lock().unwrap() {
+        return Some(stub);
+    }
+    let mmu_arc = {
+        let data = unicorn.get_data();
+        data.mmu.clone()
+    };
+    let addr = mmu_arc.lock().unwrap().heap_alloc(
+        unicorn,
+        0x20,
+        unicorn_engine::unicorn_const::Prot::READ
+            | unicorn_engine::unicorn_const::Prot::WRITE
+            | unicorn_engine::unicorn_const::Prot::EXEC,
+        "[lx-monitor-call-stub]",
+    );
+    let code: [u8; 16] = [
+        0x00, 0x00, 0x8d, 0xe5, // str r0, [sp]
+        0x24, 0xc0, 0x8d, 0xe2, // add r12, sp, #0x24
+        0xff, 0x4f, 0xbd, 0xe8, // pop {r0-r11, lr}
+        0x00, 0xa0, 0xbc, 0xe8, // ldmia r12, {sp, pc}
+    ];
+    unicorn.mem_write(addr as u64, &code).ok()?;
+    log::info!("LX monitor call stub at {:#x}", addr);
+    *LX_CALL_STUB.lock().unwrap() = Some(addr);
+    Some(addr)
+}
+
+/// The entry point handed to the monitor starts with `cmp r0, #0`, so it is a
+/// completion path that reads the service result rather than a function to call with
+/// fresh arguments. Resume there in place, reporting success.
+fn lx_resume_at_continuation(unicorn: &mut Unicorn<'_, Context>, continuation: u32) -> bool {
+    if continuation == 0 {
+        return false;
+    }
+    let mut word = [0u8; 4];
+    if unicorn.mem_read(continuation as u64, &mut word).is_err() {
+        return false;
+    }
+    // `cmp r0, #0`
+    if word[3] != 0xe3 || (word[2] & 0xf1) != 0x50 || word[1] != 0x00 || word[0] != 0x00 {
+        log::warn!(
+            "LX monitor continuation {:#x} is not a result check ({:02x} {:02x} {:02x} {:02x})",
+            continuation,
+            word[0],
+            word[1],
+            word[2],
+            word[3]
+        );
+        return false;
+    }
+    let _ = unicorn.reg_write(RegisterARM::R0, 0);
+    let _ = unicorn.reg_write(RegisterARM::PC, continuation as u64);
+    true
+}
+
+/// Run `entry` the way the monitor would: in the caller's context, with the caller's
+/// state preserved, resuming at `resume` once the callee returns.
+fn lx_invoke_monitor_callback(
+    unicorn: &mut Unicorn<'_, Context>,
+    resume: u32,
+    entry: u32,
+    args: [u32; 4],
+) -> bool {
+    if entry == 0 {
+        return false;
+    }
+    if entry & 1 != 0 {
+        log::warn!("LX monitor callback entry {:#x} looks like Thumb, not handled", entry);
+        return false;
+    }
+    let Some(stub) = lx_call_stub(unicorn) else {
+        return false;
+    };
+    let sp = unicorn.reg_read_i32(RegisterARM::R13).unwrap_or(0) as u32;
+    if sp < 0x1000 {
+        log::warn!("LX monitor callback refused, bad SP {:#x}", sp);
+        return false;
+    }
+
+    let mut saved = [0u32; 16];
+    for (slot, register) in [
+        RegisterARM::R4,
+        RegisterARM::R5,
+        RegisterARM::R6,
+        RegisterARM::R7,
+        RegisterARM::R8,
+        RegisterARM::R9,
+        RegisterARM::R10,
+        RegisterARM::R11,
+        RegisterARM::R14,
+    ]
+    .iter()
+    .enumerate()
+    {
+        saved[slot] = unicorn.reg_read(*register).unwrap_or(0) as u32;
+    }
+    saved[9] = sp;
+    saved[10] = resume;
+
+    let new_sp = sp.wrapping_sub((saved.len() * 4) as u32) & !7;
+    for (slot, value) in saved.iter().enumerate() {
+        if unicorn
+            .mem_write((new_sp + (slot as u32 * 4)) as u64, &value.to_le_bytes())
+            .is_err()
+        {
+            log::warn!(
+                "LX monitor callback refused, cannot save state at {:#x}",
+                new_sp
+            );
+            return false;
+        }
+    }
+
+    let _ = unicorn.reg_write(RegisterARM::R13, new_sp as u64);
+    for (register, value) in [
+        (RegisterARM::R0, args[0]),
+        (RegisterARM::R1, args[1]),
+        (RegisterARM::R2, args[2]),
+        (RegisterARM::R3, args[3]),
+        (RegisterARM::R14, stub),
+    ] {
+        let _ = unicorn.reg_write(register, value as u64);
+    }
+    let _ = unicorn.reg_write(RegisterARM::PC, entry as u64);
+    true
 }
 
 /// Call id of the LX monitor shim whose `svc` instruction ends just before `pc`,
