@@ -82,112 +82,6 @@ fn queue_serviced(queue: &str, thread: u32) {
         .insert(queue.to_string(), (thread, Instant::now()));
 }
 
-/// CCA message held back until the message it has to follow has been dealt with.
-struct HeldMessage {
-    queue: String,
-    blob: Vec<u8>,
-    priority: u32,
-    held_at: Instant,
-    what: &'static str,
-}
-
-/// procmapengine's threads race at startup and the emulator's host threads let
-/// DAPIAPP finish messages out of order, which the single-core device never
-/// produces. Two consequences are corrected here:
-///
-/// * `HELD_DATA_REQUEST`: the map-data request is posted before the REGISTER of
-///   the same service, so DAPIAPP's CCA worker sees the wildcard register-id,
-///   answers error 6, and that error path unregisters the client again - after
-///   which no request can ever succeed. The request is held and re-posted
-///   directly behind the registration.
-/// * `HELD_REGISTRATION`: procmapengine starts by deregistering handles left
-///   over from a previous session. DAPIAPP builds the removal key from its own
-///   live entry rather than from the message, so if that deregistration is
-///   still around when the new registration is processed it deletes the entry
-///   created moments before. The registration waits until the conf of the
-///   pending deregistration has been delivered, leaving DAPIAPP a no-op.
-const HELD_DATA_REQUEST: usize = 0;
-const HELD_REGISTRATION: usize = 1;
-
-static HELD_MESSAGES: std::sync::LazyLock<
-    std::sync::Mutex<[Option<HeldMessage>; 2]>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new([None, None]));
-
-/// A deregistration of the map-data service whose conf has not come back yet.
-static MAP_DATA_DEREGISTRATION_PENDING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Set once a registration of the map-data service has been queued, so that a
-/// later data request is posted normally.
-static MAP_DATA_REGISTRATION_QUEUED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// A held message is never lost: after this long it goes out regardless.
-const HELD_MESSAGE_LIMIT: std::time::Duration = std::time::Duration::from_millis(500);
-
-fn hold_message(slot: usize, queue: &str, blob: Vec<u8>, priority: u32, what: &'static str) {
-    let mut guard = HELD_MESSAGES.lock().unwrap();
-    if guard[slot].is_some() {
-        return;
-    }
-    log::info!("[LIBOSAL-MBX] holding {what} for {queue} until it is in order");
-    guard[slot] = Some(HeldMessage {
-        queue: queue.to_string(),
-        blob,
-        priority,
-        held_at: Instant::now(),
-        what,
-    });
-}
-
-fn flush_held_message(unicorn: &mut Unicorn<'_, Context>, slot: usize, reason: &str) {
-    let Some(mut held) = HELD_MESSAGES.lock().unwrap()[slot].take() else {
-        return;
-    };
-    if slot == HELD_DATA_REQUEST {
-        // The request was built while its sender did not know the handle yet;
-        // the map worker rejects the wildcard with error 6, so fill it in now.
-        let register_id = crate::libs::procmapengine::map_data_register_id();
-        if register_id != 0xffff && held.blob.len() >= 8 + 0x18 {
-            held.blob[8 + 0x16..8 + 0x18].copy_from_slice(&register_id.to_le_bytes());
-        }
-    }
-    let accepted = {
-        let mut state = unicorn.get_data().namespace.lock().unwrap();
-        let queue_id = OsalQueueService::ensure_queue(&mut state.mq, &held.queue);
-        state.mq.grow_msgsize(queue_id, held.blob.len() as i64);
-        let accepted = OsalQueueService::guest_post(
-            &mut state.mq,
-            &held.queue,
-            held.blob.clone(),
-            held.priority,
-        );
-        if accepted {
-            state.notify_waiters();
-        }
-        accepted
-    };
-    log::info!(
-        "[LIBOSAL-MBX] re-posted held {} to {queue} after {reason} (accepted={accepted})",
-        held.what,
-        queue = held.queue
-    );
-    if accepted {
-        if slot == HELD_REGISTRATION {
-            registration_queued(unicorn);
-        }
-    } else {
-        HELD_MESSAGES.lock().unwrap()[slot] = Some(held);
-    }
-}
-
-/// A registration of the map-data service has been queued: the data request
-/// waiting behind it can go out now.
-fn registration_queued(unicorn: &mut Unicorn<'_, Context>) {
-    MAP_DATA_REGISTRATION_QUEUED.store(true, Ordering::Relaxed);
-    flush_held_message(unicorn, HELD_DATA_REQUEST, "the registration was queued");
-}
-
 /// Message-queue observation and OSAL service bridge hooks.
 ///
 /// These hooks decode enough of the OSAL queue handle structure to log which
@@ -1879,16 +1773,6 @@ fn bridge_mbx_queue(
         return false;
     }
 
-    // A held message must not be lost if its prerequisite never shows up.
-    for slot in [HELD_DATA_REQUEST, HELD_REGISTRATION] {
-        let expired = HELD_MESSAGES.lock().unwrap()[slot]
-            .as_ref()
-            .is_some_and(|held| held.held_at.elapsed() >= HELD_MESSAGE_LIMIT);
-        if expired {
-            flush_held_message(unicorn, slot, "timeout");
-        }
-    }
-
     match api_name {
         "OSAL_s32MessageQueuePost" => {
             if msg_ptr == 0 || msg_ptr > 0xf000_0000 || msg_len < 8 {
@@ -1944,75 +1828,10 @@ fn bridge_mbx_queue(
                     u16::from_le_bytes([body[0xe], body[0xf]]),
                 );
             }
-            // procmapengine replays a deregistration for a handle from an
-            // earlier session. DAPIAPP answers that with error 6 and removes the
-            // entry it finds for the service and client, which is the live
-            // registration - so a deregistration naming any other handle is
-            // dropped here, the way a server that knows no such handle would
-            // have nothing to remove.
-            if name == "mbx_7"
-                && body.len() >= 0x18
-                && body[0xb] == 0x41
-                && body[0x14..0x16] == 0x26u16.to_le_bytes()
-            {
-                let register_id = u16::from_le_bytes([body[0x16], body[0x17]]);
-                let live = (crate::libs::dapi::MAP_DATA_LIVE_REGISTER_ID.load(Ordering::Relaxed)
-                    & 0xffff) as u16;
-                if live != 0xffff && register_id != live {
-                    log::info!(
-                        "[LIBOSAL-MBX] dropped deregistration of svc 0x0026 handle {register_id:#06x}: DAPIAPP holds {live:#06x}"
-                    );
-                    unicorn
-                        .get_data()
-                        .sys_calls_state
-                        .lock()
-                        .unwrap()
-                        .osal_messages
-                        .release(content);
-                    return_to_caller(unicorn, 0);
-                    return true;
-                }
-            }
             let mut blob = Vec::with_capacity(8 + body.len());
             blob.extend_from_slice(&1u32.to_le_bytes());
             blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
             blob.extend_from_slice(&body);
-
-            // Hold both messages of the map-data handshake until they reach
-            // DAPIAPP in the order the device produces (see HELD_MESSAGES).
-            let is_map_data =
-                name == "mbx_7" && body.len() >= 0x18 && body[0x14..0x16] == 0x26u16.to_le_bytes();
-            let hold = is_map_data
-                && match body[0xb] {
-                    0x45 => {
-                        body[0x16..0x18] == 0xffffu16.to_le_bytes()
-                            && !MAP_DATA_REGISTRATION_QUEUED.load(Ordering::Relaxed)
-                    }
-                    0x42 => MAP_DATA_DEREGISTRATION_PENDING.load(Ordering::Relaxed),
-                    _ => false,
-                };
-            if hold {
-                let what = if body[0xb] == 0x45 {
-                    "map-data request"
-                } else {
-                    "service registration"
-                };
-                let slot = if body[0xb] == 0x45 {
-                    HELD_DATA_REQUEST
-                } else {
-                    HELD_REGISTRATION
-                };
-                hold_message(slot, name, blob, prio_or_prio_ptr, what);
-                unicorn
-                    .get_data()
-                    .sys_calls_state
-                    .lock()
-                    .unwrap()
-                    .osal_messages
-                    .release(content);
-                return_to_caller(unicorn, 0);
-                return true;
-            }
 
             let accepted = {
                 let mut state = unicorn.get_data().namespace.lock().unwrap();
@@ -2026,13 +1845,6 @@ fn bridge_mbx_queue(
                 accepted
             };
             if accepted {
-                if is_map_data {
-                    match body[0xb] {
-                        0x41 => MAP_DATA_DEREGISTRATION_PENDING.store(true, Ordering::Relaxed),
-                        0x42 => registration_queued(unicorn),
-                        _ => {}
-                    }
-                }
                 // Ownership of an OSAL message transfers to the queue on a
                 // successful Post; the recipient gets a materialized copy,
                 // so the poster's buffer can be recycled right away. Without
@@ -2114,15 +1926,6 @@ fn bridge_mbx_queue(
                         let register_id =
                             u16::from_le_bytes([message.data[0x1e], message.data[0x1f]]);
                         crate::libs::procmapengine::note_dapi_register_conf(service, register_id);
-                        if service == 0x0026
-                            && MAP_DATA_DEREGISTRATION_PENDING.swap(false, Ordering::Relaxed)
-                        {
-                            flush_held_message(
-                                unicorn,
-                                HELD_REGISTRATION,
-                                "the pending deregistration was answered",
-                            );
-                        }
                     }
                 }
                 let _ = result;
