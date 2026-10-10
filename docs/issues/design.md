@@ -906,3 +906,14 @@ mapping is available in the emulator already: create a **guest thread** per coro
 (entry `r2`, arguments `r0..r3`, its own stack, link = a coroutine-exit handler that wakes
 the parent with the child's result) and block the yielding thread on it, reusing the
 existing `Blocked`/`pending_result` machinery. That is the next step.
+
+#### Implementation pointers for the coroutine threads
+
+`mqueue.rs:222-260` (`mq_notify`) is the exact template: allocate a stack, snapshot the
+caller context with `context_init`, write SP/R0/LR on the shared vCPU, `context_init`
+again for the child, restore the caller, then push a `GuestThread { status: Runnable,
+pc: function, .. }`. For `svc #6`: child `pc = r2` with `r0..r3` passed through and `LR`
+set to a coroutine-exit stub; the yielding thread parks until that child terminates and
+takes the child's final `R0` as the result of the yield. Check `BlockReason` for a
+join/child-exit variant (only futex/sleep/mq/signal variants were seen so far) - if there
+is none, add one and complete it in `advance_blocked` when the child thread is `Exited`.
