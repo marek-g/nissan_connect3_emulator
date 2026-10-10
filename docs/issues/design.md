@@ -385,3 +385,28 @@ error-reply flood at all - procmapengine never registers the map-data service.
 The synthesis therefore cannot simply be deleted; the flood is downstream of the
 failing answer, and one status message cannot explain a second registration.
 Removing our syntheses is not the way out of this one.
+
+### Update: what the registry actually contains when the request is answered
+
+The list at `app+0x58` (0xf614c8) that the registry hooks talk about is the real
+`ail_tclServiceRegistry` of DAPIAPP's application object - the data-request scan
+walks exactly that pointer. Walking it while a GetBlockIDs request is answered
+(run_r90 line 5426) shows eight entries, all of them DAPIAPP's own services:
+
+    [ffff,0008,0007,ffff] [ffff,0056,0007,ffff] [ffff,0007,0007,ffff]
+    [ffff,0012,0007,ffff] [ffff,0011,0007,ffff] [ffff,0026,0007,ffff]
+    [ffff,003c,0007,ffff] [ffff,0006,0007,ffff]
+
+The search tuple of the request is (regid=0x0001, svc=0x0026, client=0x0400,
+sub=0xfffe), so nothing can match and `id=6 unknown-register` is the correct
+answer: at that moment DAPIAPP does not hold a client registration for
+procmapengine at all. Earlier in the same run an `ADD [0001,0026,0400,fffe]` on
+the same list is followed later by a `REMOVE` of exactly that entry, with the
+only observed `ServiceRegister` posted in between - who adds it, and what removes
+it again, is still open and is now the thing to determine (the ADD is reached from
+a region Ghidra has no function for, so name it and look at the callers).
+
+`MAP_DATA_CLIENT_ENTRY_LIVE` from the registry hooks was reverted for a different
+reason than assumed there: it is not a scratch list, but it also cannot help,
+because the message that must be kept away from the entry is posted before the
+entry exists.
