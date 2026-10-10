@@ -1093,3 +1093,38 @@ the in-use-list next), flags in `[p+4]` low bits (1 allocated, 2 block, 4 end), 
 list entries at `p+8`/`p+0xc` stored as slots (walkers dereference the slot, so
 `[node - 8]` is the in-use-list word). The user pointer is `p + 8`; `free` walks
 neighbours through the in-use list, never below `p`.
+
+### The bank/directory-service object (0x0a): resolve hands back the receive context
+
+`0x5ea668` is PROCNAV's directory-service registration. It issues four `0x0a`
+commands through the `tkse_*` wrappers that each build a request block on the
+stack and trap (`0x62ef88` = `svc #6`); the dispatcher keys on `id >> 16`
+(`0x8004829c`). The real leaves validate and walk kernel bank/DS state the
+monitor image never initialises (`0x8052e295`, `*0x80516fc4 = 0`), so each
+command is served to its *observable* contract, the value the caller reads back:
+
+- `0x0008030a` (cmd 8): `0x5ea6d4` checks only `cmp r0, #0`. Served status 0.
+- `0x0063040a` (cmd 63): `0x5ea69c` stores the returned word into a global
+  (`0x5ea6a0`) and does not dereference it here. Served status 0.
+- `0x0201020a` (cmd 201): `0x5ea71c` reads the result as a path *length*; a zero
+  makes the caller take the same branch as an unregistered entry and use its
+  statically linked default path (`0x5ea72c -> 0x5ea734`). Served status 0.
+- `0x0203020a` (cmd 203): the only command whose *output* is dereferenced. The
+  wrapper passes `r0 = 0` (self handle) and `r1 = &obj->0x24` as an output slot;
+  the continuation (`0x5ea7d4`) runs `0x5f2ab4 -> 0x5f5af0`, which reads
+  `[obj->0x24 + 0x1c]` (byte count) and `[obj->0x24 + 0x2c]` (`u16` element
+  count) and walks the buffer only when the count is non-zero. At boot nothing
+  has been received, so the truthful object the bank manager hands back has an
+  empty list; a freshly mapped, zero-filled page gives a zero count and
+  `0x5f5af0` returns 0 without touching the buffer. `complete()` therefore
+  allocates one zero page and writes its address through `block + 4`.
+
+Object identity, checked against the run: the out-slot `0x122f4cc` is
+`obj + 0x24` where `obj = 0x122f4a8`, and `0x5f2ab4`'s argument is
+`0x5ea858 - 0x98 = 0x122f540 - 0x98 = 0x122f4a8` - the same object the reader
+dereferences, so the pointer written at `block + 4` is exactly the one read.
+
+Result: PROCNAV completes its OSAL bring-up (spawns Timer/MAXCB_Timer/AE_109,
+opens `mbx_265`/`mbx_0`) and parks on a `MonitorYield` instead of dying at
+`0x5f5af8`. The `0x64` (queue) and `0x6e` objects its peers then drive are the
+next decode surface; they currently fall to the status-0 catch-all.

@@ -132,6 +132,21 @@ pub const SERVICE_POOL_FREE: u32 = 0x0102_010b;
 pub const SERVICE_GET_TID: u32 = 0x0010_000a;
 pub const SERVICE_GET_CFN: u32 = 0x0300_030a;
 
+/// Object `0x0a` (the bank/mbk + directory service) commands. The dispatcher
+/// (`0x8004829c`) keys on `id >> 16`; the four PROCNAV issues during its DS
+/// registration are here. Each is served to the observable contract the caller
+/// (`0x5ea668`) depends on, since the real leaves (`0x80047b90`, `0x80051178`,
+/// `0x800d1d68`, `0x80043a6c`) walk kernel state the image never initialises.
+pub const SERVICE_MBK_OPEN: u32 = 0x0008_030a; // cmd 8:  validate + `0x80047b90`
+pub const SERVICE_MBK_INFO: u32 = 0x0063_040a; // cmd 63: forward 4 words to `0x80051178`
+pub const SERVICE_MBK_LEN: u32 = 0x0201_020a; // cmd 201: path length of the DS entry
+pub const SERVICE_MBK_RESOLVE: u32 = 0x0203_020a; // cmd 203: resolve a handle to its object
+
+/// Bytes of freshly mapped, zero-filled memory handed back for a resolved bank
+/// object. The reader (`0x5f5af0`) only needs `[obj + 0x1c]` and `[obj + 0x2c]`;
+/// a page is more than enough and keeps both reads inside the mapping.
+const BANK_OBJECT_BYTES: u32 = 0x1000;
+
 /// Bytes per chunk the pool allocator (`0x5f5d54`) expects the create service to hand back
 /// for it to store at `[desc + 0x18]`. It multiplies that word by chunk counts wherever it
 /// computes a region end (`end = p + n * chunk - 8`), compares request sizes against
@@ -574,6 +589,77 @@ pub fn complete(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) ->
         SERVICE_POOL_FREE => {
             log::info!(
                 "monitor: free request at {:#x} acknowledged: {}",
+                block,
+                describe(unicorn, block)
+            );
+            0
+        }
+        // Command 203 resolves a handle to the object that owns the caller's incoming
+        // message list and writes its address through the output slot at `block + 4`.
+        // PROCNAV's DS registration (`0x5ea668`) calls it with `r0 = 0` (the self handle)
+        // and `r1 = &obj->0x24`; the continuation (`0x5ea7d4`) then runs
+        // `0x5f2ab4 -> 0x5f5af0`, which reads `[obj->0x24 + 0x1c]` (a byte count) and
+        // `[obj->0x24 + 0x2c]` (a `u16` element count) and walks the buffer only when the
+        // count is non-zero. Nothing has been received at boot, so the truthful state the
+        // bank manager hands back is an empty list: a freshly mapped, zero-filled page has
+        // a zero count, and `0x5f5af0` returns `0` without dereferencing the buffer.
+        SERVICE_MBK_RESOLVE => {
+            let out = read_word(unicorn, block + 4).unwrap_or(0);
+            if out == 0 {
+                log::warn!(
+                    "monitor: mailbox resolve at {:#x} names a null output slot",
+                    block
+                );
+                return 0xfff6_0000;
+            }
+            let mmu = {
+                let data = unicorn.get_data();
+                data.mmu.clone()
+            };
+            let object = mmu.lock().unwrap().heap_alloc(
+                unicorn,
+                BANK_OBJECT_BYTES,
+                Prot::READ | Prot::WRITE,
+                "[monitor-mbk]",
+            );
+            if object == 0 || write_word(unicorn, out, object).is_err() {
+                log::warn!(
+                    "monitor: cannot back the bank object for the resolve at {:#x} into {:#x}",
+                    block,
+                    out
+                );
+                return 0xfff6_0000;
+            }
+            log::info!(
+                "monitor: mailbox resolve at {:#x} wrote empty bank object {:#x} into {:#x}",
+                block,
+                object,
+                out
+            );
+            0
+        }
+        // The other three bank commands report status only on the paths PROCNAV follows:
+        // `0x8030a` (register a bank) and `0x201020a` (ask the bank's path length) are
+        // branched on with `cmp r0, #0` alone, and a zero length makes the caller fall back
+        // to its statically linked default path (`0x5ea72c` -> `0x5ea734`), which is the
+        // same branch the real manager takes for an unregistered entry. Neither output is
+        // modelled beyond the status, so they are reported as served, not as emulated.
+        SERVICE_MBK_OPEN | SERVICE_MBK_LEN => {
+            log::info!(
+                "monitor: bank request {:#x} at {:#x} served with status 0: {}",
+                service,
+                block,
+                describe(unicorn, block)
+            );
+            0
+        }
+        // `0x63040a` forwards its four request words to `0x80051178`; PROCNAV only stores
+        // the returned word into a global (`0x5ea6a0`) and does not dereference it here, so
+        // it is answered with a success status until that value's use is decoded.
+        SERVICE_MBK_INFO => {
+            log::info!(
+                "monitor: bank info {:#x} at {:#x} served with status 0: {}",
+                service,
                 block,
                 describe(unicorn, block)
             );
