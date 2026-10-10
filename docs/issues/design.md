@@ -336,3 +336,19 @@ Notes:
   (then delivering the stale deregistration *after* the conf would be a no-op
   and correct), or whether the deregistration has to be answered locally in the
   emulated ail layer without ever reaching DAPIAPP.
+
+### Update (registration ordering fixed, worker error remains)
+
+- DAPIAPP resolves a deregistration's removal key from its own live entry, so
+  the stale deregistration cannot be neutralised by ordering it after the conf.
+  It has to run while no entry exists: the bridge now also holds the map-data
+  *registration* until the conf of a pending deregistration has been delivered
+  to procmapengine (procmapengine waits for that conf before it registers, so
+  the deregistration may not simply be dropped).
+- With that, the ail layer accepts the request (register-id matches, the
+  `id=6 unknown-register` errors are gone) and all three attempts reach
+  `dap_map_tclWorker::enProcessJob`. Each is answered with an error via
+  `dap_map_tclWorker::vReportError` (0x844e78).
+- **Next step:** the hook's register reading is unreliable there (code and
+  "func" print the same value), so decode the real arguments of `vReportError`
+  and find which check in the worker fails now that the request is valid.
