@@ -104,10 +104,10 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         // link slot the shim pops next, so skipping the call sends PROCNAV into the
         // NX stack.
         restore_callee_saved_regs(unicorn, saved_callee_saved);
-        if lx_resume_at_continuation(unicorn, args[2]) {
+        if lx_invoke_monitor_callback(unicorn, pc, args[2], args) {
             return;
         }
-        if lx_invoke_monitor_callback(unicorn, pc, args[2], args) {
+        if lx_resume_at_continuation(unicorn, args[2]) {
             return;
         }
         let scratch = lx_scratch_page(unicorn);
@@ -688,7 +688,33 @@ fn lx_invoke_monitor_callback(
         }
     }
 
-    let _ = unicorn.reg_write(RegisterARM::R13, new_sp as u64);
+    // The entry point is a mid-function address: its prologue (`push {r4, lr}` and
+    // `sub sp, #0x10`) already ran, so lay out that frame for it - the saved `r4` and
+    // the return link above the locals, with the call arguments standing in for
+    // its own `add sp, #0x10 ; pop {r4, pc}` land on the stub.
+    let body_sp = new_sp.wrapping_sub(0x10);
+    let link = [args[0], args[1], args[2], args[3], 0, 0, 0, 0];
+    for (slot, value) in link.iter().enumerate() {
+        if unicorn
+            .mem_write((body_sp + (slot as u32 * 4)) as u64, &value.to_le_bytes())
+            .is_err()
+        {
+            return false;
+        }
+    }
+    for (offset, value) in [(0x10u32, saved[0]), (0x14, stub)] {
+        if unicorn
+            .mem_write(
+                (body_sp + offset) as u64,
+                &(value as u32).to_le_bytes(),
+            )
+            .is_err()
+        {
+            return false;
+        }
+    }
+
+    let _ = unicorn.reg_write(RegisterARM::R13, body_sp as u64);
     for (register, value) in [
         (RegisterARM::R0, args[0]),
         (RegisterARM::R1, args[1]),

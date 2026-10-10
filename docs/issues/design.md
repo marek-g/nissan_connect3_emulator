@@ -738,3 +738,18 @@ thread is neither parked in the scheduler nor stopped by a wall-clock budget ins
 finishes essentially instantly, so the thread stays `Runnable` and nothing is ever
 logged. That is a host-side livelock, not a guest spin loop and not a blocked thread,
 and it is what has to be chased next (log the PC at quantum entry for that process).
+
+### Update: null-PC resume is fatal, not a quantum (livelock fixed)
+
+The stall was PROCNAV being rescheduled with `pc = 0x0` (`lr = 0x60c9e8`): `emu_start`
+with `begin == until == 0` returns immediately, so the loop counted 43469 empty quanta
+without logging anything. `run_quantum` now refuses to start such a thread and
+terminates it with the SIGSEGV default action (139), which turns the livelock into a
+single clear error line.
+
+Giving the mid-function entries the frame their prologue implies (`r4` and the return
+link above a `0x10` locals area, entered with `sp` below it) makes the `str r0, [sp]`
+site (`0x5ea67c`) behave, but the last site still lands on a null link: those entries are
+epilogues of *other* functions, so an inline call cannot restore their frames - the
+handoff needs a per-handoff context save (the monitor's TCB role) so the yielder is
+resumed by the body returning, rather than us re-entering the body.

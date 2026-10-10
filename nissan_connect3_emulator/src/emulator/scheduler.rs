@@ -121,6 +121,49 @@ fn run_quantum(
             .unwrap();
     }
 
+    // A thread whose saved PC is a null branch cannot run at all: `emu_start(0, 0)`
+    // returns immediately (begin == until), which would livelock this loop forever.
+    // Linux would deliver SIGSEGV here, so terminate with the same default action.
+    if pc < 0x1000 {
+        log::error!(
+            "[{}] cannot resume at pc={:#x} (lr={:#x} sp={:#x}), terminating",
+            next_id,
+            pc,
+            unicorn.reg_read(RegisterARM::R14).unwrap_or(0),
+            unicorn.reg_read(RegisterARM::R13).unwrap_or(0)
+        );
+        let data = unicorn.get_data();
+        if let Some(thread) = data
+            .threads
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|t| t.id == next_id)
+        {
+            thread.pc = pc;
+            thread.status = ThreadStatus::Exited(139);
+        }
+        return Ok(true);
+    }
+
+    // Trace quantum starts for one process family: a livelock shows up as quanta that
+    // keep starting at (almost) the same PC and returning immediately.
+    {
+        static QUANTA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let watched = unicorn.get_data().elf_path.contains("navbin");
+        let tick = QUANTA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if watched && tick % 512 == 0 {
+            log::info!(
+                "[{}] quantum {}: pc={:#x} lr={:#x} sp={:#x}",
+                next_id,
+                tick,
+                pc,
+                unicorn.reg_read(RegisterARM::R14).unwrap_or(0),
+                unicorn.reg_read(RegisterARM::R13).unwrap_or(0)
+            );
+        }
+    }
+
     let budget = spin_watch_timeout();
     let res = unicorn.emu_start(pc as u64, 0, budget, count);
 
