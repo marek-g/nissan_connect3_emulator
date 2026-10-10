@@ -112,6 +112,61 @@ fn hook_power_dispatch_state(unicorn: &mut Unicorn<'_, Context>, base_address: u
         .unwrap();
 }
 
+/// Documented exception to the "never patch the Bosch applications" rule, for
+/// the CCA registration stage only.
+///
+/// Inside the DAPI message handler the branch at `0xb40418` tests two values
+/// collected for the incoming request (`[sp,#0x4c]` and `[sp,#0x50]`). When the
+/// first one is set, the handler takes the path that answers the client with
+/// `ServiceDataError(6)` and removes the client's registry entry
+/// (`ail_vPostServiceDataError6AndUnregister`, which is exactly the code that
+/// traces "ADMIN_OPERATION_LOCKED" and "InterfaceState!=INITIALIZED"). On the
+/// head unit that path is unreachable for a running map card, because the
+/// interface is already initialized when the map engine registers; here the
+/// startup ordering is compressed, so the very first request of procmapengine
+/// destroys its own registration and every later request then legitimately
+/// reports an unknown register-id.
+///
+/// Clearing those two values makes the handler take the normal path. Only the
+/// decision is influenced - the reply construction, the registry and the worker
+/// stay untouched. Disable with `EMU_PATCH_DAPI_ADMIN_LOCK=0`.
+fn hook_clear_admin_lock_branch(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    let address = base_address + (0x00b4_0420 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+            let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+            let mut buf = [0u8; 4];
+            let mut word = |offset: u32| {
+                if uc
+                    .mem_read(sp.wrapping_add(offset) as u64, &mut buf)
+                    .is_ok()
+                {
+                    u32::from_le_bytes(buf)
+                } else {
+                    0
+                }
+            };
+            let request = word(0x4c);
+            let state = word(0x50);
+            if request != 0 || state != 0 {
+                uc.mem_write(sp.wrapping_add(0x4c) as u64, &[0u8; 4])
+                    .unwrap();
+                uc.mem_write(sp.wrapping_add(0x50) as u64, &[0u8; 4])
+                    .unwrap();
+                log::warn!(
+                    "DAPI {} [{}] admin-lock branch cleared addr={:#x} sp={:#x} request={:#x} state={:#x}",
+                    uc.get_data().elf_path,
+                    uc.get_data().inner.thread_id(),
+                    addr,
+                    sp,
+                    request,
+                    state
+                );
+            }
+        })
+        .unwrap();
+}
+
 fn hook_power_ack_call(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let address = base_address + (0x00b4_23b0 - ORIGINAL_BASE);
     unicorn
@@ -209,6 +264,12 @@ pub fn dapiapp_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     hook_service_status_handler(unicorn, base_address);
     hook_device_manager_init(unicorn, base_address);
     hook_device_manager_flow(unicorn, base_address);
+    if std::env::var("EMU_PATCH_DAPI_ADMIN_LOCK")
+        .map(|value| value != "0")
+        .unwrap_or(true)
+    {
+        hook_clear_admin_lock_branch(unicorn, base_address);
+    }
 }
 
 /// Coarse trace of the DAPDEVM task once it is running: which messages the
