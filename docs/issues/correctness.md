@@ -13,3 +13,35 @@ Bugs where the emulated guest behaves wrongly (wrong syscall semantics, data cor
 - **Location:** `nissan_connect3_emulator/src/os/syscalls/futex.rs` (`wake_waiters`), surfaced by the `futex without FUTEX_PRIVATE_FLAG not implemented` error log.
 - **Problem:** with the parallel one-VM-per-process model, `wake_waiters` only marks threads in the *current* VM runnable. A `FUTEX_WAKE` issued by one process for a futex word whose waiters live in another process (the non-`PRIVATE`, shared-memory futex case) does not wake them; the waiter sleeps until its timeout. Same-process (pthread) futexes are unaffected. The guest logs `futex without FUTEX_PRIVATE_FLAG not implemented` when this path is hit.
 - **Fix:** route `FUTEX_WAKE` on a non-private futex through the namespace (map the shared futex word to waiters across processes, e.g. back such futexes with a host-side word in shared memory and a namespace waiter set), mirroring the mq/iosc doorbell + owner re-check pattern.
+
+## 0x305 is the DAPIAPP CCA map-data service (svc 0x26), not PROCNAV
+
+Full-run trace (r166) settles the long-standing `DAPI ServiceDataError
+code=0x305` question and overturns the PROCNAV-centric theory of earlier
+sessions:
+
+- PROCNAV (thread [18]) is healthy and never involved: it completes its startup
+  registration once and runs a normal main loop; it names `mbx_0` zero times and
+  performs zero message receives. It is not the nav responder.
+- The road-network / map-data answer is DAPIAPP's own CCA **service 0x26**
+  ("job type 4"), served by `dap_map_tclWorker` inside DAPIAPP. The registry
+  gate and medium-up ordering pass (`MAP_MEDIUM_ACTIVE` fires; `svcdata-PATH
+  r9=0x26` dispatches to handler `0x823998`; `enProcessJob result=0xffff` = the
+  worker's success code; `u16SendResponse` sends the answer).
+- Only ~2 map requests reach the worker per boot: `vSendToTask jobtype=4` count
+  is 2 and `u16SendResponse` count is 2, while the client (thread [36]) waits on
+  `DYN4MBX` ~10 times. The unanswered requests never become worker jobs; the
+  map workers' `ActionList::bSetBlock` sees `capacity=0`. The client then times
+  out and DAPI answers `0x305` (`amt_tclServiceDataError::vSetErrorData`,
+  lr=0xb52520).
+
+So the remaining blocker is upstream of the worker: why most svc-0x26 requests
+are not turned into dispatched jobs. Prime suspects, both tied to worker/action
+list initialisation and the medium-active ordering noted in `dapi.rs`:
+- the client registry entry `0x9035ab94` staying at state 1 (not ACTIVE), which
+  `dapi.rs` already flags as making later requests fail; and
+- map-worker `ActionList` capacity left at 0.
+
+Next concrete step is RE on `DAPIAPP.OUT` (already in Ghidra) at `lr=0xb52520`
+(the 0x305 site) and at the `ActionList` capacity setter / worker init, to see
+the exact branch that drops the request.
