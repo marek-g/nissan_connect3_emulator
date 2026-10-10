@@ -739,6 +739,75 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
             })
             .unwrap();
 
+        // `dap_tclAbstractWorker::u16SendResponse(comm, message, size, ...)`:
+        // logs the map worker sending its answer so the send can be put next to
+        // the error answer seen by the client.
+        let send_response = base_address + (0x00b6_3388u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(send_response as u64, send_response as u64, move |uc, _, _| {
+                static S_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if S_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 20 {
+                    return;
+                }
+                let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+                log::warn!(
+                    "DAPI worker u16SendResponse this={:#x} comm={:#x} msg={:#x} r3={:#x} lr={:#x}",
+                    read(RegisterARM::R0),
+                    read(RegisterARM::R1),
+                    read(RegisterARM::R2),
+                    read(RegisterARM::R3),
+                    read(RegisterARM::LR),
+                );
+            })
+            .unwrap();
+
+        // `amt_tclServiceDataError::vSetErrorData(u16)`: every CCA error answer
+        // carries its code through here, so logging the code and the caller
+        // shows which layer decided to answer a request with an error.
+        let set_error = base_address + (0x0081_98ecu32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(set_error as u64, set_error as u64, move |uc, _, _| {
+                static E_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if E_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 30 {
+                    return;
+                }
+                log::warn!(
+                    "DAPI ServiceDataError code={:#x} lr={:#x}",
+                    (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32) & 0xffff,
+                    uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32,
+                );
+            })
+            .unwrap();
+
+        // `dap_map_tclWorker::enProcessJob` epilogue: `r8` is the out-parameter
+        // holding the result code (0xffff means success) and `r0` the return
+        // value. Logging both shows what the map worker decided even when it
+        // does not report an error through `vReportError`.
+        let job_result = base_address + (0x0084_ba90u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(job_result as u64, job_result as u64, move |uc, _, _| {
+                static J_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if J_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
+                    return;
+                }
+                let r8 = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+                let mut buf = [0u8; 2];
+                let result = uc
+                    .mem_read(r8 as u64, &mut buf)
+                    .map(|_| u16::from_le_bytes(buf))
+                    .unwrap_or(0xffff);
+                log::warn!(
+                    "DAPI map-worker enProcessJob result={:#x} this={:#x} lr={:#x}",
+                    result,
+                    uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32,
+                );
+            })
+            .unwrap();
+
         // `ActionList::bSetBlock` entry logging is installed below.
         let setblock = base_address + (0x00b6_b610u32 - ORIGINAL_BASE);
         unicorn

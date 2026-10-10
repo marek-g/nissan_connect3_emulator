@@ -122,7 +122,12 @@ const MAP_DATA_DATASET_ID_GLOBAL: u32 = 0x0078_f7f0 - ORIGINAL_BASE;
 const MAP_DATA_DATASET_ID_VALIDATED_GLOBAL: u32 = 0x0078_f874 - ORIGINAL_BASE;
 const MAP_DATA_FASTMAP_AVAILABLE_GLOBAL: u32 = 0x0078_f7f8 - ORIGINAL_BASE;
 const MAP_DATA_STOP_LOADING_GLOBAL: u32 = 0x0078_f7a0 - ORIGINAL_BASE;
-const MAP_DATA_FAKE_DATASET_ID: u32 = 1;
+/// Dataset id of the inserted card, taken from the CRYPTNAV volume's
+/// DATA/DATASET.CFG (`DATASET_ID{ '1758962541' }`, "sd2-GENJ_EU_I.A v2"). DAPIAPP
+/// validates the id of every map-data request against the dataset it read from
+/// the medium (`dap_tclDataAccess::u16CheckDatasetIdLocked`), so the id the map
+/// engine asks for has to be the one the card carries.
+const MAP_DATA_FAKE_DATASET_ID: u32 = 1_758_962_541;
 const MAP_DATA_JOB_QUEUE_GLOBAL: u32 = 0x0050_c08c - ORIGINAL_BASE;
 const MAP_DATA_MAINLOOP_QUEUE_STATE: u32 = 0x0050_be18 - ORIGINAL_BASE;
 const MAP_DATA_MAINLOOP_GET_ELEMENT_RESULT: u32 = 0x0050_be64 - ORIGINAL_BASE;

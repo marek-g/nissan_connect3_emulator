@@ -465,3 +465,29 @@ from -1). With function id `0x0103` the worker takes the branch of
 `vHandleDatasetIdProtected` runs), so the error comes from that load - i.e. the map
 database/dataset is still not usable at this point, which is the stage the emulator
 has to reach next.
+
+### Update: the map worker runs, dataset id fixed, next gate is the RNW outline load
+
+`MAP_DATA_FAKE_DATASET_ID` was `1` while the inserted card declares
+`DATASET_ID{ '1758962541' }` in `CRYPTNAV/DATA/DATASET.CFG`. `dap_map_tclWorker`
+validates the id of every request, so the request was rejected with `0x306`. Using
+the card's id makes the worker process the request to completion
+(`enProcessJob` result `0xffff`, no `vReportError`).
+
+The answer is nevertheless an error, now `0x305`. Reading `u16SendUniqueIdList`
+(`Worker.cpp`): the branch that actually generates the unique-id list requires
+`bIsRnwRegProfOutlinesValid_Locked() && bIsRsRegProfOutlinesValid_Locked() &&
+u16CheckDatasetIdLocked() == 0xffff`; otherwise it first tries to load the
+regulation-profile outlines (`u16ProcessLoadRegProfOutlines` /
+`u16ProcessLoadRsRegProfOutlines`), and that load fails with `0x305`. So the map
+database is not in the state the worker needs: the RNW/RS regulation-profile
+outlines are not loaded. That is the next thing to produce (database loading on the
+medium, not CCA traffic).
+
+Two facts about the flood were measured while chasing this: every flood message is
+posted *and* waited by procmapengine thread 57 (posts 218073 / waits 218071 in one
+run), i.e. the client takes the unanswered answer out of its mailbox and puts it
+back, and DAPI re-sends it because no conf comes back (`dap_tclJob::u16GetErrorCode`
+returns the stored code for a job whose opcode byte is 8, and the CCA layer turns
+that into the re-sent `amt_tclServiceDataError`). Both sides stop as soon as the
+answer is a real result.
