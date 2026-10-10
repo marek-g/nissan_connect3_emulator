@@ -425,14 +425,21 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
 
     for (tid, reason) in blocked {
         match reason {
-            BlockReason::MonitorYield { object, deadline } => {
+            BlockReason::MonitorYield {
+                object,
+                block,
+                continuation,
+                deadline,
+            } => {
                 if deadline.map(|until| until <= now).unwrap_or(false) {
+                    let status = crate::rtos::monitor::complete(unicorn, continuation, block);
                     log::debug!(
-                        "[{}] monitor: yield on object {} expired, resuming",
+                        "[{}] monitor: yield on object {} ended with {:#x}",
                         tid,
-                        object
+                        object,
+                        status
                     );
-                    set_runnable(unicorn, tid, Some(0));
+                    set_runnable(unicorn, tid, Some(status));
                 }
             }
             BlockReason::SleepUntil(until) => {

@@ -141,7 +141,7 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         // parked on the host clock; everything else the monitor can serve, it serves
         // itself.
         if call == crate::rtos::monitor::SVC_YIELD
-            && crate::rtos::monitor::yield_thread(unicorn, args[1])
+            && crate::rtos::monitor::yield_thread(unicorn, args)
         {
             return;
         }

@@ -144,6 +144,10 @@ pub enum BlockReason {
     /// from there; the emulator uses the host clock for the deadline.
     MonitorYield {
         object: u32,
+        /// request block the yielding wrapper left on its own stack (R0 at the call)
+        block: u32,
+        /// what the caller asked for, identified by the continuation it handed over (R2)
+        continuation: u32,
         deadline: Option<Instant>,
     },
 }

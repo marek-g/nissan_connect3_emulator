@@ -123,6 +123,16 @@ pub const SERVICE_ID_MAX: u32 = 0x1b;
 /// Table the id-6 handler branches through: `ldr r2, [0x800750dc + (r1 >> 16) * 4]`.
 pub const WORKER_TABLE: u32 = 0x8007_50dc;
 
+/// Continuation of the request that creates a monitor memory pool: the caller of the
+/// wrapper at `0x60c9d0` resumes here and stores the block's first word into the
+/// descriptor it is initialising (`cmp r0, #0` / `ldrge r0, [sp, #4]` / `strge r0, [r4, #0x18]`).
+pub const CONTINUATION_CREATE_POOL: u32 = 0x60d674;
+
+/// Bytes handed out with each emulated pool. The allocator that uses the descriptor only
+/// reaches for the pool when its limit word is non-zero, so this is padding against
+/// callers that measure the handle rather than trust the limit.
+const POOL_SLACK: u32 = 0x100;
+
 /// The monitor image with the uImage header stripped, read once per process.
 pub fn image() -> Option<&'static [u8]> {
     static IMAGE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
@@ -399,9 +409,10 @@ fn cp15_action(mnemonic: &str, ops: &str) -> Option<(u32, Cp15)> {
 /// here runs the code that creates them, so the blocking half is what the emulator
 /// reproduces: the thread waits for the object or for the deadline, whichever comes
 /// first. Returns whether the thread was parked.
-pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, reason: u32) -> bool {
+pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool {
     const TICK: std::time::Duration = std::time::Duration::from_millis(1);
 
+    let (block, reason, continuation) = (args[0], args[1], args[2]);
     let object = reason & 0xff;
     let ticks = reason >> 16;
     let deadline = if ticks == 0 {
@@ -410,16 +421,65 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, reason: u32) -> bool {
         Some(std::time::Instant::now() + TICK * ticks)
     };
     log::info!(
-        "monitor: thread [{}] yields on object {} for {} ticks",
+        "monitor: thread [{}] yields on object {} for {} ticks (block {:#x}, continuation {:#x})",
         unicorn.get_data().thread_id(),
         object,
-        ticks
+        ticks,
+        block,
+        continuation
     );
     block_current_thread(
         unicorn,
-        BlockReason::MonitorYield { object, deadline },
+        BlockReason::MonitorYield {
+            object,
+            block,
+            continuation,
+            deadline,
+        },
     );
     true
+}
+
+/// Hand a yielded request back, the way the thread that owns the monitor object would
+/// when it completes the request: whatever the caller expects lands in its request
+/// block, and R0 carries the status the continuation branches on (`cmp r0, #0` with the
+/// out-parameter read for `r0 >= 0`).
+pub fn complete(unicorn: &mut Unicorn<'_, Context>, continuation: u32, block: u32) -> u32 {
+    match continuation {
+        // The request that creates a memory pool: the caller stores what it finds in the
+        // block into the descriptor's handle field and hands the descriptor to the
+        // allocator, which falls back to libc when the pool limit stays zero.
+        CONTINUATION_CREATE_POOL => {
+            let mmu = {
+                let data = unicorn.get_data();
+                data.mmu.clone()
+            };
+            let pool = mmu.lock().unwrap().heap_alloc(
+                unicorn,
+                POOL_SLACK,
+                Prot::READ | Prot::WRITE,
+                "[monitor-pool]",
+            );
+            if pool == 0 || write_word(unicorn, block, pool).is_err() {
+                log::warn!("monitor: cannot hand out a pool for the request at {:#x}", block);
+                return 0xfff6_0000;
+            }
+            log::info!(
+                "monitor: request at {:#x} completed with pool {:#x}",
+                block,
+                pool
+            );
+            0
+        }
+        other => {
+            log::debug!(
+                "monitor: request at {:#x} for continuation {:#x} completed without a result",
+                block,
+                other
+            );
+            0
+        }
+    }
 }
 
 /// Enter the monitor's own SWI dispatcher for `svc #id`, the way the ARM vector would.
