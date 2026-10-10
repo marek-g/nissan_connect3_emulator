@@ -132,6 +132,13 @@ const MAP_DATA_MAINLOOP_WAIT_JOB_CAN_EXECUTE: u32 = 0x0050_bf30 - ORIGINAL_BASE;
 const AIL_EN_CHECK_CLIENT_MAIL_VALIDITY: u32 = 0x0066_dd00 - ORIGINAL_BASE;
 const AIL_EN_CHECK_CLIENT_MAIL_VALIDITY_EPILOGUE: u32 = 0x0066_de18 - ORIGINAL_BASE;
 const AIL_EN_POST_MESSAGE_ENTRY: u32 = 0x0066_1a3c - ORIGINAL_BASE;
+/// `ail_tclOneThreadAppInterface::bRegisterAsyncExecute`: posts the
+/// ServiceRegister request and arms the 9000 ms retry timer.
+const AIL_EN_REGISTER_ASYNC_EXECUTE: u32 = 0x0066_0f74 - ORIGINAL_BASE;
+/// Retry timer of an unanswered registration request.
+const AIL_EN_ASYNC_REGISTER_TOUT: u32 = 0x0066_5920 - ORIGINAL_BASE;
+/// Client-side processing of a ServiceRegister conf.
+const AIL_EN_HANDLE_ASYNC_REGISTER_CONF: u32 = 0x0066_5720 - ORIGINAL_BASE;
 const AIL_EN_POST_MESSAGE_AFTER_VALIDITY: u32 = 0x0066_1b08 - ORIGINAL_BASE;
 const AIL_EN_POST_MESSAGE_SUCCESS_PATH: u32 = 0x0066_1bb8 - ORIGINAL_BASE;
 const AIL_EN_POST_MESSAGE_RECEIVER_QUEUE_CALL: u32 = 0x0066_1c2c - ORIGINAL_BASE;
@@ -2095,6 +2102,46 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             }
         })
         .unwrap();
+
+    // Who asks for a registration, does the 9 s retry timer fire, and does the
+    // conf handling run: procmapengine sends ServiceRegister for svc 0x26 twice
+    // and DAPIAPP drops the client entry when it replaces it.
+    for (offset, label) in [
+        (AIL_EN_REGISTER_ASYNC_EXECUTE, "bRegisterAsyncExecute"),
+        (AIL_EN_ASYNC_REGISTER_TOUT, "vTriggerAsyncRegisterTout"),
+        (AIL_EN_HANDLE_ASYNC_REGISTER_CONF, "vHandleAsyncRegisterConf"),
+    ] {
+        let entry = base_address + offset;
+        unicorn
+            .add_code_hook(entry as u64, entry as u64, move |uc, _, _| {
+                static REG_TRACE_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if REG_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 40 {
+                    return;
+                }
+                let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+                let this = read(RegisterARM::R0);
+                let r1 = read(RegisterARM::R1);
+                let r2 = read(RegisterARM::R2);
+                let r3 = read(RegisterARM::R3);
+                let sp = read(RegisterARM::SP);
+                let lr = read(RegisterARM::LR)
+                    .wrapping_sub(base_address)
+                    .wrapping_add(ORIGINAL_BASE);
+                // Parameters 5..7 live on the stack; the retry timer callback
+                // only gets its owner as argument.
+                log::info!(
+                    "PROCMAPENGINE ail trace {label} at {:#x}: this={this:#x} r1={r1:#x} r2={r2:#x} r3={r3:#x} stack=[{:#x},{:#x},{:#x}] app_list={:#x} timer={:#x} lr={lr:#x}",
+                    entry,
+                    read_u32_or_invalid(uc, sp),
+                    read_u32_or_invalid(uc, sp + 4),
+                    read_u32_or_invalid(uc, sp + 8),
+                    read_u32_or_invalid(uc, this + 0x70),
+                    read_u32_or_invalid(uc, this + 0x74),
+                );
+            })
+            .unwrap();
+    }
 
     let post_message_entry = base_address + AIL_EN_POST_MESSAGE_ENTRY;
     unicorn
