@@ -446,3 +446,22 @@ What is left is to keep the *registration* from being processed before the pendi
 deregistration was dealt with, which needs a reliable observation of "the
 deregistration has been answered" rather than the conf-based heuristic that armed
 wrongly before (a conf of an unrelated registration cleared it).
+
+### Update: the registration obstacle was the ADMIN_OPERATION_LOCKED branch (patched)
+
+Clearing the two request words that select that branch (`hook_clear_admin_lock_branch`,
+see the comment there for why this is the documented exception to the fidelity rule)
+makes the first map-data request survive its own registration: the registry entry
+stays, no `ServiceDataError(6)` is produced, the job reaches the CCA dispatch
+(`0xb43578` -> `0x823998`) and the map worker, and the `mbx_1024` flood drops from
+223787 to 367 messages. The post-time bridge heuristics (`HELD_MESSAGES` for the data
+request, dropping the mismatching deregistration) were not what fixed it.
+
+Next obstacle, now visible for the first time: `dap_map_tclWorker::enProcessJob`
+reports `0x306` at `Worker.cpp:374` (the shared tail that reports any result different
+from -1). With function id `0x0103` the worker takes the branch of
+`u16SendUniqueIdList` that first has to load the RNW/RS regulation-profile outlines
+(`bIsRnwRegProfOutlinesValid_Locked` is false, `u16CheckDatasetIdLocked` fails and
+`vHandleDatasetIdProtected` runs), so the error comes from that load - i.e. the map
+database/dataset is still not usable at this point, which is the stage the emulator
+has to reach next.
