@@ -789,3 +789,29 @@ therefore: prologue-shaped entry => synthesized frame; mid-function entry => res
 place with the caller's registers and SP, R0 = result - and before resuming, validate the
 link slot that epilogue will pop instead of letting the thread branch to whatever is
 there (the scheduler's null-PC guard is the backstop, not the answer).
+
+### Update: the "frame" the body pops is the handoff control block, not a C frame
+
+Logging what the mid-function entry will pop before resuming it:
+
+```
+0x5e8ab4 resumes with sp=0x7ff3ce08: pops r4=0x0     pc=0x5e8ab4
+0x60d674 resumes with sp=0x90002ff8: pops r4=0xe320f000 pc=0x90003040
+```
+
+At the first site the slot holds `r4 = 0` and `pc = 0x5e8ab4` - the continuation
+address again, which is also exactly what `r2` carried. So the slots at `sp + 0x10` /
+`sp + 0x14` are the handoff **control block** the wrapper builds (`mov r0, sp`), not a
+`push {r4, lr}` frame, and the second slot is where the app stores the resume address it
+passes in `r2`. Resuming the continuation with that block in place therefore jumps back
+to the same continuation: the loop we kept chasing (null PC, FETCH_UNMAPPED, livelock) is
+the same bug in three costumes.
+
+The monitor's actual service is to take the block - register the coroutine, remember the
+resume address, and later run it with the context it records there (`[r0+0x10] = 0` reads
+as "no context saved yet"). Both of our approximations (inline call with a synthesized
+frame, resume in place with the caller SP) only re-enter the body, so nothing can ever
+complete the handshake and PROCNAV still ends in `0x305` with the `mbx_1024` flood back at
+~1M. Next step is to model the control block: parse `[r0 + 0x00..0x20]`, keep a per-block
+coroutine record in the emulator, and make the *record* drive the resume instead of
+trusting whatever the stack slot happens to contain.

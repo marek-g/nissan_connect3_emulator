@@ -104,10 +104,10 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         // link slot the shim pops next, so skipping the call sends PROCNAV into the
         // NX stack.
         restore_callee_saved_regs(unicorn, saved_callee_saved);
-        if lx_invoke_monitor_callback(unicorn, pc, args[2], args) {
+        if lx_resume_at_continuation(unicorn, args[2]) {
             return;
         }
-        if lx_resume_at_continuation(unicorn, args[2]) {
+        if lx_invoke_monitor_callback(unicorn, pc, args[2], args) {
             return;
         }
         let scratch = lx_scratch_page(unicorn);
@@ -625,6 +625,27 @@ fn lx_resume_at_continuation(unicorn: &mut Unicorn<'_, Context>, continuation: u
         );
         return false;
     }
+    let sp = unicorn.reg_read_i32(RegisterARM::R13).unwrap_or(0) as u32;
+    // The body resumes mid-function and its epilogue pops its saved frame from the
+    // caller's own stack, so the link it will branch to is already in memory. Check it
+    // now: reporting the handoff that cannot return is far cheaper than letting the
+    // thread branch into it blind.
+    let mut frame = [0u8; 8];
+    if let (Ok(_), Ok(_)) = (
+        unicorn.mem_read(sp as u64 + 0x10, &mut frame[0..4]),
+        unicorn.mem_read(sp as u64 + 0x14, &mut frame[4..8]),
+    ) {
+        let popped_r4 = u32::from_le_bytes(frame[0..4].try_into().unwrap());
+        let popped_pc = u32::from_le_bytes(frame[4..8].try_into().unwrap());
+        log::info!(
+            "LX continuation {:#x} resumes with sp={:#x}: pops r4={:#x} pc={:#x}",
+            continuation,
+            sp,
+            popped_r4,
+            popped_pc
+        );
+    }
+
     let _ = unicorn.reg_write(RegisterARM::R0, 0);
     let _ = unicorn.reg_write(RegisterARM::PC, continuation as u64);
     true
