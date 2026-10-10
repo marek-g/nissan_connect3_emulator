@@ -981,3 +981,35 @@ Result: PROCNAV's syscall count `navsys` went from 6 to 12 and the execution err
 10 to 2 - `0x5ea818` (`str r4, [0]`, an error path inside a completion that called
 something still unimplemented) and `0x122f560` (`FETCH_PROT`, one completion whose return
 address is taken by something other than a pop).
+
+### The service wrappers, and the stack geometry that is still wrong
+
+Every `svc #6` comes out of a thin wrapper that copies its arguments into a stack block and
+hands over its own return address:
+
+```text
+5f282c: push {lr} ; sub sp, sp, #20 ; stmib sp, {r0,r1,r2,r3}
+        add r0, sp, #4         ; argument block
+        ldr r2, [sp, #20]      ; completion = return address into the caller
+        ldr r1, [pc, #8]       ; service id (0x0063040a here)
+        bl  62ef88             ; push {r4,lr} ; svc #6 ; pop {r4,pc}
+        add sp, sp, #20
+        pop {pc}
+```
+
+The completion therefore continues the *caller* of the wrapper, mid-function, while SP is
+still inside the wrapper's frame. The return slot has to be computed from the wrapper's
+frame as well: `block + (wrapper frame - block offset) + unwind + 4*skipped`, where `skipped`
+is the number of registers before `pc` in the epilogue that finally ends the outer function
+(`0x5ea820: pop {r3,r4,r5,r6,r7,r8,r9,sl,fp,pc}` -> 9 registers). Two symptoms show the
+current decoder missing that:
+
+* `0x122f560: [21] FETCH_PROT` with `sp=0x7ff3cdc4`, right after
+  `[21] quantum 23: pc=0x62ef90 lr=0x5f2848 sp=0x7ff3cdbc` - a completion that issued its
+  own service call popped a return address that was not the exit trap.
+* the linear "first pop after the entry" scan can stop at an inner function's epilogue
+  instead of the one that ends the outer function.
+
+Fix: take the *outermost* epilogue (the pop whose list matches the `push {..., lr}` that
+starts the function containing the completion) and add the issuing wrapper's frame size,
+decoded from the wrapper at `lr - 8` of the `svc`.
