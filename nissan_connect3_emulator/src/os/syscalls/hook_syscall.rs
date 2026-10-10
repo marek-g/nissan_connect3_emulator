@@ -101,6 +101,39 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
             args[3],
             pc
         );
+        // Who is supposed to answer this request? On the real unit the request is
+        // served by the monitor's message pump, so a `svc #6` that nobody wakes is
+        // fatal no matter how the resume frame is built. Dump the whole thread list the
+        // first time we see one, to see whether a serving thread exists in-process.
+        if call == 6 {
+            static DUMPED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let listing = unicorn
+                    .get_data()
+                    .threads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|thread| {
+                        let state = match &thread.status {
+                            ThreadStatus::Runnable => "runnable".to_string(),
+                            ThreadStatus::Running => "running".to_string(),
+                            ThreadStatus::Blocked(reason) =>
+                                format!("blocked on {:?}", std::mem::discriminant(reason)),
+                            ThreadStatus::Exited(code) => format!("exited {}", code),
+                        };
+                        format!("[{}] {} pc={:#x}", thread.id, state, thread.pc)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                log::info!("LX: threads when [{}] yields: {}", unicorn.get_data().thread_id(), listing);
+            }
+        }
+        // The `svc` vector belongs to the Triton monitor, so the first service call of a
+        // process maps it into this address space; everything below is served by host
+        // code until the monitor's own handlers can be dispatched.
+        crate::rtos::monitor::attach(unicorn);
         // A monitor service that is handed an entry point has to run it in the
         // caller's context and return the callee's result: only the callee fills the
         // link slot the shim pops next, so skipping the call sends PROCNAV into the

@@ -1,5 +1,6 @@
 pub mod boot;
 pub mod interaction;
+pub mod monitor;
 pub mod pwr_proxy;
 
 pub use boot::{RtosBootConfig, RtosBootService};
