@@ -45,3 +45,37 @@ list initialisation and the medium-active ordering noted in `dapi.rs`:
 Next concrete step is RE on `DAPIAPP.OUT` (already in Ghidra) at `lr=0xb52520`
 (the 0x305 site) and at the `ActionList` capacity setter / worker init, to see
 the exact branch that drops the request.
+
+### End-to-end 0x305 chain and the real (already largely working) responder
+
+Following the `0x305` value to its origin in the `DAPIAPP.OUT` Ghidra program:
+
+- `amt_tclServiceDataError::vSetErrorData` at `0xb5251c` is fed the code in `r4`
+  = `dap_tclJob::u16GetErrorCode` (`0xb54380`). That function does **not create**
+  the code: it returns `*actionAddr` when `job+0x15 == 8` and the job has an
+  action, else `0xffff` (success). So DAPIAPP only *forwards* a code some other
+  party stored in the job's action block. `0x305` is that stored value.
+- The jobs that carry it are `job+0x15 == 8`, produced by the map data path; the
+  actual map responder is **procmapengine**, whose map-data mainloop queue
+  (`procmapengine.rs`, `MAP_DATA_MAINLOOP_QUEUE_STATE`) is where `job_type=0x83`
+  elements wait.
+- In r166 procmapengine is no longer the blocker it was: the engine starts
+  naturally (`natural map engine start result r0=1 state=2`,
+  `MAP_ENGINE_NATURALLY_STARTED`), and the map-data path runs
+  (`PerformMapDataRequest result r0=1` hundreds of times, `IntGetBlockIDs`,
+  `SendCCARequest`, `SendServiceDataMsg`). The medium is ACTIVE at t=0.
+
+Remaining gap, precisely: only ~2 requests reach DAPI's `dap_map_tclWorker`
+(`vSendToTask jobtype=4` count 2) and 2 requests come back as `0x305`; the
+client `DYN4MBX` waiter (thread [36]) times out on the rest. Two things to
+investigate on the procmapengine side, in its map-data mainloop queue:
+1. Why the map-data queue leaves `job_type=0x83` requests pending instead of
+   draining and answering them (`wait GetElement` idle-wait loop, `queue_state`).
+2. What writes `0x305` into a job's action for the type-8 jobs (a procmapengine
+   failure result that DAPI then forwards), vs the type-4 map jobs that answer
+   `0xffff` (success).
+
+Correction to earlier sessions: the "PROCNAV road-network server / mbx_0" theory
+was wrong. PROCNAV is healthy and uninvolved; nav/map data is procmapengine via
+the DAPI CCA broker, and that path is now mostly functional - `0x305` is a small
+residual, not a total outage.
