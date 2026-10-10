@@ -114,6 +114,19 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
             )))),
             is_read_only: true,
         },
+        // PROCNAV.OUT - the application that owns the road-network (RNW) side of
+        // the DAPI protocol - is not part of the head-unit image. It ships on the
+        // map card in `CRYPTNAV/DNL/BIN/NAV/COMMON/`, but there it is a `ULI `
+        // container, not an ELF, so the loader cannot run it. Unpacked with the
+        // LX monitor's own decompressor (nissan_connect3_map_conv
+        // src/elf_decompressor/uli_unpack.py) and served from this directory.
+        MountPoint {
+            mount_point: "/opt/bosch/navbin".to_string(),
+            file_system: Box::new(OsFileSystem::new(PathBuf::from(
+                "/tmp/opencode/nissan_emu/navbin",
+            ))),
+            is_read_only: true,
+        },
         // volatile temp-fs
         MountPoint {
             mount_point: "/var/volatile".to_string(),
