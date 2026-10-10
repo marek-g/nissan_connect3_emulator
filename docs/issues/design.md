@@ -521,3 +521,22 @@ Next question, then, is how to satisfy the road-network side: either find the
 component that unpacks the card's `ULI` payload (and the install path it writes to),
 or emulate the road-network service on the DAPI level so the outline request is
 answered without PROCNAV.
+
+### Update: the road-network worker is inside DAPIAPP, and it has the data
+
+`DAPDEVMMBX`/`DAPDATAMMBX`/`DAPDATASMBX` are not external peers: the threads using
+them (`DAPDEVM...`, `DAPDATAM...`, `DYN6`, `DYN7`) are DAPIAPP's own worker threads,
+and `u16SendResponse` is never used on that path. So the `GetRegProfOutline` sub-job
+is served in-process and answered with `0x305` by DAPI itself - no missing process.
+
+Tracing reads of the navdata tree (`NAVDATA_FDS` + a read log) shows the reads are
+complete, so nothing fails on I/O. DAPIAPP reads `MEDIUM.CFG`, `DATASET.CFG`,
+`POI_MAPPING.DAT`, `tp_meta.dat` and then the whole road-network root file
+`data/connect/rnw/NAV_ROOT.DAT` (61136 bytes, magic `CPRNAV_2`) in three requests
+(16 KiB at 0, 11108 at 0x4C, 42704 at 0x4800) and *still* fails. It never opens
+anything under `CRYPTNAV/DATA/CONNECT/RNW/CCP/<CC>/*.PTH`, although `DATASET.CFG`
+declares a `PTH` database (`'PTH' | '/RNW/' | '' | '1.2' | '1'`) next to `RNW`
+(`16.12`) and `MAP` (`10.23`), plus 19 `REGION_CONFIG` entries with profile ids -
+which is what "regulation profile outlines" refers to. The next thing to find is the
+check that rejects the medium before those files are ever opened (format version,
+region/profile lookup, or a signature/`CHECK_SIGNATURE` gate).

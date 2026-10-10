@@ -5,6 +5,11 @@ use super::SysCallError;
 use std::path::PathBuf;
 use unicorn_engine::{RegisterARM, Unicorn};
 
+/// fds handed out for files below the navdata (CRYPTNAV) tree, so that reads of
+/// the navigation databases can be traced without logging every other read.
+pub static NAVDATA_FDS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
 pub fn open(unicorn: &mut Unicorn<'_, Context>, path_name: u32, flags: u32, mode: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] open(path_name = {:#x}, flags: {:#x} = {:?}, mode: {:#x}) [IN]",
@@ -231,6 +236,7 @@ fn open_internal(
                 // Everything the navdata (CRYPTNAV) tree serves the navigation
                 // database from; without this a successful read of the map data
                 // is invisible while a failed one is logged.
+                NAVDATA_FDS.lock().unwrap().insert(fd as u32);
                 log::info!(
                     "[{}] [SYSCALL] open {} flags={:#x} -> fd={} (elf={})",
                     thread,

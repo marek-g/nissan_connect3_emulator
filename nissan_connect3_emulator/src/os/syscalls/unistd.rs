@@ -194,6 +194,32 @@ pub fn read(unicorn: &mut Unicorn<'_, Context>, fd: u32, buf: u32, length: u32) 
         res
     );
 
+    if crate::os::syscalls::fcntl::NAVDATA_FDS
+        .lock()
+        .unwrap()
+        .contains(&fd)
+    {
+        // How much of a navigation database the guest actually consumes: a reader
+        // that stops after a header is rejecting the content, not missing the file.
+        let position = unicorn
+            .get_data()
+            .inner
+            .file_system
+            .lock()
+            .unwrap()
+            .stream_position(fd as i32)
+            .unwrap_or(0);
+        log::info!(
+            "[{}] [SYSCALL] read navdata fd={:#x} requested={:#x} -> {} pos={:#x} (elf={})",
+            unicorn.get_data().inner.thread_id(),
+            fd,
+            length,
+            res as i32,
+            position,
+            unicorn.get_data().elf_path.clone()
+        );
+    }
+
     res
 }
 
