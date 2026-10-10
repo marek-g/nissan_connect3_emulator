@@ -127,32 +127,22 @@ pub const WORKER_TABLE: u32 = 0x8007_50dc;
 /// themselves. The low byte is the monitor kernel object to wait on, the rest identifies
 /// the request.
 pub const SERVICE_CREATE_POOL: u32 = 0x0103_010b;
-pub const SERVICE_POOL_SIBLING: u32 = 0x0101_030b;
+pub const SERVICE_POOL_GROW: u32 = 0x0101_030b;
+pub const SERVICE_POOL_FREE: u32 = 0x0102_010b;
 pub const SERVICE_GET_TID: u32 = 0x0010_000a;
 pub const SERVICE_GET_CFN: u32 = 0x0300_030a;
 
-/// Offset in the request block of the pointer to where the result belongs. The wrapper
-/// stores the caller's argument - which is the caller's own result slot, e.g. `add r0, sp, #4`
-/// in `0x60d630` - into the first word of the block, and the continuation then reads the
-/// result back from that slot (`ldrge r0, [sp, #4]` in `0x60d674`, `ldrge r0, [sp]` in
-/// `0x5f2a3c`). Both are the same word: the first block word points at it.
-pub const REQUEST_RESULT_POINTER: u32 = 0x0;
+/// Bytes per chunk the pool allocator (`0x5f5d54`) expects the create service to hand back
+/// for it to store at `[desc + 0x18]`. It multiplies that word by chunk counts wherever it
+/// computes a region end (`end = p + n * chunk - 8`), compares request sizes against
+/// `chunk >> 2` to pick its free-list walk direction, and rounds grow requests up to it, so
+/// it is the slab granularity - not a pointer. Handing back a pointer here makes the
+/// allocator's `mla` land in unmapped space, which is how `0x5f5ed4` died.
+pub const POOL_CHUNK: u32 = 0x1000;
 
-/// Offset in the request block of the pool size the caller asked for. The caller of the
-/// wrapper at `0x60c9b0` builds its arguments with `mov r0, #0x1000000` (16 MB) and the
-/// size ends up as the third word of the block.
-pub const REQUEST_SIZE: u32 = 0x8;
-
-/// Smallest and largest pool the emulator is willing to back. The caller sizes its pool in
-/// megabytes, and the allocator links blocks across the whole of it, so a token region
-/// makes the allocator write past the end of what was mapped.
-const POOL_MIN: u32 = 0x1000;
-const POOL_MAX: u32 = 0x1000_0000;
-
-/// Bytes handed out with each emulated pool. The allocator that uses the descriptor only
-/// reaches for the pool when its limit word is non-zero, so this is padding against
-/// callers that measure the handle rather than trust the limit.
-const POOL_SLACK: u32 = 0x100;
+/// Largest single grow the emulator will back. The allocator asks for
+/// `ceil((aligned_size + 16) / POOL_CHUNK)` chunks; anything wilder is a misread block.
+const GROW_MAX_BYTES: u32 = 64 * 1024 * 1024;
 
 /// The monitor image with the uImage header stripped, read once per process.
 pub fn image() -> Option<&'static [u8]> {
@@ -504,51 +494,88 @@ fn describe(unicorn: &mut Unicorn<'_, Context>, block: u32) -> String {
 /// out-parameter read for `r0 >= 0`).
 pub fn complete(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) -> u32 {
     match service {
-        // `0x60c9d0` creates a memory pool. Its caller resumes at `0x60d674` and reads the
-        // result with `ldrge r0, [sp, #4]` from its own frame, which is four past the word
-        // the wrapper pushed its link register onto, so the result belongs at
-        // `block + 0xc`. The caller stores it into the descriptor it is initialising and
-        // hands the descriptor to the allocator, which falls back to libc while the pool
-        // limit stays zero.
-        SERVICE_CREATE_POOL | SERVICE_POOL_SIBLING => {
+        // `0x60c9d0`, called from `0x60d630`, initialises a pool descriptor: it zeroes
+        // `[desc+0x18]`/`[desc+0x20]`, stores the caller's grow callback at `[desc+0x24]`,
+        // and the resumed continuation (`0x60d674`) reads `[sp, #4]` - `block + 0xc` - and
+        // stores that into `[desc+0x18]`, which the allocator then treats as *bytes per
+        // chunk*. So this service answers with the slab granularity, not with a buffer;
+        // the buffers arrive through the grow service.
+        SERVICE_CREATE_POOL => {
+            if write_word(unicorn, block + 0xc, POOL_CHUNK).is_err() {
+                log::warn!(
+                    "monitor: cannot write the chunk size for the pool request at {:#x}",
+                    block
+                );
+                return 0xfff6_0000;
+            }
+            log::info!(
+                "monitor: pool request at {:#x} completed with chunk size {:#x}",
+                block,
+                POOL_CHUNK
+            );
+            0
+        }
+        // When the free list runs dry the allocator tail-calls the grow thunk at
+        // `[desc+0x24]` (`0x5f2a28`, and `0x60d600` for the other pool), which repacks
+        // `(chunk count, context)` into the `0x60c988` wrapper: the block is
+        // `[pointer to the result slot, chunk count, context, continuation]`, the
+        // continuation reads `[sp]` - the word `block + 0` points at - and turns a negative
+        // status into NULL with `movlt r0, #0`. The allocator initialises the whole region
+        // itself - it lays the end sentinel at `p + count * chunk - 8` and threads both
+        // nodes through it - so the region must be exactly `count * POOL_CHUNK` bytes of
+        // mapped, writable memory and nothing else. The context word is the create
+        // caller's first argument (the thunk at `0x5f2a54` passes the 16 MB pool size),
+        // so it identifies the pool, not the request.
+        SERVICE_POOL_GROW => {
+            let slot = read_word(unicorn, block).unwrap_or(0);
+            let count = read_word(unicorn, block + 4).unwrap_or(0);
+            let total = read_word(unicorn, block + 8).unwrap_or(0);
+            let size = count.saturating_mul(POOL_CHUNK);
+            if count == 0 || size > GROW_MAX_BYTES {
+                log::warn!(
+                    "monitor: refusing grow of {} chunks at {:#x} (slot {:#x}, pool {:#x})",
+                    count,
+                    block,
+                    slot,
+                    total
+                );
+                return 0xfff6_0000;
+            }
             let mmu = {
                 let data = unicorn.get_data();
                 data.mmu.clone()
             };
-            let asked = read_word(unicorn, block + REQUEST_SIZE).unwrap_or(0);
-            let size = asked.clamp(POOL_MIN, POOL_MAX);
-            let pool = mmu.lock().unwrap().heap_alloc(
+            let region = mmu.lock().unwrap().heap_alloc(
                 unicorn,
                 size,
                 Prot::READ | Prot::WRITE,
                 "[monitor-pool]",
             );
-            let slot = match read_word(unicorn, block + REQUEST_RESULT_POINTER) {
-                Ok(slot) if slot != 0 => slot,
-                _ => {
-                    log::warn!(
-                        "monitor: service {:#x} request at {:#x} has no result slot",
-                        service,
-                        block
-                    );
-                    return 0xfff6_0000;
-                }
-            };
-            if pool == 0 || write_word(unicorn, slot, pool).is_err() {
+            if region == 0 || write_word(unicorn, slot, region).is_err() {
                 log::warn!(
-                    "monitor: cannot write the pool for the request at {:#x} into {:#x}",
+                    "monitor: cannot hand out {} bytes for the grow at {:#x} into {:#x}",
+                    size,
                     block,
                     slot
                 );
                 return 0xfff6_0000;
             }
             log::info!(
-                "monitor: service {:#x} request at {:#x} completed with pool {:#x} size {:#x} into {:#x}",
-                service,
+                "monitor: grow request at {:#x} ({} chunks, pool {:#x}) completed with region {:#x}",
                 block,
-                pool,
-                size,
-                slot
+                count,
+                total,
+                region
+            );
+            0
+        }
+        // `0x60d624` hands back a grown region. The emulator never gives heap memory out
+        // again, so this service only has to acknowledge.
+        SERVICE_POOL_FREE => {
+            log::info!(
+                "monitor: free request at {:#x} acknowledged: {}",
+                block,
+                describe(unicorn, block)
             );
             0
         }

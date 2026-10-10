@@ -1066,3 +1066,30 @@ allocator's own list linking at `0x5f5ed4`, which computes
 `r1 = r7 * [desc + 0x24] + (block - 8)` and stores there. The descriptor's stride and
 limit words (`+0x24`, `+0x20`) are only zeroed by `0x60d630`, so the pool service has to
 initialise the descriptor rather than only hand back a pointer.
+
+### The pool object (0x0b) services: create returns a chunk size, grow returns the memory
+
+The `0x5f5d54` allocator and its OSAL glue (`0x5f2a28`/`0x5f2a4c`/`0x5f2a54`, plus the
+same trio `0x60d600`/`0x60d624`/`0x60d630`) split the work over three `svc #6` services:
+
+- `0x0103010b` create: `0x60d630` zeroes `[desc+0x18]`/`[desc+0x20]`, stores the caller's
+  first argument (pool size, e.g. `0x1000000`) at `[desc+0x1c]`, the grow thunk at
+  `[desc+0x24]` and the free thunk at `[desc+0x28]`, then calls the wrapper. The
+  continuation stores the result into `[desc+0x18]`, and the allocator multiplies that
+  word by chunk counts (`end = p + n * chunk - 8`) and thresholds against `chunk >> 2`:
+  the result is the **bytes-per-chunk granularity**, not a buffer. Returning a pointer
+  there is what made `0x5f5ed4` write to `mla`-garbage.
+- `0x0101030b` grow: the allocator tail-calls `[desc+0x24]`, which packs
+  `[pointer to result slot, chunk count, context, continuation]` into the `0x60c988`
+  wrapper. The continuation reads the pointer back from the word `block + 0` points at
+  and maps negative statuses to NULL (`movlt r0, #0`), so refusal must be a negative
+  status. The allocator initializes the region itself - end sentinel at
+  `p + count * chunk - 8`, both nodes threaded - so the region must be exactly
+  `count * chunk` mapped bytes.
+- `0x0102010b` free: acknowledges a returned region; the emulator never reclaims heap.
+
+Block layout of a grown region: header at `p` (`[p]` = region end sentinel address, also
+the in-use-list next), flags in `[p+4]` low bits (1 allocated, 2 block, 4 end), free
+list entries at `p+8`/`p+0xc` stored as slots (walkers dereference the slot, so
+`[node - 8]` is the in-use-list word). The user pointer is `p + 8`; `free` walks
+neighbours through the in-use list, never below `p`.
