@@ -111,3 +111,37 @@ id-0x1e (0x800203e8) = lazy VFP enable/restore (vmrs/vmsr fpexc, vldmia s0-s31).
   id 0x05: 8000bf74 <-0x8000af18   id 0x0a: 8000bfc8 <-0x8000af48
   (all other ids 0 — late registration phase never reached)
 ```
+## Embedded `sysprog*.uout` overlays (source of the unregistered objects 0x64/0x6e)
+
+`triton_mid.bin` is monolithic: after the kernel image it stores **18 loadable
+overlay modules back to back as ordinary little-endian 32-bit ARM `ET_EXEC` ELF
+files** (first at file off `0x120ec0` = `0x80120e80`, last `0x4eed80`). The
+monitor relocates and runs them at boot, which is why objects 0x64 and 0x6e have
+no static registration in the flat disassembly: their handlers are installed by
+an overlay's init. Carve them with `extract_sysprog_overlays.py`.
+
+Identified by the `SysProg*.cpp` string each embeds:
+
+| ELF (order) | overlay | size | role |
+|---|---|---|---|
+| blob0  | **sysprogosal** | 0x52600 | OSAL kernel service: message queues, pools, events, IO control |
+| blob4  | sysprogvirtio | 0xcf80  | virtio host transport |
+| blob6  | sysprogsensor | 0x755c0 | |
+| blob10 | sysprogdnl    | 0x7fd00 | DNL (navigation layer) kernel service |
+| blob12 | sysproganalysis | 0x1cb3c | performance analyser / SI (hooks `TMaxSemId`, SVC extended) |
+| blob14 | sysprogosalutil (cand.) | 0x12e00 | OSAL diagnostic shell (`MSGPOOL_*`, `OSAL_FS_*`, `EM_TRACE`) |
+| ...    | can/flash/rvc/usbf/audio/drv/filesys/spm/od/input | | device overlays |
+
+**`sysprogosal` (blob0) is the OSAL message substrate.** Its strings expose the
+message header and queue internals the whole system shares:
+- Header fields (`Check Msg:` format): `Sender, Receiver, Size, Blocks, Type,
+  s-sub, d-sub, Time, Serv-ID, Func-ID, OpCode`.
+- Queue/pool: `FFD_MSGQ`, `FFD_READ_MESSAGE_QUEUE`,
+  `OSAL_s32MessagePoolGetMinimalSize`, block allocator states
+  `Used Block / Deleted marked block / Unknown queue`.
+- Sync: `Event : %d used for OSAL Current/Max`, `IOSC_EVENT_INVALID`,
+  semaphore creation (`..._SEM`).
+
+This is the object PROCNAV hits 181x (`0x64`) and the counterpart of
+`libosal_linux`. Decoding blob0's 0x64 registration + header layout is the
+concrete path to bridging PROCNAV's IPC to the DAPIAPP `mbx_0` requests.
