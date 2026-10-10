@@ -307,6 +307,25 @@ fn handle_queue_api(
                     decoded.name
                 );
             }
+
+            if bridge_dyn_mbx_queue(
+                unicorn,
+                api_name,
+                &decoded.name,
+                r1,
+                r2,
+                r3,
+                synthetic_stack_timeout,
+            ) {
+                log::info!(
+                    "0x{:x} [{}] [LIBOSAL-DYN] {} handled name={}",
+                    addr - base_address + 0x484d8000,
+                    thread,
+                    api_name,
+                    decoded.name
+                );
+                return;
+            }
         }
     }
 }
@@ -1721,6 +1740,112 @@ fn bridge_guest_osal_queue(
                 name,
                 queue_id
             );
+            block_guest_osal_wait(
+                unicorn,
+                queue_id,
+                msg_ptr,
+                msg_len,
+                prio_ptr,
+                deadline_from_osal_timeout(timeout),
+                false,
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Post/Wait bridge for the DAPI dynamic request/reply mailboxes `DYN<n>MBX`.
+///
+/// These are IOSC-class OSAL queues (`queue_type == 3`) that DAPI uses for its
+/// internal request/response handoff (the CCA `DYN4MBX` a DAPI worker parks on
+/// for a service answer). On the unit the IOSC layer is served by the Triton
+/// monitor's OSAL-overlay object 0x64 via `svc #6`; the emulator serves 0x64 as
+/// a catch-all, so a native `DYN*MBX` wait never receives anything - the waiter
+/// times out and DAPI answers the outer client with `ServiceDataError 0x305`
+/// (observed: 13 `DYN4MBX` waits, 0 deliveries, while 12 posts pile up).
+///
+/// Only the `DYN<n>MBX` mailboxes are bridged here - deliberately NOT the whole
+/// `type == 3` class: the `Dp*` datapool and `NOIOSC*` queues are also IOSC but
+/// are handled correctly by native `libosal` in-process, and intercepting those
+/// stalls process bring-up. `DYN*MBX` traffic stays inside a single process
+/// (DAPI's own threads), so the OSAL message-reference pointer remains valid in
+/// that VM and the raw message bytes are queued and returned unchanged
+/// (`materialize = false`), letting the guest resolve its own reference.
+fn bridge_dyn_mbx_queue(
+    unicorn: &mut Unicorn<'_, Context>,
+    api_name: &str,
+    name: &str,
+    msg_ptr: u32,
+    msg_len: u32,
+    prio_ptr: u32,
+    timeout: u32,
+) -> bool {
+    if !(name.starts_with("DYN") && name.ends_with("MBX")) {
+        return false;
+    }
+    if !matches!(
+        api_name,
+        "OSAL_s32MessageQueuePost"
+            | "OSAL_s32MessageQueueWait"
+            | "OSAL_s32MessageQueuePriorityWait"
+    ) {
+        return false;
+    }
+
+    match api_name {
+        "OSAL_s32MessageQueuePost" => {
+            let data = match read_guest_buffer(unicorn, msg_ptr, msg_len as usize) {
+                Some(data) => data,
+                None => return false,
+            };
+            let accepted = {
+                let mut state = unicorn.get_data().namespace.lock().unwrap();
+                let accepted = OsalQueueService::guest_post(&mut state.mq, name, data, prio_ptr);
+                if accepted {
+                    state.notify_waiters();
+                }
+                accepted
+            };
+            if accepted {
+                return_to_caller(unicorn, 0);
+            }
+            accepted
+        }
+        "OSAL_s32MessageQueueWait" | "OSAL_s32MessageQueuePriorityWait" => {
+            let (queue_id, message) = {
+                let mut state = unicorn.get_data().namespace.lock().unwrap();
+                let queue_id = OsalQueueService::ensure_queue(&mut state.mq, name);
+                let message =
+                    OsalQueueService::pop_guest_message(&mut state.mq, queue_id, msg_len as usize);
+                if message.is_some() {
+                    state.notify_waiters();
+                }
+                (queue_id, message)
+            };
+
+            if let Some(message) = message {
+                if !message.data.is_empty()
+                    && unicorn.mem_write(msg_ptr as u64, &message.data).is_err()
+                {
+                    return false;
+                }
+                if prio_ptr != 0
+                    && unicorn
+                        .mem_write(prio_ptr as u64, &pack_u32(message.priority))
+                        .is_err()
+                {
+                    return false;
+                }
+                return_to_caller(unicorn, message.data.len() as u32);
+                return true;
+            }
+
+            if timeout == 0 {
+                return_to_caller(unicorn, 0);
+                return true;
+            }
+
             block_guest_osal_wait(
                 unicorn,
                 queue_id,
