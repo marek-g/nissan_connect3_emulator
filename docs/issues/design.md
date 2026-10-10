@@ -772,3 +772,20 @@ word (zero), sent the stub to SP 0 and produced a null PC again.
 With both fixed PROCNAV takes no null PC at all, `ServiceDataError code=0x305` is gone and
 the `mbx_1024` flood collapses from ~1M messages to 30. It still ends by exiting with
 code 1 after the handoffs and never reaches `mq_open` or the registry device.
+
+### Update: the synthesized frame is wrong for the mid-function entries
+
+The handoff now dies with `FETCH_UNMAPPED` at `PC=0x90006000`, `LR=0x90005000` (that
+handoff's trampoline), `SP=0x90005038`, `R0=0x90004000` (the previous handoff's block),
+`R1=0x103010b`, `R2=0x60d674`. `SP` sits `0x18` above the synthesized entry SP, so the
+body's epilogue popped one word past our saved link: the frame whose `r4`/`lr` it pops
+is `0x18` (or generally `0x10 + n`) below the entry point, not `0x10`.
+
+That frame is not ours to invent - for the entries starting with `cmp r0, #0` the body
+belongs to the *same function as the yielder*, so its frame is the yielder's own frame
+and the correct SP is the yielder's SP at the moment of the `svc`. Only the entries that
+start with a real prologue (`str r0, [sp]`) need a synthesized frame. The hybrid is
+therefore: prologue-shaped entry => synthesized frame; mid-function entry => resume in
+place with the caller's registers and SP, R0 = result - and before resuming, validate the
+link slot that epilogue will pop instead of letting the thread branch to whatever is
+there (the scheduler's null-PC guard is the backstop, not the answer).
