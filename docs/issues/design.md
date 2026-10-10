@@ -753,3 +753,22 @@ site (`0x5ea67c`) behave, but the last site still lands on a null link: those en
 epilogues of *other* functions, so an inline call cannot restore their frames - the
 handoff needs a per-handoff context save (the monitor's TCB role) so the yielder is
 resumed by the body returning, rather than us re-entering the body.
+
+### Update: per-handoff context frame (the monitor's TCB role)
+
+`lx_invoke_monitor_callback` now allocates one `[lx-monitor-handoff]` block per handoff
+(a handoff body can hand off again, so they cannot share a block) with three separated
+areas - trampoline at +0, the entry's own frame at +0x20, the save table at +0x40 - and
+enters the mid-function entry with SP at the locals, `r4` and the return link above them.
+The link is a trampoline that points the shared resume stub at this handoff's save table;
+the stub's `add r12, sp, #0x34` matches the table layout `R0..R11, R14, SP, resume PC`.
+
+Two bugs this exposed, both worth remembering: the save area must not sit directly above
+the body frame (the body's `add sp, #0x10 ; pop {r4, pc}` pops it as its own saved
+frame, which is how the null PC used to appear), and the trampoline's literal must be
+addressed with `ldr sp, [pc, #4]` for a word at +0xC - with `#8` it read the next page
+word (zero), sent the stub to SP 0 and produced a null PC again.
+
+With both fixed PROCNAV takes no null PC at all, `ServiceDataError code=0x305` is gone and
+the `mbx_1024` flood collapses from ~1M messages to 30. It still ends by exiting with
+code 1 after the handoffs and never reaches `mq_open` or the registry device.

@@ -592,7 +592,7 @@ fn lx_call_stub(unicorn: &mut Unicorn<'_, Context>) -> Option<u32> {
     );
     let code: [u8; 16] = [
         0x00, 0x00, 0x8d, 0xe5, // str r0, [sp]
-        0x24, 0xc0, 0x8d, 0xe2, // add r12, sp, #0x24
+        0x34, 0xc0, 0x8d, 0xe2, // add r12, sp, #0x34
         0xff, 0x4f, 0xbd, 0xe8, // pop {r0-r11, lr}
         0x00, 0xa0, 0xbc, 0xe8, // ldmia r12, {sp, pc}
     ];
@@ -630,8 +630,9 @@ fn lx_resume_at_continuation(unicorn: &mut Unicorn<'_, Context>, continuation: u
     true
 }
 
-/// Run `entry` the way the monitor would: in the caller's context, with the caller's
-/// state preserved, resuming at `resume` once the callee returns.
+/// Run `entry` the way the monitor would: the caller's state is saved aside, the
+/// entry runs on its own frame, and when it returns the caller resumes at `resume`
+/// with the callee's result in R0.
 fn lx_invoke_monitor_callback(
     unicorn: &mut Unicorn<'_, Context>,
     resume: u32,
@@ -642,7 +643,10 @@ fn lx_invoke_monitor_callback(
         return false;
     }
     if entry & 1 != 0 {
-        log::warn!("LX monitor callback entry {:#x} looks like Thumb, not handled", entry);
+        log::warn!(
+            "LX monitor callback entry {:#x} looks like Thumb, not handled",
+            entry
+        );
         return false;
     }
     let Some(stub) = lx_call_stub(unicorn) else {
@@ -654,8 +658,33 @@ fn lx_invoke_monitor_callback(
         return false;
     }
 
+    // One block per handoff, because a handoff body can itself hand off. The three
+    // areas must not be adjacent: the body walks its own stack (`add sp, #0x10`) and
+    // would otherwise pop our bookkeeping as its saved frame, which is exactly how a
+    // null PC used to be produced.
+    let mmu_arc = {
+        let data = unicorn.get_data();
+        data.mmu.clone()
+    };
+    let block = mmu_arc.lock().unwrap().heap_alloc(
+        unicorn,
+        0x100,
+        unicorn_engine::unicorn_const::Prot::READ
+            | unicorn_engine::unicorn_const::Prot::WRITE
+            | unicorn_engine::unicorn_const::Prot::EXEC,
+        "[lx-monitor-handoff]",
+    );
+    let tramp = block;
+    let body_sp = block + 0x20;
+    let table = block + 0x40;
+
+    // Save table in the layout the shared stub expects: R0..R11, R14, SP, resume PC.
     let mut saved = [0u32; 16];
     for (slot, register) in [
+        RegisterARM::R0,
+        RegisterARM::R1,
+        RegisterARM::R2,
+        RegisterARM::R3,
         RegisterARM::R4,
         RegisterARM::R5,
         RegisterARM::R6,
@@ -671,43 +700,41 @@ fn lx_invoke_monitor_callback(
     {
         saved[slot] = unicorn.reg_read(*register).unwrap_or(0) as u32;
     }
-    saved[9] = sp;
-    saved[10] = resume;
-
-    let new_sp = sp.wrapping_sub((saved.len() * 4) as u32) & !7;
+    saved[13] = sp;
+    saved[14] = resume;
     for (slot, value) in saved.iter().enumerate() {
         if unicorn
-            .mem_write((new_sp + (slot as u32 * 4)) as u64, &value.to_le_bytes())
+            .mem_write((table + (slot as u32 * 4)) as u64, &value.to_le_bytes())
             .is_err()
         {
             log::warn!(
                 "LX monitor callback refused, cannot save state at {:#x}",
-                new_sp
+                table
             );
             return false;
         }
     }
 
-    // The entry point is a mid-function address: its prologue (`push {r4, lr}` and
-    // `sub sp, #0x10`) already ran, so lay out that frame for it - the saved `r4` and
-    // the return link above the locals, with the call arguments standing in for
-    // its own `add sp, #0x10 ; pop {r4, pc}` land on the stub.
-    let body_sp = new_sp.wrapping_sub(0x10);
-    let link = [args[0], args[1], args[2], args[3], 0, 0, 0, 0];
-    for (slot, value) in link.iter().enumerate() {
+    // `ldr sp, [pc, #4] ; b <stub> ; nop ; <table>`: point the shared stub at
+    // this handoff's save table.
+    let branch = 0xea00_0000u32 | ((((stub as i32) - (tramp as i32 + 12)) >> 2) as u32 & 0x00ff_ffff);
+    let mut trampoline = Vec::with_capacity(16);
+    for word in [0xe59f_f004u32, branch, 0xe320_f000, table] {
+        trampoline.extend_from_slice(&word.to_le_bytes());
+    }
+    if unicorn.mem_write(tramp as u64, &trampoline).is_err() {
+        return false;
+    }
+
+    // The entry is a mid-function address, so give it the frame its prologue implies:
+    // locals below a saved r4 and a return link, entered with SP at the locals.
+    let mut body = [0u32; 6];
+    body[..4].copy_from_slice(&args);
+    body[4] = saved[4]; // r4
+    body[5] = tramp;
+    for (slot, value) in body.iter().enumerate() {
         if unicorn
             .mem_write((body_sp + (slot as u32 * 4)) as u64, &value.to_le_bytes())
-            .is_err()
-        {
-            return false;
-        }
-    }
-    for (offset, value) in [(0x10u32, saved[0]), (0x14, stub)] {
-        if unicorn
-            .mem_write(
-                (body_sp + offset) as u64,
-                &(value as u32).to_le_bytes(),
-            )
             .is_err()
         {
             return false;
@@ -720,7 +747,7 @@ fn lx_invoke_monitor_callback(
         (RegisterARM::R1, args[1]),
         (RegisterARM::R2, args[2]),
         (RegisterARM::R3, args[3]),
-        (RegisterARM::R14, stub),
+        (RegisterARM::R14, tramp),
     ] {
         let _ = unicorn.reg_write(register, value as u64);
     }
