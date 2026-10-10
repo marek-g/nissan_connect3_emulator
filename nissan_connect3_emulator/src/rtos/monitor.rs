@@ -15,8 +15,10 @@
 
 use crate::emulator::mmu::Mmu;
 use crate::emulator::context::Context;
+use crate::emulator::memory_map::MQ_NOTIFY_EXIT_STUB;
+use crate::emulator::thread::{GuestThread, ThreadStatus};
 use unicorn_engine::unicorn_const::Prot;
-use unicorn_engine::Unicorn;
+use unicorn_engine::{RegisterARM, Unicorn};
 
 /// Where the firmware keeps the monitor. Read-only by rule: nothing here writes to it.
 pub const IMAGE_PATH: &str =
@@ -67,7 +69,13 @@ pub const TCB: u32 = 0x8054_0100;
 /// Service stacks taken through `[[0x805118e0]]` by `svc #0` and `svc #4`.
 pub const SERVICE_STACK_POINTER: u32 = 0x8051_18e0;
 pub const SERVICE_STACKS: u32 = 0x8053_e000;
-pub const SERVICE_STACK: u32 = 0x8053_f000;
+/// Entry 0 of that table, i.e. the stack the handler switches to. It grows down from
+/// here, so it is placed at the far end of the monitor's RAM, away from the table itself.
+pub const SERVICE_STACK: u32 = 0x8055_f000;
+
+/// Scratch buffer handed to a system task in R0; the monitor passes a RAM block of its
+/// own, the emulator hands over a zeroed one.
+pub const SYSTEM_TASK_SCRATCH: u32 = 0x8055_0000;
 
 /// Page holding the replacement stubs for the coprocessor reads the emulator cannot
 /// execute. It is deliberately the page right above [`TIB`], so a stub can reach
@@ -185,6 +193,7 @@ pub fn attach(unicorn: &mut Unicorn<'_, Context>) -> bool {
     }
 
     let sites = install_cp15_shim(unicorn);
+    spawn_system_tasks(unicorn);
 
     log::info!(
         "monitor: Triton monitor mapped at {:#x} ({} bytes), service table at {:#x}, message pump at {:#x}, {} coprocessor sites rewritten",
@@ -346,6 +355,59 @@ fn cp15_action(mnemonic: &str, ops: &str) -> Option<(u32, Cp15)> {
         ("c13", "4", true) => Some((destination, Cp15::Indirect(TIB + 4))),
         _ => Some((destination, Cp15::Nop)),
     }
+}
+
+/// Start the monitor's system tasks as ordinary guest threads, the way `svc #4` would:
+/// the task is entered on the service stack with the scratch block in R0 and the task
+/// number tagged into R1. Task 1, the message pump, is the producer behind the deferred
+/// work the Linux side waits for with `svc #6`, so it has to run on the same core as the
+/// process it serves.
+fn spawn_system_tasks(unicorn: &mut Unicorn<'_, Context>) {
+    let parent_context = match unicorn.context_init() {
+        Ok(context) => context,
+        Err(_) => return,
+    };
+    for task in [MESSAGE_PUMP_TASK] {
+        let registers = [
+            (RegisterARM::SP as i32, SERVICE_STACK as u64),
+            (RegisterARM::R0 as i32, SYSTEM_TASK_SCRATCH as u64),
+            (RegisterARM::R1 as i32, (0x8000_0000u64 | (task as u64) << 16) | 0),
+            (RegisterARM::R14 as i32, MQ_NOTIFY_EXIT_STUB as u64),
+            (RegisterARM::PC as i32, MESSAGE_PUMP as u64),
+        ];
+        let mut usable = true;
+        for (register, value) in registers {
+            if unicorn.reg_write(register, value).is_err() {
+                usable = false;
+            }
+        }
+        if !usable {
+            return;
+        }
+        let Ok(task_context) = unicorn.context_init() else {
+            break;
+        };
+        let tid = unicorn
+            .get_data()
+            .next_thread_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        unicorn.get_data().threads.lock().unwrap().push(GuestThread {
+            id: tid,
+            status: ThreadStatus::Runnable,
+            cpu_context: Some(task_context),
+            pc: MESSAGE_PUMP,
+            pending_result: None,
+            clear_child_tid: None,
+        });
+        log::info!(
+            "monitor: system task {} running as thread [{}] at {:#x} on stack {:#x}",
+            task,
+            tid,
+            MESSAGE_PUMP,
+            SERVICE_STACK
+        );
+    }
+    let _ = unicorn.context_restore(&parent_context);
 }
 
 /// `b` from `from` to `to`, both 4-byte aligned and within 32 MB of each other.
