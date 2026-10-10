@@ -569,6 +569,8 @@ fn lx_scratch_page(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     page
 }
 
+const LX_HANDOFF_STACK_SIZE: u32 = 0x10000;
+
 /// Stub that finishes a monitor callback: it stores the callee's result into the
 /// saved R0 slot, then restores the caller's registers plus SP and resume address,
 /// so the detour through the callback is invisible apart from the result.
@@ -777,7 +779,8 @@ fn lx_invoke_monitor_callback(
         let data = unicorn.get_data();
         data.mmu.clone()
     };
-    let block = mmu_arc.lock().unwrap().heap_alloc(
+    let mut alloc = mmu_arc.lock().unwrap();
+    let block = alloc.heap_alloc(
         unicorn,
         0x100,
         unicorn_engine::unicorn_const::Prot::READ
@@ -785,9 +788,22 @@ fn lx_invoke_monitor_callback(
             | unicorn_engine::unicorn_const::Prot::EXEC,
         "[lx-monitor-handoff]",
     );
+    // The body runs calls and can yield again, so it needs a stack of its own - with a
+    // single page the nested handoff ended up popping past the end of our block.
+    let body_stack = alloc.heap_alloc(
+        unicorn,
+        LX_HANDOFF_STACK_SIZE,
+        unicorn_engine::unicorn_const::Prot::READ
+            | unicorn_engine::unicorn_const::Prot::WRITE
+            | unicorn_engine::unicorn_const::Prot::EXEC,
+        "[lx-monitor-stack]",
+    );
+    drop(alloc);
+
     let tramp = block;
     let locals = lx_entry_frame_size(unicorn, entry);
-    let body_sp = block + 0x20;
+    let body_sp =
+        (body_stack + LX_HANDOFF_STACK_SIZE - 0x100 - locals) & !7;
     let table = block + 0x40;
 
     // Save table in the layout the shared stub expects: R0..R11, R14, SP, resume PC.
@@ -835,6 +851,12 @@ fn lx_invoke_monitor_callback(
         trampoline.extend_from_slice(&word.to_le_bytes());
     }
     if unicorn.mem_write(tramp as u64, &trampoline).is_err() {
+        return false;
+    }
+    // Same stub at the bottom of the coroutine stack: the epilogues that end a
+    // coroutine branch to a landing address on that stack, and it must hand control
+    // back to the yielder instead of faulting.
+    if unicorn.mem_write(body_stack as u64, &trampoline).is_err() {
         return false;
     }
 

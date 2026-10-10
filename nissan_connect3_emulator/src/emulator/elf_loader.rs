@@ -220,7 +220,9 @@ fn setup_stack(
         unicorn,
         STACK_BASE,
         STACK_SIZE,
-        Prot::READ | Prot::WRITE,
+        // The LX runtime puts its monitor-return stub on the stack (seen at
+        // 0x7ff3cfe0 in PROCNAV), so a Linux-style NX stack breaks coroutine exit.
+        Prot::READ | Prot::WRITE | Prot::EXEC,
         "[stack]",
         "",
     );

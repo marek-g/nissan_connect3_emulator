@@ -864,3 +864,21 @@ by handoff 3 the yielder's frame lives inside a block we allocated and reuse per
 Per-handoff blocks are therefore still the wrong unit: a coroutine needs one stack
 allocated when the coroutine starts and reused for all of its handoffs, which is what
 `[TCB+0xe0]` context frames are on the real monitor.
+
+### Update: executable stacks make PROCNAV fault-free (and it now hangs instead)
+
+Two fidelity fixes: the process stack is mapped `PROT_READ|WRITE|EXEC` (the LX runtime
+keeps its monitor-return stub on the app stack, `0x7ff3cfe0`), and each handoff gets a
+real 64 KiB executable coroutine stack plus the same landing stub at its bottom - because
+the epilogues that end a coroutine branch to a landing address *on that stack*, which is
+exactly what `FETCH_UNMAPPED`/`FETCH_PROT` at `block + 0x1000` had been reporting.
+
+Result: PROCNAV no longer takes any execution error, no null PC, no exit. The control
+blocks of the nested handoffs now point into their parent's coroutine stack with clean
+zero slots, i.e. the nesting is consistent. What changed is the failure mode: after the
+third handoff thread 18 goes completely silent - no syscall, no park report, no
+spin-watch sample with `EMU_QUANTUM_TIMEOUT_US=1000000`, no `Execution error`, no exit -
+so its host thread is neither in `emu_start`, nor parked, nor terminating; it is stuck
+somewhere between quanta (or on a host lock). Attaching gdb to confirm is blocked by
+`ptrace_scope`, so the next step is a host-side heartbeat inside `run_process_loop`
+(log the loop tick per process) to tell "stuck in a call" from "spinning in the loop".
