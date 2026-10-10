@@ -841,3 +841,26 @@ Concrete next step, no guessing left: at each handoff, write our resume trampoli
 at, make that page executable (add PROT_EXEC to the stack mapping, or map a small
 executable landing area and point the slot at it), and enter the epilogue with the
 caller's SP as it already is - no synthesized frame at all.
+
+### Update: per-entry frame geometry decoded, one coroutine still needs a real stack
+
+`lx_entry_frame_size` reads the entry code and commits on the first instruction that
+picks a stack discipline: `push`/`bl`/`bx` or a call means the entry brings its own frame
+(`locals = 0`), while touching `[sp, #imm]` / popping means the frame belongs to us and its
+size is the `add sp, sp, #imm` that precedes the `pop` (prefix matching is required, since
+the reads are conditional: `ldrge r0, [sp, #4]`). The sites come out as:
+
+```
+0x5e8ab4  locals = 0x00   (mov lr, pc ; bx r3 - returns through lr)
+0x5ea67c  locals = 0x00   (str r0,[sp] ; bl ... ; subs r4, r0, #0 - sets up its own)
+0x60d674  locals = 0x10   (cmp r0,#0 ; ldrge r0,[sp,#4] ; add sp,#0x10 ; pop {r4, pc})
+```
+
+That removes the guessed frame size and there is no null PC any more, but the third site
+still ends in `FETCH_UNMAPPED` at `0x90006000` with `SP = 0x90005038`, one block page
+below its own trampoline. The reason is visible in its control block: its `r0` was
+`0x90003000`, i.e. *our previous handoff block* - the body of handoff 2 yielded again, so
+by handoff 3 the yielder's frame lives inside a block we allocated and reuse per handoff.
+Per-handoff blocks are therefore still the wrong unit: a coroutine needs one stack
+allocated when the coroutine starts and reused for all of its handoffs, which is what
+`[TCB+0xe0]` context frames are on the real monitor.

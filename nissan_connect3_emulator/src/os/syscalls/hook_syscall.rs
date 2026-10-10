@@ -105,10 +105,10 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         // NX stack.
         lx_log_handoff(unicorn, args[0], args[2]);
         restore_callee_saved_regs(unicorn, saved_callee_saved);
-        if lx_resume_at_continuation(unicorn, args[2]) {
+        if lx_invoke_monitor_callback(unicorn, pc, args[2], args) {
             return;
         }
-        if lx_invoke_monitor_callback(unicorn, pc, args[2], args) {
+        if lx_resume_at_continuation(unicorn, args[2]) {
             return;
         }
         let scratch = lx_scratch_page(unicorn);
@@ -695,6 +695,52 @@ fn lx_resume_at_continuation(unicorn: &mut Unicorn<'_, Context>, continuation: u
     true
 }
 
+/// Byte offset from the entry SP to the saved `r4` / link that the entry's epilogue
+/// pops, decoded from its own code. Entries are mid-function addresses, so the frame
+/// size belongs to them and not to us: `add sp, sp, #imm` right before a
+/// `pop {..., pc}` names it. Falls back to `0x10` when nothing matches.
+fn lx_entry_frame_size(unicorn: &mut Unicorn<'_, Context>, entry: u32) -> u32 {
+    use capstone::arch::arm::ArchMode;
+    use capstone::prelude::*;
+    use capstone::{Capstone, Endian};
+
+    let mut code = [0u8; 256];
+    if unicorn.mem_read(entry as u64, &mut code).is_err() {
+        return 0x10;
+    }
+    let Ok(cs) = Capstone::new().arm().mode(ArchMode::Arm).endian(Endian::Little).build()
+    else {
+        return 0x10;
+    };
+    let Ok(insns) = cs.disasm_all(&code, entry as u64) else {
+        return 0x10;
+    };
+    // The first instruction that commits to a stack discipline decides it: a `push`,
+    // a call or a tail jump means the entry brings its own frame (nothing to build),
+    // while touching `[sp, #imm]` or popping right away means the frame is ours.
+    let mut last_add_sp = None;
+    for insn in insns.iter() {
+        let mnemonic = insn.mnemonic().unwrap_or("");
+        let ops = insn.op_str().unwrap_or("");
+        if mnemonic == "add" && ops.starts_with("sp, sp, #") {
+            if let Ok(value) = u32::from_str_radix(ops.rsplit('#').next().unwrap_or(""), 16) {
+                last_add_sp = Some(value);
+            }
+            continue;
+        }
+        if mnemonic == "pop" && ops.contains("pc") {
+            return last_add_sp.unwrap_or(0x10);
+        }
+        // Conditional mnemonics keep their stem (`ldrge r0, [sp, #4]` still reads the
+        // incoming frame), so compare prefixes rather than exact names.
+        let reads_stack = ops.contains("[sp") && mnemonic.starts_with("ldr");
+        if !reads_stack && (matches!(mnemonic, "push" | "bl" | "bx") || ops.contains("[sp")) {
+            return 0;
+        }
+    }
+    0
+}
+
 /// Run `entry` the way the monitor would: the caller's state is saved aside, the
 /// entry runs on its own frame, and when it returns the caller resumes at `resume`
 /// with the callee's result in R0.
@@ -740,6 +786,7 @@ fn lx_invoke_monitor_callback(
         "[lx-monitor-handoff]",
     );
     let tramp = block;
+    let locals = lx_entry_frame_size(unicorn, entry);
     let body_sp = block + 0x20;
     let table = block + 0x40;
 
@@ -793,18 +840,32 @@ fn lx_invoke_monitor_callback(
 
     // The entry is a mid-function address, so give it the frame its prologue implies:
     // locals below a saved r4 and a return link, entered with SP at the locals.
-    let mut body = [0u32; 6];
-    body[..4].copy_from_slice(&args);
-    body[4] = saved[4]; // r4
-    body[5] = tramp;
+    // Locals, then the saved r4 and the link the epilogue pops. With no frame at all
+    // (a return through lr), the link has to be in LR instead.
+    let mut body = vec![0u32; (locals / 4) as usize + 2];
+    for (slot, value) in args.iter().take((locals / 4) as usize).enumerate() {
+        body[slot] = *value;
+    }
+    body[(locals / 4) as usize] = saved[4]; // r4
+    body[(locals / 4) as usize + 1] = tramp;
     for (slot, value) in body.iter().enumerate() {
         if unicorn
-            .mem_write((body_sp + (slot as u32 * 4)) as u64, &value.to_le_bytes())
+            .mem_write(
+                (body_sp + (slot as u32 * 4)) as u64,
+                &value.to_le_bytes(),
+            )
             .is_err()
         {
             return false;
         }
     }
+    log::info!(
+        "LX handoff entry {:#x} runs with locals={:#x} sp={:#x} link={:#x}",
+        entry,
+        locals,
+        body_sp,
+        tramp
+    );
 
     let _ = unicorn.reg_write(RegisterARM::R13, body_sp as u64);
     for (register, value) in [
