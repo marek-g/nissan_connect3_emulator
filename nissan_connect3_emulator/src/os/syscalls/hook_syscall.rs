@@ -53,6 +53,21 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         return;
     }
 
+    // PROCNAV is statically linked, so none of the library-level traces cover it
+    // and it looks silent while it is really sitting in a syscall we do not log.
+    // Trace every syscall of that one process instead of guessing.
+    if unicorn.get_data().elf_path.contains("/navbin/") {
+        log::info!(
+            "[{}] NAVBIN syscall #{} args {:#x} {:#x} {:#x} (pc={:#x})",
+            unicorn.get_data().thread_id(),
+            unicorn.get_syscall_number(),
+            unicorn.get_u32_arg(0),
+            unicorn.get_u32_arg(1),
+            unicorn.get_u32_arg(2),
+            pc
+        );
+    }
+
     // table:
     // - https://marcin.juszkiewicz.com.pl/download/tables/syscalls.html
     // - https://github.com/qilingframework/qiling/blob/master/qiling/os/linux/map_syscall.py

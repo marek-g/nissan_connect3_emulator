@@ -566,3 +566,36 @@ Two things settled:
   First thing to find next: what PROCNAV's main thread waits on before it opens its
   mailboxes (it is silent in a way that futex/poll waits, which we do not log, would
   explain - add temporary logging there rather than guessing).
+
+### Update: why PROCNAV stops right after it starts (syscall trace)
+
+With a per-process syscall trace (`NAVBIN syscall` in `hook_syscall.rs`) PROCNAV is
+not silent at all - it makes exactly ten syscalls and dies:
+
+```
+brk, uname, mmap2 x2, #33, then #983045 (0xF0005, a stub svc),
+then four calls of "syscall #0" from pc=0x62ef90, then
+[16] thread exited with code 1  and  Execution error: FETCH_PROT at 0x7ff3cfe0
+```
+
+The `#0` calls are not Linux syscalls. The call site is a two-instruction ARM stub:
+
+```
+0x62ef88  push {r4, lr}
+0x62ef8c  svc  #6
+0x62ef90  pop  {r4, pc}
+```
+
+so the call number is the *immediate* of `svc`, not R7 (R7 is whatever the caller
+left behind - here 0, which is why we reported the unimplemented syscall #0). Its
+caller passes `r0 = sp`, `r1` = a version-like id (`0x50312`, `0x3010a`, `0x60112`)
+and `r2` = a code pointer (`0x5e8ab4`, `0x5f2824`), which reads like a component
+registration handshake (id+version+entry), not a filesystem or IPC operation.
+Around `0x62efac` the words are themselves ARM encodings (`0xe92d4008`,
+`0xe59f1010`, `0xe58d0000`), i.e. this area holds generated stub fragments.
+
+So PROCNAV needs the service ABI that `svc #imm` selects (LX monitor / dual-OS call
+layer that statically linked processes use instead of `libtrace_dualos`), and it
+aborts as soon as that call is unanswered. Next step is to dump every distinct
+`svc #imm` in the image, find the table the immediate indexes, and answer those
+calls at syscall level (return a value, do not freeze on the first one).
