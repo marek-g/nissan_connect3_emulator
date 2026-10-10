@@ -79,3 +79,31 @@ Correction to earlier sessions: the "PROCNAV road-network server / mbx_0" theory
 was wrong. PROCNAV is healthy and uninvolved; nav/map data is procmapengine via
 the DAPI CCA broker, and that path is now mostly functional - `0x305` is a small
 residual, not a total outage.
+
+### Update: the `DYN*MBX` client wait is now bridged (errors 7 -> 2)
+
+Root cause of the "client `DYN4MBX` waiter times out" gap: `DYN<n>MBX` is an
+IOSC-class OSAL queue (`queue_type == 3`). Its native `libosal` implementation
+traps into the Triton monitor's OSAL-overlay object `0x64` via `svc #6`, which
+the emulator serves as a catch-all - so a native `DYN*MBX` wait never receives
+(r166: 13 waits, 0 deliveries, while posts pile up), and DAPI answers the outer
+client with `0x305`.
+
+Fix (`bridge_dyn_mbx_queue`, `message.rs`): name-gated `Post`/`Wait` bridge onto
+the existing host `MqState`. `DYN*MBX` traffic stays within one process (DAPI's
+own threads), so the OSAL message-reference pointer is valid in that VM and the
+raw bytes are queued/returned unchanged (`materialize = false`).
+
+Do NOT gate this on `queue_type == 3`: the `Dp*` datapool queues and `NOIOSC*`
+queues are also IOSC but are handled correctly by native `libosal` in-process,
+and intercepting those stalls bring-up (broad `type==3` gate made procbaselx loop
+forever on `Dp00000001` and collapsed the run to ~676 lines). The narrow name
+gate is what makes it safe.
+
+Validated r168 vs r166: `ServiceDataError` 7 -> 2 (`0x502x4` and `0x501x1` gone,
+both were `DYN*MBX` timeouts that now resolve), run length 1.03M -> 1.07M lines,
+`DYN4MBX` 20 posts + 27 waits handled, 0 execution errors, 0 exits/panics. Map
+flow counters unchanged. Remaining `0x305x2` is a *different, early-startup*
+path: on thread [36] right after `amt::bAllocateMessage` ->
+`OSAL_s32MessageCreate(pool, size=0x22)` (log lines ~11.5k/12.8k of 1M), before
+the responder peer is up - a startup race, not the `DYN*MBX` wait.
