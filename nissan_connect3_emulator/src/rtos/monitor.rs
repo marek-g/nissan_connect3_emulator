@@ -69,6 +69,11 @@ pub const SERVICE_STACK_POINTER: u32 = 0x8051_18e0;
 pub const SERVICE_STACKS: u32 = 0x8053_e000;
 pub const SERVICE_STACK: u32 = 0x8053_f000;
 
+/// Page holding the replacement stubs for the coprocessor reads the emulator cannot
+/// execute. It is deliberately the page right above [`TIB`], so a stub can reach
+/// `[TIB + 4]` with one PC-relative load.
+pub const TRAMPOLINES: u32 = 0x8054_1000;
+
 /// Globals the boot code of the real unit pre-fills before entering the monitor; the
 /// probe harness had to seed the same three to get past the dual-core handoff.
 pub const DUAL_CORE_SKIP: u32 = 0x8051_7004;
@@ -138,7 +143,8 @@ pub fn attach(unicorn: &mut Unicorn<'_, Context>) -> bool {
             unicorn,
             CODE_END,
             RAM_END - CODE_END,
-            Prot::READ | Prot::WRITE,
+            // Executable as well, because [`TRAMPOLINES`] lives in this region.
+            Prot::READ | Prot::WRITE | Prot::EXEC,
         );
     }
 
@@ -168,6 +174,9 @@ pub fn attach(unicorn: &mut Unicorn<'_, Context>) -> bool {
         (DEVICE_REGISTRY, DEVICE_REGISTRY_VALUE),
         (SERVICE_STACK_POINTER, SERVICE_STACKS),
         (SERVICE_STACKS, SERVICE_STACK),
+        // Before the monitor stores its tagged form, the thread slot already points at
+        // the single thread the emulator gives it.
+        (TIB + 4, TCB),
     ] {
         if write_word(unicorn, address, value).is_err() {
             log::warn!("monitor: cannot seed the word at {:#x}", address);
@@ -175,14 +184,174 @@ pub fn attach(unicorn: &mut Unicorn<'_, Context>) -> bool {
         }
     }
 
+    let sites = install_cp15_shim(unicorn);
+
     log::info!(
-        "monitor: Triton monitor mapped at {:#x} ({} bytes), service table at {:#x}, message pump at {:#x}",
+        "monitor: Triton monitor mapped at {:#x} ({} bytes), service table at {:#x}, message pump at {:#x}, {} coprocessor sites rewritten",
         MONITOR_BASE,
         image.len(),
         SERVICE_TABLE,
-        MESSAGE_PUMP
+        MESSAGE_PUMP,
+        sites
     );
     true
+}
+
+/// Rewrite the coprocessor accesses the emulator cannot execute.
+///
+/// The monitor reads its thread slot with `mrc p15,0,r12,c13,c0,3` and stores the thread
+/// control block back with the matching `mcr`. Unicorn implements neither the banked TLS
+/// registers nor the SPSR semantics, so every coprocessor instruction is replaced at
+/// attach time:
+///
+/// * `mrc ...,c13,c0,3` becomes a branch to a stub loading the [`TIB`] address,
+/// * `mrc ...,c13,c0,4` becomes a stub loading the word at `[TIB + 4]`, i.e. the thread
+///   control block the monitor stores there,
+/// * every other coprocessor access (cache maintenance, wait-for-interrupt, the `mcr`
+///   write-back) becomes a `nop`, which leaves `[TIB + 4]` holding the plain thread
+///   control block pointer instead of the tagged form the monitor would have written.
+///
+/// Returns how many sites were rewritten.
+pub fn install_cp15_shim(unicorn: &mut Unicorn<'_, Context>) -> usize {
+    use capstone::arch::arm::ArchMode;
+    use capstone::prelude::*;
+    use capstone::{Capstone, Endian};
+
+    let Ok(cs) = Capstone::new().arm().mode(ArchMode::Arm).endian(Endian::Little).build() else {
+        return 0;
+    };
+
+    let mut rewritten = 0usize;
+    let mut stub = TRAMPOLINES;
+    let mut chunk = [0u8; 0x4000];
+
+    for page in (MONITOR_BASE..CODE_END).step_by(chunk.len()) {
+        let Ok(()) = unicorn.mem_read(page as u64, &mut chunk) else {
+            continue;
+        };
+        // Literal pools and jump tables sit between functions, so decoding stops in the
+        // middle of a chunk routinely. Resume after whatever was decoded instead of
+        // dropping the rest of the page.
+        let mut offset = 0usize;
+        while offset + 4 <= chunk.len() {
+            let decoded = match cs.disasm_all(&chunk[offset..], (page + offset as u32) as u64) {
+                Ok(insns) => insns,
+                Err(_) => {
+                    offset += 4;
+                    continue;
+                }
+            };
+            let mut reached = offset;
+            for insn in decoded.iter() {
+                reached = (insn.address() as u32 - page) as usize + 4;
+                let Some((target, value)) =
+                    cp15_action(insn.mnemonic().unwrap_or(""), insn.op_str().unwrap_or(""))
+                else {
+                    continue;
+                };
+                let address = insn.address() as u32;
+                if rewrite_cp15_site(unicorn, value, target, address, stub) {
+                    stub += match value {
+                        Cp15::Constant(_) => 12,
+                        _ => 8,
+                    };
+                    rewritten += 1;
+                }
+            }
+            offset = if reached > offset { reached } else { offset + 4 };
+        }
+    }
+    rewritten
+}
+
+/// Replace one coprocessor instruction, either with a `nop` or with a branch to a stub
+/// placed at `stub`. Returns whether the site was rewritten.
+fn rewrite_cp15_site(
+    unicorn: &mut Unicorn<'_, Context>,
+    action: Cp15,
+    target: u32,
+    address: u32,
+    stub: u32,
+) -> bool {
+    match action {
+        Cp15::Nop => {
+            return unicorn
+                .mem_write(address as u64, &0xe320_f000u32.to_le_bytes())
+                .is_ok();
+        }
+        Cp15::Constant(value) => {
+            // ldr rD, [pc] ; b site + 4 ; .word value
+            let loaded = 0xe59f_0000u32 | target << 12;
+            let layout = [loaded, branch_to(address + 4, stub + 4), value];
+            let bytes: Vec<u8> = layout.iter().flat_map(|word| word.to_le_bytes()).collect();
+            if unicorn.mem_write(stub as u64, &bytes).is_err() {
+                return false;
+            }
+        }
+        Cp15::Indirect(base) => {
+            // The trampoline page is the one right above the thread slot, so the word is
+            // always within PC-relative load range.
+            let signed = base as i64 - (stub as i64 + 8);
+            if signed.unsigned_abs() > 0xfff {
+                return false;
+            }
+            let load = if signed < 0 { 0xe51f_0000 } else { 0xe59f_0000 }
+                | target << 12
+                | signed.unsigned_abs() as u32;
+            let bytes: Vec<u8> = [load, branch_to(address + 4, stub + 4)]
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect();
+            if unicorn.mem_write(stub as u64, &bytes).is_err() {
+                return false;
+            }
+        }
+    }
+    unicorn
+        .mem_write(address as u64, &branch_to(stub, address).to_le_bytes())
+        .is_ok()
+}
+
+/// What a coprocessor instruction has to be replaced with.
+#[derive(Clone, Copy)]
+enum Cp15 {
+    Nop,
+    Constant(u32),
+    Indirect(u32),
+}
+
+impl Cp15 {
+    fn constant(&self) -> u32 {
+        match self {
+            Cp15::Constant(value) => *value,
+            _ => 0,
+        }
+    }
+}
+
+/// Classify one disassembled coprocessor instruction into `(destination register, action)`.
+fn cp15_action(mnemonic: &str, ops: &str) -> Option<(u32, Cp15)> {
+    if mnemonic != "mrc" && mnemonic != "mrc2" && mnemonic != "mcr" && mnemonic != "mcr2" {
+        return None;
+    }
+    let fields: Vec<&str> = ops.split(',').map(|field| field.trim()).collect();
+    // p15, opcode1, Rt, CRn, CRm, opcode2
+    if fields.len() != 6 || fields[0] != "p15" {
+        return None;
+    }
+    let destination = fields[2].strip_prefix('r')?.parse::<u32>().ok()?;
+    let is_read = mnemonic.starts_with("mrc");
+    match (fields[3], fields[5], is_read) {
+        ("c13", "3", true) => Some((destination, Cp15::Constant(TIB))),
+        ("c13", "4", true) => Some((destination, Cp15::Indirect(TIB + 4))),
+        _ => Some((destination, Cp15::Nop)),
+    }
+}
+
+/// `b` from `from` to `to`, both 4-byte aligned and within 32 MB of each other.
+fn branch_to(to: u32, from: u32) -> u32 {
+    let words = ((to as i64 - (from as i64 + 8)) >> 2) as i32;
+    0xea00_0000u32 | (words as u32 & 0x00ff_ffff)
 }
 
 fn map_pages(
