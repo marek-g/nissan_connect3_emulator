@@ -714,3 +714,16 @@ not switch a TCB, we run that body inline (host scheduler does the switching), w
 why the entry-point shape decides between resuming in place and calling through a stub.
 PROCNAV stays the RNW data source - replacing it with a service simulator is off the
 table, because we need the real binary for diagnostics once we start editing map data.
+
+### Update: PROCNAV is blocked, not spinning
+
+`run_quantum` gives a lone thread `count = 0`, i.e. `emu_start` runs until the thread
+blocks or exits, so a user-space spin loop would look like a frozen process from the
+outside. To tell the two apart, `EMU_QUANTUM_TIMEOUT_US` adds a wall-clock budget per
+quantum and dumps PC/LR/SP when it stops a run without treating it as an error.
+
+With the budget enabled (`EMU_QUANTUM_TIMEOUT_US=1000000`) the run is byte-for-byte the
+same as before and not a single spin-watch sample appears: thread 18 is never inside
+`emu_start`. PROCNAV therefore sits in our own `Blocked` state after the three `svc #6`
+handoffs - it is waiting on an emulator-side object whose wake side we do not implement,
+which is also why it never reaches `mq_open` or the registry device.

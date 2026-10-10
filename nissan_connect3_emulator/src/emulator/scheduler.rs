@@ -69,6 +69,20 @@ pub fn setup_process(
     Ok(())
 }
 
+/// Wall-clock budget per quantum in microseconds, from `EMU_QUANTUM_TIMEOUT_US`
+/// (0 disables it). Without a budget, a lone thread runs until it blocks or exits, so
+/// a user-space spin loop is invisible from the outside.
+fn spin_watch_timeout() -> u64 {
+    use std::sync::OnceLock;
+    static VALUE: OnceLock<u64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("EMU_QUANTUM_TIMEOUT_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// Run one scheduling quantum on a single process' VM: switch in its next
 /// runnable guest thread, execute up to `count` instructions (0 = until the
 /// thread blocks or exits), handle any memory fault, then switch out. Returns
@@ -107,7 +121,25 @@ fn run_quantum(
             .unwrap();
     }
 
-    let res = unicorn.emu_start(pc as u64, 0, 0, count);
+    let budget = spin_watch_timeout();
+    let res = unicorn.emu_start(pc as u64, 0, budget, count);
+
+    // A spin watch can only stop the run from the outside, which is not a fault and
+    // not an exit: sample where the thread actually is and let it run again.
+    let spin_stop = budget != 0
+        && res
+            .as_ref()
+            .err()
+            .map_or(false, |err| format!("{:?}", err).to_uppercase().contains("TIMEOUT"));
+    if spin_stop {
+            log::warn!(
+                "[{}] spin watch: pc={:#x} lr={:#x} sp={:#x}",
+                unicorn.get_data().thread_id(),
+                unicorn.reg_read(RegisterARM::PC).unwrap_or(0),
+                unicorn.reg_read(RegisterARM::R14).unwrap_or(0),
+                unicorn.reg_read(RegisterARM::R13).unwrap_or(0)
+            );
+    }
 
     // a memory fault captured by the mem hook? With the VM stopped we can now read
     // registers and write the signal frame. Delivery either jumps to the guest's
@@ -141,7 +173,7 @@ fn run_quantum(
                 } else if had_fault {
                     // unhandled SIGSEGV -> default action: terminate (128 + SIGSEGV)
                     thread.status = ThreadStatus::Exited(139);
-                } else if res.is_err() {
+                } else if res.is_err() && !spin_stop {
                     thread.status = ThreadStatus::Exited(1);
                 } else {
                     // timeslice simply expired
@@ -158,7 +190,7 @@ fn run_quantum(
         }
     }
 
-    if res.is_err() && !fault_handled {
+    if res.is_err() && !fault_handled && !spin_stop {
         // the VM is stopped now, so dumping memory is safe
         log::error!(
             "{:#x}: [{}] Execution error: {:?}",
