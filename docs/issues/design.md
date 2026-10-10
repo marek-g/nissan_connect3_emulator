@@ -1206,3 +1206,32 @@ static OSAL reads. Making PROCNAV serve `0x305` needs one of:
 Both are blocked on first decoding PROCNAV's own OSAL queue table layout and
 object 0x64, which needs a live table dump (the monitor's real init) rather
 than static RE.
+
+### Reframe: PROCNAV is gated in its registration phase, not missing an `mbx_0` wait
+
+Pointer-deref added to the monitor request-block dump (`describe()`/
+`dereferenced_names`) surfaced the names carried behind the pointer args of
+PROCNAV's `svc #6` (thread [18]). It shows PROCNAV never names `mbx_0` and does
+**zero** message receives: across a full run only 4 calls to the message object
+0x12 exist (2 boot-only `0x50312`), `mbx_0` wait count is 0, and every `0x64`
+(`0x1b0464`/`0x30164`/...) is a *create/register* of a named kernel object:
+
+- OSAL objects it builds at startup: `LBS_REGISTRY`, `LBS_FUEL_SERVICE_TREE`,
+  `LBS_MOVIE_SERVICE_DESC`, `GD_ThreadCommonCommunication`,
+  `RDB_DEBUGINFO_SEM`, `wdb_safecnt_XX`... (registry / LBS / DB service objects)
+- **Gating strings**: `_LICENSE` + `00000000` (an empty licence), `NAVEND`,
+  `SPM_LCN2KAI_DownloadWorkaround`, `ON_TENGINE`, `MAXPOOLSIZE`,
+  `LIBTKSE_FIRST_MEMALLOC_BLOCK`.
+
+Conclusion: the earlier model ("PROCNAV should wait on `mbx_0`, so bridge
+DAPIAPP's post to it") is wrong. PROCNAV is stuck *earlier*, in its
+SPM/licence/registry bring-up, blocked on a semaphore/event that a peer or the
+authorization path should release, so it never reaches the point of opening its
+request queue and becoming the road-network server. The `0x305` is downstream of
+that, not a name-mapping gap. The name-keyed C-bridge would therefore connect
+nothing.
+
+Next real question (supersedes the queue bridge): which semaphore/event/SPM
+handshake is `0x10030313` / the `_LICENSE`/`NAVEND`/`SPM_LCN2KAI_*` sequence
+waiting on, and who signals it on real hardware (map-card authorization via
+`/dev/cryptnav`/`/dev/prm`, the `sysprogdnl` DNL overlay, or a peer process).

@@ -492,15 +492,65 @@ fn describe(unicorn: &mut Unicorn<'_, Context>, block: u32) -> String {
             }
         })
         .collect();
+    // Some requests pass a name (a queue like `mbx_0`, a device, a service) as a pointer
+    // instead of inline, so the raw word reads as an address. Follow each pointer-shaped
+    // word one level and surface anything that looks like a NUL-terminated identifier: this
+    // is what reveals which object service carries which queue name.
+    let names = dereferenced_names(unicorn, &words);
+    let suffix = if names.is_empty() {
+        String::new()
+    } else {
+        format!(" names [{}]", names.join(", "))
+    };
+
     format!(
-        "words {} | {}",
+        "words {} | {}{}",
         words
             .iter()
             .map(|word| format!("{:#x}", word))
             .collect::<Vec<_>>()
             .join(" "),
-        text
+        text,
+        suffix
     )
+}
+
+/// For every word in the request block that looks like a pointer into the guest's address
+/// space, read what it points at and keep it if it is a plausible identifier string
+/// (`[A-Za-z][A-Za-z0-9_./-]{2,31}`, NUL terminated). Returns `w<index>->"<string>"` pairs.
+fn dereferenced_names(unicorn: &mut Unicorn<'_, Context>, words: &[u32; 8]) -> Vec<String> {
+    let mut found = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        // Treat it as a pointer only if it is in the user address range and not a small
+        // integer the caller packed into the field.
+        if *word < 0x1_0000 || *word >= 0xf000_0000 {
+            continue;
+        }
+        if let Some(name) = read_identifier(unicorn, *word) {
+            found.push(format!("w{}->{:?}", index, name));
+        }
+    }
+    found
+}
+
+/// Read up to 32 bytes at `address` and return them as a `String` only if they form a
+/// NUL-terminated run of identifier characters at least three characters long.
+fn read_identifier(unicorn: &mut Unicorn<'_, Context>, address: u32) -> Option<String> {
+    let mut bytes = [0u8; 32];
+    unicorn.mem_read(address as u64, &mut bytes).ok()?;
+    let end = bytes.iter().position(|byte| *byte == 0)?;
+    if end < 3 || end >= 32 {
+        return None;
+    }
+    let run = &bytes[..end];
+    let printable = |byte: u8| {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b'_' | b'.' | b'/' | b'-')
+    };
+    if !run[0].is_ascii_alphabetic() || !run.iter().all(|byte| printable(*byte)) {
+        return None;
+    }
+    String::from_utf8(run.to_vec()).ok()
 }
 
 /// Hand a yielded request back, the way the thread that owns the monitor object would
