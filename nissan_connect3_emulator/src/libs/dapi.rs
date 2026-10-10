@@ -426,6 +426,15 @@ fn hook_device_manager_init(unicorn: &mut Unicorn<'_, Context>, base_address: u3
 pub static MAP_MEDIUM_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// True while DAPIAPP's service registry holds a client registration of the
+/// map-data service (service 0x26, client application 0x0400). Maintained by the
+/// registry list hooks; read by the mailbox bridge, which keeps a deregistration
+/// naming a handle DAPIAPP never assigned away from a live entry - `nRemove`
+/// keys the removal on the entry it finds, not on the message, so such a message
+/// deletes whichever registration happens to exist.
+pub static MAP_DATA_CLIENT_ENTRY_LIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Wall-clock origin for the boot-timing traces (first use, i.e. early boot).
 pub static EMU_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
@@ -811,6 +820,22 @@ fn hook_service_data_scan(unicorn: &mut Unicorn<'_, Context>, base_address: u32)
                             0xff
                         },
                     );
+                }
+                // Whether DAPIAPP currently holds a client registration of the
+                // map-data service. The mailbox bridge uses this to keep a
+                // stale deregistration away from a live entry, because
+                // `fwl_List<ail_tclServiceRegistry>::nRemove` takes its key from
+                // the entry it finds rather than from the message.
+                if !is_scan
+                    && fields.len() == 5
+                    && fields[1] == 0x0026
+                    && fields[2] == 0x0400
+                {
+                    if name.contains("ADD") {
+                        MAP_DATA_CLIENT_ENTRY_LIVE.store(true, Ordering::Relaxed);
+                    } else if name.contains("REMOVE") || name.contains("NODE-DEL") {
+                        MAP_DATA_CLIENT_ENTRY_LIVE.store(false, Ordering::Relaxed);
+                    }
                 }
                 let r6 = read(RegisterARM::R6);
                 let lr = read(RegisterARM::LR);
