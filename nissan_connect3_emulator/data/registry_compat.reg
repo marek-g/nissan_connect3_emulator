@@ -280,6 +280,14 @@
 "WATCHDOG_INTERVALL"=dword:00000000
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\FC_STAT\APP_CONFIG]
+; `scd_s32GetThreadConfiguration` (PROCNAV `0x34f71a`) reads these three values under
+; the app's APP_CONFIG key while resolving a thread config; any miss zeroes the
+; config and fails `rtf::tclComponent::s32SetupThreads` (-1), which makes STAT's
+; bOnInit fail and the CCA adapter stuck in INITIALIZED. Values follow the TIMA
+; bring-up defaults seen in the trace output (ms-per-tick 2500, 120/900 ticks).
+"WDG_MSPERTICK"=dword:000009c4
+"WTICKS"=dword:00000078
+"MAXWTICKS"=dword:00000384
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\FC_STAT\SERVICES\FC_STAT]
 "SERVICEID"=dword:00000016
@@ -347,6 +355,14 @@
 "DYN1_STCK"=dword:00002710
 "DYN2_PRIO"=dword:0000004b
 "DYN2_STCK"=dword:00002710
+; STAT_tclComponent::s32Initialize -> rtf s32SetupThreads queries STAT_TASK1 through
+; scd_s32GetThreadConfiguration; a miss returns a zero config and bOnInit fails (-1).
+; The watchdog pair is the thread name + `_WTICKS`/`_MAXWTICKS` (`%s_%s` built in
+; PROCNAV `0x34f6c8`), read from the very same APP_THREAD key.
+"STAT_TASK1_PRIO"=dword:0000004b
+"STAT_TASK1_STCK"=dword:00002710
+"STAT_TASK1_WTICKS"=dword:00000078
+"STAT_TASK1_MAXWTICKS"=dword:00000384
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\WDB\APP_THREAD]
 "AE_PRIO"=dword:0000004b
