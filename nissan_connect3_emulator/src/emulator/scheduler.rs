@@ -165,7 +165,12 @@ fn run_quantum(
     }
 
     let budget = spin_watch_timeout();
-    let res = unicorn.emu_start(pc as u64, 0, budget, count);
+    // `uc_emu_start(begin)` also picks the mode: an even `begin` forces ARM even though the
+    // saved context says THUMB, so every odd (THUMB) thread entry would decode as garbage
+    // ARM. Hand the restored CPSR's T bit to `emu_start` as the address's low bit.
+    let cpsr = unicorn.reg_read(RegisterARM::CPSR).unwrap_or(0) as u32;
+    let begin = pc as u64 | u64::from((cpsr >> 5) & 1);
+    let res = unicorn.emu_start(begin, 0, budget, count);
 
     // A spin watch can only stop the run from the outside, which is not a fault and
     // not an exit: sample where the thread actually is and let it run again.
