@@ -1406,3 +1406,41 @@ and are absent from the emulator registry (the client handles the failed opens
 with defaults, exactly as on a unit without those keys), and the `0xb` lookup
 only fires once something drives PROCNAV's commcon - the `cmb_sensorfi` GPS
 provider (next work item) is still the trigger.
+
+### Sensorfi provider slice - recon notes (r175, post-0x6e)
+
+With `0x6e` served, PROCNAV's boot-time traffic was re-catalogued (r175, 45 s):
+every one of the 51 `0x5036e` ioctls is answered (42 trace class-mask `0x3`,
+7 probes, 1 `MAXPOOLSIZE` query, 1 probe-resolution) - there are **no unknown
+registry ioctls left**. The SCD `0xb` service lookup is *lazy*: nothing calls
+`scd_bGetAppIdFromServiceId` during bring-up, and within PROCNAV's static image
+there are no callers of the `scd_*` API at all (only `.dynsym` exports - the
+runtime binder that calls `scd_init` lives outside the analyzed text, reached
+through symbol resolution like the rest of the component framework). So the GPS
+unlock is not an ioctl gap either: after init PROCNAV idles in its DS message
+pump - waits on object `0x13` (`0x10200113`/`0x10220213`/`0x10030313`, ~4130
+tick cadence) backed by the bank object the `0x0203020a` resolve handed out
+(`[monitor-mbk]` page, currently truthful-empty), plus the `0x200164`/`0x210264`
+queue get/put churn around it. It publishes NavPosition only once a message
+arrives there.
+
+Concrete plan for the provider (next slice):
+
+1. Ground the bank wire format: `0x5f2ab4` -> `0x5f5af0` walk over the bank
+   object (`+0x1c` = byte count, `+0x2c` = u16 element count), the element
+   header, and what the reader consumes per element; that page is the injection
+   point the emulator already controls.
+2. Ground the real *post* path: find the sender-side tkse service (object `0x13`
+   / `0x0a` send or post ids) in the Linux processes' libtkse wrappers - if any
+   launched process ever posts to a Triton bank, the emulator learns the exact
+   message framing for free; otherwise frame it from the reader side.
+3. Ground the payload: locate `pc_tclSensorMsgHandler` (via the
+   `cmb_sensorfi_tclMsgGpsDataStatus` / `...GpsTightCouplingDataStatus` strings)
+   and extract the ServiceID/FunctionID + struct layout of the GPS status
+   message PROCNAV must receive to drive map-matching -> `posfi` NavPosition.
+4. Implement `src/rtos/sensorfi.rs` (gated `EMU_SENSORFI=1`): after PROCNAV's DS
+   registration, post a Krakow fix (~50.0614 N, 19.9456 E, grid unit =
+   deg * 11.93e6) into its bank and wake the parked `0x13` wait, mimicking app
+   `10041` (PROCMW/SENSOR). Also expect the `0x64` cmd `0x17` app-id registry
+   lookup (currently "not modelled -> not found" for id 1) to be asked for app
+   `10041` once commcon resolves the publisher - serve it from the registry.
