@@ -168,6 +168,21 @@ pub const OSAL_REGISTRY_LOOKUP: u32 = 0x17;
 pub const OSAL_CTX_RELEASE: u32 = 0x20;
 pub const OSAL_CTX_POST: u32 = 0x21;
 pub const OSAL_STATUS_FLAG: u32 = 0x43;
+/// The OSAL Event family on object 0x64 (`osal_core/osalevent.cpp`), reached by PROCNAV once
+/// the frequent context/sem commands above were answered. Same shape as the semaphore object.
+/// - `0x31` `OSAL_EventCreate` (shim `0xbd30` -> `0x58b0`): block = `{ name ptr @0,
+///   out-handle ptr @4, event param u16 @8 }`; the created handle (event control block) is
+///   written through `block @4`, returns 0.
+/// - `0x33` `OSAL_EventDelete` (shim `0xbd28` -> `0x5788`): block = `{ handle @0 }`, returns 0.
+/// - `0x34` event close/release (shim `0xbd3c` -> `0x1b59c`): block = `{ handle @0 }`, 0 on the
+///   success path PROCNAV follows.
+pub const OSAL_EVENT_CREATE: u32 = 0x31;
+pub const OSAL_EVENT_DELETE: u32 = 0x33;
+pub const OSAL_EVENT_CLOSE: u32 = 0x34;
+/// Bytes of freshly mapped guest memory handed back as an event control block. The real op
+/// (`0x58b0`) writes the name at `[cb + 0x10]` up to `0x20` bytes and a type id at `+0x34`, so
+/// `0x60` covers the layout the client may read back.
+const OSAL_EVENT_BLOCK: u32 = 0x60;
 /// Bytes of freshly mapped guest memory handed back as a semaphore control block. The real
 /// op (`0x36734`) writes the name at `[cb + 0x15]` up to `0x20` bytes, so `0x40` covers the
 /// whole layout the client may read back.
@@ -788,6 +803,8 @@ pub fn complete(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) ->
 struct OsalState {
     /// Named semaphore name -> guest control-block handle (process-global).
     sems: HashMap<String, u32>,
+    /// Named event name -> guest control-block handle (process-global).
+    events: HashMap<String, u32>,
     /// Thread id -> the value the last `0x03` stored for it (the current context).
     context: HashMap<u32, u32>,
     /// Thread id -> a dense positive OSAL task id, handed out by `0x16`.
@@ -820,6 +837,7 @@ fn complete_osal_service(
     let thread = unicorn.get_data().thread_id();
     match service >> 16 {
         OSAL_SEM_CREATE => Some(complete_osal_sem_create(unicorn, service, block)),
+        OSAL_EVENT_CREATE => Some(complete_osal_event_create(unicorn, service, block)),
         // `0x03` (`0x2e49c`): store `block[0]` as this task's current context, return 0.
         OSAL_CTX_SET => {
             let value = read_word(unicorn, block).unwrap_or(0);
@@ -880,7 +898,8 @@ fn complete_osal_service(
         // re-dispatch, the trace/log op, the always-zero status flag, and the two context
         // post/release ops that act on the `0x03`-set context. Named here so they are served
         // on their decoded contract instead of by the blind catch-all.
-        OSAL_IOSC_SERVICE | OSAL_TRACE | OSAL_STATUS_FLAG | OSAL_CTX_RELEASE | OSAL_CTX_POST => {
+        OSAL_IOSC_SERVICE | OSAL_TRACE | OSAL_STATUS_FLAG | OSAL_CTX_RELEASE | OSAL_CTX_POST
+        | OSAL_EVENT_DELETE | OSAL_EVENT_CLOSE => {
             log::info!(
                 "monitor: OSAL[{thread}] service {service:#x} (cmd {:#x}) at {block:#x} served with status 0: {}",
                 service >> 16,
@@ -890,6 +909,106 @@ fn complete_osal_service(
         }
         _ => None,
     }
+}
+
+/// Serve `OSAL_EventCreate` (cmd 49) the way `0x58b0` does: a named event whose handle (the
+/// control-block pointer) lands in the request block's output slot at `block @4`. Mirrors
+/// [`complete_osal_sem_create`]: the name is resolved through the shared registry so a name
+/// created by one process resolves to the same handle in another, and the hook never holds the
+/// lock across the map or a write.
+fn complete_osal_event_create(
+    unicorn: &mut Unicorn<'_, Context>,
+    service: u32,
+    block: u32,
+) -> u32 {
+    let name = read_word(unicorn, block).unwrap_or(0);
+    let out = read_word(unicorn, block + 4).unwrap_or(0);
+    let param = (read_word(unicorn, block + 8).unwrap_or(0) & 0xffff) as u16;
+    if out == 0 {
+        log::warn!(
+            "monitor: event create at {:#x} names a null output slot",
+            block
+        );
+        return 0xfff6_0000;
+    }
+    let name = read_identifier(unicorn, name);
+    let shared = name
+        .as_ref()
+        .and_then(|n| osal_state().lock().unwrap().events.get(n).copied());
+    let handle = match shared {
+        Some(handle) => {
+            log::info!(
+                "monitor: event create {:?} at {:#x} reuses shared handle {:#x}",
+                name.as_deref().unwrap_or("?"),
+                block,
+                handle
+            );
+            handle
+        }
+        None => {
+            let mmu = {
+                let data = unicorn.get_data();
+                data.mmu.clone()
+            };
+            let control = mmu.lock().unwrap().heap_alloc(
+                unicorn,
+                OSAL_EVENT_BLOCK,
+                Prot::READ | Prot::WRITE,
+                "[monitor-osal-event]",
+            );
+            if control == 0 {
+                log::warn!(
+                    "monitor: cannot back the event object for the create at {:#x}",
+                    block
+                );
+                return 0xfff6_0000;
+            }
+            // Mirror the control-block `0x58b0` lays down: state byte +4 = 1, event param u16
+            // at +6, max u16 +8 = 1, type id `0xc9` at +0x34, name copied 0x20 bytes at +0x10.
+            let mut object = [0u8; OSAL_EVENT_BLOCK as usize];
+            object[0x04] = 1;
+            object[0x06..0x08].copy_from_slice(&param.to_le_bytes());
+            object[0x08..0x0a].copy_from_slice(&1u16.to_le_bytes());
+            object[0x34..0x38].copy_from_slice(&0xc9u32.to_le_bytes());
+            if let Some(name) = &name {
+                for (dest, byte) in object[0x10..0x30].iter_mut().zip(name.as_bytes()) {
+                    *dest = *byte;
+                }
+            }
+            if unicorn.mem_write(control as u64, &object).is_err() {
+                log::warn!(
+                    "monitor: cannot initialise the event object at {:#x}",
+                    control
+                );
+                return 0xfff6_0000;
+            }
+            if let Some(name) = &name {
+                osal_state()
+                    .lock()
+                    .unwrap()
+                    .events
+                    .insert(name.clone(), control);
+            }
+            log::info!(
+                "monitor: event create {:?} (param {}) at {:#x} -> handle {:#x}",
+                name.as_deref().unwrap_or("?"),
+                param,
+                block,
+                control
+            );
+            control
+        }
+    };
+    if write_word(unicorn, out, handle).is_err() {
+        log::warn!(
+            "monitor: cannot write event handle {:#x} into {:#x} (service {:#x})",
+            handle,
+            out,
+            service
+        );
+        return 0xfff6_0000;
+    }
+    0
 }
 
 /// Serve `OSAL_s32SemaphoreCreate` (cmd 27) the way `0x36734` does, in the caller's own RAM:
