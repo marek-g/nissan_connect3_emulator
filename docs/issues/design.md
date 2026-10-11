@@ -1291,3 +1291,25 @@ Cheaper but non-faithful alternative (rejected for now): have the emulator answe
 the `posfi`/`statfi` CurrentPosition/NavPosition service directly with Krakow
 (infrastructure partly in `dapi.rs`). Keeps the GUI moving but the position is a
 fabrication rather than something PROCNAV computes from a GPS feed.
+
+### Addendum: the GPS/CCP path is gated behind the un-implemented 0x64 overlay
+
+Before GPS can even be consumed, PROCNAV must reach its main loop that registers
+the `posfi` NavPosition service and subscribes the `cmb_sensorfi` GPS property.
+r168 shows PROCNAV (thread [18]) never gets there: it loops on Triton monitor
+service `0x1b0464` - **object `0x64`**, the OSAL-util overlay (`sysprogosal`,
+which implements OSAL message queues / IOSC / the ail-IPC substrate) - and the
+monitor answers every call with `completed without a result` (catch-all), mixed
+with timed `0x13`/`0x0b` bank waits (a bring-up retry cadence, e.g.
+`0x10200113` = object 0x13, 4128 ticks). Because 0x64 is a no-op catch-all,
+PROCNAV's OSAL message-queue operations silently do nothing, so it never
+establishes the IPC it needs (service register, property subscribe) and never
+publishes a NavPosition.
+
+So the real root of the residual `0x305`, and of PROCNAV's silence in general, is
+the **missing 0x64 (and 0x6e) OSAL-util overlay**, not GPS and not the queue
+name-mapping. GPS injection is downstream and moot until the 0x64 overlay is
+emulated (or the specific OSAL operations PROCNAV drives through 0x64 are given
+real backing). This is the same hard gap earlier sessions hit: the recovered
+`sysprogosal` overlay loads crippled in Ghidra (1 function, overlay memory
+space, no imports), so 0x64 has never been statically decoded.
