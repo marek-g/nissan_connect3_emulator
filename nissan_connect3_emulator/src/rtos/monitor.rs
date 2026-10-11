@@ -17,6 +17,8 @@ use crate::emulator::mmu::Mmu;
 use crate::emulator::context::Context;
 use crate::emulator::memory_map::MQ_NOTIFY_EXIT_STUB;
 use crate::emulator::thread::{block_current_thread, BlockReason, GuestThread, ThreadStatus};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -131,6 +133,22 @@ pub const SERVICE_POOL_GROW: u32 = 0x0101_030b;
 pub const SERVICE_POOL_FREE: u32 = 0x0102_010b;
 pub const SERVICE_GET_TID: u32 = 0x0010_000a;
 pub const SERVICE_GET_CFN: u32 = 0x0300_030a;
+
+/// OSAL service object (`sysprogosal`, blob0). Its handler table is registered by the
+/// overlay init with `FUN_00027b00(0x64, {table @0x4c134, 99 entries})`; a `svc #6`
+/// request `r1 = (cmd << 16) | (sub << 8) | 0x64` runs `table[cmd]`, a thin shim that
+/// unpacks the request block and tail-calls the real `OSAL_*` op. See
+/// `docs/reverse_engineering/triton_mid_swi_services.md` "Object 0x64 fully decoded".
+pub const OSAL_SERVICE_OBJECT: u32 = 0x64;
+/// cmd 27: `OSAL_s32SemaphoreCreate` (`osal_core/osalsmphr.cpp:0x2e0`, shim `0xbf08` ->
+/// `0x36734`). Block = `{ name ptr @0, out-handle ptr @4, initial count @8, max count u16
+/// @0xc }`; the created handle (a pointer to the semaphore control block) is written through
+/// `block @4`. PROCNAV's single most-frequent 0x64 op - it stalls without a real handle.
+pub const OSAL_SEM_CREATE: u32 = 0x1b;
+/// Bytes of freshly mapped guest memory handed back as a semaphore control block. The real
+/// op (`0x36734`) writes the name at `[cb + 0x15]` up to `0x20` bytes, so `0x40` covers the
+/// whole layout the client may read back.
+const OSAL_SEM_BLOCK: u32 = 0x40;
 
 /// Object `0x0a` (the bank/mbk + directory service) commands. The dispatcher
 /// (`0x8004829c`) keys on `id >> 16`; the four PROCNAV issues during its DS
@@ -558,6 +576,17 @@ fn read_identifier(unicorn: &mut Unicorn<'_, Context>, address: u32) -> Option<S
 /// block, and R0 carries the status the continuation branches on (`cmp r0, #0` with the
 /// out-parameter read for `r0 >= 0`).
 pub fn complete(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) -> u32 {
+    // The OSAL service object (0x64) dispatches on `cmd = service >> 16` through the 99-entry
+    // table blob0 registers; each cmd is answered like the pool/bank services above - by
+    // reproducing the observable contract of the real `OSAL_*` leaf in the guest's own RAM.
+    // Only the cmds modelled here branch out; every other 0x64 cmd still falls through to the
+    // catch-all below, so this stays a narrow, per-cmd slice.
+    if service & 0xff == OSAL_SERVICE_OBJECT {
+        match service >> 16 {
+            OSAL_SEM_CREATE => return complete_osal_sem_create(unicorn, service, block),
+            _ => {}
+        }
+    }
     match service {
         // `0x60c9d0`, called from `0x60d630`, initialises a pool descriptor: it zeroes
         // `[desc+0x18]`/`[desc+0x20]`, stores the caller's grow callback at `[desc+0x24]`,
@@ -725,6 +754,126 @@ pub fn complete(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) ->
             0
         }
     }
+}
+
+/// Everything the OSAL service object shares across processes. Named OSAL objects (like
+/// these semaphores) are process-global on the unit, so two processes that resolve the same
+/// name must get the same handle back - hence a host-global registry rather than per-process
+/// state. Kept small and lock-fast: the lock is never held across a memory map or a write.
+#[derive(Default)]
+struct OsalSemState {
+    by_name: HashMap<String, u32>,
+}
+
+/// Process-global semaphore registry, shared by every process's monitor instance (mirrors the
+/// `pwr_proxy::global()` `OnceLock<Mutex<..>>` pattern).
+fn osal_sems() -> &'static Mutex<OsalSemState> {
+    static SEMS: OnceLock<Mutex<OsalSemState>> = OnceLock::new();
+    SEMS.get_or_init(|| Mutex::new(OsalSemState::default()))
+}
+
+/// Serve `OSAL_s32SemaphoreCreate` (cmd 27) the way `0x36734` does, in the caller's own RAM:
+/// a named, counting semaphore whose handle (the control-block pointer) lands in the request
+/// block's output slot. The name is resolved through the shared registry so a name created by
+/// one process resolves to the same handle in another. The real op never blocks, so this hook
+/// neither parks the thread nor holds a lock across the map.
+fn complete_osal_sem_create(
+    unicorn: &mut Unicorn<'_, Context>,
+    service: u32,
+    block: u32,
+) -> u32 {
+    let name = read_word(unicorn, block).unwrap_or(0);
+    let out = read_word(unicorn, block + 4).unwrap_or(0);
+    let initial = read_word(unicorn, block + 8).unwrap_or(0) as u16;
+    let max = (read_word(unicorn, block + 0xc).unwrap_or(0) & 0xffff) as u16;
+    if out == 0 {
+        log::warn!(
+            "monitor: semaphore create at {:#x} names a null output slot",
+            block
+        );
+        return 0xfff6_0000;
+    }
+    let name = read_identifier(unicorn, name);
+    // Reuse the shared handle if this process is resolving a name another already created.
+    let shared = name
+        .as_ref()
+        .and_then(|n| osal_sems().lock().unwrap().by_name.get(n).copied());
+    let handle = match shared {
+        Some(handle) => {
+            log::info!(
+                "monitor: semaphore create {:?} at {:#x} reuses shared handle {:#x}",
+                name.as_deref().unwrap_or("?"),
+                block,
+                handle
+            );
+            handle
+        }
+        None => {
+            let mmu = {
+                let data = unicorn.get_data();
+                data.mmu.clone()
+            };
+            let control = mmu.lock().unwrap().heap_alloc(
+                unicorn,
+                OSAL_SEM_BLOCK,
+                Prot::READ | Prot::WRITE,
+                "[monitor-osal-sem]",
+            );
+            if control == 0 {
+                log::warn!(
+                    "monitor: cannot back the semaphore object for the create at {:#x}",
+                    block
+                );
+                return 0xfff6_0000;
+            }
+            // Mirror the control-block `0x36734` lays down: type 1 at +4, `+6 = 0xffff`,
+            // max at +8, initial at +0xc, state byte +0xa = 1, name copied 0x20 bytes at +0x15.
+            let mut object = [0u8; OSAL_SEM_BLOCK as usize];
+            object[0x04..0x06].copy_from_slice(&1u16.to_le_bytes());
+            object[0x06..0x08].copy_from_slice(&0xffffu16.to_le_bytes());
+            object[0x08..0x0a].copy_from_slice(&max.to_le_bytes());
+            object[0x0a] = 1;
+            object[0x0c..0x0e].copy_from_slice(&initial.to_le_bytes());
+            if let Some(name) = &name {
+                for (dest, byte) in object[0x15..0x35].iter_mut().zip(name.as_bytes()) {
+                    *dest = *byte;
+                }
+            }
+            if unicorn.mem_write(control as u64, &object).is_err() {
+                log::warn!(
+                    "monitor: cannot initialise the semaphore object at {:#x}",
+                    control
+                );
+                return 0xfff6_0000;
+            }
+            if let Some(name) = &name {
+                osal_sems()
+                    .lock()
+                    .unwrap()
+                    .by_name
+                    .insert(name.clone(), control);
+            }
+            log::info!(
+                "monitor: semaphore create {:?} (init {}, max {}) at {:#x} -> handle {:#x}",
+                name.as_deref().unwrap_or("?"),
+                initial,
+                max,
+                block,
+                control
+            );
+            control
+        }
+    };
+    if write_word(unicorn, out, handle).is_err() {
+        log::warn!(
+            "monitor: cannot write semaphore handle {:#x} into {:#x} (service {:#x})",
+            handle,
+            out,
+            service
+        );
+        return 0xfff6_0000;
+    }
+    0
 }
 
 /// Enter the monitor's own SWI dispatcher for `svc #id`, the way the ARM vector would.
