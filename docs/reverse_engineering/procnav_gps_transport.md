@@ -193,3 +193,16 @@ handle + its ioctl, in `complete()` for object `0x6e`:
 Open RE before coding step 1: the OSAL handle-object layout the ioctl dispatch consumes
 (magic at `+0x00`, type at `param_1[7]`/`+0x1c`) and how `func_0x0062ef88` turns the ioctl
 into a `svc #6` (the resume frame + status contract).
+
+## Scope after instrumentation (bigger than a one-off ioctl)
+Both lookup branches bottom out in the same prerequisite: PROCNAV must be able to READ the
+registry. `scd_tclServiceAppMap::bReadData` (`0x34e3ec`, the mode-0 static map) uses the
+`reg_tclProcess/Application/Service` client iterators, which - like DAPI/procmapengine -
+reach the registry through the same OSAL IO opens. For PROCNAV (native) those are `svc #6`
+object `0x6e` (`0x1026e`), which the emulator answers with a **null handle**, so PROCNAV
+currently cannot read the registry by EITHER branch. Therefore the real work is modeling
+PROCNAV's **OSAL registry IO service on object `0x6e`** (open a `/dev/registry` path -> a
+valid OSAL handle, read/ioctl/close) against the emulator's existing registry
+(`common/registry.rs`); the sensorfi `IOControl(0xb)` answer (and every later service/app
+lookup, comm-member resolution, etc.) rides on top of that. This is a core OSAL-IO feature,
+not a sensorfi-specific shim - sensorfi is just the first thing it unblocks.
