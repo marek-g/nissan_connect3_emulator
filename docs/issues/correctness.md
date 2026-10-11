@@ -122,3 +122,14 @@ returns `r0 = 0xffff` (failure, e.g. `target_app = 0x94b1c490`), so DAPI's devic
 event subscription - a plausible part of the CCP-delivery chain - is not succeeding.
 Investigate why the subscribe returns `0xffff` (target app / device not registered)
 alongside the GPS-source work.
+
+### Correction (r204): PROCNAV's idle point is the NAVEND main loop, with FC threads live
+
+The r172 note above ("parks on a blocking take of monitor object 0x13") predates
+the FC bring-up. As of r204 PROCNAV runs the full `vStartApp`: SCD static app map
+(48 entries), NAVI/STAT/TEA/APP03/WDB instances initialised, AE/AB component
+threads alive on their message receives, and the main thread parked at the NAVEND
+event wait (OSAL `0x35` on object `0x64`) - the unit's normal idle. The GPS/CCP
+data-source conclusion stands (nothing posts position), but the wait point and the
+thread picture are different; see design.md's r191-r204 section and
+`docs/reverse_engineering/triton_mid_swi_services.md` for the chain.

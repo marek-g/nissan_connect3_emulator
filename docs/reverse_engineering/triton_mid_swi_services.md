@@ -208,27 +208,23 @@ OSAL helpers: `FUN_0002df74`=get task id, `FUN_0002c668`=get last error,
 ### cmd → op (PROCNAV's hot cmds, resolved)
 | cmd | shim | op | semantics |
 |---|---|---|---|
+| `0x02` | - | get last error | per-thread monitor error code (`0x72011` after the refused SCD probe); PROCNAV's get-last-error wrapper chain lands here (`0x20064`) |
 | `0x03` | `0xc048` | `FUN_0002e49c` | set current-task record `[+0x60] = block[0]` |
 | `0x0a` | `0xbc8c` | `FUN_0002c3e4` | status query (`FUN_00041b7c`) |
 | `0x16` | `0xbcc8` | `FUN_0002df74` | get current task/service id |
 | `0x17` | `0xbf64` | `FUN_00044e20(id, out*)` | registry App-id→descriptor lookup |
-| **`0x1b`** | `0xbf08` | **`FUN_00036734`** | **`OSAL_s32SemaphoreCreate`** (`osal_core/osalsmphr.cpp:0x2e0`) |
+| **`0x1b`** | `0xbf08` | **`FUN_00036734`** | **`OSAL_s32SemaphoreCreate`** (`osal_core/osalsmphr.cpp:0x2e0`); handle written to `block[1]`, r0 = status |
+| `0x1c` | `0x2ec06c` | semaphore open | block `[0]=name, [4]=optional handle slot`; **the handle is returned in r0** (`0` = not found). Names the unit found pre-provisioned (`AIL_TRACE_SEMAPHORE`) are lazily created by the emulator. |
 | `0x20` | `0xbf2c` | `FUN_00029500` | release/put current obj (trace class 6) |
 | `0x21` | `0xbf34` | `FUN_00029414(a,b)` | post/acquire current obj w/ param (class 5) |
+| `0x31` | `0x58b0` | event create | named event, handle written to `block[1]` |
+| `0x33`/`0x34` | - | event delete/close | status only |
+| `0x35` | `0x2ec3d4` | event wait | block `[0]=handle, [0xc]=timeout` (`0xffffffff` = forever); **must park** - see the NAVEND note below |
 | `0x43` | `0xbc20` | `FUN_0002cf88` | get/clear a status flag |
 
-**Prime blocker = cmd `0x1b` SemaphoreCreate** (PROCNAV's single most-frequent 0x64
-op, 53×, seen next to `wdb_safecnt_*`): it allocates a semaphore from the free
-list (`DAT_00053310` list head, `DAT_0004c114`=created / `DAT_0004c118`=max
-counters), fills the slot `{type@+4, state@+10, count@+8, max@+0xc, name@+0x15}`,
-and **writes the new handle into `*param_2` (= request block field `@4`)**,
-returning 0. The emulator's catch-all returns r0=0 **without writing that output
-handle**, so PROCNAV's create "succeeds" with a null semaphore; its first wait on
-it parks forever on object 0x64 - which is exactly why it never reaches the main
-loop that registers `posfi` / subscribes the combined-sensor and publishes
-NavPosition. Narrow first implementation target: back a semaphore object + fill
-`block[1]` with its handle in `complete()` (mirrors `SERVICE_CREATE_POOL`), then
-implement Wait/Post (`0x20`/`0x21`) and the rest per-cmd.
+The former prime blocker, cmd `0x1b` SemaphoreCreate, is modelled (guest control
+block + shared name→handle map + `block[1]` output), as are Wait/Post (`0x20`/
+`0x21`).
 
 ## Object 0x6e fully decoded — the OSAL IO (file) services
 
@@ -270,9 +266,25 @@ handles are self-describing and per-process by construction.
 - request `3` (`bSetU32` `0x273cbc`, `bSetString`): buffer `[0]=name, [4]=size,
   [0xc]=pointer to the data to store`.
 - request `0xa`/`0xb` probes (`scd_bTestLookupIoControl` `0x34e340`): buffer
-  `+0x100` holds a scratch u32; *not* answering `-1` with error `0x72011`/
-  `0x72015` selects PROCNAV's SCD mode 1 (`cRam01215110`), mode 0 being the
-  static registry-walk fallback.
+  `+0x100` holds a scratch u32; the probe compares the OSAL last-error (`0x20064`
+  = the get-last-error cmd, per-thread map in `OsalState`) against constants at
+  `0x34e718`/`0x34e71c` (`0x72011`/`0x72015`). The emulator refuses both probes
+  with `-1` *and* last-error `0x72011`, which classifies the platform as "can NOT
+  handle SCD Lookup" and pins PROCNAV to SCD mode 0, the static registry-walk.
+  Mode 1 (an SCD-hosted IOSC queue server) would demand a full SPM emulation and
+  was judged disproportionate. Refusing with `-1` but a stale last-error still
+  selects mode 1, so the two must move together.
+- request `0x3eb` subkey enumeration (`reg_tclRegKey` iterator `0x2c4738`, used
+  by the mode-0 SCD walk to iterate `PROCESS` -> apps -> `SERVICES`): the ioctl
+  argument *is* the caller's 0x108-byte request object (`+0` io handle, `+4` zero
+  flag, `+8..` a 0x100-byte name buffer) and the client hands out `object + 8` as
+  the name pointer (`0x2c475a`), so the answer is written into that inline buffer.
+  The call returns the subkey *following* the name currently stored there (empty
+  or stale buffer = restart at the first child), `-1` when it is the last one;
+  status `0` keeps the loop going. The walk is stateless on the emulator side -
+  keyed purely on the name the caller hands over - which is what the client's
+  re-open-per-step iterator (`0x653e8` closes and re-opens the request, moving to
+  a fresh io handle each child) requires.
 - request `0xb` service→app lookup (`scd_bGetAppIdFromServiceId` `0x34f012` at
   `0x34f084`): the service id is a u32 at `arg + 0x100`; the app id is read back
   from the *same* word (`strh r0,[r5]` of `(ushort)`). The emulator resolves it
@@ -287,6 +299,54 @@ like a device without that key (which also retires the stale-path
 `/dev/registry/P/` retries the client makes after failed opens on the real unit
 would fail the same way). `/dev/trace` opens get handles too; its ioctl `0x3`
 (class-mask setup) and writes are acknowledged/consumed. The `PROCESS\NAVAPP`
-and `FC_*/APP_CONFIG` opens genuinely fail: those keys live in the encrypted
-region files (`ni2k_*/NAVAPP.ERG`), which are not decrypted in the emulator's
-registry yet.
+keys live in the encrypted region files (`ni2k_*/NAVAPP.ERG`), which are not
+decrypted in the emulator's registry; the required shapes are fabricated in
+`data/registry_compat.reg` instead - see the FC bring-up section below.
+
+## PROCNAV FC bring-up reaches its main loop (r191-r204)
+
+With mode 0 pinned and the registry walk served, the whole `vStartApp` chain now
+runs. The gates, in the order the code demands them (`0x34f14e` gate, then each
+component's `bInitInstance`):
+
+1. `scd_bGetAppPath(appid)` non-NULL *and* `/dev/registry/.../PROCESS/<p>/<app>`
+   openable *and* an `APPID` u32 hit - else the component prints "startup
+   suppressed" (all-suppressed is what fired the old Shutdown-Event). AppIDs are
+   compiled into the init gates: NAVAPP/FC_NAVI=1, APP03=3, FC_TEA=19, FC_STAT=22,
+   WDB=23, FC_LBS=284.
+2. `scd_bCreateQueue` (an OSAL message-queue create - already modelled).
+3. `scd_bGetAppInterfaceConfiguration` (`0x34f272` family): opens `<app>\AIF_CONFIG`
+   and queries `MSG_COUNT_INTERMEDIATE_MBX` (+ watchdog); a failed open fails
+   `bInitInstance` ("Msg %d Wdt %d" prints the uninitialised outs). `80`/`0` works.
+4. `scd_s32GetThreadConfiguration` (`0x34f2d0`): opens `<app>\APP_THREAD`, queries
+   `<name>_PRIO`/`<name>_STCK`. NAVI asks `AE` then `AB`; the other components ask
+   `AE` only (TIMA/TIMA `AB`). Names are passed by the callers (no static name
+   table), so they were recovered empirically from the trace misses; unknown thread
+   names log "failed to find key <name>_PRIO".
+5. `scd_OpenQueue success for AppId = 0x..` then the worker threads: OSAL cmd
+   `0x16`-family create/spawn with entries `0x248af5` (AE, a vtable thunk) and
+   `0x24de67` (AB) - **odd entries**, which is what exposed the scheduler bug that
+   `uc_emu_start(begin)` forces ARM on an even `begin` regardless of the saved
+   CPSR. Fixed by OR-ing the restored T bit into `begin`.
+6. TIMA/APP03 reads its whole `APP_CONFIG/*` tree through
+   `ccatima_registry.cpp(635)` and falls back to coded defaults (`value: X *`) for
+   every miss - no registry work needed there.
+7. NAVEntry (`navapp_exeenv.cpp`): opens `FC_LBS\APP_CONFIG`, queries
+   `ON_TENGINE` - a *miss* aborts ProcNav with the Shutdown-Event ("No LBS-
+   'ON_TENGINE'-Value found"); `0` selects "Don't start LBS on tengine" and
+   defers FC_LBS, `1` would start it on the engine-on message.
+8. The tail of `vStartApp` (`0x53e76`) creates the `NAVEND` event (OSAL `0x31`)
+   and waits on it (OSAL `0x35`, timeout word `0xffffffff` at `block + 0xc`) -
+   that wait *is* the main loop: SPM only signals NAVEND when it tears the
+   software block down. Answering it reads as "shutdown requested" (the code then
+   unconditionally logs "Shutdown-Event occured --> remove NAVAPP sofwareblock"
+   and deinits every component), so cmd `0x35` parks the thread until woken.
+
+Run r204 (90 s): 48 apps registered once each (incl. the six fabricated NAVAPP
+apps), NAVI/STAT/TEA/APP03/CTMC/WDB pass `bInitInstance`, `scd_OpenQueue`
+succeeds per app, `AE_1`/`AB_1`/`AE_16`/`AE_13`/`AE_3`/`AB_3`/`AE_17` and the
+AIO2 pool park on their receives (`0x10240513`), the main thread idles at
+`0x350564`, and no Shutdown-Event fires. Remaining PROCNAV thread deaths are the
+one-shot helper (`exited(1)`) and the TSE command-loop thread (`exited(139)`,
+whose literal-pool "return address" teardown matches the real kernel's illtrap
+path, see the `0x60112` note in `yield_thread`).

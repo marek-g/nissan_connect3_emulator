@@ -1538,3 +1538,35 @@ Two live leads for who runs the binder (tracked in correctness.md next):
 2. `PROCDLSAVER.OUT` / `procbaselx` are in the firmware launch set but not in
    our `EMU_RTOS_START`; the real startup ordering (StartConfig*.reg) may put
    the binder before PROCNAV's consumer threads are created.
+
+### PROCNAV FC bring-up completes: component threads live, main loop at NAVEND (r191-r204)
+
+The registration-phase gating is over. With SCD pinned to mode 0 (refusing the
+`0xa`/`0xb` lookup ioctls with `-1` + last-error `0x72011`), the subkey-enumeration
+ioctl `0x3eb` served, and the NAVAPP app family fabricated in `registry_compat.reg`
+(APPID / MAXMCOUNT / MAXMSIZE / AIF_CONFIG / APP_CONFIG / SERVICES / APP_THREAD +
+`FC_LBS\APP_CONFIG\ON_TENGINE`), every FC component passes its startup gate:
+NAVI/STAT/TEA/APP03(TIMA)/WDB `bInitInstance` ok, `scd_OpenQueue` success per app,
+AE/AB worker threads created and parked on their message receives, TIMA fully up,
+and `vStartApp` idling at the NAVEND event wait (OSAL `0x35`, parked). Two fixes
+outside the registry made it work: the OSAL `0x1c` named-semaphore open (lazy
+`AIL_TRACE_SEMAPHORE`) and the scheduler THUMB-mode bug (`uc_emu_start` forces ARM
+on an even begin, killing every odd-entry FC worker thread at its first
+instruction). Full chain documented in
+`docs/reverse_engineering/triton_mid_swi_services.md` ("PROCNAV FC bring-up reaches
+its main loop").
+
+Consequences for the open threads here:
+
+- The "sensorfi stack is runtime-bound; binder never ran" analysis above is
+  superseded: the component binder *did* run (AE threads exist); the sensorfi
+  receiver threads are now reachable. GPS injection (`EMU_SENSORFI=1`,
+  `src/rtos/sensorfi.rs`) is unblocked - next milestone is verifying NavPosition
+  publish and the CCP/`0x305` effect with a Krakow-fixed position.
+- FC_LBS is deferred by `ON_TENGINE=0`; if LBS proves needed for a feature, the
+  value flips to 1 and its `APP_CONFIG` tree will surface real requirements
+  (iterate like AIF_CONFIG did).
+- Unknown `APP_THREAD\<name>` misses are benign only where the caller tolerates
+  them (TIMA defaults); a component that requires its named thread fails
+  `bInitInstance` with "failed to find key <NAME>_PRIO" - add the pair to the
+  compat file when seen.
