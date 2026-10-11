@@ -134,6 +134,53 @@ pub const SERVICE_POOL_FREE: u32 = 0x0102_010b;
 pub const SERVICE_GET_TID: u32 = 0x0010_000a;
 pub const SERVICE_GET_CFN: u32 = 0x0300_030a;
 
+/// OSAL IO object (`0x6e`): the file-shaped services (open/create/remove/close/
+/// iocontrol/read/write) that the native `OSAL_IO*` wrappers drive - PROCNAV's registry
+/// client (`reg_tclRegKey`) and SCD service map (`scd`) are the ones that matter. The
+/// service ids are the literals the wrapper shims load next to themselves
+/// (PROCNAV `0x32b7f4..0x32b818`, see `docs/reverse_engineering` notes on object `0x6e`).
+pub const OSAL_IO_OBJECT: u32 = 0x6e;
+/// `OSAL_IOOpen(path, u16 flags)`: block `[path ptr, flags @+4 (u16)]`, status carries a
+/// handle (`-1` on failure). The client (`OSAL_s32IOControl`, PROCNAV `0x32cfb4`) then
+/// demands `*[handle] == OSAL_IO_MAGIC` and takes the generic ioctl path unless
+/// `[handle + 0x1c] == 0x22`, so the handle is a real guest object, not a table index.
+pub const SERVICE_IO_OPEN: u32 = 0x0001_026e;
+/// `OSAL_s32IOClose(handle)`: block `[handle]`, status only.
+pub const SERVICE_IO_CLOSE: u32 = 0x0002_016e;
+/// `OSAL_IOCreate(path, u16 flags)`: block like open, handle back like open.
+pub const SERVICE_IO_CREATE: u32 = 0x0003_026e;
+/// `OSAL_s32IORemove(path)`: block `[path ptr]`, status only.
+pub const SERVICE_IO_REMOVE: u32 = 0x0004_016e;
+/// `OSAL_s32IOControl(handle, request, arg)`: block `[handle, request, arg]`; PROCNAV
+/// reaches it through `OSAL_s32IOControl` (`0x32cfb4`), which tail-branches into the
+/// `PRC_OSAL_s32IOControl` wrapper (`0x32b6f4`) that packs the three arguments with `stm`.
+pub const SERVICE_IO_CONTROL: u32 = 0x0005_036e;
+/// `PRC_OSAL_s32IOWrite(handle, buffer, length)`: block `[handle, buffer, length]`.
+pub const SERVICE_IO_WRITE: u32 = 0x0006_036e;
+/// `PRC_OSAL_s32IORead(handle, buffer, length)`: block `[handle, buffer, length]`.
+pub const SERVICE_IO_READ: u32 = 0x0007_036e;
+
+/// Magic word the OSAL user library checks at `*[handle]` before any IO call (`0xD0E1D0E1`,
+/// the literal at PROCNAV `0x32d11c`).
+const OSAL_IO_MAGIC: u32 = 0xd0e1_d0e1;
+
+/// Device-type word at `handle + 0x1c`. The real unit's registry device answers the request
+/// `3` (`bSetU32`) *remotely* - the client only special-cases type `0x22` locally - so any
+/// other value takes the generic svc path. Exact real value unknown; only "not 0x22" is
+/// pinned by evidence.
+const OSAL_IO_REGISTRY_TYPE: u32 = 1;
+
+/// The registry ioctl request codes, taken from the client call sites:
+/// `reg_tclRegKey::bQueryU32`/`bQueryString` (`0x273d2c`/`0x273dac`) use `1` with buffer
+/// `[name ptr, size, out count, out data ptr]` and require count `1` (u32) / `0` (string);
+/// `bSetU32` (`0x273cbc`) uses `3` with the data pointer as input; `scd_bTestLookupIoControl`
+/// (`0x34e340`) probes `0xa` and `0xb`; `scd_bGetAppIdFromServiceId` (`0x34f012`) uses `0xb`
+/// with the service id at `arg + 0x100` and the app id read back from the same word.
+const IO_REQUEST_QUERY: u32 = 1;
+const IO_REQUEST_SET: u32 = 3;
+const IO_REQUEST_LOOKUP_PROBE: u32 = 0xa;
+const IO_REQUEST_SERVICE_TO_APP: u32 = 0xb;
+
 /// OSAL service object (`sysprogosal`, blob0). Its handler table is registered by the
 /// overlay init with `FUN_00027b00(0x64, {table @0x4c134, 99 entries})`; a `svc #6`
 /// request `r1 = (cmd << 16) | (sub << 8) | 0x64` runs `table[cmd]`, a thin shim that
@@ -660,6 +707,14 @@ pub fn complete(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) ->
             return status;
         }
     }
+    // The OSAL IO object (0x6e) carries the registry client traffic (`/dev/registry/...`)
+    // and `/dev/trace`; every id on it is modelled or consciously acknowledged, so the
+    // whole object branches out here.
+    if service & 0xff == OSAL_IO_OBJECT {
+        if let Some(status) = complete_osal_io(unicorn, service, block) {
+            return status;
+        }
+    }
     match service {
         // `0x60c9d0`, called from `0x60d630`, initialises a pool descriptor: it zeroes
         // `[desc+0x18]`/`[desc+0x20]`, stores the caller's grow callback at `[desc+0x24]`,
@@ -1156,6 +1211,421 @@ fn complete_osal_sem_create(
         return 0xfff6_0000;
     }
     0
+}
+
+/// Serve an OSAL IO request on object `0x6e` the way the monitor's device layer would,
+/// backed by the emulator's shared registry (`SystemNamespace::registry`). Like the 0x64
+/// unit this reproduces the observable contract of the client side that was decoded from
+/// PROCNAV (wrappers at `0x32b66c..0x32b77c`, validation in `OSAL_s32IOControl` `0x32cfb4`):
+/// open/create hand back a guest handle object `{ +0: magic, +0x1c: type, +0x20: path }`,
+/// iocontrol dispatches on the request word, and everything else is acknowledged. The path
+/// travels *inside* the handle object, so handles from different processes can never be
+/// confused and no host-side table has to be kept in step with guest memory.
+///
+/// Returns `None` only for services on this object that are not modelled (the async pair),
+/// which keeps the catch-all log for them.
+fn complete_osal_io(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) -> Option<u32> {
+    match service {
+        SERVICE_IO_OPEN | SERVICE_IO_CREATE => {
+            let path_address = read_word(unicorn, block).ok()?;
+            let path = match read_c_string(unicorn, path_address) {
+                Some(path) => path,
+                None => {
+                    // The caller handed over an unusable path pointer (uninitialised key
+                    // object). The device could not have opened such a name either, so the
+                    // honest status is the client's "open failed" value.
+                    log::info!(
+                        "monitor: io open at {:#x} names unreadable path {:#x}, failing",
+                        block,
+                        path_address
+                    );
+                    return Some(0xffff_ffff);
+                }
+            };
+            let flags = read_word(unicorn, block + 4).unwrap_or(0) & 0xffff;
+            Some(complete_io_open_create(unicorn, service, block, path_address, &path, flags))
+        }
+        SERVICE_IO_CLOSE => {
+            let handle = read_word(unicorn, block).ok()?;
+            log::info!(
+                "monitor: io close of handle {:#x} at {:#x} acknowledged",
+                handle,
+                block
+            );
+            Some(0)
+        }
+        SERVICE_IO_REMOVE => {
+            let path_address = read_word(unicorn, block).ok()?;
+            log::info!(
+                "monitor: io remove of {:?} at {:#x} acknowledged",
+                read_c_string(unicorn, path_address),
+                block
+            );
+            Some(0)
+        }
+        SERVICE_IO_CONTROL => {
+            let handle = read_word(unicorn, block).ok()?;
+            let request = read_word(unicorn, block + 4).ok()?;
+            let argument = read_word(unicorn, block + 8).ok()?;
+            Some(complete_io_control(unicorn, handle, request, argument))
+        }
+        // Nothing on this unit reads or writes registry keys through the byte API (the
+        // client speaks iocontrol), and `/dev/trace` records go through write. Accept the
+        // write as consumed, report the read as end-of-file.
+        SERVICE_IO_WRITE => {
+            let handle = read_word(unicorn, block).ok()?;
+            let length = read_word(unicorn, block + 8).ok()?;
+            log::debug!(
+                "monitor: io write of {} bytes to handle {:#x} consumed",
+                length,
+                handle
+            );
+            Some(length)
+        }
+        SERVICE_IO_READ => {
+            let handle = read_word(unicorn, block).ok()?;
+            log::debug!("monitor: io read from handle {:#x} reports end of file", handle);
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
+/// `0x1026e`/`0x3026e`: hand back a handle object for the path. Registry keys must exist in
+/// the emulator's registry for open (create inserts them first), mirroring the device's
+/// "no such key" failure; the client treats `-1` as exactly that (`reg_tclRegKey::bOpen`
+/// only branches on it, `scd_init` falls back to its static map). Every other device path
+/// seen so far (`/dev/trace`) is modelled loosely: it gets a handle too, because the old
+/// catch-all already reported those opens as successful and its ioctls are acknowledged.
+fn complete_io_open_create(
+    unicorn: &mut Unicorn<'_, Context>,
+    service: u32,
+    block: u32,
+    path_address: u32,
+    path: &str,
+    flags: u32,
+) -> u32 {
+    let is_registry = path
+        .to_ascii_lowercase()
+        .starts_with("/dev/registry/");
+    let namespace = {
+        let data = unicorn.get_data();
+        data.namespace.clone()
+    };
+    if is_registry {
+        let exists = namespace.lock().unwrap().registry.has_path(path);
+        if service == SERVICE_IO_CREATE {
+            let created = namespace
+                .lock()
+                .unwrap()
+                .registry
+                .create_key(path);
+            log::info!("monitor: io create {:?} -> {:?}", path, created);
+        } else if !exists {
+            let mut raw = [0u8; 40];
+            let raw = match unicorn.mem_read(u64::from(path_address), &mut raw) {
+                Ok(()) => format!("{:02x?}", &raw[..]),
+                Err(_) => "unreadable".to_string(),
+            };
+            log::info!(
+                "monitor: io open of {:?} (flags {:#x}) at {:#x} (path ptr {:#x}) fails: no such key, raw {}",
+                path,
+                flags,
+                block,
+                path_address,
+                raw
+            );
+            return 0xffff_ffff;
+        }
+    } else if service == SERVICE_IO_CREATE || path.to_ascii_lowercase() != "/dev/trace" {
+        log::warn!(
+            "monitor: io {:?} of {:?} is not a modelled device, handing back a plain handle",
+            if service == SERVICE_IO_CREATE {
+                "create"
+            } else {
+                "open"
+            },
+            path
+        );
+    }
+    match alloc_io_handle(unicorn, path) {
+        Some(handle) => {
+            log::info!(
+                "monitor: io open of {:?} (flags {:#x}) completed with handle {:#x}",
+                path,
+                flags,
+                handle
+            );
+            handle
+        }
+        None => {
+            log::warn!("monitor: cannot allocate the io handle object for {:?}", path);
+            0xffff_ffff
+        }
+    }
+}
+
+/// Build the guest-side handle object: one zero-filled page with the magic the user library
+/// demands at `+0`, a device type at `+0x1c` that keeps iocontrol on the generic path, and
+/// the device path at `+0x20` (iocontrol reads it back to route the request).
+fn alloc_io_handle(unicorn: &mut Unicorn<'_, Context>, path: &str) -> Option<u32> {
+    let mmu = {
+        let data = unicorn.get_data();
+        data.mmu.clone()
+    };
+    let object = mmu.lock().unwrap().heap_alloc(
+        unicorn,
+        0x1000,
+        Prot::READ | Prot::WRITE,
+        "[monitor-osal-io]",
+    );
+    if object == 0 {
+        return None;
+    }
+    if write_word(unicorn, object, OSAL_IO_MAGIC).is_err()
+        || write_word(unicorn, object + 0x1c, OSAL_IO_REGISTRY_TYPE).is_err()
+    {
+        return None;
+    }
+    let mut bytes = path.as_bytes().to_vec();
+    bytes.truncate(0x100);
+    bytes.push(0);
+    if unicorn
+        .mem_write(u64::from(object) + 0x20, &bytes)
+        .is_err()
+    {
+        return None;
+    }
+    Some(object)
+}
+
+/// `0x5036e`: route the request by the device recorded in the handle object. Registry
+/// requests run against the shared registry; anything else is acknowledged, matching how
+/// the old catch-all answered these before real handles existed (and the SCD probes must
+/// not error, or `scd_bTestLookupIoControl` drops PROCNAV to its static lookup mode).
+fn complete_io_control(
+    unicorn: &mut Unicorn<'_, Context>,
+    handle: u32,
+    request: u32,
+    argument: u32,
+) -> u32 {
+    if handle < 0x1_0000
+        || read_word(unicorn, handle).unwrap_or(0) != OSAL_IO_MAGIC
+    {
+        log::warn!(
+            "monitor: io control {:#x} on handle {:#x} without the OSAL magic fails",
+            request,
+            handle
+        );
+        return 0xffff_ffff;
+    }
+    let path = read_c_string(unicorn, handle + 0x20).unwrap_or_default();
+    if !path
+        .to_ascii_lowercase()
+        .starts_with("/dev/registry/")
+    {
+        log::info!(
+            "monitor: io control {:#x} on device {:?} acknowledged",
+            request,
+            path
+        );
+        return 0;
+    }
+    match request {
+        IO_REQUEST_QUERY => complete_registry_query(unicorn, &path, argument),
+        IO_REQUEST_SET => complete_registry_set(unicorn, &path, argument),
+        IO_REQUEST_LOOKUP_PROBE => {
+            log::info!("monitor: registry lookup probe on {:?} answered", path);
+            0
+        }
+        IO_REQUEST_SERVICE_TO_APP => complete_service_to_app(unicorn, argument),
+        other => {
+            log::warn!(
+                "monitor: registry io control {:#x} on {:?} at {:#x} acknowledged without a result: {}",
+                other,
+                path,
+                argument,
+                describe(unicorn, argument)
+            );
+            0
+        }
+    }
+}
+
+/// Request `1`: read the value `buf[0]` (name) of key `path`, up to `buf[1]` bytes, into
+/// the buffer at `*[buf + 0xc]`, and write the match indicator at `buf + 8`. The two
+/// clients disagree on what that indicator means - `bQueryU32` requires `1`,
+/// `bQueryString` requires `0` - so it is answered to satisfy each: one value for a DWORD,
+/// no overflow indicator for a string. A missing value answers "no match" with status 0,
+/// which is how the real server lets the client take its default branch without failing
+/// the io call itself.
+fn complete_registry_query(unicorn: &mut Unicorn<'_, Context>, path: &str, buffer: u32) -> u32 {
+    let name_address = read_word(unicorn, buffer).unwrap_or(0);
+    let size = read_word(unicorn, buffer + 4).unwrap_or(0);
+    let data = read_word(unicorn, buffer + 0xc).unwrap_or(0);
+    let name = read_c_string(unicorn, name_address).unwrap_or_default();
+    let value = {
+        let namespace = {
+            let data = unicorn.get_data();
+            data.namespace.clone()
+        };
+        let found = namespace.lock().unwrap().registry.query_value(path, &name);
+        found
+    };
+    let Some(value) = value else {
+        log::info!(
+            "monitor: registry query {:?}\\{:?} (size {}) misses, count 0",
+            path,
+            name,
+            size
+        );
+        let _ = write_word(unicorn, buffer + 8, 0);
+        return 0;
+    };
+    match value {
+        crate::common::registry::RegistryValue::U32(number) => {
+            if data != 0 && write_word(unicorn, data, number).is_err() {
+                return 0xffff_ffff;
+            }
+            let _ = write_word(unicorn, buffer + 8, 1);
+            log::info!(
+                "monitor: registry query {:?}\\{:?} = {:#x}",
+                path,
+                name,
+                number
+            );
+        }
+        crate::common::registry::RegistryValue::String(text) => {
+            if data != 0 {
+                let capacity = size.max(1).min(0x1000) as usize;
+                let mut bytes = text.as_bytes().to_vec();
+                bytes.truncate(capacity - 1);
+                bytes.push(0);
+                if unicorn.mem_write(u64::from(data), &bytes).is_err() {
+                    return 0xffff_ffff;
+                }
+            }
+            let _ = write_word(unicorn, buffer + 8, 0);
+            log::info!("monitor: registry query {:?}\\{:?} = {:?}", path, name, text);
+        }
+    }
+    0
+}
+
+/// Request `3` (`bSetU32`/`bSetString`): store `*[buf + 0xc]` (a DWORD when `buf[1] == 4`,
+/// else a NUL-terminated string) as value `buf[0]` of key `path`. PROCNAV marks processes
+/// and configuration through this, so the write lands in the shared registry like every
+/// other mutation.
+fn complete_registry_set(unicorn: &mut Unicorn<'_, Context>, path: &str, buffer: u32) -> u32 {
+    let name_address = read_word(unicorn, buffer).unwrap_or(0);
+    let size = read_word(unicorn, buffer + 4).unwrap_or(0);
+    let data = read_word(unicorn, buffer + 0xc).unwrap_or(0);
+    let name = read_c_string(unicorn, name_address).unwrap_or_default();
+    if data == 0 || name.is_empty() {
+        return 0xffff_ffff;
+    }
+    let value = if size == 4 {
+        crate::common::registry::RegistryValue::U32(read_word(unicorn, data).unwrap_or(0))
+    } else {
+        crate::common::registry::RegistryValue::String(
+            read_c_string(unicorn, data).unwrap_or_default(),
+        )
+    };
+    let display = value.display();
+    {
+        let namespace = {
+            let data = unicorn.get_data();
+            data.namespace.clone()
+        };
+        namespace
+            .lock()
+            .unwrap()
+            .registry
+            .set_value(path, &name, value);
+    }
+    log::info!("monitor: registry set {:?}\\{:?} = {}", path, name, display);
+    0
+}
+
+/// Request `0xb`: the SCD service -> app lookup PROCNAV uses to find the peer of a commcon
+/// service (`scd_bGetAppIdFromServiceId` `0x34f012` at `0x34f084`). Contract pinned from
+/// the caller: the service id is a `u32` at `argument + 0x100` and the app id is read back
+/// from the same word. On the unit the server resolves it from the registry tree - every
+/// app publishes `SERVICEID` under `...\PROCESS\<p>\<app>\SERVICES\<name>` and its own
+/// `APPID` one level above - and that is exactly what runs here. A miss fails the call so
+/// the caller logs it instead of talking to app 0.
+fn complete_service_to_app(unicorn: &mut Unicorn<'_, Context>, argument: u32) -> u32 {
+    let slot = argument + 0x100;
+    let service_id = read_word(unicorn, slot).unwrap_or(0);
+    let namespace = {
+        let data = unicorn.get_data();
+        data.namespace.clone()
+    };
+    let namespace = namespace.lock().unwrap();
+    let Some(key) = namespace
+        .registry
+        .find_key_by_u32_value("SERVICEID", service_id)
+    else {
+        log::warn!(
+            "monitor: no registry app publishes SERVICEID {:#x}, lookup fails",
+            service_id
+        );
+        return 0xffff_ffff;
+    };
+    // `...\PROCESS\<p>\<app>\SERVICES\<svc>` -> `...\PROCESS\<p>\<app>`.
+    let Some(app_key) = key.rsplit_once('/').and_then(|(parent, _)| parent.rsplit_once('/').map(|(app, _)| app))
+    else {
+        log::warn!(
+            "monitor: SERVICEID {:#x} found at unexpected path {:?}",
+            service_id,
+            key
+        );
+        return 0xffff_ffff;
+    };
+    let Some(app_id) = namespace.registry.query_u32(app_key, "APPID") else {
+        log::warn!(
+            "monitor: service {:?} has no APPID for service {:#x}",
+            app_key,
+            service_id
+        );
+        return 0xffff_ffff;
+    };
+    drop(namespace);
+    if write_word(unicorn, slot, app_id).is_err() {
+        return 0xffff_ffff;
+    }
+    log::info!(
+        "monitor: service {:#x} resolved to app {} via {:?}",
+        service_id,
+        app_id,
+        app_key
+    );
+    0
+}
+
+/// Read a NUL-terminated printable string from guest memory (device paths and value names
+/// start with `/` or are arbitrary ASCII, so the identifier filter in [`describe`] is too
+/// strict here). Returns `None` only when the memory cannot be read at all.
+fn read_c_string(unicorn: &mut Unicorn<'_, Context>, address: u32) -> Option<String> {
+    if address < 0x1_0000 {
+        return None;
+    }
+    let mut bytes = vec![0u8; 260];
+    unicorn
+        .mem_read(u64::from(address), &mut bytes)
+        .ok()?;
+    let end = bytes.iter().position(|byte| *byte == 0)?;
+    if end >= 256 {
+        return None;
+    }
+    let run = &bytes[..end];
+    if !run
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+    {
+        return None;
+    }
+    String::from_utf8(run.to_vec()).ok()
 }
 
 /// Enter the monitor's own SWI dispatcher for `svc #id`, the way the ARM vector would.
