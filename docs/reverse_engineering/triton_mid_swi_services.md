@@ -178,3 +178,54 @@ command surface in the monitor's `complete()` (as the `0x0a` bank / pool service
 already do), *and* afterwards still provide a `cmb_sensorfi` GPS source before
 PROCNAV publishes NavPosition. This is a multi-session subsystem, not a single
 fix; implement per-cmd as validated slices against the r168 baseline.
+
+## Object 0x64 fully decoded — registration, dispatch ABI, cmd map
+
+### Registration mechanism (`sysprogosal`, blob0 = *tengine_osal*)
+- Kernel registrar **`FUN_00027b00(id r0, desc r1)`**; `desc` is a `0x28`-byte
+  block `{ +0x00 flags=0x80000000, +0x24 handler_table_ptr, +0x28 entry_count }`.
+  Calling `FUN_00027b00(id, 0)` tears the service object down.
+- Service objects registered by blob0 init (each its own `FUN_…`):
+  | obj | registrar | table ptr | count |
+  |---|---|---|---|
+  | **`0x64` (100)** | `FUN_000134a0` | **`0x0004c134`** | **99** |
+  | `0x6e` | `FUN_00011bfc` | `0x0004eaf4` | 19 |
+  | `0x77` | `FUN_00013560` | `0x0004eb40` | 12 |
+  (`FUN_00011bbc` / `FUN_00011bfc` are the create/destroy wrappers.)
+
+### Dispatch ABI (svc #6 → object 0x64)
+`r1 = (cmd << 16) | (sub << 8) | 0x64`. The kernel finds the object's
+`handler_table`, indexes `entry = table[cmd]` (stride 4, cmds `0..count-1`), and
+jumps to it. Each `entry` is a thin **shim** called with `r0 = &request_block`;
+it unpacks block fields into `r0..r3` and **tail-branches** (`b`, not `bl`) to the
+real `OSAL_*` implementation, which returns `0`/error and writes any out-params
+back into the block. **Request block layout** (observed across shims):
+`{ u32 @0, u16 @4, u32 @8, u16 @0xc, … }`.
+OSAL helpers: `FUN_0002df74`=get task id, `FUN_0002c668`=get last error,
+`FUN_0002ce9c`/`FUN_0002cde4`/`FUN_0002c1fc`=trace (severity+class+name),
+`DAT_00072000/02/03/07/14`=error-code constants (`0x72000`=OK).
+
+### cmd → op (PROCNAV's hot cmds, resolved)
+| cmd | shim | op | semantics |
+|---|---|---|---|
+| `0x03` | `0xc048` | `FUN_0002e49c` | set current-task record `[+0x60] = block[0]` |
+| `0x0a` | `0xbc8c` | `FUN_0002c3e4` | status query (`FUN_00041b7c`) |
+| `0x16` | `0xbcc8` | `FUN_0002df74` | get current task/service id |
+| `0x17` | `0xbf64` | `FUN_00044e20(id, out*)` | registry App-id→descriptor lookup |
+| **`0x1b`** | `0xbf08` | **`FUN_00036734`** | **`OSAL_s32SemaphoreCreate`** (`osal_core/osalsmphr.cpp:0x2e0`) |
+| `0x20` | `0xbf2c` | `FUN_00029500` | release/put current obj (trace class 6) |
+| `0x21` | `0xbf34` | `FUN_00029414(a,b)` | post/acquire current obj w/ param (class 5) |
+| `0x43` | `0xbc20` | `FUN_0002cf88` | get/clear a status flag |
+
+**Prime blocker = cmd `0x1b` SemaphoreCreate** (PROCNAV's single most-frequent 0x64
+op, 53×, seen next to `wdb_safecnt_*`): it allocates a semaphore from the free
+list (`DAT_00053310` list head, `DAT_0004c114`=created / `DAT_0004c118`=max
+counters), fills the slot `{type@+4, state@+10, count@+8, max@+0xc, name@+0x15}`,
+and **writes the new handle into `*param_2` (= request block field `@4`)**,
+returning 0. The emulator's catch-all returns r0=0 **without writing that output
+handle**, so PROCNAV's create "succeeds" with a null semaphore; its first wait on
+it parks forever on object 0x64 - which is exactly why it never reaches the main
+loop that registers `posfi` / subscribes the combined-sensor and publishes
+NavPosition. Narrow first implementation target: back a semaphore object + fill
+`block[1]` with its handle in `complete()` (mirrors `SERVICE_CREATE_POOL`), then
+implement Wait/Post (`0x20`/`0x21`) and the rest per-cmd.
