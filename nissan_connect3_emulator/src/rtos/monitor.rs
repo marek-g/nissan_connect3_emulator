@@ -145,6 +145,29 @@ pub const OSAL_SERVICE_OBJECT: u32 = 0x64;
 /// @0xc }`; the created handle (a pointer to the semaphore control block) is written through
 /// `block @4`. PROCNAV's single most-frequent 0x64 op - it stalls without a real handle.
 pub const OSAL_SEM_CREATE: u32 = 0x1b;
+/// The other object-0x64 commands PROCNAV drives (each a shim in the `0x4c134` table tail-
+/// branching to an `OSAL_*` leaf). The observable contract each must reproduce:
+/// - `0x01` trace/log (`0x2e1ac`), returns 0.
+/// - `0x02` get the calling task's current-context pointer (`0x288c8`): returns the value the
+///   last `0x03` stored for this task, or `0` (the leaf's not-set sentinel) when none.
+/// - `0x03` set the calling task's current-context pointer (`0x2e49c`): stores `block[0]`,
+///   returns 0. `0x02`/`0x03` are a per-task set/get pair the message/sem ops read back.
+/// - `0x0a` IOSC service re-dispatch (`0x2c3e4` -> nested svc #6), status only.
+/// - `0x16` get the calling task's id (`0x2df74`): a positive per-task id.
+/// - `0x17` registry App-id -> descriptor lookup (`0x44e20`): `-1` for `id < 1` (which is all
+///   PROCNAV sends), the leaf itself rejects `id == 0`.
+/// - `0x20` release/put the current context (`0x29500`), `0x21` post/acquire it with a param
+///   (`0x29414`); both act on the `0x03`-set context and answer with status 0.
+/// - `0x43` get/clear a status flag (`0x2cf88`), always returns 0.
+pub const OSAL_TRACE: u32 = 0x01;
+pub const OSAL_CTX_GET: u32 = 0x02;
+pub const OSAL_CTX_SET: u32 = 0x03;
+pub const OSAL_IOSC_SERVICE: u32 = 0x0a;
+pub const OSAL_GET_TASK_ID: u32 = 0x16;
+pub const OSAL_REGISTRY_LOOKUP: u32 = 0x17;
+pub const OSAL_CTX_RELEASE: u32 = 0x20;
+pub const OSAL_CTX_POST: u32 = 0x21;
+pub const OSAL_STATUS_FLAG: u32 = 0x43;
 /// Bytes of freshly mapped guest memory handed back as a semaphore control block. The real
 /// op (`0x36734`) writes the name at `[cb + 0x15]` up to `0x20` bytes, so `0x40` covers the
 /// whole layout the client may read back.
@@ -582,9 +605,8 @@ pub fn complete(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) ->
     // Only the cmds modelled here branch out; every other 0x64 cmd still falls through to the
     // catch-all below, so this stays a narrow, per-cmd slice.
     if service & 0xff == OSAL_SERVICE_OBJECT {
-        match service >> 16 {
-            OSAL_SEM_CREATE => return complete_osal_sem_create(unicorn, service, block),
-            _ => {}
+        if let Some(status) = complete_osal_service(unicorn, service, block) {
+            return status;
         }
     }
     match service {
@@ -756,20 +778,118 @@ pub fn complete(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) ->
     }
 }
 
-/// Everything the OSAL service object shares across processes. Named OSAL objects (like
-/// these semaphores) are process-global on the unit, so two processes that resolve the same
-/// name must get the same handle back - hence a host-global registry rather than per-process
-/// state. Kept small and lock-fast: the lock is never held across a memory map or a write.
+/// Everything the OSAL service object (0x64) shares. The unit keeps this state in the monitor
+/// kernel, which every process reads the same way, so it is host-global (not per-process):
+/// named objects (semaphores) resolve to the same handle across processes, and each task's
+/// "current context" pointer (`0x03` set / `0x02` get) is per task, matching the leaf's
+/// `record + 0x60` walk keyed by task id. Kept small and lock-fast: the lock is never held
+/// across a memory map, a guest write, or a sleep.
 #[derive(Default)]
-struct OsalSemState {
-    by_name: HashMap<String, u32>,
+struct OsalState {
+    /// Named semaphore name -> guest control-block handle (process-global).
+    sems: HashMap<String, u32>,
+    /// Thread id -> the value the last `0x03` stored for it (the current context).
+    context: HashMap<u32, u32>,
+    /// Thread id -> a dense positive OSAL task id, handed out by `0x16`.
+    task_ids: HashMap<u32, u32>,
+    next_task_id: u32,
 }
 
-/// Process-global semaphore registry, shared by every process's monitor instance (mirrors the
+/// Process-global OSAL service state, shared by every process's monitor instance (mirrors the
 /// `pwr_proxy::global()` `OnceLock<Mutex<..>>` pattern).
-fn osal_sems() -> &'static Mutex<OsalSemState> {
-    static SEMS: OnceLock<Mutex<OsalSemState>> = OnceLock::new();
-    SEMS.get_or_init(|| Mutex::new(OsalSemState::default()))
+fn osal_state() -> &'static Mutex<OsalState> {
+    static STATE: OnceLock<Mutex<OsalState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(OsalState::default()))
+}
+
+/// The `OSAL_NOT_SET` sentinel the context leaf (`0x288c8`) hands back when the task has no
+/// context stored: a null pointer is the value PROCNAV's callers already branch on.
+const OSAL_CONTEXT_UNSET: u32 = 0;
+
+/// Serve an object-0x64 command the way the shim in the `0x4c134` table + its `OSAL_*` leaf do,
+/// reproducing only the observable contract (arguments read from the request block, the `R0`
+/// status the continuation branches on, and any value written back through an out-parameter).
+/// Returns `Some(status)` for a command it models and `None` for an unmodelled one, which then
+/// falls through to the generic catch-all. It never parks the thread and never holds the shared
+/// lock across a guest write or memory map.
+fn complete_osal_service(
+    unicorn: &mut Unicorn<'_, Context>,
+    service: u32,
+    block: u32,
+) -> Option<u32> {
+    let thread = unicorn.get_data().thread_id();
+    match service >> 16 {
+        OSAL_SEM_CREATE => Some(complete_osal_sem_create(unicorn, service, block)),
+        // `0x03` (`0x2e49c`): store `block[0]` as this task's current context, return 0.
+        OSAL_CTX_SET => {
+            let value = read_word(unicorn, block).unwrap_or(0);
+            osal_state().lock().unwrap().context.insert(thread, value);
+            log::info!(
+                "monitor: OSAL[{thread}] context set to {value:#x} at {block:#x}"
+            );
+            Some(0)
+        }
+        // `0x02` (`0x288c8`): return this task's stored context, or null when unset.
+        OSAL_CTX_GET => {
+            let value = osal_state()
+                .lock()
+                .unwrap()
+                .context
+                .get(&thread)
+                .copied()
+                .unwrap_or(OSAL_CONTEXT_UNSET);
+            log::info!(
+                "monitor: OSAL[{thread}] context get -> {value:#x} at {block:#x}"
+            );
+            Some(value)
+        }
+        // `0x16` (`0x2df74`): a positive, stable per-task id (assigned densely on first ask).
+        OSAL_GET_TASK_ID => {
+            let mut state = osal_state().lock().unwrap();
+            let existing = state.task_ids.get(&thread).copied();
+            let id = match existing {
+                Some(id) => id,
+                None => {
+                    state.next_task_id += 1;
+                    let id = state.next_task_id;
+                    state.task_ids.insert(thread, id);
+                    id
+                }
+            };
+            drop(state);
+            log::info!("monitor: OSAL[{thread}] task id get -> {id}");
+            Some(id)
+        }
+        // `0x17` (`0x44e20`): App-id -> registry descriptor lookup. PROCNAV only ever asks for
+        // `id == 0`, which the leaf itself rejects (`id < 1`), so the truthful answer is -1.
+        OSAL_REGISTRY_LOOKUP => {
+            let id = read_word(unicorn, block).unwrap_or(0) as i32;
+            if id < 1 {
+                log::info!(
+                    "monitor: OSAL[{thread}] registry lookup id {id} at {block:#x} -> not found"
+                );
+                return Some(0xffff_ffff);
+            }
+            // A non-zero id we cannot resolve from the (unmodelled) registry is also "not found".
+            log::warn!(
+                "monitor: OSAL[{thread}] registry lookup id {id:#x} at {block:#x}: registry not modelled -> not found"
+            );
+            Some(0xffff_ffff)
+        }
+        // Status-only commands whose leaf answers 0 for every path PROCNAV follows: the IOSC
+        // re-dispatch, the trace/log op, the always-zero status flag, and the two context
+        // post/release ops that act on the `0x03`-set context. Named here so they are served
+        // on their decoded contract instead of by the blind catch-all.
+        OSAL_IOSC_SERVICE | OSAL_TRACE | OSAL_STATUS_FLAG | OSAL_CTX_RELEASE | OSAL_CTX_POST => {
+            log::info!(
+                "monitor: OSAL[{thread}] service {service:#x} (cmd {:#x}) at {block:#x} served with status 0: {}",
+                service >> 16,
+                describe(unicorn, block)
+            );
+            Some(0)
+        }
+        _ => None,
+    }
 }
 
 /// Serve `OSAL_s32SemaphoreCreate` (cmd 27) the way `0x36734` does, in the caller's own RAM:
@@ -797,7 +917,7 @@ fn complete_osal_sem_create(
     // Reuse the shared handle if this process is resolving a name another already created.
     let shared = name
         .as_ref()
-        .and_then(|n| osal_sems().lock().unwrap().by_name.get(n).copied());
+        .and_then(|n| osal_state().lock().unwrap().sems.get(n).copied());
     let handle = match shared {
         Some(handle) => {
             log::info!(
@@ -847,10 +967,10 @@ fn complete_osal_sem_create(
                 return 0xfff6_0000;
             }
             if let Some(name) = &name {
-                osal_sems()
+                osal_state()
                     .lock()
                     .unwrap()
-                    .by_name
+                    .sems
                     .insert(name.clone(), control);
             }
             log::info!(
