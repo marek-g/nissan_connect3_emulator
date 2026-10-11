@@ -1339,3 +1339,11 @@ not the object id) and implementing each in `complete()` (like
 writing a real result before the continuation runs. This is
 necessary-but-not-sufficient: after 0x64 works, PROCNAV still needs the
 `cmb_sensorfi` GPS source to publish NavPosition.
+
+**Update**: the 0x64 command surface is now decoded - see
+`docs/reverse_engineering/triton_mid_swi_services.md` "Object 0x64 fully decoded".
+The prime unlock is **cmd `0x1b` = `OSAL_s32SemaphoreCreate`** (PROCNAV's most
+frequent 0x64 op): the catch-all returns 0 but never writes the created handle
+back into the request block, so PROCNAV stalls on a null semaphore before it can
+register `posfi` / subscribe the sensor. Narrow first implementation: back a
+semaphore object + fill `block[1]` with its handle in `complete()`.
