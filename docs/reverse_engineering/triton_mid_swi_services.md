@@ -229,3 +229,64 @@ loop that registers `posfi` / subscribes the combined-sensor and publishes
 NavPosition. Narrow first implementation target: back a semaphore object + fill
 `block[1]` with its handle in `complete()` (mirrors `SERVICE_CREATE_POOL`), then
 implement Wait/Post (`0x20`/`0x21`) and the rest per-cmd.
+
+## Object 0x6e fully decoded — the OSAL IO (file) services
+
+PROCNAV's registry client (`reg_tclRegKey`) and SCD service map (`scd`) speak to
+`/dev/registry/...` through the OSAL IO wrappers, whose service literals sit as a
+table right behind the wrappers (PROCNAV `0x32b7f4..0x32b818`, all little-endian
+words `0x00cc116e` = `(cmd << 16) | (sub << 8) | 0x6e`):
+
+| literal | wrapper | request block | status |
+|---|---|---|---|
+| `0x1026e` | `OSAL_IOOpen(path r0, u16 flags r1)` `0x32b66c` | `[0]=path ptr, u16 @4` | handle in r0, `-1` = failure |
+| `0x2016e` | `OSAL_s32IOClose(handle r0)` `0x32b694` | `[0]=handle` | r0 |
+| `0x3026e` | `OSAL_IOCreate(path, u16 flags)` `0x32b6b0` | like open | handle |
+| `0x4016e` | `OSAL_s32IORemove(path)` `0x32b6d8` | `[0]=path ptr` | r0 |
+| `0x5036e` | `PRC_OSAL_s32IOControl(handle, request, arg)` `0x32b6f4` | `[0]=handle, [4]=request, [8]=arg` | r0 |
+| `0x6036e` | `PRC_OSAL_s32IOWrite(handle, buf, len)` `0x32b718` | `[0]=handle, [4]=buf, [8]=len` | written |
+| `0x7036e` | `PRC_OSAL_s32IORead(handle, buf, len)` `0x32b73c` | like write | read |
+| `0x8016e`/`0x9016e` | async write/read `0x32b760`/`0x32b77c` | unobserved | - |
+
+`OSAL_s32IOControl` (`0x32cfb4`) validates the handle *client-side* before the
+svc: `*[handle]` must equal `0xD0E1D0E1` (literal `0x32d11c`) or it fails locally
+with error `0x7200c`; `[handle + 0x1c] == 0x22 && request == 3` is answered
+locally too, and *everything else tail-branches into the `PRC_OSAL_s32IOControl`
+wrapper* (the branch keeps the caller's LR, so the svc continuation lands back in
+the ioctl's caller). The handle therefore has to be a real guest object, not a
+table index: the emulator allocates a zero page `{ +0: 0xD0E1D0E1, +0x1c: type,
++0x20: device path }` and reads the path back in iocontrol to route requests, so
+handles are self-describing and per-process by construction.
+
+### Registry ioctl protocol (from the client call sites)
+
+- request `1` (`bQueryU32` `0x273d2c`, `bQueryString` `0x273dac`): buffer
+  `[0]=value-name ptr, [4]=size, [8]=out indicator, [0xc]=out data ptr` (the
+  server *dereferences* `[0xc]`). The two clients disagree on the indicator:
+  `bQueryU32` requires `1` after success, `bQueryString` requires `0` - the
+  emulator writes `1` for DWORD values and `0` for strings, which satisfies
+  both. A missing value answers status 0 with indicator 0 (client default
+  branch, no error code).
+- request `3` (`bSetU32` `0x273cbc`, `bSetString`): buffer `[0]=name, [4]=size,
+  [0xc]=pointer to the data to store`.
+- request `0xa`/`0xb` probes (`scd_bTestLookupIoControl` `0x34e340`): buffer
+  `+0x100` holds a scratch u32; *not* answering `-1` with error `0x72011`/
+  `0x72015` selects PROCNAV's SCD mode 1 (`cRam01215110`), mode 0 being the
+  static registry-walk fallback.
+- request `0xb` service→app lookup (`scd_bGetAppIdFromServiceId` `0x34f012` at
+  `0x34f084`): the service id is a u32 at `arg + 0x100`; the app id is read back
+  from the *same* word (`strh r0,[r5]` of `(ushort)`). The emulator resolves it
+  the way the registry publishes it: any key with `SERVICEID == id` under
+  `...\PROCESS\<p>\<app>\SERVICES\<svc>`, then `APPID` two levels up - service
+  `0xb` (SENSORS) -> `PROCESS\PROCMW\SENSOR` -> app id `10041`.
+
+Evidence: `run_r174/r175` - PROCNAV reaches SCD mode 1, `MAXPOOLSIZE` queries
+return `0xFA000` from `base.reg`, the probe resolves service `0x100` to
+`PROCESS\BASE\SPM` (APPID 0), and unreadable/unknown paths fail the open exactly
+like a device without that key (which also retires the stale-path
+`/dev/registry/P/` retries the client makes after failed opens on the real unit
+would fail the same way). `/dev/trace` opens get handles too; its ioctl `0x3`
+(class-mask setup) and writes are acknowledged/consumed. The `PROCESS\NAVAPP`
+and `FC_*/APP_CONFIG` opens genuinely fail: those keys live in the encrypted
+region files (`ni2k_*/NAVAPP.ERG`), which are not decrypted in the emulator's
+registry yet.
