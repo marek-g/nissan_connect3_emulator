@@ -1357,20 +1357,30 @@ is shared across processes (OSAL named objects are process-global). r169 vs r168
 PROCNAV advances into its semaphore post/release path (cmd `0x20` 4 -> 14, `0x21`
 2 -> 12).
 
-**0x64 is no longer the gate.** After the semaphore fix PROCNAV runs a steady
-service loop; the remaining frequent 0x64 cmds are *not* read-back gates and
-implementing them is a no-op or a regression risk:
-- `0x03`/`0x43`/`0x16`/`0x0a` return status (or store into an internal per-task
-  record the caller never reads back through a service) - the catch-all `r0 = 0`
-  already matches the real leaf's success answer.
-- `0x17` (registry lookup) is polled by PROCNAV with `id = 0`, which `FUN_00044e20`
-  itself rejects (`id < 1` -> error) regardless of the emulator - a PROCNAV retry,
-  not a gap.
-- sem post/release `0x20`/`0x21` answer with status 0 (the permissive branch).
+**All PROCNAV-hit 0x64 commands served faithfully (r170-r172).** The earlier
+prediction that the remaining 0x64 commands were "no-ops / regression risk" was
+**wrong**: answering each to its decoded contract (per-task context set/get
+`0x03`/`0x02`, dense per-task id `0x16`, registry lookup `0x17` -> not-found for
+`id < 1`, status 0 for trace/IOSC/flag/post/release, and the whole **OSAL Event**
+family PROCNAV then reaches - `0x31` EventCreate via `complete_osal_event_create`,
+`0x33`/`0x34` delete/close, `0x48` the stub that returns 3) pushed PROCNAV *past*
+the service-registration churn, not into a regression. r170 vs r169 and r171/r172
+vs r170: `0x305` unchanged (2), exec-fault 5, 0 panics / 0 exits / 0 hook failures
+throughout, and PROCNAV advanced through previously-unreached 0x64 commands.
 
-The run's tail is PROCHMI's (thread [58]) `mbx_1024` post/wait heartbeat, not a
-PROCNAV stall. The real next blocker is therefore a **source/trigger**, not a
-command: PROCNAV never receives the combined-sensor GPS (`cmb_sensorfi`) so it
-never map-matches or publishes `NavPosition`. Next work item = a faithful
-`cmb_sensorfi` GPS source + the `posfi` registration trigger (still "necessary,
-not sufficient" - see the DYN4MBX bridge and this chain).
+**0x64 is fully cleared; PROCNAV now parks on a real data wait.** PROCNAV now runs
+its init to completion and stops yielding (last monitor activity near the tail),
+going quiet on a **blocking take of object `0x13`** (continuations `0x5e9be8` /
+`0x5e9bfc` / `0x5e9c44`, "4130 ticks"). That is the correct idle-on-data-wait
+state, not a stall: nothing ever posts that semaphore because no GPS/CCP producer
+runs. Object `0x6e` (`0x1026e` / `0x2016e`, "SPM_LCN2KAI_DownloadWorkaround") and
+`0x13` are periodic/startup OSAL traffic PROCNAV continues past - not read-back
+gates. A secondary gate: DAPI's `DeviceManager subscribe-event8` returns `r0 =
+0xffff` (failure) - see correctness.md.
+
+The real next blocker is therefore a **source/trigger**, not a command: PROCNAV
+never receives the combined-sensor GPS (`cmb_sensorfi`) so it never map-matches or
+publishes `NavPosition` / feeds the CCP. Next work item = a faithful `cmb_sensorfi`
+GPS source + the `posfi` registration trigger, and/or unblocking the DAPI
+`subscribe-event8` `0xffff` path (both still "necessary, not sufficient" - see the
+DYN4MBX bridge and this chain).

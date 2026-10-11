@@ -107,3 +107,18 @@ flow counters unchanged. Remaining `0x305x2` is a *different, early-startup*
 path: on thread [36] right after `amt::bAllocateMessage` ->
 `OSAL_s32MessageCreate(pool, size=0x22)` (log lines ~11.5k/12.8k of 1M), before
 the responder peer is up - a startup race, not the `DYN*MBX` wait.
+
+### Update: 0x64 fully served; PROCNAV parks on the GPS/CCP wait; DAPI subscribe fails
+
+With the whole OSAL `0x64` surface answered faithfully (see design.md r170-r172),
+PROCNAV no longer stalls on service registration: it completes init and goes quiet
+on a **blocking take of monitor object `0x13`**, i.e. it is correctly idle waiting
+for a GPS/CCP producer that never posts. The CCP / `NavPosition` gap is therefore a
+**missing data source** (`cmb_sensorfi` GPS feed + `posfi` trigger), not a monitor
+command.
+
+Secondary gate found on the DAPI side: `DAPIAPP.OUT` `DeviceManager subscribe-event8`
+returns `r0 = 0xffff` (failure, e.g. `target_app = 0x94b1c490`), so DAPI's device
+event subscription - a plausible part of the CCP-delivery chain - is not succeeding.
+Investigate why the subscribe returns `0xffff` (target app / device not registered)
+alongside the GPS-source work.
