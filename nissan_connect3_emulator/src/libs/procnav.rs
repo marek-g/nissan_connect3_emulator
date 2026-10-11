@@ -102,6 +102,20 @@ const PROBE_STAT_INITED: u32 = 0x0199_6b0 - ORIGINAL_BASE;
 /// Decision point of `s32SetupThreads` (`0x19969a`): `r2` (0 = a config slot was
 /// null), `r6` (configured thread count) and `r1` (the init-config array).
 const PROBE_STAT_SETUP: u32 = 0x0199_69a - ORIGINAL_BASE;
+/// `bpstl::less<unsigned short>::operator()` (`0x359528`): tid 76 faults inside a
+/// map lookup during `s32InitializeChannelFactory` (READ_UNMAPPED at `0x35952a`).
+const PROBE_LESS_U16: u32 = 0x0359_528 - ORIGINAL_BASE;
+/// `s32InitializeChannelFactory` (`0x570f4`): after the inner-app virtual
+/// (`0x57126`, channel id in `r2`) and after the factory open (`0x57140`, `r4`
+/// must be 0) - the probe chain around the faulting map operation.
+const PROBE_FACTORY_VIRT: u32 = 0x0057_126 - ORIGINAL_BASE;
+const PROBE_FACTORY_OPEN: u32 = 0x0057_140 - ORIGINAL_BASE;
+/// app-19 adapter `bOnInit` (`0x57f66`): right after the factory (`0x57f7a`),
+/// components (`0x57f84`) and run (`0x57f8e`) sub-steps - `r0` must be 0 each.
+/// Its state gate rejects the GPS class-69 messages while the init returns false.
+const PROBE_T19_FACTORY: u32 = 0x0057_f7a - ORIGINAL_BASE;
+const PROBE_T19_COMPONENTS: u32 = 0x0057_f84 - ORIGINAL_BASE;
+const PROBE_T19_RUN: u32 = 0x0057_f8e - ORIGINAL_BASE;
 /// GPS-data sink inside `pc_tclSensorMsgHandler::s32OnStatusMsg` (ARM).
 const GPS_STATUS_SINK: u32 = 0x0068_ff8c - ORIGINAL_BASE;
 
@@ -181,19 +195,25 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ("probe-stat-created", PROBE_STAT_CREATED, 2),
         ("probe-stat-inited", PROBE_STAT_INITED, 2),
         ("probe-stat-setup", PROBE_STAT_SETUP, 2),
+        ("probe-less-u16", PROBE_LESS_U16, 2),
+        ("probe-factory-virt", PROBE_FACTORY_VIRT, 2),
+        ("probe-factory-open", PROBE_FACTORY_OPEN, 2),
+        ("probe-t19-factory", PROBE_T19_FACTORY, 2),
+        ("probe-t19-components", PROBE_T19_COMPONENTS, 2),
+        ("probe-t19-run", PROBE_T19_RUN, 2),
     ] {
         let address = (base_address + offset) as u64;
         let repost_count = repost_count.clone();
         let new_count = new_count.clone();
         let result = unicorn.add_code_hook(address, address + size, move |uc, _, _| {
             let tid = uc.get_data().inner.thread_id();
-            if name == "power-repost" || name.starts_with("probe-") {
-                let counter = if name.starts_with("probe-new-") {
-                    &new_count
+            if name == "power-repost" || (name.starts_with("probe-") && name != "probe-less-u16") {
+                let (counter, limit) = if name.starts_with("probe-new-") {
+                    (&new_count, 200)
                 } else {
-                    &repost_count
+                    (&repost_count, 200)
                 };
-                if counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 200 {
+                if counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= limit {
                     return; // dispatch retries and startup allocations flood the log
                 }
             }
@@ -319,7 +339,10 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 "probe-oninit-base"
                 | "probe-oninit-factory"
                 | "probe-oninit-components"
-                | "probe-oninit-run" => {
+                | "probe-oninit-run"
+                | "probe-t19-factory"
+                | "probe-t19-components"
+                | "probe-t19-run" => {
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
                     log::info!("PROCNAV[{tid}] {name}: returned {r0:#x}");
                 }
@@ -364,6 +387,23 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         word(uc, r1),
                         word(uc, r1.wrapping_add(0x14)),
                     );
+                }
+                "probe-less-u16" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                    // Only interesting when the key pointer is unmapped: log exactly
+                    // the calls that would fault two instructions later.
+                    if word(uc, r0 & !3).is_none() {
+                        log::info!(
+                            "PROCNAV[{tid}] probe-less-u16: UNMAPPED key {r0:#010x} lr={:#010x}",
+                            lr & !1
+                        );
+                    }
+                }
+                "probe-factory-virt" | "probe-factory-open" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0);
+                    log::info!("PROCNAV[{tid}] {name}: r0={r0:#010x} r2={r2:#x}");
                 }
                 "svc-data" => {
                     let msg = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
