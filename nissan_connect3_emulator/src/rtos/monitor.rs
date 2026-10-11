@@ -179,6 +179,9 @@ pub const OSAL_STATUS_FLAG: u32 = 0x43;
 pub const OSAL_EVENT_CREATE: u32 = 0x31;
 pub const OSAL_EVENT_DELETE: u32 = 0x33;
 pub const OSAL_EVENT_CLOSE: u32 = 0x34;
+/// cmd 72 (shim `0xbd80` -> `0x5e88`): a stub leaf that unconditionally returns `3`, so the
+/// truthful answer is `3` rather than the catch-all's `0`.
+pub const OSAL_UNSUPPORTED3: u32 = 0x48;
 /// Bytes of freshly mapped guest memory handed back as an event control block. The real op
 /// (`0x58b0`) writes the name at `[cb + 0x10]` up to `0x20` bytes and a type id at `+0x34`, so
 /// `0x60` covers the layout the client may read back.
@@ -838,6 +841,13 @@ fn complete_osal_service(
     match service >> 16 {
         OSAL_SEM_CREATE => Some(complete_osal_sem_create(unicorn, service, block)),
         OSAL_EVENT_CREATE => Some(complete_osal_event_create(unicorn, service, block)),
+        // `0x48` (shim `0xbd80` -> leaf `0x5e88`): a stub that always returns 3.
+        OSAL_UNSUPPORTED3 => {
+            log::info!(
+                "monitor: OSAL[{thread}] service {service:#x} (cmd 0x48) at {block:#x} -> 3"
+            );
+            Some(3)
+        }
         // `0x03` (`0x2e49c`): store `block[0]` as this task's current context, return 0.
         OSAL_CTX_SET => {
             let value = read_word(unicorn, block).unwrap_or(0);
