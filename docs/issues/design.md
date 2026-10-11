@@ -1507,3 +1507,34 @@ for service `0xb` (the DAPI `subscribe-event8` `0xffff` failure in
 correctness.md is the prime suspect); (c) only then does the bank/`snd_mbf`
 injection of a GPS `cmb_sensorfi` status (service `0xb`, func `5`, opcode `6`,
 TypeId `0x00050600`, payload `cmb_fi_tcl_GpsBigdata`) have a receiver.
+
+#### The sensorfi stack is runtime-bound; with one PROCNAV thread it never starts (r175)
+
+`pc_tclSensorCommunications`/`pc_tclSensorMsgHandler` (and the whole `scd_*` API)
+are only referenced through `.dynsym`/EXTERNAL - the position/sensor ("pc")
+layer is bound at runtime by the component framework, not called directly from
+PROCNAV's static text, and there is no component DLL tree under
+`CRYPTNAV/DNL/BIN/NAV/COMMON` (only `PROCNAV.OUT`, `DAPIAPP.OUT`,
+`PROCDLSAVER.OUT`). r175 proves the binder never ran: no yield has a
+continuation inside `scd_bGetAppIdFromServiceId` (`0x34f012..0x34f0c2`) or any
+`pc_*` ctor region, and the scheduler's park dump shows PROCNAV with exactly
+**one** thread (`threads: :blocked(MonitorYield { deadline })`) while its code
+clearly builds an async-IO job-queue worker (`OSAL_bInitAsyncIO` + `LockOsal`
+sem, `s32PrepAsyncTask`), a DR/position pipeline and CCP pumps - threads that
+would exist only after the component bring-up. So the sensorfi unlock is NOT a
+message-injection problem yet: nothing has created the receiver.
+
+Two live leads for who runs the binder (tracked in correctness.md next):
+
+1. `s32PrepAsyncTask` (`0x5e9af8`) calls `CreateOsalLock` + `OSAL_bInitAsyncIO`
+   - i.e. the async-IO/OSAL task-creation surface (OSAL_s32TaskCreate on the
+   monitor or via `tkse`/IOSC svc-0x26). The DAPI-side `svc-0x26` service
+   registry (`dapi.rs`, `MAP_MEDIUM_ACTIVE`) is emulated - PROCNAV's native
+   equivalent may be the same IOSC that must tell PROCNAV "system ready", and
+   the DAPI `subscribe-event8` `0xffff` gate (target = PRM app `0x0a` in the
+   unlaunched `procbaselx`) is the visible symptom of the same hole. Spawning
+   `procbaselx` (or emulating its PRM announcements on IOSC) is therefore the
+   first thing to try.
+2. `PROCDLSAVER.OUT` / `procbaselx` are in the firmware launch set but not in
+   our `EMU_RTOS_START`; the real startup ordering (StartConfig*.reg) may put
+   the binder before PROCNAV's consumer threads are created.
