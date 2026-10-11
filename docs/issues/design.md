@@ -1310,29 +1310,32 @@ So the real root of the residual `0x305`, and of PROCNAV's silence in general, i
 the **missing 0x64 (and 0x6e) OSAL-util overlay**, not GPS and not the queue
 name-mapping. GPS injection is downstream and moot until the 0x64 overlay is
 emulated (or the specific OSAL operations PROCNAV drives through 0x64 are given
-real backing). This is the same hard gap earlier sessions hit: the recovered
-`sysprogosal` overlay loads crippled in Ghidra (1 function, overlay memory
-space, no imports), so 0x64 has never been statically decoded.
+real backing). The recovered `sysprogosal` overlay (blob0) now decodes in Ghidra
+(1319 functions once analysis is triggered - see
+`docs/reverse_engineering/triton_mid_swi_services.md`), but it has no named
+symbols and 0x64's command switch has not yet been mapped.
 
-Empirical 0x64 op catalog (r168, PROCNAV thread [18], `service = ticks<<16 |
-op<<8 | 0x64`; every one currently answered by the catch-all with r0=0):
+Empirical 0x64 op catalog (r168, PROCNAV thread [18]). Dispatch key is
+`cmd = service >> 16` (the `[15:8]` byte is a sub-arg, low byte `0x64` is the
+object); every one is currently answered by the catch-all with r0=0:
 
-| service | op | x | request-block flavour |
-|---|---|---|---|
-| `0x1b0464` | 0x04 | 53 | named-object work; `w0->"wdb_safecnt_00"` (watchdog safe counters) |
-| `0x30164`  | 0x01 | 49 | `w4->"ALWAYS"` - message-route/condition |
-| `0x430064` | 0x00 | 19 | block reads all-zero at the completion point |
-| `0xa0064`  | 0x00 | 12 | all-zero |
-| `0x160064` | 0x00 | 10 | all-zero |
-| `0x170264` | 0x02 |  9 | pointers + two sizes (`0x610`,`0x698`) - a copy/pack |
-| `0x200164` | 0x01 |  4 | ASCII path/name (`"122f764"`, `"22f764"`) - named lookup |
-| `0x210264` | 0x02 |  2 | `(ptr, 0x7d0, ...)` with a `-1` sentinel |
+| service | cmd | sub | x | request-block flavour |
+|---|---|---|---|---|
+| `0x1b0464` | 0x1b | 0x04 | 53 | named-object work; `w0->"wdb_safecnt_00"` (watchdog safe counters) |
+| `0x30164`  | 0x03 | 0x01 | 49 | `w4->"ALWAYS"` - message-route/condition |
+| `0x430064` | 0x43 | 0x00 | 19 | block reads all-zero at the completion point |
+| `0xa0064`  | 0x0a | 0x00 | 12 | all-zero |
+| `0x160064` | 0x16 | 0x00 | 10 | all-zero |
+| `0x170264` | 0x17 | 0x02 |  9 | pointers + two sizes (`0x610`,`0x698`) - a copy/pack |
+| `0x200164` | 0x20 | 0x01 |  4 | ASCII path/name (`"122f764"`, `"22f764"`) - named lookup |
+| `0x210264` | 0x21 | 0x02 |  2 | `(ptr, 0x7d0, ...)` with a `-1` sentinel |
 
-So 0x64 exposes at least ops `0x00..0x04` (plus more seen: `0x10364`, `0x20064`)
-covering named-object create/lookup, message routing, and pack/copy - i.e. the
-OSAL message+named-object substrate, not one call. Faithful support means
-decoding `sysprogosal`'s per-op contract and implementing each in `complete()`
-(like `SERVICE_CREATE_POOL`/`SERVICE_MBK_*` already do), driven by the request
-block and writing a real result before the continuation runs. This is
+So 0x64 keys on `cmd = r1>>16` and PROCNAV alone drives cmds up to `0x43`, i.e.
+the OSAL message/pool/event/sem/IOCTL surface (~68 arms), not one call. Faithful
+support means decoding `sysprogosal`'s per-cmd contract (via its dense OSAL log
+format strings - see the RE doc; the immediate `100`/`0x64` is the log channel,
+not the object id) and implementing each in `complete()` (like
+`SERVICE_CREATE_POOL`/`SERVICE_MBK_*` already do), driven by the request block and
+writing a real result before the continuation runs. This is
 necessary-but-not-sufficient: after 0x64 works, PROCNAV still needs the
 `cmb_sensorfi` GPS source to publish NavPosition.

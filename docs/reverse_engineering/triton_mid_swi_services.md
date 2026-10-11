@@ -145,3 +145,36 @@ message header and queue internals the whole system shares:
 This is the object PROCNAV hits 181x (`0x64`) and the counterpart of
 `libosal_linux`. Decoding blob0's 0x64 registration + header layout is the
 concrete path to bridging PROCNAV's IPC to the DAPIAPP `mbx_0` requests.
+
+### 0x64 decode status (this session)
+
+- **`sysprogosal.elf` (blob0) is now decodable in Ghidra** — the old "1 function /
+  crippled load" note was just *auto-analysis never having been triggered*.
+  Creating the `entry` function at `0x0000f0a4` kicked analysis over to **1319
+  functions** (all `FUN_*`, no named symbols). Program saved back to the project,
+  so it persists for later sessions. The overlay is base-0 here; at runtime it is
+  relocated, so runtime handler addresses seen in the emulator must be re-based
+  to this ELF before they can be cross-walked.
+- **Dispatch key for object 0x64 = `r1 >> 16`** (the "cmd"), matching the object
+  `0x0a` bank service which also keys on `id >> 16` (`0x8004829c`). PROCNAV
+  drives cmds `0x1b, 0x03, 0x43, 0x0a, 0x16, 0x17, 0x20, 0x21, ...` (scattered up
+  to `0x43`) → the handler is a **command switch of ~68 arms**, i.e. the whole
+  OSAL message/pool/event/sem/IOCTL surface, not one call. The `cmd` lives in
+  `r1>>16`; the `[15:8]` byte is a sub-arg/arg.
+- **Dead end recorded**: the object id is *not* findable by grepping immediate
+  `0x64`/`100` — every `mov r1,#0x64` in blob0 is `FUN_0002bdf4(buf, 100, fmt, …)`,
+  i.e. **100 is the OSAL log channel** (`FUN_0002bdf4` = OSAL printf, `FUN_000284c4`
+  / `FUN_0004543c` = emit). Useful corollary: the overlay is densely instrumented,
+  so its **log format strings are the map** to each command's semantics (e.g.
+  `OSAL_s32IOReadAsync of Task:%d with Invalid Callback`). Use strings, not the
+  `100` immediate, to navigate.
+- Object 0x64's service routine is installed by the **overlay init** (which the
+  emulator never runs, per the "late registration" blockers above), so it is not
+  reachable statically from `triton_mid`'s flat disassembly — it must be located
+  inside blob0 via its log strings / the kernel-object-create call it makes.
+
+**Scope reality**: faithfully serving 0x64 = decode + reimplement the whole OSAL
+command surface in the monitor's `complete()` (as the `0x0a` bank / pool services
+already do), *and* afterwards still provide a `cmb_sensorfi` GPS source before
+PROCNAV publishes NavPosition. This is a multi-session subsystem, not a single
+fix; implement per-cmd as validated slices against the r168 baseline.
