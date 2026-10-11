@@ -1799,6 +1799,12 @@ fn complete_osal_mbx_open(unicorn: &mut Unicorn<'_, Context>, thread: u32, block
         log::warn!("monitor: OSAL[{thread}] queue open {name:?}: cannot write handle to {out:#x}");
         return 0;
     }
+    // The PWR proxy answers every app that opens its `mbx_<id>` queue with the
+    // START_CONF power message (mode 3) - the CCA INIT every component's
+    // `ail_bHandleMsgPowerMessage` runs `bOnInit()` on and promotes the adapter
+    // to ACTIVE. Linux processes get this from the libosal hook; the statically
+    // linked PROCNAV reaches the same proxy through this monitor path.
+    crate::rtos::pwr_proxy::register_app_queue_open(&name);
     log::info!("monitor: OSAL[{thread}] queue open name {name:?} -> handle {handle:#x}");
     0
 }
@@ -1841,22 +1847,28 @@ fn complete_osal_mbx_wait(
         return None;
     };
     let prio_ptr = read_word(unicorn, block + 0xc).unwrap_or(0);
-    let namespace = unicorn.get_data().namespace.clone();
-    let message = {
-        let mut guard = namespace.lock().unwrap();
-        let queue_id = crate::common::osal_queues::OsalQueueService::ensure_queue(
-            &mut guard.mq,
-            &name,
-        );
-        let message = crate::common::osal_queues::OsalQueueService::pop_guest_message(
-            &mut guard.mq,
-            queue_id,
-            usize::MAX,
-        );
-        if message.is_some() {
-            guard.notify_waiters();
+    // Proxy-queued power messages take precedence over bridge traffic, exactly
+    // like the libosal-side wait hook (`pwr_proxy_service_handle`). The body is
+    // pre-encoded in snapshot format so `materialize_snapshot` handles it.
+    let message = match take_pwr_power_message(&name) {
+        Some(message) => Some(message),
+        None => {
+            let namespace = unicorn.get_data().namespace.clone();
+            let mut guard = namespace.lock().unwrap();
+            let queue_id = crate::common::osal_queues::OsalQueueService::ensure_queue(
+                &mut guard.mq,
+                &name,
+            );
+            let message = crate::common::osal_queues::OsalQueueService::pop_guest_message(
+                &mut guard.mq,
+                queue_id,
+                usize::MAX,
+            );
+            if message.is_some() {
+                guard.notify_waiters();
+            }
+            message
         }
-        message
     };
     let message = message?;
     match crate::libs::libosal_linux::message::materialize_snapshot(
@@ -1902,6 +1914,27 @@ pub fn poll_osal_mbx_wait(unicorn: &mut Unicorn<'_, Context>, service: u32, bloc
     }
     let thread = unicorn.get_data().thread_id();
     complete_osal_mbx_wait(unicorn, thread, block, true)
+}
+
+/// Consume the PWR proxy's next pending PowerMessage for this queue as a
+/// snapshot-format blob (`[u32 flag, u32 len, body]`) ready for
+/// `materialize_snapshot`, mirroring the libosal-side injection hook.
+fn take_pwr_power_message(name: &str) -> Option<crate::common::osal_queues::OsalMessage> {
+    let app_id = crate::rtos::pwr_proxy::parse_mbx_app_id(name)?;
+    let message = crate::rtos::pwr_proxy::take_pending_for(app_id)?;
+    let mut blob = Vec::with_capacity(8 + message.body.len());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(message.body.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&message.body);
+    log::info!(
+        "monitor: PWR proxy delivers type {:#x} to {}-wait",
+        message.power_type,
+        name
+    );
+    Some(crate::common::osal_queues::OsalMessage {
+        data: blob,
+        priority: 0,
+    })
 }
 
 /// Request `0x1c`: resolve a named semaphore and hand the control-block handle back in the
