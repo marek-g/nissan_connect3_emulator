@@ -84,27 +84,57 @@ build one property handler per sensor type (14,50,66,64,19,20,**5**,38,46,49,23,
 service `0xb`, so PROCNAV's register request currently has no server and no status is
 ever pushed -> the GPS pipeline stays empty.
 
-## Remaining work to inject GPS (each must be RE'd before coding)
-1. **Transport / addressing** (the big one): how PROCNAV's client-side out-channel
-   method (`s32StartMethod` register, and the server's later push) is carried - the
-   amt/commcon addressing (`rtf_tclCommAddress::vFetchAddressInfo`, `amt_tclServiceData`
-   target) and the underlying monitor/OSAL queue that delivers it. This is what makes
-   the property push reach `s32ProcessMessage`. The kernel EventFlag (0x13) is only the
-   wake, not the payload path.
-2. **Server emulation surface**: become the service-`0xb` provider - accept the RELUP
-   register method (answer its method-result) and push a `GpsDataStatus` (opcode 6) whose
-   `d4+0x14=0xb`, `d4+0x18=5`, then a valid `cmb_fi_tcl_GpsBigdata` body.
-3. **Exact `cmb_fi_tcl_GpsBigdata` body offsets**: `cmb_fi_tcl_GpsBigdata::oRead` / field
-   visit order (the client-view `msg+0x10..` in the sink `0x68ff8c` is post-deserialise).
-4. **`fi_tclTypeBase` header format** (`operator<<`/`>>` for `fi_tclTypeBase`) so a hand
-   -built message maps back correctly.
-5. Even after GPS is consumed, non-empty `NavPosition` is **"necessary, not sufficient"**
-   - the fusion may also need gyro/accel/vehicle-speed and a valid map context.
+## Transport / addressing (item 1) - RESOLVED, and it moves the earliest blocker upstream
+PROCNAV talks to property servers through a **client-side out-channel bound to a commcon
+member** (a named remote application/process), not a raw queue:
+- Channel creation `pc_tclClientSideOutChannel::bCreate` (`0x1c8818`) ->
+  `rtf_tclChannelFactory::poCreateClientSideOutChannel(serviceType, mt1, mt2, ...)`
+  (`0x657be`), under an OSAL semaphore, calls
+  `pGetCommMemberInfo(factory, type, subtype)` for BOTH the service's member and the
+  local member. **If either comm-member lookup returns null, channel creation fails**
+  with error class `0x430007` (`0x65842` error path) and the caller gets a null channel.
+  `STAT_tclThread::s32CreateSideOutChannel` (`0x11d548`) returns that result as `-1` and
+  logs a level-1 trace at `0x11d8d8` - i.e. PROCNAV logs a failure and the sensor property
+  handlers are left with no channel, so `s32RegisterForProperty`/`s32StartMethod` never
+  even send.
+- On success the channel is built from the comm-member record: `memberInfo+0x14` is a
+  `u16` **comm member / app id** (the server's routing address), `memberInfo+0x8` a
+  sub-object; the send is the channel vtable `+0x10`
+  (`channel->vtable[0x10](channel, amt_tclServiceData&, 7, functionId, 3)`) which carries
+  the request to that comm member's receive queue (commcon addressing via
+  `rtf_tclCommAddress`), the same `target_app`-style id the DAPI hooks already observe.
+- The comm-member table is `rtf_tclCommMemberList` (factory `+0x4c`), filled by
+  `s32AddClientSideOutChannelParam` / `s32AddServerSideOutChannelParam` and
+  `s32GetCommMemberID` (`0x1f71aa`, `0x65d54`), and bootstrapped from the boot
+  **directory / bank service** - the same monitor object `0x0a` (mbk) the emulator
+  already models. So the resolution PROCNAV needs is a comm-member entry that
+  *provides* the sensorfi service (`0xb`).
+
+Net: the earliest failure is not the GPS push but **comm-member resolution for service
+`0xb`** at channel-creation time. Until a comm member advertising that service exists in
+the directory, PROCNAV never opens the sensor channel and never sends RELUP.
+
+## Remaining work to inject GPS (each RE'd or scoped)
+1. **Comm-member / directory entry for service `0xb`** so `pGetCommMemberInfo` succeeds
+   and PROCNAV opens the sensor channel: add a comm member (id + app/target id) that
+   serves the sensorfi service, in the boot directory the emulator already backs (object
+   `0x0a`) plus the `rtf_tclCommMemberList` seed PROCNAV reads. Need to find where PROCNAV
+   populates its own comm-member list (which directory queries fill `factory+0x4c`) and the
+   exact member-record layout (`+0x8`, `+0x14`).
+2. **Server emulation surface**: answer the RELUP register method sent on channel vtable
+   `+0x10` and push a `GpsDataStatus` (opcode 6, `d4+0x14=0xb`, `d4+0x18=5`) with a valid
+   `cmb_fi_tcl_GpsBigdata` body, delivered to PROCNAV's receive queue + `tkse_set_flg` wake.
+3. **`cmb_fi_tcl_GpsBigdata` body offsets**: `cmb_fi_tcl_GpsBigdata::oRead` field visit
+   order (client-view `msg+0x10..` in the sink `0x68ff8c` is post-deserialise).
+4. **`fi_tclTypeBase` header format** (`operator<<`/`>>`) for a hand-built message.
+5. Non-empty `NavPosition` remains **"necessary, not sufficient"** - fusion may also need
+   gyro/accel/vehicle-speed and a valid map context.
 
 ## Verdict
-GPS publishing means **emulating a sensorfi (service 0xb) amt property server** that
-answers PROCNAV's RELUP registration and pushes a valid `cmb_sensorfi_tclMsgGpsDataStatus`
-over the amt transport - a framework-level feature (amt addressing + msgq/OSAL modelling
-+ a serialised GpsBigdata body), not a bounded hook. Message ids are now pinned
-(service `0xb`, property `5`, opcode `6`); the open RE is the amt transport/addressing
-(item 1) and the `GpsBigdata` body/header serialisation (items 3-4).
+GPS publishing is a **commcon/amt server-emulation** feature: register a commcon member
+that provides the sensorfi service `0xb` (so PROCNAV opens its sensor channel at all),
+then act as that server - answer the RELUP register and push a serialised
+`cmb_sensorfi_tclMsgGpsDataStatus`. It rides the directory (monitor object `0x0a`) + the
+amt comm-member/queue transport the emulator only partially models today, so it is far
+bigger than the `DYN*MBX` bridge. Message ids are pinned (service `0xb`, property `5`,
+opcode `6`); earliest open RE is the comm-member/directory entry (item 1).
