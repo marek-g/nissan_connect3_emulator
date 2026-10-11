@@ -1444,3 +1444,31 @@ Concrete plan for the provider (next slice):
    `10041` (PROCMW/SENSOR). Also expect the `0x64` cmd `0x17` app-id registry
    lookup (currently "not modelled -> not found" for id 1) to be asked for app
    `10041` once commcon resolves the publisher - serve it from the registry.
+
+#### Bank object wire format (decoded from PROCNAV `0x5f5af0`, r2 = the page the
+`0x0203020a` resolve hands out through `block + 4`, stored by PROCNAV at `obj->0x24`):
+
+```
+struct bank {            // the [monitor-mbk] page
+    u32 slots[];         // +0x00: fixed-size slots, stride 0x20, one per message;
+                         // slot[0] = class/magic word, valid == 0x70000001;
+                         // slot[+8]  = u32 (offset/length into the data array)
+    u32 data_off;        // +0x1c: offset from the bank pointer to the parallel
+                         // data array (data[i] at bank + data_off + 0*i / +0x14*i)
+    u32 size;            // +0x28: span used for range checks (see 0x5f5b64)
+    u16 count;           // +0x2c: number of entries the walk iterates
+};
+```
+
+`0x5f5af0` returns 0 when `count == 0` (the truthful-empty page the emulator hands
+out today - hence PROCNAV's silent park), otherwise walks `count` 32-byte slots,
+matches `slot[0] == 0x70000001` and accumulates `slot[+8] + obj->0x3c + data[i]`.
+So the emulator-side GPS injection point is confirmed: fill one slot with the
+`cmb_sensorfi` class word + payload into the data array + set `count`, then let
+the parked `0x13` wait complete. Open sub-questions: what class id `0x70000001`
+is (the matched reader looks class-specialised - find the dispatcher and the
+`cmb_sensorfi` class id near the `pc_tclSensorMsgHandler` strings), whether the
+slot stride/magic hold for posted-but-unconsumed frames written by a sender
+(the real post path fills this from the other side - look for the sender-side
+tkse wrapper services on object `0x13`/`0x0a` in the launched processes), and
+the meaning of `obj->0x3c` (a per-object base added to every hit).
