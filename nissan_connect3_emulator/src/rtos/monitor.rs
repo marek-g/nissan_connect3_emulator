@@ -267,12 +267,14 @@ pub const OSAL_THREAD_DELETE: u32 = 0x11;
 ///   timeout `0` and blocks until `set_flg`.
 pub const TSE_OBJECT: u32 = 0x13;
 /// TSE task management (µITRON `tk_*`) on service object `0x12` (PROCNAV wrappers
-/// `0x5f27d4`/`0x5f27fc`/`0x5f280c`). Blocks carry `[tid]` (delete) or `[ticks]`
-/// (delay); tid `0` is the caller. `0x0006_0112` is the one PROCNAV's init-finalize
-/// chain (`0x5e8a80`) ends with: it tail-branches into the wrapper with its return
-/// address sitting in the *literal pool*, so the real kernel destroying the task on
-/// self-delete is load-bearing - returning from the svc walks the thread into data
-/// (`INSN_INVALID` at `0x5e8b64`).
+/// `0x5f27c0`-`0x5f2820`). `0x0005_0312` is a `tk_sta_tsk`-style task start when block
+/// `[1]` carries an entry: `(interval, entry, context)` - `interval 1` starts the
+/// stdin/command loop (`0x5ea540`, behind the stack-alignment thunk `0x5ea41c`), the
+/// saturated interval starts the `0x5e8d98` state pump; a bare small word is a plain
+/// `OSAL_s32TaskDelay`. `0x0006_0112` is polled by that command loop (`bgt` on `R0`) and
+/// ends PROCNAV's init-finalize chain (`0x5e8a80`), whose return address sits in the
+/// literal pool - the answer does not matter there, the stubs after it run into data and
+/// the kernel's illtrap teardown ends the thread (`INSN_INVALID` at `0x5e8b64`).
 pub const TSE_TASK_OBJECT: u32 = 0x12;
 pub const TSE_TASK_TERMINATE: u32 = 0x0002_0412;
 pub const TSE_TASK_DELAY: u32 = 0x0005_0312;
@@ -607,6 +609,52 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool 
     let (block, service, continuation) = (args[0], args[1], args[2]);
     let object = service & 0xff;
     let ticks = service >> 16;
+    // A task start/delete on the object-0x12 family is answered in place. `0x50312` is a
+    // µITRON `tk_sta_tsk`-style *task start* (`(interval, entry, context)`): both PROCNAV
+    // callers (`1` = the stdin/command loop behind the alignment thunk `0x5ea41c`,
+    // `0xfffffffe` = the `0x5e8d98` state pump) get a real guest thread. `0x60112` answers
+    // "no more work" through `R0`: the command loop (`0x5ea574`) tests it in a `bgt` loop
+    // and returns from its entry on 0, while the exit chain (`0x5e8b3c`) ignores the
+    // reply and walks into its literal-pool "return address" (the stubs there end in
+    // data, so the real kernel's illtrap teardown kills the thread the same way).
+    if object == TSE_TASK_OBJECT {
+        let self_id = unicorn.get_data().thread_id();
+        match service {
+            TSE_TASK_DELETE | TSE_TASK_TERMINATE => {
+                let tid = read_word(unicorn, block).unwrap_or(0);
+                log::info!(
+                    "monitor: thread [{self_id}] task {} for thread [{tid}] at {block:#x} answered",
+                    if service == TSE_TASK_DELETE { "delete" } else { "terminate" }
+                );
+                if tid != 0 && tid != self_id {
+                    let mut threads = unicorn.get_data().threads.lock().unwrap();
+                    if let Some(target) = threads.iter_mut().find(|t| t.id == tid) {
+                        if !matches!(target.status, ThreadStatus::Exited(_)) {
+                            target.status = ThreadStatus::Exited(0);
+                        }
+                    }
+                }
+                if unicorn.reg_write(RegisterARM::R0 as i32, 0).is_ok() {
+                    return true;
+                }
+            }
+            TSE_TASK_DELAY => {
+                let interval = read_word(unicorn, block).unwrap_or(0);
+                let entry = read_word(unicorn, block + 4).unwrap_or(0);
+                if entry >= 0x1000 {
+                    let context = read_word(unicorn, block + 8).unwrap_or(0);
+                    let tid = spawn_guest_thread(unicorn, entry, context, 0x2800);
+                    log::info!(
+                        "monitor: thread [{self_id}] TSE task start (interval {interval:#x}, entry {entry:#x}, context {context:#x}) -> thread [{tid}]"
+                    );
+                    if unicorn.reg_write(RegisterARM::R0 as i32, 0).is_ok() {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     // Requests the emulator can answer without waiting do not belong on a deadline at all:
     // the TSE creates/signals/sets and the OSAL thread family return through `R0` the way
     // the monitor's own leaf would, and a TSE *wait* whose condition already holds (an
@@ -634,8 +682,18 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool 
     // The object-0x13 waits carry their real timeout in the request block (`sem: [2]`,
     // `flg: [4]`); the service's upper half is their *command*, so for them the parked
     // deadline comes from the block - 0 or a saturated word means "wait until woken", and
-    // `poll_tse_wait` is what actually releases them.
-    let deadline = if matches!(service, TSE_SEM_WAIT | TSE_FLG_WAIT) {
+    // `poll_tse_wait` is what actually releases them. A `tk_dly_tsk` parks on its one
+    // block word, which is already a tick count.
+    let deadline = if service == TSE_TASK_DELAY {
+        // With no entry word this is a plain `OSAL_s32TaskDelay(ticks)` and parks on the
+        // block word; task starts were answered in place above.
+        match read_word(unicorn, block) {
+            Ok(ticks) if ticks != 0 && ticks < 0x0010_0000 => {
+                Some(std::time::Instant::now() + TICK * ticks)
+            }
+            _ => None,
+        }
+    } else if matches!(service, TSE_SEM_WAIT | TSE_FLG_WAIT) {
         let timeout = read_word(
             unicorn,
             block + if service == TSE_SEM_WAIT { 0x8 } else { 0x10 },
@@ -1135,13 +1193,34 @@ fn complete_osal_service(
             );
             Some(tid)
         }
-        OSAL_THREAD_ACTIVATE | OSAL_THREAD_DELETE => {
+        OSAL_THREAD_ACTIVATE => {
             let tid = read_word(unicorn, block).unwrap_or(0);
-            log::info!(
-                "monitor: OSAL[{thread}] thread {} for thread [{tid}] at {block:#x}",
-                if service >> 16 == OSAL_THREAD_ACTIVATE { "activate" } else { "delete" }
-            );
+            log::info!("monitor: OSAL[{thread}] thread activate for thread [{tid}] at {block:#x}");
             Some(0)
+        }
+        OSAL_THREAD_DELETE => {
+            // taking the target away is the whole point of this call: a parked worker
+            // must not be woken by a later signal, so the delete marks it exited.
+            let tid = read_word(unicorn, block).unwrap_or(0);
+            let self_id = thread;
+            if tid == 0 || tid == self_id {
+                log::info!("monitor: OSAL[{thread}] thread delete ends the thread at {block:#x}");
+                crate::emulator::thread::exit_current_thread(unicorn, 0);
+                return Some(0);
+            }
+            let mut threads = unicorn.get_data().threads.lock().unwrap();
+            if let Some(target) = threads.iter_mut().find(|t| t.id == tid) {
+                if !matches!(target.status, ThreadStatus::Exited(_)) {
+                    target.status = ThreadStatus::Exited(0);
+                }
+                drop(threads);
+                log::info!("monitor: OSAL[{thread}] thread delete for thread [{tid}] at {block:#x}");
+                Some(0)
+            } else {
+                drop(threads);
+                log::warn!("monitor: OSAL[{thread}] thread delete for unknown thread [{tid}]");
+                Some(0xffff_ffff)
+            }
         }
         _ => None,
     }
