@@ -229,6 +229,66 @@ pub const OSAL_EVENT_CLOSE: u32 = 0x34;
 /// cmd 72 (shim `0xbd80` -> `0x5e88`): a stub leaf that unconditionally returns `3`, so the
 /// truthful answer is `3` rather than the catch-all's `0`.
 pub const OSAL_UNSUPPORTED3: u32 = 0x48;
+/// The OSAL thread family on object 0x64 (`osal_core/osallock.c`/`osalthred.cpp`), reached
+/// through the `_Cntxt` wrappers at PROCNAV `0x2ebeb8-0x2ebf3c`. Every one of them is
+/// non-blocking and answers in `R0`: the block is `[cb ptr, ctx info, u16 4, continuation]`
+/// and the thread CB the block points at is `{ name ptr @0, name len u16 @4, stack size @8,
+/// entry @0xc, argument @0x10 }` - the same layout `libosal_linux` reads on the Linux side.
+/// - `0x0e` `OSAL_ThreadCreate`: the thread starts out suspended; `0x0f` `OSAL_s32ThreadActivate`
+///   takes `{ tid @0 }` and starts it. (The emulator starts created threads right away; see
+///   `complete_osal_service`.)
+/// - `0x10` `OSAL_ThreadSpawn`: create + start in one call; `R0` is the new thread id, `-1`
+///   on failure - `OSAL_bInitAsyncIO` (`0x5e9968`) asserts on `-1` and skips its three
+///   `AIO2_%02d` workers when the spawn is answered wrong.
+pub const OSAL_THREAD_CREATE: u32 = 0x0e;
+pub const OSAL_THREAD_ACTIVATE: u32 = 0x0f;
+pub const OSAL_THREAD_SPAWN: u32 = 0x10;
+pub const OSAL_THREAD_DELETE: u32 = 0x11;
+
+/// TSE kernel objects (`tkse_*`, µITRON-style) on service object `0x13`. The service literals
+/// are the ones the PROCNAV wrappers load next to themselves (`tkse_cre_sem` `0x6233c0`,
+/// `tkse_del_sem` `0x623408`, `tkse_sig_sem` `0x623428`, `tkse_wai_sem` `0x623450`, and the
+/// flag family at `0x5f5220-0x5f52a4`); `service >> 16` is the command, *not* a tick timeout -
+/// reading it as ticks parked every call for ~4 s and answering `0` is what made
+/// `OSAL_bInitAsyncIO` assert (`cre_flg` must return a **positive** id) and never spawn its
+/// workers. Requests are the wrapper's stack frame: the first words are the arguments, and
+/// the caller's return address follows them (visible in every parked-request dump).
+/// - `0x1000` `tkse_cre_sem(semCB)`: block `[cb]`; `R0` = positive sem id. The OSAL lock
+///   (`CreateOsalLock` `0x5f3d50`) is one of these, initial count 1.
+/// - `0x1002` `tkse_sig_sem(sem)` / `0x1003` `tkse_wai_sem(sem, count, timeout)`: block
+///   `[sem, count, timeout]`; the `LockOsal` wrapper (`0x5f3de0`) waits count 1, timeout
+///   `0xffffffff`.
+/// - `0x1020` `tkse_cre_flg(flgCB)`: block `[cb]`; `R0` = positive flag id (OSAL checks
+///   `> 0`), pattern starts clear.
+/// - `0x1022` `tkse_set_flg(flg, pattern)`: block `[flg, pattern]`; wakes matching waiters.
+/// - `0x1024` `tkse_wai_flg(flg, pattern, atr, cycle, timeout)`: five-word block; matches
+///   when every pattern bit is set, clears them on match. The async-IO worker
+///   (`0x5e9430`) waits pattern `1` on its own queue flag with `atr = 0x21`, cycle `-1`,
+///   timeout `0` and blocks until `set_flg`.
+pub const TSE_OBJECT: u32 = 0x13;
+/// TSE task management (µITRON `tk_*`) on service object `0x12` (PROCNAV wrappers
+/// `0x5f27d4`/`0x5f27fc`/`0x5f280c`). Blocks carry `[tid]` (delete) or `[ticks]`
+/// (delay); tid `0` is the caller. `0x0006_0112` is the one PROCNAV's init-finalize
+/// chain (`0x5e8a80`) ends with: it tail-branches into the wrapper with its return
+/// address sitting in the *literal pool*, so the real kernel destroying the task on
+/// self-delete is load-bearing - returning from the svc walks the thread into data
+/// (`INSN_INVALID` at `0x5e8b64`).
+pub const TSE_TASK_OBJECT: u32 = 0x12;
+pub const TSE_TASK_TERMINATE: u32 = 0x0002_0412;
+pub const TSE_TASK_DELAY: u32 = 0x0005_0312;
+pub const TSE_TASK_DELETE: u32 = 0x0006_0112;
+pub const TSE_SEM_CREATE: u32 = 0x1000_0113;
+pub const TSE_SEM_DELETE: u32 = 0x1001_0113;
+pub const TSE_SEM_SIGNAL: u32 = 0x1002_0213;
+pub const TSE_SEM_WAIT: u32 = 0x1003_0313;
+pub const TSE_FLG_CREATE: u32 = 0x1020_0113;
+pub const TSE_FLG_DELETE: u32 = 0x1021_0113;
+pub const TSE_FLG_SET: u32 = 0x1022_0213;
+pub const TSE_FLG_WAIT: u32 = 0x1024_0513;
+/// µITRON `E_TMOUT`, the error a timed TSE wait returns when the condition did not hold.
+const TSE_E_TMOUT: u32 = 0xffff_fff3;
+/// µITRON `E_OBJ`, returned for waits/signals on an id the emulator never created.
+const TSE_E_OBJ: u32 = 0xffff_ffff;
 /// Bytes of freshly mapped guest memory handed back as an event control block. The real op
 /// (`0x58b0`) writes the name at `[cb + 0x10]` up to `0x20` bytes and a type id at `+0x34`, so
 /// `0x60` covers the layout the client may read back.
@@ -547,7 +607,46 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool 
     let (block, service, continuation) = (args[0], args[1], args[2]);
     let object = service & 0xff;
     let ticks = service >> 16;
-    let deadline = if ticks == 0 {
+    // Requests the emulator can answer without waiting do not belong on a deadline at all:
+    // the TSE creates/signals/sets and the OSAL thread family return through `R0` the way
+    // the monitor's own leaf would, and a TSE *wait* whose condition already holds (an
+    // unlock racing ahead of its lock) finishes in place too. Writing `R0` and letting the
+    // `svc` retire reproduces a non-blocking completion exactly.
+    let immediate = if object == TSE_OBJECT {
+        complete_tse(unicorn, service, block, true)
+    } else if object == OSAL_SERVICE_OBJECT
+        && matches!(ticks, OSAL_THREAD_CREATE | OSAL_THREAD_ACTIVATE | OSAL_THREAD_SPAWN | OSAL_THREAD_DELETE)
+    {
+        complete_osal_service(unicorn, service, block)
+    } else {
+        None
+    };
+    if let Some(status) = immediate {
+        log::info!(
+            "monitor: thread [{}] service {service:#x} (object {object}) completes in place with {status:#x}: {}",
+            unicorn.get_data().thread_id(),
+            describe(unicorn, block)
+        );
+        if unicorn.reg_write(RegisterARM::R0 as i32, status as u64).is_ok() {
+            return true;
+        }
+    }
+    // The object-0x13 waits carry their real timeout in the request block (`sem: [2]`,
+    // `flg: [4]`); the service's upper half is their *command*, so for them the parked
+    // deadline comes from the block - 0 or a saturated word means "wait until woken", and
+    // `poll_tse_wait` is what actually releases them.
+    let deadline = if matches!(service, TSE_SEM_WAIT | TSE_FLG_WAIT) {
+        let timeout = read_word(
+            unicorn,
+            block + if service == TSE_SEM_WAIT { 0x8 } else { 0x10 },
+        )
+        .unwrap_or(0xffff_ffff);
+        if timeout == 0 || timeout >= 0x8000_0000 {
+            None
+        } else {
+            Some(std::time::Instant::now() + TICK * timeout)
+        }
+    } else if ticks == 0 {
         None
     } else {
         Some(std::time::Instant::now() + TICK * ticks)
@@ -712,6 +811,15 @@ pub fn complete(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) ->
     // whole object branches out here.
     if service & 0xff == OSAL_IO_OBJECT {
         if let Some(status) = complete_osal_io(unicorn, service, block) {
+            return status;
+        }
+    }
+    // The TSE object (0x13): a timed wait that reaches this completion path has either been
+    // woken by its predicate (checked again here) or run out its deadline, so it is answered
+    // as an expiry rather than parked a second time. Commands that still refuse to answer
+    // (the mbx family) keep falling through to the catch-all.
+    if service & 0xff == TSE_OBJECT {
+        if let Some(status) = complete_tse(unicorn, service, block, false) {
             return status;
         }
     }
@@ -901,6 +1009,13 @@ struct OsalState {
     /// Thread id -> a dense positive OSAL task id, handed out by `0x16`.
     task_ids: HashMap<u32, u32>,
     next_task_id: u32,
+    /// TSE semaphore id -> current count (object `0x13`, `tkse_*_sem`). Ids are µITRON
+    /// ERIDs: small and positive, `0` is never handed out.
+    tse_sems: HashMap<u32, u32>,
+    /// TSE flag id -> currently set pattern (object `0x13`, `tkse_*_flg`).
+    tse_flags: HashMap<u32, u32>,
+    /// The next positive TSE id to hand out.
+    tse_next_id: u32,
 }
 
 /// Process-global OSAL service state, shared by every process's monitor instance (mirrors the
@@ -1005,8 +1120,246 @@ fn complete_osal_service(
             );
             Some(0)
         }
+        // The thread family. These are non-blocking and answered in place (see
+        // `yield_thread`); `ThreadCreate` semantics are only half modelled - the real op
+        // starts the thread suspended for `0x0f` to release, the emulator starts it right
+        // away, which is safe because every created entry parks on its own wait object
+        // until there is work. Nothing in the launched set used `0x0e`/`0x0f` yet; `0x10`
+        // is the one PROCNAV's async-IO init drives once `cre_flg` hands back real ids.
+        OSAL_THREAD_CREATE | OSAL_THREAD_SPAWN => {
+            let cb = read_word(unicorn, block).unwrap_or(0);
+            let tid = start_osal_thread(
+                unicorn,
+                cb,
+                if service >> 16 == OSAL_THREAD_CREATE { "create" } else { "spawn" },
+            );
+            Some(tid)
+        }
+        OSAL_THREAD_ACTIVATE | OSAL_THREAD_DELETE => {
+            let tid = read_word(unicorn, block).unwrap_or(0);
+            log::info!(
+                "monitor: OSAL[{thread}] thread {} for thread [{tid}] at {block:#x}",
+                if service >> 16 == OSAL_THREAD_ACTIVATE { "activate" } else { "delete" }
+            );
+            Some(0)
+        }
         _ => None,
     }
+}
+
+/// Serve a TSE kernel-object request (object `0x13`) from the emulator-side µITRON state.
+/// `at_entry` tells the two waits apart: called while the request arrives (thread still in
+/// the `svc`) an unsatisfied wait returns `None` so the caller can park the thread, while
+/// called from the completion path the same wait has run out of luck and answers `E_TMOUT`.
+/// A wait on an id that was never created answers `E_OBJ` right away instead of parking -
+/// that is what a real µITRON kernel says, and it keeps a caller holding a stale id from
+/// sleeping forever. The lock is never held across a memory map or a guest write.
+fn complete_tse(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32, at_entry: bool) -> Option<u32> {
+    let thread = unicorn.get_data().thread_id();
+    match service {
+        TSE_SEM_CREATE => {
+            let id = {
+                let mut state = osal_state().lock().unwrap();
+                state.tse_next_id += 1;
+                let id = state.tse_next_id;
+                // `CreateOsalLock` (`0x5f3d50`) builds its locks from this call and expects
+                // `LockOsal` to take the first unit right away, so the count starts at 1.
+                state.tse_sems.insert(id, 1);
+                id
+            };
+            log::info!("monitor: TSE[{thread}] semaphore create -> id {id}");
+            Some(id)
+        }
+        TSE_SEM_DELETE => {
+            let id = read_word(unicorn, block).unwrap_or(0);
+            osal_state().lock().unwrap().tse_sems.remove(&id);
+            Some(0)
+        }
+        TSE_SEM_SIGNAL => {
+            let id = read_word(unicorn, block).unwrap_or(0);
+            let mut state = osal_state().lock().unwrap();
+            match state.tse_sems.get_mut(&id) {
+                Some(count) => *count += 1,
+                None => {
+                    drop(state);
+                    log::warn!("monitor: TSE[{thread}] signal on unknown semaphore {id}");
+                    return Some(TSE_E_OBJ);
+                }
+            }
+            Some(0)
+        }
+        TSE_SEM_WAIT => {
+            let id = read_word(unicorn, block).unwrap_or(0);
+            let mut state = osal_state().lock().unwrap();
+            match state.tse_sems.get_mut(&id) {
+                Some(count) if *count > 0 => {
+                    *count -= 1;
+                    Some(0)
+                }
+                Some(_) => {
+                    if at_entry {
+                        None
+                    } else {
+                        log::warn!("monitor: TSE[{thread}] semaphore {id} wait timed out");
+                        Some(TSE_E_TMOUT)
+                    }
+                }
+                None => {
+                    drop(state);
+                    log::warn!("monitor: TSE[{thread}] wait on unknown semaphore {id}");
+                    Some(TSE_E_OBJ)
+                }
+            }
+        }
+        TSE_FLG_CREATE => {
+            // The flag name lives inline in the CB as two 4-character words (the async-IO
+            // workers name theirs `AIO2_%02d` split across them); read it for the log only.
+            let cb = read_word(unicorn, block).unwrap_or(0);
+            let (lo, hi) = (
+                read_word(unicorn, cb + 0xc).unwrap_or(0),
+                read_word(unicorn, cb + 0x10).unwrap_or(0),
+            );
+            let name: String = lo
+                .to_le_bytes()
+                .into_iter()
+                .chain(hi.to_le_bytes())
+                .map(|byte| if byte.is_ascii_graphic() { byte as char } else { '.' })
+                .collect();
+            let id = {
+                let mut state = osal_state().lock().unwrap();
+                state.tse_next_id += 1;
+                let id = state.tse_next_id;
+                state.tse_flags.insert(id, 0);
+                id
+            };
+            log::info!("monitor: TSE[{thread}] flag create (name {name:?}) -> id {id}");
+            Some(id)
+        }
+        TSE_FLG_DELETE => {
+            let id = read_word(unicorn, block).unwrap_or(0);
+            osal_state().lock().unwrap().tse_flags.remove(&id);
+            Some(0)
+        }
+        TSE_FLG_SET => {
+            let flag = read_word(unicorn, block).unwrap_or(0);
+            let pattern = read_word(unicorn, block + 4).unwrap_or(0);
+            let mut state = osal_state().lock().unwrap();
+            match state.tse_flags.get_mut(&flag) {
+                Some(bits) => *bits |= pattern,
+                None => {
+                    drop(state);
+                    log::warn!("monitor: TSE[{thread}] set {pattern:#x} on unknown flag {flag}");
+                    return Some(TSE_E_OBJ);
+                }
+            }
+            Some(0)
+        }
+        TSE_FLG_WAIT => {
+            let flag = read_word(unicorn, block).unwrap_or(0);
+            let pattern = read_word(unicorn, block + 4).unwrap_or(0);
+            let mut state = osal_state().lock().unwrap();
+            match state.tse_flags.get_mut(&flag) {
+                Some(bits) if *bits & pattern == pattern => {
+                    *bits &= !pattern;
+                    Some(0)
+                }
+                Some(_) => {
+                    if at_entry {
+                        None
+                    } else {
+                        log::warn!("monitor: TSE[{thread}] flag {flag} pattern {pattern:#x} wait timed out");
+                        Some(TSE_E_TMOUT)
+                    }
+                }
+                None => {
+                    drop(state);
+                    log::warn!("monitor: TSE[{thread}] wait on unknown flag {flag}");
+                    Some(TSE_E_OBJ)
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Re-check a parked TSE wait from the scheduler: `Some(0)` once the semaphore can be taken
+/// or the flag pattern matches (and the unit is consumed), `None` while it must keep waiting.
+/// Only the two wait services are looked at; everything parked elsewise is untouched.
+pub fn poll_tse_wait(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) -> Option<u32> {
+    if !matches!(service, TSE_SEM_WAIT | TSE_FLG_WAIT) {
+        return None;
+    }
+    complete_tse(unicorn, service, block, true)
+}
+
+/// Start a guest thread for an OSAL create/spawn request: a fresh zero-filled stack from the
+/// process heap, `R0` = argument, `LR` = 0 (returning from the entry ends the thread through
+/// the scheduler's null-pc guard), and the entry's ARM/Thumb bit folded into `CPSR`. Mirrors
+/// what `clone` does for Linux-side threads; the entry runs in the caller's address space.
+fn spawn_guest_thread(unicorn: &mut Unicorn<'_, Context>, entry: u32, arg: u32, stack_size: u32) -> u32 {
+    let size = (stack_size.max(0x4000) + 0xfff) & !0xfff;
+    let mmu = {
+        let data = unicorn.get_data();
+        data.mmu.clone()
+    };
+    let stack = {
+        let mut mmu = mmu.lock().unwrap();
+        mmu.heap_alloc(unicorn, size, Prot::READ | Prot::WRITE, "osal-thread-stack")
+    };
+    let sp = (stack + size - 8) & !7;
+    let parent_context = unicorn.context_init().unwrap();
+    unicorn
+        .reg_write(RegisterARM::R0 as i32, arg as u64)
+        .unwrap();
+    unicorn.reg_write(RegisterARM::R13 as i32, sp as u64).unwrap();
+    unicorn.reg_write(RegisterARM::R14 as i32, 0).unwrap();
+    unicorn
+        .reg_write(RegisterARM::PC as i32, (entry & !1) as u64)
+        .unwrap();
+    let cpsr = unicorn.reg_read(RegisterARM::CPSR).unwrap_or(0) as u32;
+    let cpsr = if entry & 1 != 0 { cpsr | 0x20 } else { cpsr & !0x20 };
+    unicorn.reg_write(RegisterARM::CPSR as i32, cpsr as u64).unwrap();
+    let child_context = unicorn.context_init().unwrap();
+    unicorn.context_restore(&parent_context).unwrap();
+
+    let tid = {
+        let data = unicorn.get_data();
+        let tid = data.inner.next_thread_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        data.threads.lock().unwrap().push(GuestThread {
+            id: tid,
+            status: ThreadStatus::Runnable,
+            cpu_context: Some(child_context),
+            pc: entry & !1,
+            pending_result: None,
+            clear_child_tid: None,
+        });
+        tid
+    };
+    tid
+}
+
+/// Read and start one OSAL thread CB (`{ name, len, stack, entry, argument }`, see the
+/// `OSAL_THREAD_*` docs). Returns the new thread id, or `-1` when the CB carries no entry -
+/// the callers (`OSAL_bInitAsyncIO` among them) branch on exactly that.
+fn start_osal_thread(unicorn: &mut Unicorn<'_, Context>, cb: u32, verb: &str) -> u32 {
+    if cb < 0x1000 {
+        log::warn!("monitor: OSAL thread {verb} on bad CB {cb:#x}");
+        return 0xffff_ffff;
+    }
+    let name_ptr = read_word(unicorn, cb).unwrap_or(0);
+    let stack = read_word(unicorn, cb + 8).unwrap_or(0);
+    let entry = read_word(unicorn, cb + 0xc).unwrap_or(0);
+    let arg = read_word(unicorn, cb + 0x10).unwrap_or(0);
+    if entry < 0x1000 {
+        log::warn!("monitor: OSAL thread {verb} CB {cb:#x} carries entry {entry:#x}");
+        return 0xffff_ffff;
+    }
+    let name = read_c_string(unicorn, name_ptr).unwrap_or_default();
+    let tid = spawn_guest_thread(unicorn, entry, arg, stack);
+    log::info!(
+        "monitor: OSAL thread {verb} (name {name:?}, entry {entry:#x}, arg {arg:#x}, stack {stack:#x}) -> thread [{tid}]"
+    );
+    tid
 }
 
 /// Serve `OSAL_EventCreate` (cmd 49) the way `0x58b0` does: a named event whose handle (the
