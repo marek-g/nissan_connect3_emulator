@@ -1384,3 +1384,25 @@ publishes `NavPosition` / feeds the CCP. Next work item = a faithful `cmb_sensor
 GPS source + the `posfi` registration trigger, and/or unblocking the DAPI
 `subscribe-event8` `0xffff` path (both still "necessary, not sufficient" - see the
 DYN4MBX bridge and this chain).
+
+**Object `0x6e` is the OSAL IO service and is now served (r174/r175).** The
+earlier note above called `0x1026e`/`0x2016e` "periodic/startup OSAL traffic
+PROCNAV continues past" - true only in the sense that PROCNAV survived it: the
+catch-all's handle `0` made every client-side `OSAL_s32IOControl` fail its magic
+check *before* the svc, so PROCNAV's registry traffic never reached the monitor
+at all and the SCD lookup fell back to mode 0 (static map, which needs registry
+enumeration the catch-all cannot answer). The wrappers/clients are now fully
+decoded (see `docs/reverse_engineering/triton_mid_swi_services.md` "Object 0x6e
+fully decoded") and `complete_osal_io` serves the object: opens of
+`/dev/registry/...` hand back real handle objects (magic `0xD0E1D0E1`, path at
+`+0x20`), registry query/set run against the shared registry (`MAXPOOLSIZE` =
+`0xFA000` resolves), the `0xa`/`0xb` probes pass and PROCNAV **reaches SCD mode
+1**, with the `0xb` service->app lookup wired to the registry (`SERVICEID` ->
+`APPID`, service `0xb` -> app `10041`). r175 vs r174: no crashes, GPU/quantum
+volume unchanged, PROCNAV still parks on the same object `0x13` data wait.
+Remaining gaps on this object are *data*, not ABI: the `PROCESS\NAVAPP` and
+`FC_*/APP_CONFIG` keys live in the encrypted region files (`ni2k_*/NAVAPP.ERG`)
+and are absent from the emulator registry (the client handles the failed opens
+with defaults, exactly as on a unit without those keys), and the `0xb` lookup
+only fires once something drives PROCNAV's commcon - the `cmb_sensorfi` GPS
+provider (next work item) is still the trigger.
