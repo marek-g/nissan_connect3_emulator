@@ -11,6 +11,7 @@ use crate::libs::gl_stub::{libegl_add_code_hooks, libgles2_add_code_hooks};
 use crate::libs::libsvg_resource::libsvg_resource_add_code_hooks;
 use crate::libs::libtrace::libtrace_add_code_hooks;
 use crate::libs::procmapengine::procmapengine_add_code_hooks;
+use crate::libs::procnav::procnav_add_code_hooks;
 use crate::libs::prochmi::prochmi_add_code_hooks;
 pub use syscalls::hook_syscall::hook_syscall;
 pub use syscalls::sys_calls_state::SysCallsState;
@@ -94,6 +95,7 @@ pub fn add_library_hook(unicorn: &mut Unicorn<'_, Context>, library: &str, base_
             procmapengine_add_code_hooks(unicorn, base_address)
         }
         "/opt/bosch/processes/DAPIAPP.OUT" => dapiapp_add_code_hooks(unicorn, base_address),
+        "/opt/bosch/navbin/PROCNAV.OUT" => procnav_add_code_hooks(unicorn, base_address),
         _ => return,
     }
 
