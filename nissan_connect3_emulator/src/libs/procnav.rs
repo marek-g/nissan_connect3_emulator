@@ -74,6 +74,34 @@ const PROBE_VT68: u32 = 0x0024_b786 - ORIGINAL_BASE;
 const PROBE_INIT_RESULT: u32 = 0x00be_08a - ORIGINAL_BASE;
 const PROBE_STATE_STORE: u32 = 0x00be_094 - ORIGINAL_BASE;
 const PROBE_INIT_FAIL: u32 = 0x00be_144 - ORIGINAL_BASE;
+/// `STAT_tclApplication::bOnInit` (`0x57210`) sub-step results: after the base init
+/// check (`0x5722e`, must return 1), the channel factory (`0x570f4`), the components
+/// (`0x5708e`) and the run step (`0x57032`) - the first non-matching value fails all.
+const PROBE_ONINIT_BASE: u32 = 0x0057_232 - ORIGINAL_BASE;
+const PROBE_ONINIT_FACTORY: u32 = 0x0057_23c - ORIGINAL_BASE;
+const PROBE_ONINIT_COMPONENTS: u32 = 0x0057_246 - ORIGINAL_BASE;
+const PROBE_ONINIT_RUN: u32 = 0x0057_250 - ORIGINAL_BASE;
+/// `s32InitializeComponents` (`0x5708e`): right after the object creation call
+/// (`0x570b0 bl 0x31814c`) - `r0` is the created component object or null.
+const PROBE_ONINIT_CREATE: u32 = 0x0057_0b4 - ORIGINAL_BASE;
+/// The nothrow `operator new` body (`0xb9a2c`): `r0` is the requested size on entry,
+/// the returned pointer (or null) right after the allocator `blx` at `0xb9a38`.
+const PROBE_NEW_ENTRY: u32 = 0x000b_9a2c - ORIGINAL_BASE;
+const PROBE_NEW_EXIT: u32 = 0x000b_9a38 - ORIGINAL_BASE;
+/// Inside `STAT_tclComponent::s32Initialize` (`0x59c30`): after `new(0x550)`
+/// (`0x59c58`), after the app-interface attach (`0x59c7c`, must return 0) and after
+/// the component start (`0x59caa`) - the first non-zero/`-1` decides the result.
+const PROBE_STAT_ALLOC: u32 = 0x0059_c58 - ORIGINAL_BASE;
+const PROBE_STAT_ATTACH: u32 = 0x0059_c7c - ORIGINAL_BASE;
+const PROBE_STAT_START: u32 = 0x0059_caa - ORIGINAL_BASE;
+/// `rtf::tclComponent::s32SetupThreads` (`0x199674`): after `u32CreateThreads`
+/// (`0x1996a4`) and `u32InitializeThreads` (`0x1996b0`) - `r0` is the per-step
+/// count, `[component+8]` the number the component expects.
+const PROBE_STAT_CREATED: u32 = 0x0199_6a4 - ORIGINAL_BASE;
+const PROBE_STAT_INITED: u32 = 0x0199_6b0 - ORIGINAL_BASE;
+/// Decision point of `s32SetupThreads` (`0x19969a`): `r2` (0 = a config slot was
+/// null), `r6` (configured thread count) and `r1` (the init-config array).
+const PROBE_STAT_SETUP: u32 = 0x0199_69a - ORIGINAL_BASE;
 /// GPS-data sink inside `pc_tclSensorMsgHandler::s32OnStatusMsg` (ARM).
 const GPS_STATUS_SINK: u32 = 0x0068_ff8c - ORIGINAL_BASE;
 
@@ -112,6 +140,7 @@ fn hexdump(unicorn: &mut Unicorn<'_, Context>, address: u32, len: usize) -> Stri
 
 pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let repost_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let new_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     for (name, offset, size) in [
         ("dispatcher", PROPERTY_DISPATCHER, 2u64),
         ("field-helper", PUMP_FIELD_HELPER, 2),
@@ -139,15 +168,34 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ("probe-init-result", PROBE_INIT_RESULT, 2),
         ("probe-state-store", PROBE_STATE_STORE, 2),
         ("probe-init-fail", PROBE_INIT_FAIL, 2),
+        ("probe-oninit-base", PROBE_ONINIT_BASE, 2),
+        ("probe-oninit-factory", PROBE_ONINIT_FACTORY, 2),
+        ("probe-oninit-components", PROBE_ONINIT_COMPONENTS, 2),
+        ("probe-oninit-run", PROBE_ONINIT_RUN, 2),
+        ("probe-oninit-create", PROBE_ONINIT_CREATE, 2),
+        ("probe-new-entry", PROBE_NEW_ENTRY, 2),
+        ("probe-new-exit", PROBE_NEW_EXIT, 2),
+        ("probe-stat-alloc", PROBE_STAT_ALLOC, 2),
+        ("probe-stat-attach", PROBE_STAT_ATTACH, 2),
+        ("probe-stat-start", PROBE_STAT_START, 2),
+        ("probe-stat-created", PROBE_STAT_CREATED, 2),
+        ("probe-stat-inited", PROBE_STAT_INITED, 2),
+        ("probe-stat-setup", PROBE_STAT_SETUP, 2),
     ] {
         let address = (base_address + offset) as u64;
         let repost_count = repost_count.clone();
+        let new_count = new_count.clone();
         let result = unicorn.add_code_hook(address, address + size, move |uc, _, _| {
             let tid = uc.get_data().inner.thread_id();
-            if (name == "power-repost" || name.starts_with("probe-"))
-                && repost_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 200
-            {
-                return; // dispatch retries would otherwise flood the log
+            if name == "power-repost" || name.starts_with("probe-") {
+                let counter = if name.starts_with("probe-new-") {
+                    &new_count
+                } else {
+                    &repost_count
+                };
+                if counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 200 {
+                    return; // dispatch retries and startup allocations flood the log
+                }
             }
             match name {
                 "dispatcher" => {
@@ -267,6 +315,55 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 }
                 "probe-init-fail" => {
                     log::info!("PROCNAV[{tid}] probe-init-fail: bOnInit failed");
+                }
+                "probe-oninit-base"
+                | "probe-oninit-factory"
+                | "probe-oninit-components"
+                | "probe-oninit-run" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    log::info!("PROCNAV[{tid}] {name}: returned {r0:#x}");
+                }
+                "probe-oninit-create" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    log::info!("PROCNAV[{tid}] probe-oninit-create: new(0x30) -> {r0:#010x}");
+                }
+                "probe-new-entry" => {
+                    let size = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    if size >= 0x20 {
+                        log::info!(
+                            "PROCNAV[{tid}] probe-new-entry: allocation of {size:#x} bytes"
+                        );
+                    }
+                }
+                "probe-new-exit" => {
+                    let ptr = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    if ptr == 0 {
+                        log::info!("PROCNAV[{tid}] probe-new-exit: allocation FAILED (null)");
+                    }
+                }
+                "probe-stat-alloc"
+                | "probe-stat-attach"
+                | "probe-stat-start" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    log::info!("PROCNAV[{tid}] {name}: result {r0:#010x}");
+                }
+                "probe-stat-created" | "probe-stat-inited" => {
+                    let component = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    let got = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    let expected = word(uc, component.wrapping_add(8)).unwrap_or(0);
+                    log::info!(
+                        "PROCNAV[{tid}] {name}: component={component:#010x} got {got} expected {expected}"
+                    );
+                }
+                "probe-stat-setup" => {
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0);
+                    let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0);
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCNAV[{tid}] probe-stat-setup: flag={r2:#x} count={r6} config={r1:#010x} entry0={:?} entry1={:?}",
+                        word(uc, r1),
+                        word(uc, r1.wrapping_add(0x14)),
+                    );
                 }
                 "svc-data" => {
                     let msg = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;

@@ -1795,6 +1795,20 @@ fn complete_osal_mbx_open(unicorn: &mut Unicorn<'_, Context>, thread: u32, block
             }
         }
     };
+    // One-shot block dump: the open callers use at least two layouts and the AE
+    // pumps starve on slots the write-back above apparently misses.
+    {
+        static DUMPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if DUMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+            let raw: Vec<u32> = (0..8u32)
+                .map(|i| read_word(unicorn, block + 4 * i).unwrap_or(0))
+                .collect();
+            log::info!(
+                "monitor: OSAL[{thread}] queue open {name:?} handle {handle:#x} out {out:#x} block {block:#x} raw {:08x?}",
+                raw
+            );
+        }
+    }
     if out == 0 || write_word(unicorn, out, handle).is_err() {
         log::warn!("monitor: OSAL[{thread}] queue open {name:?}: cannot write handle to {out:#x}");
         return 0;
@@ -1823,22 +1837,39 @@ fn complete_osal_mbx_wait(
     let slot = read_word(unicorn, block).unwrap_or(0);
     let handle = read_word(unicorn, slot).unwrap_or(0);
     let (buf, size) = (read_word(unicorn, block + 4).unwrap_or(0), read_word(unicorn, block + 8).unwrap_or(0));
-    if handle == 0 || buf == 0 || buf > 0xf000_0000 || size < 8 {
-        // A wait on a slot no open filled can never receive; answer it like an empty
-        // queue instead of parking forever on a queue that does not exist.
+    // The AE pumps carry the target app id in the request block itself (`w7`,
+    // offset 0x1c). Their `w0` slot on the bring-up stack gets re-written by the
+    // guest (app ids, zeroes) after the open write-back, so the id is the only
+    // stable routing information; the handle table stays the fallback.
+    let app_id = read_word(unicorn, block + 0x1c).unwrap_or(0);
+    let name = if (1..=0xff).contains(&app_id) {
+        Some(format!("mbx_{app_id}"))
+    } else {
+        osal_state()
+            .lock()
+            .unwrap()
+            .mbx_handles
+            .iter()
+            .find(|(_, h)| **h == handle)
+            .map(|(n, _)| n.clone())
+    };
+    if buf == 0 || buf > 0xf000_0000 || size < 8 {
+        // A wait without a usable receive buffer can never complete; answer it
+        // like an empty queue instead of parking forever.
+        {
+            static GUARDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if GUARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+                log::info!(
+                    "monitor: OSAL[{thread}] queue wait rejected: slot {slot:#x} handle {handle:#x} buf {buf:#x} size {size:#x}"
+                );
+            }
+        }
         if !at_entry {
             osal_state().lock().unwrap().last_error.insert(thread, 0x72005);
             return Some(-1i32 as u32);
         }
         return None;
     }
-    let name = osal_state()
-        .lock()
-        .unwrap()
-        .mbx_handles
-        .iter()
-        .find(|(_, h)| **h == handle)
-        .map(|(n, _)| n.clone());
     let Some(name) = name else {
         if !at_entry {
             osal_state().lock().unwrap().last_error.insert(thread, 0x72005);
@@ -1846,6 +1877,16 @@ fn complete_osal_mbx_wait(
         }
         return None;
     };
+    // One-line map of which pump thread consumes which queue: the parked AE waits
+    // are otherwise invisible and the GPS provider has to target the right `mbx_`.
+    {
+        static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(u32, String)>>> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let mut seen = SEEN.lock().unwrap();
+        if seen.insert((thread, name.clone())) {
+            log::info!("monitor: OSAL[{thread}] pump waits on {name} (handle {handle:#x})");
+        }
+    }
     let prio_ptr = read_word(unicorn, block + 0xc).unwrap_or(0);
     // Proxy-queued power messages take precedence over bridge traffic, exactly
     // like the libosal-side wait hook (`pwr_proxy_service_handle`). The body is
@@ -2037,6 +2078,20 @@ fn complete_osal_io(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32
                 handle,
                 block
             );
+            // Return the handle page to the guest's block pool so a later open
+            // reuses it instead of mapping a fresh QEMU section. Only addresses
+            // the pool handed out dynamically may be released: an unknown
+            // address (double close) must never reach the static-slot path.
+            {
+                let state = {
+                    let data = unicorn.get_data();
+                    data.sys_calls_state.clone()
+                };
+                let mut guard = state.lock().unwrap();
+                if guard.osal_messages.is_dynamic(handle) {
+                    guard.osal_messages.release(handle);
+                }
+            }
             Some(0)
         }
         SERVICE_IO_REMOVE => {
@@ -2172,16 +2227,39 @@ fn complete_io_open_create(
 /// demands at `+0`, a device type at `+0x1c` that keeps iocontrol on the generic path, and
 /// the device path at `+0x20` (iocontrol reads it back to route the request).
 fn alloc_io_handle(unicorn: &mut Unicorn<'_, Context>, path: &str) -> Option<u32> {
-    let mmu = {
+    // The handle is a full page, and a busy bring-up opens hundreds of keys in
+    // open/ioctl/close cycles. QEMU memory sections never collapse, so every fresh
+    // mapping counts towards the hard 4096-section abort - recycle the guest's
+    // closed handle pages through the same pool the message snapshots use.
+    let state = {
         let data = unicorn.get_data();
-        data.mmu.clone()
+        data.sys_calls_state.clone()
     };
-    let object = mmu.lock().unwrap().heap_alloc(
-        unicorn,
-        0x1000,
-        Prot::READ | Prot::WRITE,
-        "[monitor-osal-io]",
-    );
+    let reused = state.lock().unwrap().osal_messages.take_freed(0x1000);
+    let object = match reused {
+        Some(object) => object,
+        None => {
+            // No guard may be live here: `heap_alloc` re-enters the very lock.
+            let mmu = {
+                let data = unicorn.get_data();
+                data.mmu.clone()
+            };
+            let object = mmu.lock().unwrap().heap_alloc(
+                unicorn,
+                0x1000,
+                Prot::READ | Prot::WRITE,
+                "[monitor-osal-io]",
+            );
+            if object != 0 {
+                state
+                    .lock()
+                    .unwrap()
+                    .osal_messages
+                    .mark_dynamic(object, 0x1000);
+            }
+            object
+        }
+    };
     if object == 0 {
         return None;
     }

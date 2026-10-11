@@ -105,6 +105,15 @@ impl OsalMessagePool {
         self.dynamic.insert(content, size);
     }
 
+    /// Whether `content` is a dynamically allocated block (not a static-pool
+    /// slot). Callers that recycle foreign addresses must check this first:
+    /// `release` falls through to static-pool slot arithmetic for unknown
+    /// addresses, which corrupts the pool bookkeeping when the address is not
+    /// a pool message at all (double-closed io handle objects).
+    pub fn is_dynamic(&self, content: u32) -> bool {
+        self.dynamic.contains_key(&content)
+    }
+
     /// Hand back a previously released emulated-message block that can hold
     /// `size` bytes. Reusing the already-mapped guest block keeps QEMU's
     /// memory-section count flat under sustained CCA traffic (each fresh
