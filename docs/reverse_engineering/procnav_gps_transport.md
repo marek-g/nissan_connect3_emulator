@@ -138,3 +138,23 @@ then act as that server - answer the RELUP register and push a serialised
 amt comm-member/queue transport the emulator only partially models today, so it is far
 bigger than the `DYN*MBX` bridge. Message ids are pinned (service `0xb`, property `5`,
 opcode `6`); earliest open RE is the comm-member/directory entry (item 1).
+
+## Provider identity + where to implement (RESOLVED)
+`scd_bGetAppIdFromServiceId` resolves service -> app via `scd_tclServiceAppMap`, whose
+`bReadData` (`0x34e3ec`) iterates the **amt registry** (`/dev/registry`, emulator model =
+`common/registry.rs` in `namespace.rs`) over `PROCESS/<proc>/<app>/SERVICES/<svc>` reading
+`APPID` + `SERVICEID`. The emulator already loads `procmw.reg`, which declares the
+provider: `PROCESS/PROCMW/SENSOR` has `APPID = 0x2739 (10041)` with
+`SERVICES/SENSORS : SERVICEID = 0xb`. So "who provides sensorfi service 0xb" is
+**PROCMW / SENSOR app 10041** - already in the registry - but `PROCMW` is **not launched**,
+so PROCNAV resolves the app id yet has no live/reachable comm peer and parks on the kernel
+event flag (`0x13`). `scd_bTestLookupIoControl` picks the static-map branch when the SCD
+queue device can't be opened, else `IOControl(scd_fd, 0xb)`; both bottom out in the same
+service->app answer.
+
+Placement: the service->app *data* is the **registry** (`common/registry.rs`, already
+present, no new data needed). The *provider behaviour* (be PROCMW/SENSOR: answer PROCNAV's
+channel/RELUP send, push GPS) is inter-process commcon delivery, which lives in
+**`src/rtos`** (monitor object `0x0a` mailbox/directory + the `interaction`/app-info
+announcement path) - NOT the OSAL-service `complete_osal_service` code. So `src/rtos` is
+the right place for the provider, seeded off the existing registry data.
