@@ -441,6 +441,11 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
                     set_runnable(unicorn, tid, Some(status));
                     continue;
                 }
+                // an OSAL queue wait wakes the moment a message lands in its host queue
+                if let Some(status) = crate::rtos::monitor::poll_osal_mbx_wait(unicorn, service, block) {
+                    set_runnable(unicorn, tid, Some(status));
+                    continue;
+                }
                 if deadline.map(|until| until <= now).unwrap_or(false) {
                     let status = crate::rtos::monitor::complete(unicorn, service, block);
                     log::debug!(

@@ -1486,8 +1486,9 @@ fn suppress_synthetic_message_delete(
 /// Dispatch hook for the host-side Bosch PWR-proxy policy. Runs before
 /// `bridge_guest_osal_queue` for the small set of OSAL queue calls the
 /// proxy cares about. `mbx_0` posts are observed (never intercepted) so
-/// the guest's own Post still succeeds; `mbx_<app_id>` waits are served
-/// from the proxy's pending queue when it has anything queued.
+/// the proxy always sees them; the `mbx_` bridge then snapshots them for the
+/// Triton-side waiters (`<mbx_<app_id>` waits are also served from the
+/// proxy's pending queue when it has anything queued).
 fn pwr_proxy_service_handle(
     unicorn: &mut Unicorn<'_, Context>,
     api_name: &str,
@@ -1886,7 +1887,7 @@ fn bridge_mbx_queue(
     prio_or_prio_ptr: u32,
     timeout: u32,
 ) -> bool {
-    if !name.starts_with("mbx_") || name == "mbx_0" {
+    if !name.starts_with("mbx_") {
         return false;
     }
     if !matches!(
@@ -2285,6 +2286,21 @@ pub(crate) fn deliver_snapshot_message(
     prio_ptr: u32,
     priority: u32,
 ) -> Option<u32> {
+    let count = materialize_snapshot(unicorn, blob, buf, prio_ptr, priority)?;
+    return_to_caller(unicorn, count);
+    Some(count)
+}
+
+/// The register-free half of `deliver_snapshot_message`: materialize the snapshotted
+/// content in this guest's VM and leave the 8-byte reference at `buf`. The Triton monitor
+/// path delivers through its own completion machinery, so it uses this directly.
+pub(crate) fn materialize_snapshot(
+    unicorn: &mut Unicorn<'_, Context>,
+    blob: &[u8],
+    buf: u32,
+    prio_ptr: u32,
+    priority: u32,
+) -> Option<u32> {
     if blob.len() < 8 {
         return None;
     }
@@ -2330,7 +2346,6 @@ pub(crate) fn deliver_snapshot_message(
             .mem_write(prio_ptr as u64, &pack_u32(priority))
             .ok()?;
     }
-    return_to_caller(unicorn, 8);
     Some(8)
 }
 
