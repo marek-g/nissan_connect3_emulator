@@ -612,11 +612,44 @@ fn read_identifier(unicorn: &mut Unicorn<'_, Context>, address: u32) -> Option<S
     String::from_utf8(run.to_vec()).ok()
 }
 
+/// `EMU_SENSORFI_TRACE=1`: surface PROCNAV's service->app lookup state so the sensorfi
+/// provider shim can be written against what the guest actually does rather than static
+/// inference. `scd_bGetAppIdFromServiceId` (`0x34f012`) branches on `cRam01215110`
+/// (`0x1215110`): `0` = the static service->app map it builds by iterating the registry,
+/// `1` = query the SCD queue over `OSAL_s32IOControl(handle, 0xb, ...)`. `iRam01215114`
+/// (`0x1215114`) is the SCD queue handle from `scd_bCreateQueue`/`scd_OpenQueue`, `-1` when
+/// no connection was obtained (which forces mode `0`). Both are PROCNAV `.bss` globals at
+/// their Ghidra addresses (the binary runs unrelocated), so they are read straight from the
+/// guest. The value is logged only when it changes, so a full run yields a handful of lines.
+fn trace_scd_lookup(unicorn: &mut Unicorn<'_, Context>) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    if !*ON.get_or_init(|| std::env::var_os("EMU_SENSORFI_TRACE").is_some())
+        || !unicorn.get_data().elf_path.contains("PROCNAV")
+    {
+        return;
+    }
+    // Two brief guest-memory reads; no host lock is held across them and nothing sleeps.
+    let mode = read_word(unicorn, 0x1215_110).map(|word| word & 0xff).unwrap_or(0xff);
+    let handle = read_word(unicorn, 0x1215_114).unwrap_or(u32::MAX);
+    let packed = (u64::from(mode) << 32) | u64::from(handle);
+    if LAST.swap(packed, std::sync::atomic::Ordering::Relaxed) == packed {
+        return;
+    }
+    log::warn!(
+        "EMU-SCD: PROCNAV service->app lookup mode {} (0=static registry map, 1=SCD-queue ioctl), SCD handle {:#x} ({})",
+        mode,
+        handle,
+        handle as i32,
+    );
+}
+
 /// Hand a yielded request back, the way the thread that owns the monitor object would
 /// when it completes the request: whatever the caller expects lands in its request
 /// block, and R0 carries the status the continuation branches on (`cmp r0, #0` with the
 /// out-parameter read for `r0 >= 0`).
 pub fn complete(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) -> u32 {
+    trace_scd_lookup(unicorn);
     // The OSAL service object (0x64) dispatches on `cmd = service >> 16` through the 99-entry
     // table blob0 registers; each cmd is answered like the pool/bank services above - by
     // reproducing the observable contract of the real `OSAL_*` leaf in the guest's own RAM.
