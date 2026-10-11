@@ -1235,3 +1235,59 @@ Next real question (supersedes the queue bridge): which semaphore/event/SPM
 handshake is `0x10030313` / the `_LICENSE`/`NAVEND`/`SPM_LCN2KAI_*` sequence
 waiting on, and who signals it on real hardware (map-card authorization via
 `/dev/cryptnav`/`/dev/prm`, the `sysprogdnl` DNL overlay, or a peer process).
+
+## The residual `0x305` is a missing vehicle position (CCP), not a data gap
+
+After the `DYN<n>MBX` IOSC bridge made the IPC work, `0x305` dropped to a
+steady residual (see correctness.md): 2 requests still fail, and they are the
+road-network *area/coverage* requests, i.e. the ones that depend on where the
+car is. Investigation (r168 + Ghidra) pinned the cause to a **missing position
+feed**, end to end:
+
+- `procmapengine` renders and requests map areas relative to the vehicle's
+  **Car-Current-Position (CCP)**: `PortControl_CCAClientHandler_Navi::vHandleNavPosition`,
+  `AddCCP`/`GetCCP` (`AddCCP: Updated CCA 1st TS..`, `GetCCP: Pos (%d/%d/%f) OUT OF BOUNDS`),
+  and `MapEngine_GetCurrentGlobalMapPosition` (view `+0x2b8`=Long, `+0x2bc`=Lat,
+  int grid units, degrees = unit * `8.381903e-08`).
+- In the whole run there are **zero** `NavPosition`/`CCP`/`GlobalMapPosition`
+  events - nothing ever delivers a position to the map engine, so the derived
+  area requests resolve to "no data" and DAPI's `dap_map_tclWorker::enProcessJob`
+  answers `0x305`. Confirmed empirically: seeding the map *view* centre to Krakow
+  (`view+0x2b8/+0x2bc`, the `RENDER_CONTROL_GET_VIEW_RESULT` hook) did **not**
+  change the CCA request count or the `0x305` - the block requests are driven by
+  CCP, not the view centre. (That experiment was reverted; it also perturbed the
+  steady-state `mbx_1024` loop.)
+- The position *producer* is **`PROCNAV`** (pid 4). PROCNAV is the server of the
+  `posfi` NavPosition service (`rtf_tclServerSideOutChannel` + `posfi_tclMsgNavPositionStatus`,
+  `pc_tclMapMatching::vExtractBestSections_SetPosition`, map-matching) and the
+  **client** of the combined-sensor service: it installs handlers for
+  `cmb_sensorfi_tclMsgGpsDataStatus` / `GpsTightCouplingDataStatus` /
+  `GpsExtDataStatus` via `pc_tclSensorMsgHandler`. GPS in -> map-match -> NavPosition out.
+- PROCNAV spawns, takes its start-proc callback, then parks in
+  `MonitorYield { deadline }` and only runs periodically; it never publishes a
+  NavPosition because it never receives a `cmb_sensorfi` GPS fix.
+- Nobody in the launched process set serves `cmb_sensorfi`: `procsds` is Speech
+  (TTS/Recognizer), and `prochmi`/`procsmartphone` are FI *clients* (they merely
+  statically link the same FI lib). "cmb" = combined sensor (GPS + gyro + vehicle
+  speed for dead-reckoning). The GPS sensor server is either a Triton-side
+  component or a Linux process outside our launch set; no `/dev/gps|nmea|gpt` node
+  exists in the rootfs (created at runtime).
+
+So the faithful fix (Option A, chosen) is to establish a position source:
+
+1. Find how the combined-sensor `cmb_sensorfi` GPS property is provided and
+   delivered to PROCNAV: the service/function id PROCNAV registers for
+   (`cmb_sensorfi` RelUpReg), and whether the provider is a Triton service (svc #6)
+   or a process to spawn + feed a GPS device.
+2. Deliver a GPS fix for Krakow (~50.0614 N, 19.9456 E; grid unit = deg * 11.93e6)
+   through that channel so PROCNAV map-matches and publishes NavPosition, which
+   then flows to procmapengine's CCP and makes the area requests resolve.
+3. If PROCNAV is parked *before* it even subscribes to the sensor service, resolve
+   the earlier SPM/licence/registry bring-up first (see previous section) - GPS
+   will not be consumed until PROCNAV reaches its main loop that registers the
+   sensor handler.
+
+Cheaper but non-faithful alternative (rejected for now): have the emulator answer
+the `posfi`/`statfi` CurrentPosition/NavPosition service directly with Krakow
+(infrastructure partly in `dapi.rs`). Keeps the GUI moving but the position is a
+fabrication rather than something PROCNAV computes from a GPS feed.
