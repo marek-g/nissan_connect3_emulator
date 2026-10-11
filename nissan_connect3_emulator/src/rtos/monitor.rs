@@ -263,6 +263,11 @@ pub const OSAL_MBX_CREATE: u32 = 0x2a;
 /// forever). Returns the received byte count (> 0) and only branches on last-error `0x72005`
 /// as the benign "no message" code; an answered wait must never leave the queue unfilled.
 pub const OSAL_MBX_WAIT: u32 = 0x2d;
+/// `0x57`: resolve a received message reference in the receive pump (wrapper `0x2ec8dc`,
+/// block `[+0]=1, [+4]=content_ptr, [+8]=0xffff0004`). Answers the pointer to the message
+/// data (past the 8-byte OSAL envelope); the pump stores it and reads fields through it,
+/// and a `0` answer makes the pump discard the message before the amt dispatcher sees it.
+pub const OSAL_MBX_FIELD: u32 = 0x57;
 /// cmd 72 (shim `0xbd80` -> `0x5e88`): a stub leaf that unconditionally returns `3`, so the
 /// truthful answer is `3` rather than the catch-all's `0`.
 pub const OSAL_UNSUPPORTED3: u32 = 0x48;
@@ -700,7 +705,7 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool 
     let immediate = if object == TSE_OBJECT {
         complete_tse(unicorn, service, block, true)
     } else if object == OSAL_SERVICE_OBJECT
-        && matches!(ticks, OSAL_THREAD_CREATE | OSAL_THREAD_ACTIVATE | OSAL_THREAD_SPAWN | OSAL_THREAD_DELETE | OSAL_MBX_CREATE | OSAL_MBX_OPEN)
+        && matches!(ticks, OSAL_THREAD_CREATE | OSAL_THREAD_ACTIVATE | OSAL_THREAD_SPAWN | OSAL_THREAD_DELETE | OSAL_MBX_CREATE | OSAL_MBX_OPEN | OSAL_MBX_FIELD)
     {
         complete_osal_service(unicorn, service, block)
     } else if object == OSAL_SERVICE_OBJECT && ticks == OSAL_MBX_WAIT {
@@ -1167,6 +1172,22 @@ fn complete_osal_service(
         OSAL_MBX_CREATE => Some(complete_osal_mbx_create(unicorn, thread, block)),
         OSAL_MBX_OPEN => Some(complete_osal_mbx_open(unicorn, thread, block)),
         OSAL_MBX_WAIT => complete_osal_mbx_wait(unicorn, thread, block, false),
+        // `0x57`: resolve a received message reference `{1, content}` to its data pointer.
+        // The OSAL envelope is `{u32 id, u32 size}` (8 bytes), so the message itself starts
+        // at `content + 8`; the pump stores the pointer and reads `[ptr+4]` through it, so a
+        // non-pointer answer (or 0) makes it dereference garbage or drop the message.
+        OSAL_MBX_FIELD => {
+            let content = read_word(unicorn, block + 4).unwrap_or(0);
+            let data = if (0x1000..0xf000_0000).contains(&content) {
+                content + 8
+            } else {
+                0
+            };
+            log::info!(
+                "monitor: OSAL[{thread}] message reference {content:#x} -> data {data:#x}"
+            );
+            Some(data)
+        }
         // `0x48` (shim `0xbd80` -> leaf `0x5e88`): a stub that always returns 3.
         OSAL_UNSUPPORTED3 => {
             log::info!(
@@ -1843,8 +1864,16 @@ fn complete_osal_mbx_wait(
         message.priority,
     ) {
         Some(count) => {
+            let dump: Vec<String> = message
+                .data
+                .iter()
+                .skip(8)
+                .take(0x20)
+                .map(|b| format!("{b:02x}"))
+                .collect();
             log::info!(
-                "monitor: OSAL[{thread}] queue wait handle {handle:#x} ({name}) delivered {count} bytes"
+                "monitor: OSAL[{thread}] queue wait handle {handle:#x} ({name}) delivered {count} bytes body: {}",
+                dump.join(" ")
             );
             Some(count)
         }
