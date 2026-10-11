@@ -1472,3 +1472,38 @@ slot stride/magic hold for posted-but-unconsumed frames written by a sender
 (the real post path fills this from the other side - look for the sender-side
 tkse wrapper services on object `0x13`/`0x0a` in the launched processes), and
 the meaning of `obj->0x3c` (a per-object base added to every hit).
+
+#### Correction: object `0x13` is the TSE object family, and the PROCNAV park is
+*idle*, not a bank wait (r175 disassembly of the wrapper clusters)
+
+The service literals ending `0x13` resolve to named TSE wrappers, and the
+`>> 16` field the yield model reads as "ticks" is actually the **command**:
+
+| service | wrapper | block | notes |
+|---|---|---|---|
+| `0x10000113` | `tkse_cre_sem` `0x6233c0` | `[0]=&semid` | PROCNAV creates `wdb_safecnt_21` this way (catch-all returns sem id `0`) |
+| `0x10010113` | `tkse_del_sem` `0x623408` | `[0]=sem` | |
+| `0x10020213` | `tkse_sig_sem` `0x623428` | `[0]=sem` | |
+| `0x10030313` | `tkse_wai_sem` `0x623450` | `[0]=sem, [4]=?, [8]=timeout` | the *last* PROCNAV wait: sem `0` (= its own `CreateOsalLock` result), timeout `0xffffffff`, continuation `0x5e9b60` = `LockOsal` inside the OSAL **async-IO** job-queue code (`0x5e99xx-0x5e9cxx`, `nFindJobQueue`/`OSAL_bInitAsyncIO`) |
+| `0x10320413` | `tkse_snd_mbf` `0x6233e0` | `[4..]=msg,len,...` | mailbox-full send = the physical FI/OSAL queue post |
+| `0x10200113`/`0x10210113`/`0x10220213`/`0x10240513` | `tkse_cre_flg`/`del_flg`/`set_flg`/`wai_flg` `0x5f5220-0x5f5288` | `set_flg [0]=flg,[4]=pat`; `wai_flg [0]=flg,[1]=pat,[2]=cyc,[3]=mode,[4]=to` | flags; `set_flg` was PROCNAV's final monitor call |
+
+Re-reading the tail of r175 with this table: PROCNAV's last acts are event
+`NAVEND` create + delete/close (`0x31/0x33/0x34` on 0x64 - normal bring-up), a
+`/dev/trace` close (`0x2016e`), then the async-IO worker's `LockOsal`/`UnlockOsal`
+- and then *silence*: no svc #6, no LX monitor calls, no exits (heap telemetry
+runs to the end). It is not parked on a bank and not blocked on data - the main
+threads are idle/sleeping while the commcon member registration that would call
+`scd_bGetAppIdFromServiceId` (and eventually `tkse_snd_mbf`) has simply not been
+started. Note `yield_thread` misreads `service >> 16` as a tick timeout for
+these services (it is the cmd), so every TSE call gets a spurious ~4 s deadline
+park - harmless today but it must not be extended to real sem/flag semantics
+until the decode uses `(cmd, block)` instead.
+
+Next-step order follows from this: (a) model object `0x13` per-(cmd, block) -
+named sems/flags with real wait/sig, replacing the deadline-park for the TSE
+cmds; (b) find what is supposed to trigger PROCNAV's commcon member registration
+for service `0xb` (the DAPI `subscribe-event8` `0xffff` failure in
+correctness.md is the prime suspect); (c) only then does the bank/`snd_mbf`
+injection of a GPS `cmb_sensorfi` status (service `0xb`, func `5`, opcode `6`,
+TypeId `0x00050600`, payload `cmb_fi_tcl_GpsBigdata`) have a receiver.
