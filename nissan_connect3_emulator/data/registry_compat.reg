@@ -271,6 +271,12 @@
 "WATCHDOG_INTERVALL"=dword:00000000
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\FC_TEA\APP_CONFIG]
+; `scd_s32GetThreadConfiguration` (PROCNAV `0x34f71a`) reads the watchdog ms-per-tick
+; directly under the app's APP_CONFIG key after the thread PRI O/STCK (the
+; APP_CONFIG/WDG sub-key it tries first falls back to this value). A miss fails TEA's
+; bOnInit -> the app-19 adapter stays INITIALIZED and rejects GPS class-0x45 at the
+; state gate. Value follows the TIMA bring-up default (2500 ms).
+"WDG_MSPERTICK"=dword:000009c4
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\FC_TEA\SERVICES\FC_TEA]
 "SERVICEID"=dword:00000013
@@ -337,6 +343,15 @@
 "DYN2_STCK"=dword:00002710
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\FC_TEA\APP_THREAD]
+; TEA_tclApplication::s32InitializeComponents -> component "TEA" -> rGetThreadConfig
+; (appId 19). `scd_s32GetThreadConfiguration` builds `<AppName>_TASK1_<SUFFIX>` from
+; the app id's registry name, so the values are TEA_TASK1_PRIO/_STCK plus the
+; watchdog pair. A miss fails TEA's bOnInit and the app-19 adapter stays in
+; INITIALIZED, rejecting the GPS class-0x45 messages at the state gate.
+"TEA_TASK1_PRIO"=dword:0000004b
+"TEA_TASK1_STCK"=dword:00002710
+"TEA_TASK1_WTICKS"=dword:00000078
+"TEA_TASK1_MAXWTICKS"=dword:00000384
 "AE_PRIO"=dword:0000004b
 "AE_STCK"=dword:00002710
 "AB_PRIO"=dword:0000004b
