@@ -264,9 +264,9 @@ pub const OSAL_MBX_CREATE: u32 = 0x2a;
 /// as the benign "no message" code; an answered wait must never leave the queue unfilled.
 pub const OSAL_MBX_WAIT: u32 = 0x2d;
 /// `0x57`: resolve a received message reference in the receive pump (wrapper `0x2ec8dc`,
-/// block `[+0]=1, [+4]=content_ptr, [+8]=0xffff0004`). Answers the pointer to the message
-/// data (past the 8-byte OSAL envelope); the pump stores it and reads fields through it,
-/// and a `0` answer makes the pump discard the message before the amt dispatcher sees it.
+/// block `[+0]=1, [+4]=content_ptr, [+8]=0xffff0004`). Answers the **content base** - the
+/// amt `amt_tclBaseMessage` accessors read fields at `content+0xb..0x1c` through it - and a
+/// `0` answer makes the pump discard the message before the amt dispatcher sees it.
 pub const OSAL_MBX_FIELD: u32 = 0x57;
 /// cmd 72 (shim `0xbd80` -> `0x5e88`): a stub leaf that unconditionally returns `3`, so the
 /// truthful answer is `3` rather than the catch-all's `0`.
@@ -1173,13 +1173,16 @@ fn complete_osal_service(
         OSAL_MBX_OPEN => Some(complete_osal_mbx_open(unicorn, thread, block)),
         OSAL_MBX_WAIT => complete_osal_mbx_wait(unicorn, thread, block, false),
         // `0x57`: resolve a received message reference `{1, content}` to its data pointer.
-        // The OSAL envelope is `{u32 id, u32 size}` (8 bytes), so the message itself starts
-        // at `content + 8`; the pump stores the pointer and reads `[ptr+4]` through it, so a
-        // non-pointer answer (or 0) makes it dereference garbage or drop the message.
+        // r212 field-helper traces (0x258b6a = `amt_tclBaseMessage::u8GetValue(4)`, the pump
+        // stores the answer at `[block+4]` and double-dereferences through it) show the real
+        // OSAL answers the **content base**: the amt accessors (`u16GetValue` @ 0x2e3418 =
+        // `[[this+4]+idx]`) read serviceId u16 @ data+0x14, propertyId @ +0x18, opCode @ +0x1a,
+        // class/type @ +0xb - the same envelope the snapshot bodies carry from offset 0.
+        // Answering `content + 8` (r211) shifted every field by 8 and silently mis-dispatched.
         OSAL_MBX_FIELD => {
             let content = read_word(unicorn, block + 4).unwrap_or(0);
             let data = if (0x1000..0xf000_0000).contains(&content) {
-                content + 8
+                content
             } else {
                 0
             };
