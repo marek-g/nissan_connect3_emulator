@@ -362,7 +362,7 @@ pub fn run_process_loop(
                 .unwrap()
                 .iter()
                 .map(|t| match t.status {
-                    ThreadStatus::Blocked(reason) => format!("{}:blocked({:?})", t.id, reason),
+                    ThreadStatus::Blocked(reason) => format!("{}:blocked({})", t.id, reason.name()),
                     ThreadStatus::Exited(code) => format!("{}:exited({})", t.id, code),
                     ThreadStatus::Runnable => format!("{}:runnable", t.id),
                     ThreadStatus::Running => format!("{}:running", t.id),
@@ -370,11 +370,9 @@ pub fn run_process_loop(
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        // Deadline values tick every pass, so compare the situation without them.
-        let park_report: String = thread_state
-            .chars()
-            .filter(|c| !c.is_ascii_digit())
-            .collect::<String>();
+        // Deadline values tick every pass, so compare the situation without them
+        // (but keep the thread ids and block reasons legible in the report itself).
+        let park_report = thread_state.clone();
         if last_park_report.as_deref() != Some(park_report.as_str()) {
             log::info!(
                 "SCHED: parked {}, threads: {}",

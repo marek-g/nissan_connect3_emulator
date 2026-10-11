@@ -154,6 +154,33 @@ pub enum BlockReason {
     },
 }
 
+impl BlockReason {
+    /// Stable one-word label for park reports: unlike `Debug` it never contains the
+    /// ticking deadline, so the scheduler can report the real ids and services without
+    /// re-logging the same situation on every pass.
+    pub fn name(&self) -> String {
+        match self {
+            BlockReason::FutexWait { addr, deadline } => format!("futex@{addr:#x}{}", if deadline.is_some() { "/to" } else { "" }),
+            BlockReason::FutexWaitShared { id, deadline } => format!("futex-shared[{id}]{}", if deadline.is_some() { "/to" } else { "" }),
+            BlockReason::SleepUntil(_) => "sleep".to_string(),
+            BlockReason::MqSend { queue_id, .. } => format!("mqsend[{queue_id}]"),
+            BlockReason::MqReceive { queue_id, .. } => format!("mqreceive[{queue_id}]"),
+            BlockReason::OsalQueueReceive { queue_id, .. } => format!("osalqueue[{queue_id}]"),
+            BlockReason::IoscMutex { id, .. } => format!("iosc-mutex[{id:#x}]"),
+            BlockReason::IoscEvent { id, .. } => format!("iosc-event[{id:#x}]"),
+            BlockReason::IoscSemaphore { id, .. } => format!("iosc-sem[{id:#x}]"),
+            BlockReason::InotifyRead { fd, .. } => format!("inotify-read(fd {fd})"),
+            BlockReason::SocketRead { fd, .. } => format!("socket-read(fd {fd})"),
+            BlockReason::SignalWait { set, .. } => format!("signal-wait({set:#x})"),
+            BlockReason::CoroutineExit { child, deadline } => format!("coroutine({child:#x}){}", if deadline.is_some() { "/to" } else { "" }),
+            BlockReason::MonitorYield { service, deadline, .. } => format!(
+                "monitor-yield(svc {service:#x}){}",
+                if deadline.is_some() { "/to" } else { "/inf" }
+            ),
+        }
+    }
+}
+
 /// Action requested by a syscall handler; consumed by the syscall hook wrapper.
 #[derive(Clone, Copy, PartialEq)]
 pub enum ThreadAction {
