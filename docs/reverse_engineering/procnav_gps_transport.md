@@ -158,3 +158,38 @@ channel/RELUP send, push GPS) is inter-process commcon delivery, which lives in
 **`src/rtos`** (monitor object `0x0a` mailbox/directory + the `interaction`/app-info
 announcement path) - NOT the OSAL-service `complete_osal_service` code. So `src/rtos` is
 the right place for the provider, seeded off the existing registry data.
+
+## Instrumented runtime ground truth (r173, `EMU_SENSORFI_TRACE=1`)
+The static analysis above was partly wrong about *which* branch runs; the diagnostic (reads
+`cRam01215110`/`iRam01215114` from PROCNAV's `.bss`, logged on change) settles it:
+- PROCNAV opens `/dev/registry/LOCAL_MACHINE/SOFTWARE/BLAUPUNKT` through the **OSAL IO
+  service** (a `svc #6`, object `0x6e`, `0x1026e` = open) - the "SCD queue" IS the registry
+  over object `0x6e`, path pointer `0x34ed14`. There is no separate scd device and no
+  `ioctl` syscall.
+- The emulator's `complete()` catch-all answers that open with status `0` and a handle of
+  **`0` (null)**. PROCNAV stores it as `iRam01215114 = 0`, and `scd_bTestLookupIoControl`
+  still sets `cRam01215110 = 1` (the null-handle error `0x72002` is "unexpected enough" to
+  imply the queue supports ioctl), so **mode 1 (SCD-queue ioctl) is live**.
+- With mode 1 + a **null handle**, PROCNAV's `OSAL_s32IOControl(handle, 0xb, buf)` fails its
+  own magic check (`*handle == 0xD0E1D0E1`; `handle == 0` is the explicit null-handle error
+  `0x72002`). So *every* service->app lookup fails, `scd_bGetAppIdFromServiceId` returns 0,
+  PROCNAV never learns app `10041`, never creates the sensorfi client channel, and idles.
+
+So the emulator is handing PROCNAV a **malformed registry handle** for every `0x6e` open,
+not just scd. The provider is not reached at all today.
+
+## Corrected implementation plan (src/rtos, object `0x6e`)
+To get PROCNAV to resolve service `0xb` -> app `10041` we must model the OSAL registry
+handle + its ioctl, in `complete()` for object `0x6e`:
+1. On `0x1026e` open whose path resolves under `/dev/registry`, return a **valid OSAL device
+   handle**: a guest object whose `*handle == 0xD0E1D0E1` (the magic `OSAL_s32IOControl`
+   checks at `0x32cfb4`) so the ioctl dispatch is entered instead of rejected.
+2. Serve `OSAL_s32IOControl(handle, 0xb, buf)` from the emulator registry: write the count
+   (`1`) and the provider `APPID` (`10041`) into `buf` (`scd_bGetAppIdFromServiceId` reads
+   `*param_3 = (u16)*(buf + 0x100)`) so PROCNAV resolves app `10041`.
+3. Then observe (re-instrument) PROCNAV's comm-member/addressing for app `10041`: whether it
+   still needs a live mbk/directory record (`0x0a`) and a provider to answer its RELUP,
+   before pushing `GpsDataStatus` (opcode `6`, `d4+0x14=0xb`, `d4+0x18=5`).
+Open RE before coding step 1: the OSAL handle-object layout the ioctl dispatch consumes
+(magic at `+0x00`, type at `param_1[7]`/`+0x1c`) and how `func_0x0062ef88` turns the ioctl
+into a `svc #6` (the resume frame + status contract).
