@@ -1347,3 +1347,30 @@ frequent 0x64 op): the catch-all returns 0 but never writes the created handle
 back into the request block, so PROCNAV stalls on a null semaphore before it can
 register `posfi` / subscribe the sensor. Narrow first implementation: back a
 semaphore object + fill `block[1]` with its handle in `complete()`.
+
+**Implemented & validated (r169, `complete_osal_sem_create`)**: cmd `0x1b` now
+returns a real handle (a `[monitor-osal-sem]` control block mirroring
+`FUN_00036734`'s layout: type/initial/max/state/name) written into `block[1]`,
+resolved through a process-global `name -> handle` registry so a named semaphore
+is shared across processes (OSAL named objects are process-global). r169 vs r168:
+53 creates served, `0x305` unchanged (2 -> 2), 0 exec errors / panics / exits, and
+PROCNAV advances into its semaphore post/release path (cmd `0x20` 4 -> 14, `0x21`
+2 -> 12).
+
+**0x64 is no longer the gate.** After the semaphore fix PROCNAV runs a steady
+service loop; the remaining frequent 0x64 cmds are *not* read-back gates and
+implementing them is a no-op or a regression risk:
+- `0x03`/`0x43`/`0x16`/`0x0a` return status (or store into an internal per-task
+  record the caller never reads back through a service) - the catch-all `r0 = 0`
+  already matches the real leaf's success answer.
+- `0x17` (registry lookup) is polled by PROCNAV with `id = 0`, which `FUN_00044e20`
+  itself rejects (`id < 1` -> error) regardless of the emulator - a PROCNAV retry,
+  not a gap.
+- sem post/release `0x20`/`0x21` answer with status 0 (the permissive branch).
+
+The run's tail is PROCHMI's (thread [58]) `mbx_1024` post/wait heartbeat, not a
+PROCNAV stall. The real next blocker is therefore a **source/trigger**, not a
+command: PROCNAV never receives the combined-sensor GPS (`cmb_sensorfi`) so it
+never map-matches or publishes `NavPosition`. Next work item = a faithful
+`cmb_sensorfi` GPS source + the `posfi` registration trigger (still "necessary,
+not sufficient" - see the DYN4MBX bridge and this chain).
