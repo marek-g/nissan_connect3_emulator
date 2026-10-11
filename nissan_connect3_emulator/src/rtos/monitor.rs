@@ -247,6 +247,22 @@ pub const OSAL_EVENT_CLOSE: u32 = 0x34;
 /// tears the software block down - so an answered wait reads as "shutdown requested" and
 /// ProcNav deinitialises every component. The wait must park.
 pub const OSAL_EVENT_WAIT: u32 = 0x35;
+/// `0x29`: open a named OSAL message queue by name (`scd_OpenQueue`'s leaf). Inline
+/// 16-byte name at `block + 0x14`, and the queue handle is written through the out-slot
+/// pointer at `block + 0x10`; status in r0. PROCNAV opens `mbx_0` and each started app's
+/// `mbx_<appid>` this way.
+pub const OSAL_MBX_OPEN: u32 = 0x29;
+/// `0x2a`: create a named OSAL message queue (`scd_bCreateQueue`'s leaf, wrapper
+/// continuation `0x34f643`). `[+0xc]` = max message size (8 - every payload is an OSAL
+/// message *reference* `[type, content_ptr]`), `[+0x10]` = queue depth, `[+0x14]` = inline
+/// name. The caller ignores any out-handle (it re-opens by name), answering 0 is enough.
+pub const OSAL_MBX_CREATE: u32 = 0x2a;
+/// `0x2d`: the application message pump's receive (wrapper continuation `0x190a23`).
+/// `[+0]` = pointer to the handle slot the open wrote, `[+4]` = 8-byte receive buffer,
+/// `[+8]` = buffer size, `[+0xc]` = priority out, `[+0x10]` = timeout (`0xffffffff` =
+/// forever). Returns the received byte count (> 0) and only branches on last-error `0x72005`
+/// as the benign "no message" code; an answered wait must never leave the queue unfilled.
+pub const OSAL_MBX_WAIT: u32 = 0x2d;
 /// cmd 72 (shim `0xbd80` -> `0x5e88`): a stub leaf that unconditionally returns `3`, so the
 /// truthful answer is `3` rather than the catch-all's `0`.
 pub const OSAL_UNSUPPORTED3: u32 = 0x48;
@@ -684,9 +700,12 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool 
     let immediate = if object == TSE_OBJECT {
         complete_tse(unicorn, service, block, true)
     } else if object == OSAL_SERVICE_OBJECT
-        && matches!(ticks, OSAL_THREAD_CREATE | OSAL_THREAD_ACTIVATE | OSAL_THREAD_SPAWN | OSAL_THREAD_DELETE)
+        && matches!(ticks, OSAL_THREAD_CREATE | OSAL_THREAD_ACTIVATE | OSAL_THREAD_SPAWN | OSAL_THREAD_DELETE | OSAL_MBX_CREATE | OSAL_MBX_OPEN)
     {
         complete_osal_service(unicorn, service, block)
+    } else if object == OSAL_SERVICE_OBJECT && ticks == OSAL_MBX_WAIT {
+        // a queue that already holds a message must not park its waiter
+        complete_osal_mbx_wait(unicorn, unicorn.get_data().thread_id(), block, true)
     } else {
         None
     };
@@ -725,10 +744,14 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool 
         } else {
             Some(std::time::Instant::now() + TICK * timeout)
         }
-    } else if service & 0xff == OSAL_SERVICE_OBJECT && service >> 16 == OSAL_EVENT_WAIT {
+    } else if service & 0xff == OSAL_SERVICE_OBJECT
+        && matches!(service >> 16, OSAL_EVENT_WAIT | OSAL_MBX_WAIT)
+    {
         // The OSAL commands are the service's upper half, not a deadline; the event wait
-        // carries its real timeout at `block + 0xc` (`0xffffffff` for the NAVEND latch).
-        let timeout = read_word(unicorn, block + 0xc).unwrap_or(0xffff_ffff);
+        // carries its real timeout at `block + 0xc` (`0xffffffff` for the NAVEND latch) and
+        // the queue wait at `block + 0x10`, both `0xffffffff` for forever.
+        let timeout = read_word(unicorn, block + if service >> 16 == OSAL_MBX_WAIT { 0x10 } else { 0xc })
+            .unwrap_or(0xffff_ffff);
         if timeout == 0 || timeout >= 0x8000_0000 {
             None
         } else {
@@ -1107,6 +1130,11 @@ struct OsalState {
     tse_flags: HashMap<u32, u32>,
     /// The next positive TSE id to hand out.
     tse_next_id: u32,
+    /// Named OSAL message queue (`mbx_<appid>`) name -> the monitor handle the open hands
+    /// back. Handles are process-global like the host-side `MqState` queues they name; the
+    /// base keeps them clear of the TSE id space.
+    mbx_handles: HashMap<String, u32>,
+    next_mbx_handle: u32,
 }
 
 /// Process-global OSAL service state, shared by every process's monitor instance (mirrors the
@@ -1136,6 +1164,9 @@ fn complete_osal_service(
         OSAL_SEM_CREATE => Some(complete_osal_sem_create(unicorn, service, block)),
         OSAL_SEM_OPEN => Some(complete_osal_sem_open(unicorn, block)),
         OSAL_EVENT_CREATE => Some(complete_osal_event_create(unicorn, service, block)),
+        OSAL_MBX_CREATE => Some(complete_osal_mbx_create(unicorn, thread, block)),
+        OSAL_MBX_OPEN => Some(complete_osal_mbx_open(unicorn, thread, block)),
+        OSAL_MBX_WAIT => complete_osal_mbx_wait(unicorn, thread, block, false),
         // `0x48` (shim `0xbd80` -> leaf `0x5e88`): a stub that always returns 3.
         OSAL_UNSUPPORTED3 => {
             log::info!(
@@ -1405,6 +1436,19 @@ pub fn poll_tse_wait(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u3
         return None;
     }
     complete_tse(unicorn, service, block, true)
+}
+
+/// Host-side raise of a TSE flag pattern (the emulator playing the role of a sender that
+/// delivers a message and signals the receiving app's wake flag). Waiters are released by
+/// `poll_tse_wait` on the next scheduler pass.
+pub fn raise_tse_flag(flag: u32, pattern: u32) {
+    osal_state()
+        .lock()
+        .unwrap()
+        .tse_flags
+        .entry(flag)
+        .and_modify(|bits| *bits |= pattern)
+        .or_insert(pattern);
 }
 
 /// Start a guest thread for an OSAL create/spawn request: a fresh zero-filled stack from the
@@ -1679,6 +1723,153 @@ fn complete_osal_sem_create(
         return 0xfff6_0000;
     }
     0
+}
+
+/// Request `0x2a`: create an OSAL message queue. Only the shape matters to the guest -
+/// every payload is an 8-byte OSAL message reference and the SCD framework re-opens the
+/// queue by name - so the emulator backs it with a host-side `MqState` queue of the same
+/// name (the very queues the libosal-side `mbx_` bridge posts to) and answers status 0.
+fn complete_osal_mbx_create(unicorn: &mut Unicorn<'_, Context>, thread: u32, block: u32) -> u32 {
+    let Some(name) = read_identifier(unicorn, block + 0x14) else {
+        log::warn!("monitor: OSAL[{thread}] queue create with unreadable name at {:#x}", block + 0x14);
+        return 0;
+    };
+    let (size, count) = (
+        read_word(unicorn, block + 0xc).unwrap_or(8),
+        read_word(unicorn, block + 0x10).unwrap_or(0),
+    );
+    let namespace = unicorn.get_data().namespace.clone();
+    let mut guard = namespace.lock().unwrap();
+    let queue_id = crate::common::osal_queues::OsalQueueService::ensure_queue(&mut guard.mq, &name);
+    guard.mq.grow_msgsize(queue_id, size.max(8) as i64 * count.max(1) as i64);
+    drop(guard);
+    log::info!("monitor: OSAL[{thread}] queue create name {name:?} size {size} count {count}");
+    0
+}
+
+/// Request `0x29`: open an OSAL message queue by name. The handle is a monitor-side token
+/// (stable per name) written through the out-slot pointer at `block + 0x10`; the pump
+/// later passes a pointer to that slot back to the wait.
+fn complete_osal_mbx_open(unicorn: &mut Unicorn<'_, Context>, thread: u32, block: u32) -> u32 {
+    let Some(name) = read_identifier(unicorn, block + 0x14) else {
+        log::warn!("monitor: OSAL[{thread}] queue open with unreadable name at {:#x}", block + 0x14);
+        return 0;
+    };
+    let out = match read_word(unicorn, block + 0x10) {
+        Ok(value) if (0x1000..0xf000_0000).contains(&value) => value,
+        _ => 0,
+    };
+    let handle = {
+        let mut state = osal_state().lock().unwrap();
+        match state.mbx_handles.get(&name).copied() {
+            Some(handle) => handle,
+            None => {
+                let handle = 0x4000_0000 + state.next_mbx_handle;
+                state.next_mbx_handle += 1;
+                state.mbx_handles.insert(name.clone(), handle);
+                handle
+            }
+        }
+    };
+    if out == 0 || write_word(unicorn, out, handle).is_err() {
+        log::warn!("monitor: OSAL[{thread}] queue open {name:?}: cannot write handle to {out:#x}");
+        return 0;
+    }
+    log::info!("monitor: OSAL[{thread}] queue open name {name:?} -> handle {handle:#x}");
+    0
+}
+
+/// Request `0x2d`: the app message pump's receive. Delivery materializes a snapshotted
+/// host-queue message into this guest's VM (the same path the libosal `mbx_` bridge uses),
+/// so a Linux-side poster's payload arrives pointer-correct. `at_entry` answers only when
+/// a message can be handed over right now; from the completion path an empty queue is the
+/// expired wait and answers `-1` with the benign last-error `0x72005` the pump tolerates.
+fn complete_osal_mbx_wait(
+    unicorn: &mut Unicorn<'_, Context>,
+    thread: u32,
+    block: u32,
+    at_entry: bool,
+) -> Option<u32> {
+    let slot = read_word(unicorn, block).unwrap_or(0);
+    let handle = read_word(unicorn, slot).unwrap_or(0);
+    let (buf, size) = (read_word(unicorn, block + 4).unwrap_or(0), read_word(unicorn, block + 8).unwrap_or(0));
+    if handle == 0 || buf == 0 || buf > 0xf000_0000 || size < 8 {
+        // A wait on a slot no open filled can never receive; answer it like an empty
+        // queue instead of parking forever on a queue that does not exist.
+        if !at_entry {
+            osal_state().lock().unwrap().last_error.insert(thread, 0x72005);
+            return Some(-1i32 as u32);
+        }
+        return None;
+    }
+    let name = osal_state()
+        .lock()
+        .unwrap()
+        .mbx_handles
+        .iter()
+        .find(|(_, h)| **h == handle)
+        .map(|(n, _)| n.clone());
+    let Some(name) = name else {
+        if !at_entry {
+            osal_state().lock().unwrap().last_error.insert(thread, 0x72005);
+            return Some(-1i32 as u32);
+        }
+        return None;
+    };
+    let prio_ptr = read_word(unicorn, block + 0xc).unwrap_or(0);
+    let namespace = unicorn.get_data().namespace.clone();
+    let message = {
+        let mut guard = namespace.lock().unwrap();
+        let queue_id = crate::common::osal_queues::OsalQueueService::ensure_queue(
+            &mut guard.mq,
+            &name,
+        );
+        let message = crate::common::osal_queues::OsalQueueService::pop_guest_message(
+            &mut guard.mq,
+            queue_id,
+            usize::MAX,
+        );
+        if message.is_some() {
+            guard.notify_waiters();
+        }
+        message
+    };
+    let message = message?;
+    match crate::libs::libosal_linux::message::materialize_snapshot(
+        unicorn,
+        &message.data,
+        buf,
+        prio_ptr,
+        message.priority,
+    ) {
+        Some(count) => {
+            log::info!(
+                "monitor: OSAL[{thread}] queue wait handle {handle:#x} ({name}) delivered {count} bytes"
+            );
+            Some(count)
+        }
+        None => {
+            log::warn!(
+                "monitor: OSAL[{thread}] queue wait ({name}): cannot materialize message into {buf:#x}"
+            );
+            if at_entry {
+                None
+            } else {
+                osal_state().lock().unwrap().last_error.insert(thread, 0x72005);
+                Some(-1i32 as u32)
+            }
+        }
+    }
+}
+
+/// Scheduler poll for a parked queue wait: releases it as soon as a message lands in the
+/// host queue (posted by a libosal-side process or an emulator provider).
+pub fn poll_osal_mbx_wait(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) -> Option<u32> {
+    if service & 0xff != OSAL_SERVICE_OBJECT || service >> 16 != OSAL_MBX_WAIT {
+        return None;
+    }
+    let thread = unicorn.get_data().thread_id();
+    complete_osal_mbx_wait(unicorn, thread, block, true)
 }
 
 /// Request `0x1c`: resolve a named semaphore and hand the control-block handle back in the
