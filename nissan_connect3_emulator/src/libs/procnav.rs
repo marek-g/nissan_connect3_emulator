@@ -98,6 +98,11 @@ const PROBE_STAT_START: u32 = 0x0059_caa - ORIGINAL_BASE;
 /// (`0x1996a4`) and `u32InitializeThreads` (`0x1996b0`) - `r0` is the per-step
 /// count, `[component+8]` the number the component expects.
 const PROBE_STAT_CREATED: u32 = 0x0199_6a4 - ORIGINAL_BASE;
+// Generic intrusive-container erase helper (Thumb, ~50 call sites).  Faulting
+// runs die in its tail (`strb r6,[r0]` at 0x5a43f1 with `[slot]==NULL`); this
+// entry probe fires only when that fatal precondition holds, logging the
+// caller (lr) so the offending container can be identified.
+const PROBE_LIST_ERASE: u32 = 0x005a_4360 - ORIGINAL_BASE;
 const PROBE_STAT_INITED: u32 = 0x0199_6b0 - ORIGINAL_BASE;
 /// Decision point of `s32SetupThreads` (`0x19969a`): `r2` (0 = a config slot was
 /// null), `r6` (configured thread count) and `r1` (the init-config array).
@@ -339,6 +344,7 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ("probe-stat-attach", PROBE_STAT_ATTACH, 2),
         ("probe-stat-start", PROBE_STAT_START, 2),
         ("probe-stat-created", PROBE_STAT_CREATED, 2),
+        ("probe-list-erase", PROBE_LIST_ERASE, 2),
         ("probe-stat-inited", PROBE_STAT_INITED, 2),
         ("probe-stat-setup", PROBE_STAT_SETUP, 2),
         ("probe-less-u16", PROBE_LESS_U16, 2),
@@ -616,6 +622,19 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     if word(uc, r0 & !3).is_none() {
                         log::info!(
                             "PROCNAV[{tid}] probe-less-u16: UNMAPPED key {r0:#010x} lr={:#010x}",
+                            lr & !1
+                        );
+                    }
+                }
+                "probe-list-erase" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                    // Fatal precondition of the tail `strb r6,[r0]` (0x5a43f1):
+                    // the slot word is NULL (and thus not the container itself).
+                    if word(uc, r1).unwrap_or(1) == 0 {
+                        log::info!(
+                            "PROCNAV[{tid}] probe-list-erase: NULL slot container={r0:#010x} slot={r1:#010x} lr={:#010x}",
                             lr & !1
                         );
                     }
@@ -1020,16 +1039,22 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         }
     }
 
+    // The sensorfi GPS provider is part of the emulator's device simulation
+    // (there is no hardware receiver behind us), so it runs by default with
+    // every PROCNAV; `EMU_SENSORFI=0` turns it off for control runs (e.g. the
+    // r349-style "no provider" experiments).
     if std::env::var("EMU_SENSORFI")
         .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
+        .unwrap_or(true)
     {
         spawn_gps_provider(unicorn);
     }
 }
 
-/// Push periodic `cmb_sensorfi_tclMsgGpsDataStatus` messages into PROCNAV's
-/// application mailbox (`mbx_19`), acting as the sensorfi server GPS provider.
+/// Push periodic `cmb_sensorfi_tclMsgGpsDataStatus` messages into the target
+/// component's mailbox, acting as the sensorfi server GPS provider (the device
+/// simulation stands in for the real sensorfi server application, which never
+/// runs here).
 ///
 /// The blob is pre-snapshotted (`[u32 flag, u32 len, content]`) so the monitor's
 /// `0x2d` queue-wait materializes it into PROCNAV's own VM, and the `0x57`
@@ -1037,9 +1062,9 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
 /// The content's amt header uses the offsets the `amt_tclBaseMessage` accessors
 /// read (`u16GetValue`: serviceId @ +0x14, propertyId @ +0x18, opCode @ +0x1a,
 /// class @ +0xb), pinned by `cmb_sensorfi_tclMsgGpsDataStatus`'s getters:
-/// service `0xb`, property `5`, opcode `6` (Status). The `cmb_fi_tcl_GpsBigdata`
-/// payload stays zero until its wire layout is decoded - reaching the GPS sink
-/// is the structural milestone this provider tests for.
+/// service `0xb`, property `5`, opcode `6` (Status). The CIR payload follows
+/// the header at +0x20 with the layout decoded from the guest's own `oRead`
+/// chain (see `gps_wire_body`).
 fn spawn_gps_provider(unicorn: &mut Unicorn<'_, Context>) {
     let namespace = unicorn.get_data().namespace.clone();
     let result = std::thread::Builder::new()
@@ -1084,7 +1109,7 @@ fn spawn_gps_provider(unicorn: &mut Unicorn<'_, Context>) {
             }
         });
     match result {
-        Ok(_) => log::info!("PROCNAV: GPS sensorfi provider started (EMU_SENSORFI)"),
+        Ok(_) => log::info!("PROCNAV: GPS sensorfi provider started (EMU_SENSORFI=0 disables)"),
         Err(error) => log::warn!("PROCNAV: cannot start GPS provider: {error}"),
     }
 }
@@ -1092,8 +1117,77 @@ fn spawn_gps_provider(unicorn: &mut Unicorn<'_, Context>) {
 /// One `GpsDataStatus` snapshot blob: envelope + amt header, zero payload.
 /// `msg_class` selects the amt class byte (`0x45` ServiceData for the AE pump's
 /// re-post pipeline, `0x46` = RELUP data for direct component-queue delivery).
+/// Krakow city centre - the coordinates the emulator should show on the map.
+const GPS_LAT_DEG: f32 = 50.0614;
+const GPS_LON_DEG: f32 = 19.9456;
+
+/// Wire body of `cmb_sensorfi_tclMsgGpsDataStatus` (svc `0xb`, fn `5`,
+/// opcode `6`), reconstructed from the guest's own deserializer
+/// (`oRead` `0x5b9bad` -> `fi` operator>> `0x32b265` -> generic typebase
+/// driver `0x2f55cf` -> const-data reader `0x2f510c`): the const part is 92
+/// packed bytes
+/// ```text
+/// u16,u16, 8*u8, u32, u64,u64, 8*f32, 4*u8, 4*u32, 4*u8, 2*f32
+/// ```
+/// then the VAR section starts with a u32 vector count plus that many
+/// elements.  A zero count leaves the `bpstl::vector` buffer NULL and the
+/// guest's copy helper stores through it (run r348: `WRITE_UNMAPPED @
+/// 0x5a43f0` killed the STAT pump thread), so the message always carries at
+/// least one satellite element.  Coordinates are written in several plausible
+/// encodings (degrees-as-f32 and arcsec*1000-as-u32) because the field
+/// semantics in the const block are not yet pinned down.
+fn gps_wire_body() -> Vec<u8> {
+    let mut body = Vec::with_capacity(0x80);
+    // Generic typebase driver (`0x2f55cf`) first consumes one u32 into the
+    // typebase header field (`typebase + 4`), then the const block.
+    body.extend_from_slice(&0u32.to_le_bytes());
+    let lat_arcsec_x1000: u32 = (GPS_LAT_DEG * 3_600_000.0) as u32;
+    let lon_arcsec_x1000: u32 = (GPS_LON_DEG * 3_600_000.0) as u32;
+    // u16, u16 - unknown counters (week/second?), leave zero.
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes());
+    // 8 octets: status flags - claim a valid 3D fix with SPS.
+    body.extend_from_slice(&[1, 1, 1, 0, 0, 0, 0, 0]);
+    // u32 at object +0x10: latitude, arcsec*1000.
+    body.extend_from_slice(&lat_arcsec_x1000.to_le_bytes());
+    // two u64 at +0x18/+0x20: timestamps, leave zero (host time not modelled).
+    body.extend_from_slice(&0u64.to_le_bytes());
+    body.extend_from_slice(&0u64.to_le_bytes());
+    // 8 f32 at +0x28..+0x44: first two carry lat/lon in degrees, the rest 0.
+    for v in [GPS_LAT_DEG, GPS_LON_DEG] {
+        body.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+    for _ in 0..6 {
+        body.extend_from_slice(&0u32.to_le_bytes());
+    }
+    // 4 octets at +0x48: more validity flags.
+    body.extend_from_slice(&[1, 1, 1, 0]);
+    // 4 u32 at +0x4c..+0x58: lat/lon arcsec*1000, then zero.
+    body.extend_from_slice(&lat_arcsec_x1000.to_le_bytes());
+    body.extend_from_slice(&lon_arcsec_x1000.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    // 4 octets at +0x58.
+    body.extend_from_slice(&[1, 0, 0, 0]);
+    // 2 f32 at +0x5c/+0x60: lat/lon degrees again (last plausible pair).
+    body.extend_from_slice(&GPS_LAT_DEG.to_bits().to_le_bytes());
+    body.extend_from_slice(&GPS_LON_DEG.to_bits().to_le_bytes());
+    // VAR section: satellite vector count, then one 16-byte element
+    // (`cmb_fi_tcl_GpsBigVarData::oRead` 0x2f547b: u8,u8,u16,f32,f32,f32).
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.extend_from_slice(&[1u8, 0u8]); // unknown flag bytes (obj +4, +5)
+    body.extend_from_slice(&40u16.to_le_bytes()); // signal strength (obj +6)
+    for v in [0.0f32, 45.0, 270.0] {
+        // doppler, elevation, azimuth (obj +8, +0xc, +0x10)
+        body.extend_from_slice(&v.to_bits().to_le_bytes());
+    }
+    body
+}
+
 pub(crate) fn gps_status_message(seq: u16, msg_class: u8) -> Vec<u8> {
-    const LEN: usize = 0x80;
+    let body = gps_wire_body();
+    let len = 0x20 + body.len();
+    let LEN = len.next_multiple_of(16);
     let mut content = vec![0u8; LEN];
     content[0x00..0x02].copy_from_slice(&0xfffeu16.to_le_bytes()); // source app (unknown provider)
     content[0x02..0x04].copy_from_slice(&0x0016u16.to_le_bytes()); // target app: STAT component (22, mbx_22)
@@ -1110,6 +1204,7 @@ pub(crate) fn gps_status_message(seq: u16, msg_class: u8) -> Vec<u8> {
     content[0x18..0x1a].copy_from_slice(&0x0005u16.to_le_bytes()); // propertyId: GPS data
     content[0x1a] = 0x06; // opCode: Status (server message)
     content[0x1c..0x1e].copy_from_slice(&seq.to_le_bytes()); // cmd counter
+    content[0x20..0x20 + body.len()].copy_from_slice(&body); // CIR payload
     let mut blob = Vec::with_capacity(8 + LEN);
     blob.extend_from_slice(&1u32.to_le_bytes());
     blob.extend_from_slice(&(LEN as u32).to_le_bytes());
