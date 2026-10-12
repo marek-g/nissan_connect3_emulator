@@ -135,6 +135,39 @@ const PROBE_SD_NOLOCK: u32 = 0x00bd_7c4 - ORIGINAL_BASE;
 /// built-message validity check (`0xbd624`, `r0`).
 const PROBE_SD_PAYLOAD: u32 = 0x00bd_604 - ORIGINAL_BASE;
 const PROBE_SD_BUILD: u32 = 0x00bd_624 - ORIGINAL_BASE;
+/// Entry of the repost message builder: `0xbd618` is the `add r0,sp,#0x10` that sets up
+/// the stack wrapper (the `bl` itself starts at 0xbd61a - a hook there or at 0xbd61c
+/// straddles the 4-byte branch and breaks its execution). Captures the wrapper pointer
+/// for the dump at `PROBE_SD_BUILD`.
+const PROBE_SD_BENTRY: u32 = 0x00bd_618 - ORIGINAL_BASE;
+/// Right after the payload parse `bl 0x44a3b8` inside the builder leaf
+/// `0x2b651e`: shows whether the parse zeroed the wrapper's data pointer.
+const PROBE_SD_PARSE: u32 = 0x002b_6540 - ORIGINAL_BASE;
+/// In `0x30b2f0`: right after the fastpool probe `blx 0x2ec890` (`r0` = its answer).
+const PROBE_SD_FITS: u32 = 0x0030_b306 - ORIGINAL_BASE;
+/// In `0x30b2f0`: right after the malloc `blx 0x2ec8dc` (`r0` = block pointer).
+const PROBE_SD_MALLOC: u32 = 0x0030_b316 - ORIGINAL_BASE;
+/// In `0x30b2f0`: the return sequence `mov r0,r5` (`r5` = 1 on success).
+const PROBE_SD_FRET: u32 = 0x0030_b324 - ORIGINAL_BASE;
+/// Right after `bl 0x247c70` in the repost path: `r0` is the pump object taken from
+/// `adapter+0x54` that the traced send leaf `0x19089e` unwraps (`+0xc` byte must be
+/// non-zero) before it issues the real `0x4b0364` post.
+const PROBE_SD_PUMP: u32 = 0x00bd_638 - ORIGINAL_BASE;
+/// Traced monitor-call leaf `0x19089e`: right after the first message-validity guard
+/// (`beq` -> zero-return path). `r0` = unwrapped message field pointer.
+const PROBE_SD_TG1: u32 = 0x0019_09a6 - ORIGINAL_BASE;
+/// Same leaf: after the `blx 0x2ec28c` real service call; success iff the answer is `-1`.
+const PROBE_SD_TGS: u32 = 0x0019_09c2 - ORIGINAL_BASE;
+/// Same leaf: the `0x1909e2` zero-return (guard failed) - dumps the wrapper again.
+const PROBE_SD_TGF: u32 = 0x0019_09e2 - ORIGINAL_BASE;
+/// In the builder `0x2b7a6c` right before the 12-byte field copy (`ldm r0,{r0,r1,r2}`,
+/// `r0` = copy source).
+const PROBE_SD_CPY0: u32 = 0x002b_7a9e - ORIGINAL_BASE;
+/// In the builder right after the copy (before `bl 0x2b651e`): dumps built+0xc..0x14.
+const PROBE_SD_CPY1: u32 = 0x002b_7aaa - ORIGINAL_BASE;
+/// In the builder right after `bl 0x30b2f0`: `r0` = init status, `r4` = the builder's
+/// own wrapper pointer (cross-check against the entry-captured one).
+const PROBE_SD_BINIT: u32 = 0x002b_7a8a - ORIGINAL_BASE;
 /// GPS-data sink inside `pc_tclSensorMsgHandler::s32OnStatusMsg` (ARM).
 const GPS_STATUS_SINK: u32 = 0x0068_ff8c - ORIGINAL_BASE;
 
@@ -174,6 +207,8 @@ fn hexdump(unicorn: &mut Unicorn<'_, Context>, address: u32, len: usize) -> Stri
 pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let repost_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let new_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let sd_hot = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let built_ptr = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     for (name, offset, size) in [
         ("dispatcher", PROPERTY_DISPATCHER, 2u64),
         ("field-helper", PUMP_FIELD_HELPER, 2),
@@ -228,18 +263,42 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ("probe-sd-out", PROBE_SD_OUT, 2),
         ("probe-sd-nolock", PROBE_SD_NOLOCK, 2),
         ("probe-sd-payload", PROBE_SD_PAYLOAD, 2),
+        ("probe-sd-bentry", PROBE_SD_BENTRY, 2),
+        ("probe-sd-parse", PROBE_SD_PARSE, 2),
+        ("probe-sd-fits", PROBE_SD_FITS, 2),
+        ("probe-sd-malloc", PROBE_SD_MALLOC, 2),
+        ("probe-sd-fret", PROBE_SD_FRET, 2),
+        ("probe-sd-pump", PROBE_SD_PUMP, 2),
+        ("probe-sd-tg1", PROBE_SD_TG1, 2),
+        ("probe-sd-tgs", PROBE_SD_TGS, 2),
+        ("probe-sd-tgf", PROBE_SD_TGF, 2),
+        ("probe-sd-cpy0", PROBE_SD_CPY0, 2),
+        ("probe-sd-cpy1", PROBE_SD_CPY1, 2),
+        ("probe-sd-binit", PROBE_SD_BINIT, 2),
         ("probe-sd-build", PROBE_SD_BUILD, 2),
     ] {
         let address = (base_address + offset) as u64;
         let repost_count = repost_count.clone();
         let new_count = new_count.clone();
+        let sd_hot = sd_hot.clone();
+        let built_ptr = built_ptr.clone();
         let result = unicorn.add_code_hook(address, address + size, move |uc, _, _| {
             let tid = uc.get_data().inner.thread_id();
             if name == "power-repost" || (name.starts_with("probe-") && name != "probe-less-u16") {
                 let (counter, limit) = if name.starts_with("probe-new-") {
                     (&new_count, 200)
+                } else if matches!(
+                    name,
+                    "probe-sd-unpack"
+                        | "probe-sd-payload"
+                        | "probe-sd-parse"
+                        | "probe-sd-fits"
+                        | "probe-sd-malloc"
+                        | "probe-sd-fret"
+                ) {
+                    (&sd_hot, 420)
                 } else {
-                    (&repost_count, 200)
+                    (&repost_count, 600)
                 };
                 if counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= limit {
                     return; // dispatch retries and startup allocations flood the log
@@ -472,6 +531,7 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 "probe-sd-post" => {
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
                     log::info!("PROCNAV[{tid}] probe-sd-post: repost-status={r0:#x}");
+                    built_ptr.store(0, std::sync::atomic::Ordering::Relaxed);
                 }
                 "probe-sd-payload" => {
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -483,7 +543,99 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 }
                 "probe-sd-build" => {
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
-                    log::info!("PROCNAV[{tid}] probe-sd-build: built={r0:#x}");
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let wrapper = built_ptr.load(std::sync::atomic::Ordering::Relaxed);
+                    log::info!(
+                        "PROCNAV[{tid}] probe-sd-build: built={r0:#x} wrapper={wrapper:#x} body={}",
+                        hexdump(uc, wrapper, 0x20)
+                    );
+                    let _ = sp;
+                }
+                "probe-sd-bentry" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    built_ptr.store(r0, std::sync::atomic::Ordering::Relaxed);
+                    log::info!("PROCNAV[{tid}] probe-sd-bentry: wrapper={r0:#x} sp={sp:#x}");
+                }
+                "probe-sd-binit" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    let wrapper = built_ptr.load(std::sync::atomic::Ordering::Relaxed);
+                    if wrapper != 0 {
+                        log::info!(
+                            "PROCNAV[{tid}] probe-sd-binit: init-status={r0:#x} r4={r4:#x} entry-wrapper={wrapper:#x}"
+                        );
+                    }
+                }
+                "probe-sd-parse" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    let wrapper = built_ptr.load(std::sync::atomic::Ordering::Relaxed);
+                    log::info!(
+                        "PROCNAV[{tid}] probe-sd-parse: r0={r0:#x} wrapper_body={}",
+                        hexdump(uc, wrapper, 0x20)
+                    );
+                }
+                "probe-sd-fits" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    log::info!("PROCNAV[{tid}] probe-sd-fits: answer={r0:#x}");
+                }
+                "probe-sd-malloc" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    log::info!("PROCNAV[{tid}] probe-sd-malloc: block={r0:#x}");
+                }
+                "probe-sd-fret" => {
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0);
+                    log::info!("PROCNAV[{tid}] probe-sd-fret: r5={r5:#x}");
+                }
+                "probe-sd-pump" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCNAV[{tid}] probe-sd-pump: object={r0:#010x} body={}",
+                        hexdump(uc, r0, 0x18)
+                    );
+                }
+                "probe-sd-tg1" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let wrapper = built_ptr.load(std::sync::atomic::Ordering::Relaxed);
+                    if wrapper != 0 && r0.wrapping_sub(wrapper) < 0x400 {
+                        log::info!(
+                            "PROCNAV[{tid}] probe-sd-tg1: unwrapped={r0:#010x} byte={:02x}",
+                            word(uc, r0).unwrap_or(0) & 0xff
+                        );
+                    }
+                }
+                "probe-sd-tgs" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    log::info!("PROCNAV[{tid}] probe-sd-tgs: svc-answer={r0:#x}");
+                }
+                "probe-sd-tgf" => {
+                    let wrapper = built_ptr.load(std::sync::atomic::Ordering::Relaxed);
+                    if wrapper != 0 {
+                        log::info!(
+                            "PROCNAV[{tid}] probe-sd-tgf: guard-failed wrapper={wrapper:#x} body={}",
+                            hexdump(uc, wrapper, 0x18)
+                        );
+                    }
+                }
+                "probe-sd-cpy0" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let wrapper = built_ptr.load(std::sync::atomic::Ordering::Relaxed);
+                    if r0 > 0x8000_0000 && wrapper > 0x8000_0000 {
+                        log::info!(
+                            "PROCNAV[{tid}] probe-sd-cpy0: src={r0:#010x} src_body={} wrapper_body={}",
+                            hexdump(uc, r0, 0x18),
+                            hexdump(uc, wrapper, 0x18)
+                        );
+                    }
+                }
+                "probe-sd-cpy1" => {
+                    let wrapper = built_ptr.load(std::sync::atomic::Ordering::Relaxed);
+                    if wrapper > 0x8000_0000 {
+                        log::info!(
+                            "PROCNAV[{tid}] probe-sd-cpy1: wrapper={wrapper:#x} body={}",
+                            hexdump(uc, wrapper, 0x18)
+                        );
+                    }
                 }
                 "probe-factory-virt" | "probe-factory-open" | "probe-factory-add" => {
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);

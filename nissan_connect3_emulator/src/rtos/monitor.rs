@@ -268,6 +268,12 @@ pub const OSAL_MBX_WAIT: u32 = 0x2d;
 /// amt `amt_tclBaseMessage` accessors read fields at `content+0xb..0x1c` through it - and a
 /// `0` answer makes the pump discard the message before the amt dispatcher sees it.
 pub const OSAL_MBX_FIELD: u32 = 0x57;
+/// cmd 85: the fastpool *capacity* probe in front of every `0x57`-backed
+/// `OSAL_pvMemoryAllocate` (`0x30b2f0`). The repost builder's wrapper carries an
+/// embedded buffer only after a full deserialise, so answering "does not fit"
+/// immediately forces the `0x57` malloc fallback, which the emulator does model.
+/// Left un-emulated the probe parks its caller in an 85-tick retry storm.
+pub const OSAL_MEM_FITS: u32 = 0x55;
 /// cmd 72 (shim `0xbd80` -> `0x5e88`): a stub leaf that unconditionally returns `3`, so the
 /// truthful answer is `3` rather than the catch-all's `0`.
 pub const OSAL_UNSUPPORTED3: u32 = 0x48;
@@ -705,7 +711,24 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool 
     let immediate = if object == TSE_OBJECT {
         complete_tse(unicorn, service, block, true)
     } else if object == OSAL_SERVICE_OBJECT
-        && matches!(ticks, OSAL_THREAD_CREATE | OSAL_THREAD_ACTIVATE | OSAL_THREAD_SPAWN | OSAL_THREAD_DELETE | OSAL_MBX_CREATE | OSAL_MBX_OPEN | OSAL_MBX_FIELD)
+        && matches!(
+            ticks,
+            OSAL_THREAD_CREATE
+                | OSAL_THREAD_ACTIVATE
+                | OSAL_THREAD_SPAWN
+                | OSAL_THREAD_DELETE
+                | OSAL_MBX_CREATE
+                | OSAL_MBX_OPEN
+                | OSAL_MBX_FIELD
+                | OSAL_MEM_FITS
+                | OSAL_STATUS_FLAG
+                | OSAL_TRACE
+                | OSAL_IOSC_SERVICE
+                | OSAL_CTX_RELEASE
+                | OSAL_CTX_POST
+                | OSAL_EVENT_DELETE
+                | OSAL_EVENT_CLOSE
+        )
     {
         complete_osal_service(unicorn, service, block)
     } else if object == OSAL_SERVICE_OBJECT && ticks == OSAL_MBX_WAIT {
@@ -1135,6 +1158,10 @@ struct OsalState {
     tse_flags: HashMap<u32, u32>,
     /// The next positive TSE id to hand out.
     tse_next_id: u32,
+    /// Per-process bump cursor for the `0x57` message-reference arm's
+    /// malloc-fallback role (see `complete_osal_service`); absent while the
+    /// process has not allocated from its private slab yet.
+    mem_slabs: HashMap<u32, u32>,
     /// Named OSAL message queue (`mbx_<appid>`) name -> the monitor handle the open hands
     /// back. Handles are process-global like the host-side `MqState` queues they name; the
     /// base keeps them clear of the TSE id space.
@@ -1179,17 +1206,88 @@ fn complete_osal_service(
         // `[[this+4]+idx]`) read serviceId u16 @ data+0x14, propertyId @ +0x18, opCode @ +0x1a,
         // class/type @ +0xb - the same envelope the snapshot bodies carry from offset 0.
         // Answering `content + 8` (r211) shifted every field by 8 and silently mis-dispatched.
+        // The same command doubles as `OSAL_pvMemoryAllocate` (`0x2ec8dc` wrapper, used by the
+        // service-data repost builder `0x2b7a6c` -> `0x30b2f0`): there `[block+4]` is a size,
+        // not a pointer, and the caller only branches on NULL, so a non-null slab block is
+        // bumped out of a private guest page. That repost is what feeds the component
+        // dispatcher queue (`[adapter]+0x54`), the only in-image path to `s32ProcessMessage`.
         OSAL_MBX_FIELD => {
             let content = read_word(unicorn, block + 4).unwrap_or(0);
-            let data = if (0x1000..0xf000_0000).contains(&content) {
-                content
+            if (0x1000..0xf000_0000).contains(&content) {
+                log::info!(
+                    "monitor: OSAL[{thread}] message reference {content:#x} -> data {content:#x}"
+                );
+                Some(content)
+            } else if (0x30b2f0..0x30b340).contains(&(read_word(unicorn, block + 0xc)
+                .unwrap_or(0)
+                & !1))
+            {
+                // malloc role: callers are the `0x30b2f0` wrapper family (continuation
+                // right after `blx 0x2ec8dc`). `block[8]` is the *embedded-slab* request the
+                // guest computed (often garbage like `0xffff0004`), so clamp the bump.
+                let pid = unicorn.get_data().process_id;
+                let size = (read_word(unicorn, block + 8).unwrap_or(0) & 0xff).max(4);
+                let known = osal_state().lock().unwrap().mem_slabs.get(&pid).copied();
+                let slab = match known {
+                    Some(slab) => slab,
+                    None => {
+                        let mmu = {
+                            let data = unicorn.get_data();
+                            data.mmu.clone()
+                        };
+                        let addr = {
+                            let mut mmu = mmu.lock().unwrap();
+                            mmu.heap_alloc(
+                                unicorn,
+                                0x1000,
+                                Prot::READ | Prot::WRITE,
+                                "[osal-mem-57]",
+                            )
+                        };
+                        osal_state()
+                            .lock()
+                            .unwrap()
+                            .mem_slabs
+                            .insert(pid, addr);
+                        addr
+                    }
+                };
+                let step = ((size + 0xf) & !0xf).max(0x10);
+                let (block_ptr, exhausted) = {
+                    let mut state = osal_state().lock().unwrap();
+                    let block = state.mem_slabs.get(&pid).copied().unwrap_or(slab);
+                    let next = block.wrapping_add(step);
+                    let exhausted = next >= slab + 0x1000;
+                    if !exhausted {
+                        state.mem_slabs.insert(pid, next);
+                    }
+                    (block, exhausted)
+                };
+                if exhausted {
+                    log::warn!(
+                        "monitor: OSAL[{thread}] service {service:#x} alloc out of slab space (block {content:#x})"
+                    );
+                    Some(0)
+                } else {
+                    log::info!(
+                        "monitor: OSAL[{thread}] service {service:#x} alloc(size {size:#x}) -> {block_ptr:#x}"
+                    );
+                    Some(block_ptr)
+                }
             } else {
-                0
-            };
-            log::info!(
-                "monitor: OSAL[{thread}] message reference {content:#x} -> data {data:#x}"
+                log::info!(
+                    "monitor: OSAL[{thread}] message reference {content:#x} -> data 0x0"
+                );
+                Some(0)
+            }
+        }
+        // `0x55`: capacity probe, see `OSAL_MEM_FITS`. "Does not fit" pushes the
+        // caller into the `0x57` malloc fallback, which hands out real blocks.
+        OSAL_MEM_FITS => {
+            log::debug!(
+                "monitor: OSAL[{thread}] service {service:#x} capacity probe at {block:#x} -> not fitted"
             );
-            Some(data)
+            Some(0)
         }
         // `0x48` (shim `0xbd80` -> leaf `0x5e88`): a stub that always returns 3.
         OSAL_UNSUPPORTED3 => {
