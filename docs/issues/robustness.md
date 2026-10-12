@@ -31,3 +31,14 @@ The emulator must never panic because of something the guest program does. Every
 - **Location:** `nissan_connect3_emulator/src/os/syscalls/unistd.rs:404`
 - **Problem:** The `not_enough_space && res.len() == 0` branch discards the pending entry list, losing readdir iteration state for subsequent calls.
 - **Fix:** restore `sys_calls_state` on the EINVAL path.
+
+## Startup flakiness: AE pump (tid77) never leaves its IO-control cycle in starved runs
+
+~3 of 4 PROCNAV boots end with tid77 parked in a repeating `0x5036e`/`0x2016e`/`0x1026e`
+(object `0x6e`) cycle instead of progressing to its `0x2d0564` mailbox wait; the AE pump
+then never consumes `mbx_19` and every tid77-keyed probe goes silent (0 hits). The same
+runs show tid74/75/76/78-82 parked normally, so it is one task's bring-up racing the
+registry/trace IO answers, not a global crash. Suspect: the `0x5036e` (IO control) answer
+semantics differ from the device when the target device is absent, sending the pump into a
+retry loop. Reproduce: `run_r326.log` (all-alive but starved) vs `run_r345.log` (good).
+Fixing this collapses the good-run lottery and stabilizes regression testing.
