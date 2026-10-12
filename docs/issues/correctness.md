@@ -133,3 +133,23 @@ event wait (OSAL `0x35` on object `0x64`) - the unit's normal idle. The GPS/CCP
 data-source conclusion stands (nothing posts position), but the wait point and the
 thread picture are different; see design.md's r191-r204 section and
 `docs/reverse_engineering/triton_mid_swi_services.md` for the chain.
+
+### r345: GPS status now delivered honestly to STAT; sink still unreached
+
+The host GPS provider posts `GpsDataStatus` snapshots targeting app 22, the kernel
+emulation routes them to `mbx_22`, and tid76 (STAT task) consumes them in
+`bHandleMsgServiceData` with a **chain match** on svc=11/prop=5/opcode=6. So the wire,
+the queue routing, the opcode gate and the component registrations are all correct now.
+
+The remaining gap: a chain hit in the CCA router only destroys the message (the handler
+is not called from this path, re-verified through `0x291954 -> 0x2b7f8c -> 0x30b21c`), and
+the in-app dispatcher chain (`s32ProcessMessage` `0x4d3c38` -> dispatcher `0x2e5526` ->
+sinks registered from the cmb class table `0xa38c68`) has zero call sites. The sink
+`0x68ff8c` is a message-class method (typeId `0x764`) driven by the commcon/amt receive
+pump, which PROCNAV never starts in the emulator. Next: find why the receive pump
+(amt cmds `0x3f`/`0x55` on object `0x64`, `0x13` flag waits) never spins up per channel.
+
+Side note (flakiness): run quality now hinges on the AE pump (tid77) reaching its queue
+wait - in starved runs it idles in the `0x5036e`/`0x2016e` IO cycle and never consumes
+`mbx_19`; the STAT-path delivery is unaffected by that (r345+), but old good-run checks
+based on tid77 counters need to use `probe-sd-hit` on tid76 instead.
