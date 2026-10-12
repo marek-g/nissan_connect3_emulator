@@ -121,7 +121,9 @@ const XP_TARGETS: &[(u32, &str)] = &[
     (0x0029_89c4, "rde-formatter"),
     (0x002c_4780, "traceout"),
     (0x002e_bd6c, "veneer"),
+    (0x002e_5526, "dispatcher"),
     (0x0030_b98a, "err-set"),
+    (0x0068_ff8c, "sink"),
     (0x0011_dbd8, "ventry-entry"),
     (0x0011_dc56, "ventry-step"),
 ];
@@ -131,8 +133,10 @@ const XP_PAGES: &[(u32, u32)] = &[
     (0x0011_d000, 0x1000),
     (0x0029_7000, 0x2000),
     (0x002c_4000, 0x1000),
+    (0x002e_5000, 0x1000),
     (0x002e_b000, 0x1000),
     (0x0030_b000, 0x1000),
+    (0x0068_f000, 0x1000),
 ];
 
 /// Control hook proving the observation framework itself is alive: the
@@ -389,13 +393,42 @@ fn xp_watch(unicorn: &mut Unicorn<'_, Context>, tid: u32, address: u64) {
             }
         }
         "interpret" => {
+            // The vector entry is `{kind, osal-msg, size}`; the OSAL message
+            // at `[entry+4]` is `{kind, content, size}` and `bEnableAccess`
+            // maps `[msg+4]`, so dump the content block too - byte `0xb` is
+            // `u8GetType`'s source (`u8GetValue(0xb)` at `0x36c7d2`) and must
+            // be `0x40..=0x45` or the switch defaults to "Unknown type".
             let p1 = word(unicorn, (r1 as u32).wrapping_add(4)).unwrap_or(0);
+            let content = word(unicorn, p1.wrapping_add(4)).unwrap_or(0);
             log::info!(
-                "PROCNAV[{tid}] xp-interpret: mgr={r0:#010x} entry=[{}] req=[{r2:#x} {r3:#x} {} {}] body@{p1:#010x}=[{}]",
+                "PROCNAV[{tid}] xp-interpret: mgr={r0:#010x} entry=[{}] req=[{r2:#x} {r3:#x} {} {}] body@{p1:#010x}=[{}] content@{content:#010x}=[{}]",
                 hexdump(unicorn, r1 as u32, 0x10),
                 word(unicorn, sp).unwrap_or(0),
                 word(unicorn, sp.wrapping_add(4)).unwrap_or(0),
-                hexdump(unicorn, p1, 0x20),
+                hexdump(unicorn, p1, 0x10),
+                hexdump(unicorn, content, 0x20),
+            );
+        }
+        "dispatcher" => {
+            let table = r0;
+            let msg = r1 as u32;
+            let fields = word(unicorn, msg.wrapping_add(4)).unwrap_or(0);
+            log::info!(
+                "PROCNAV[{tid}] xp-dispatcher: table={table:#010x} msg={msg:#010x} fields={fields:#010x} svc={:#x} prop={:#x} head=[{}]",
+                halfword(unicorn, fields.wrapping_add(0x14)).unwrap_or(0),
+                halfword(unicorn, fields.wrapping_add(0x18)).unwrap_or(0),
+                hexdump(unicorn, msg, 0x10),
+            );
+        }
+        "sink" => {
+            // `pc_tclSensorMsgHandler::s32OnStatusMsg` (ARM): the message is
+            // `[sp+0xf0]` per the `gps-sink` narrow-hook model.
+            let msg = word(unicorn, sp.wrapping_add(0xf0)).unwrap_or(0);
+            log::info!(
+                "PROCNAV[{tid}] xp-sink: r0={r0:#010x} msg={msg:#010x} svc={:#x} prop={:#x} head=[{}]",
+                halfword(unicorn, msg.wrapping_add(0x14)).unwrap_or(0),
+                halfword(unicorn, msg.wrapping_add(0x16)).unwrap_or(0),
+                hexdump(unicorn, msg, 0x20),
             );
         }
         "getnext-entry" => {
