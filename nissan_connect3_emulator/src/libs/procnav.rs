@@ -1696,14 +1696,19 @@ fn spawn_posfi_provider(unicorn: &mut Unicorn<'_, Context>) {
 /// (`movs r1, #0x82` in oRead `0x600f8c`) packed const block as a
 /// recognisable pattern.
 pub(crate) fn nav_position_status_message(seq: u16) -> Vec<u8> {
-    let mut body = Vec::with_capacity(0x90);
-    body.extend_from_slice(&0u32.to_le_bytes()); // typebase header word (typebase+4)
-    for i in 0..33u32 {
-        // 130 bytes of pattern (the last dword is 2 bytes pattern + 2 zero).
-        let word = 0xf000_0000u32.wrapping_add(i);
-        body.extend_from_slice(&word.to_le_bytes());
-    }
-    body.truncate(4 + 130);
+    // fi_tcl visitor payload (r424/r425 object dumps): the NavPositionStatus
+    // wire is a flat sequential encoding - DataSetId u32, PositionWGS84
+    // {Longitude s32, Latitude s32} (both degrees * 1e5), then the one-cell /
+    // section fields read 1-2 bytes each (e8/e16 descriptors).  r425 proved
+    // the map-window gate in vHandleNavPosition only opens when
+    // PositionCalculationState != 0, and a sparse dword pattern left a 0x00
+    // byte exactly there, so all bytes behind the coordinates are a uniform
+    // non-zero filler (0x01 keeps every scalar small, no length-loop risk).
+    let mut body = Vec::with_capacity(0x2c0);
+    body.extend_from_slice(&0u32.to_le_bytes()); // DataSetId
+    body.extend_from_slice(&1_991_809i32.to_le_bytes()); // Longitude (19.91809 E)
+    body.extend_from_slice(&5_006_254i32.to_le_bytes()); // Latitude (50.06254 N)
+    body.resize(0x2c0, 0x01);
     let len = 0x20 + body.len();
     let LEN = len.next_multiple_of(16);
     let mut content = vec![0u8; LEN];
