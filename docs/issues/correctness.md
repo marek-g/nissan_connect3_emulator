@@ -208,3 +208,43 @@ started (only 4 "Start program" lines). The mount is now repo-local
 (`nissan_connect3_emulator/data/navbin`, override `EMU_NAVBIN_DIR`, binary
 gitignored, regenerate with `tools/extract_procnav.sh`) and `main()` logs an
 ERROR at startup when `PROCNAV.OUT` is missing.
+
+## GPS messages delivered into real STAT handlers (runs r380-r389)
+
+Two root causes killed every STAT_TASK1 message before dispatch (both fixed):
+
+1. `s32InterpretAndCompareMessage` (0x297f54) switches on `u8GetType()` =
+   `u8GetValue(0xb)` (wire byte +0xb) over classes 0x40..0x45; out of range ->
+   "Unknown type of message" (RDE 0x43001c) + "error copying" downstream.
+2. `bEnableAccess` (0x30b27e) resolves the received OSAL reference through
+   service 0x57. The queue model hands the waiter an 8-byte reference
+   `{1, content}` in its pool slot, so 0x57 must dereference one `{1, inner}`
+   level (real OSAL resolves token -> data); answering the slot itself made
+   the class byte read as 0 (monitor.rs, r380: 546 -> 0 unknown-type errors).
+
+Dispatch ground truth (`rtf::tclMessageDispatcher`, `pfFindMessageMap`
+0x520f34): per-thread `rtf::trMessageMap` list, 16-byte entries
+`{u8 class, u16 svc, u16 fn, u8 op, handler, flags}` probed with
+`(0x45, svc, fn, op)` extracted from the message. `STAT_tclThread::
+vInitMessageMap` (0x11d08a) consumes **sensorfi as service 0x0a**:
+fn 0x8001 op 6/8 (`s32OnUsedDataSetStatus`/`s32OnUsedDataSetError`,
+`u16GetValue(0x18) == 0x8001` confirms the wire fn slot at +0x18), fn 0x201
+(method result), plus a class-0x44 svc-0x0a wildcard (`s32OnServiceStateNavi`).
+Nothing keys on the earlier guessed 0xb/5. Re-keying the fabricated envelope
+(+0x14 = 0x000a, +0x16/+0x18 = 0x8001) + ServiceReference node + registry
+SERVICEID made `s32SearchAndCallFunction` hit (r389): STAT handler executes
+16x (`xp-stat-dataset`, lr 0x4d380e), "MsgDisp: unknown message" gone.
+
+Remaining gap to the position computer (0x68ff8c `pc_tclSensorMsgHandler::
+s32OnStatusMsg`): the consumer is `pc_tclPropertyHandlerTemplate<
+cmb_sensorfi_tclMsgGpsDataStatus, h>` (client-side, ctor 0x596170) built by
+`pc_tclSensorCommunications` (ctor 0x25b5d8) - **all never executed** in
+PROCNAV (0 hits, r387); the owning component (position-computer app task,
+likely the never-started FC_01/NAVAPP-main cluster: no `s32InitApp01`/
+`s32InitAppSTAT` fetches either, tasks self-bootstrap via vEntry) needs
+bring-up. Related observations: TEA_TASK1 (tid82) never pumps - its
+`NaviThread::vEntry` (0x29e05c) skips the run loop because its message
+manager (+0x40) is NULL (its app object is not an rtf::tclCommThread:
+`rtf::tclCommThread::s32Initialize` branch probes ct-open/ct-msgman fire only
+on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
+(tid81/82) belong to these half-initialized apps.
