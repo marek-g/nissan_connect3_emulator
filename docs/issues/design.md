@@ -1647,3 +1647,16 @@ Consequences for the open threads here:
   object at 0x9020a8f4-style buffer) do not yet move `UpdateMapDataRequest`
   off the default window - parse offsets and the validity gate in
   vHandleNavPosition still need mapping (next step).
+- **r425/r426 (wire layout + window gate):** the fi_tcl payload is a flat
+  sequential encoding (no tags): `DataSetId u32`, `Longitude s32`,
+  `Latitude s32` (degrees * 1e5), then 1-2-byte e8/e16 section fields read
+  cursor-sequentially (all reads boundary-checked, `fi_tclInContext::
+  u32ReadAt`).  A uniform non-zero filler byte is required behind the
+  coordinates: the map-window gate in `vHandleNavPosition` is
+  `PositionCalculationState != 0` (field value slot object+0x15c-ish), and a
+  sparse dword pattern lands a 0x00 byte exactly there.  r426:
+  `UpdateMapDataRequest(4, 0, 5.0, 0, lon±100000, lat±50000)` fires once
+  with the Krakow rect on the body thread - the fabricated position now
+  drives the engine's map window.  Open: the MDM job queue created by that
+  call is still not consumed (no DapiGetBlockIDs for the Krakow job; the
+  early default-window request=5 chain still ends in the DAPI 0x305).

@@ -2059,7 +2059,7 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
     let vprocess_nav_pos = base_address + NAV_HANDLER_VPROCESS_NAV_POS;    unicorn
         .add_code_hook(vprocess_nav_pos as u64, vprocess_nav_pos as u64, move |uc, _, _| {
             let count = NAV_PROCESS_POS_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if count >= 4 {
+            if count >= 2 {
                 return;
             }
             let thread = uc.get_data().inner.thread_id();
@@ -2067,7 +2067,11 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
             let object = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let mut words = Vec::new();
             if object < 0xf000_0000 {
-                for i in 0..24u32 {
+                // Full posfi_tclMsgNavPositionStatus parse object (0x2bc
+                // bytes): each embedded field slot carries its descriptor
+                // cell pointer, so the whole tree plus the pattern payload
+                // identifies every field's wire offset.
+                for i in 0..176u32 {
                     words.push(format!("{:08x}", read_u32_or_invalid(uc, object + i * 4)));
                 }
             }
