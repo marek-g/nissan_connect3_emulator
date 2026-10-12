@@ -103,19 +103,41 @@ const PROBE_STAT_CREATED: u32 = 0x0199_6a4 - ORIGINAL_BASE;
 // entry probe fires only when that fatal precondition holds, logging the
 // caller (lr) so the offending container can be identified.
 const PROBE_LIST_ERASE: u32 = 0x005a_4360 - ORIGINAL_BASE;
-/// After the null-shape gate inside the `STAT_tclThread::vEntry` message
-/// pipeline (`0x298211`, `r0` = the six-word tuple test of `0x2981c3`): a
-/// failing test is reported as RDE `0x43001c "Unknown type of message"`.
-const PROBE_MSGMAN_TYPE: u32 = 0x0029_8211 - ORIGINAL_BASE;
-/// `STAT_tclThread::vEntry`'s drain call (`blx [vtable+0x54]`, `r0` = the
-/// thread, `[r4+0x3c]` = the message-map object): dumps the thread's
-/// message-map window and the map's current head/tail pair.
-const PROBE_VENTRY_STEP: u32 = 0x0011_dc57 - ORIGINAL_BASE;
-/// Start of the RDE report wrappers (called as `bl 0x30b98b` / `bl 0x30b9bf`
-/// from every trace emitter): the entry `lr` identifies which call site
-/// raised the error and `r1` the RDE code being reported.
-const PROBE_RDE_A: u32 = 0x0030_b98b - ORIGINAL_BASE;
-const PROBE_RDE_B: u32 = 0x0030_b9bf - ORIGINAL_BASE;
+/// Unicorn 2.1.5 silently never fires some narrow-range `UC_HOOK_CODE` hooks
+/// whose target sits inside a large Thumb translation block: r372-r376 show
+/// `0x2ebd6c`/`0x2989c4` hooks with zero hits while page-range hooks over the
+/// very pages logged every fetch of those exact addresses (registration
+/// succeeded for all, the closure type is shared, and swapping the startup
+/// order changed nothing - the quirk is inside the engine, not our side).
+/// The `xp-watch` machinery below is the workaround: whole pages are hooked
+/// and dispatched by exact fetch address in the callback.
+const XP_TARGETS: &[(u32, &str)] = &[
+    (0x0029_7d10, "ail-open"),
+    (0x0029_7d32, "t1-dispatch"),
+    (0x0029_7f54, "interpret"),
+    (0x0029_81e6, "getnext-entry"),
+    (0x0029_8210, "getnext-check"),
+    (0x0029_84b4, "getnext-errbl"),
+    (0x0029_89c4, "rde-formatter"),
+    (0x002c_4780, "traceout"),
+    (0x002e_bd6c, "veneer"),
+    (0x0030_b98a, "err-set"),
+    (0x0011_dbd8, "ventry-entry"),
+    (0x0011_dc56, "ventry-step"),
+];
+
+/// The pages covering `XP_TARGETS`, one hook each (see the note above).
+const XP_PAGES: &[(u32, u32)] = &[
+    (0x0011_d000, 0x1000),
+    (0x0029_7000, 0x2000),
+    (0x002c_4000, 0x1000),
+    (0x002e_b000, 0x1000),
+    (0x0030_b000, 0x1000),
+];
+
+/// Control hook proving the observation framework itself is alive: the
+/// shared svc thunk (`0x62ef90`, retired by every monitor call).
+const PROBE_CTL_THUNK: u32 = 0x0062_ef90 - ORIGINAL_BASE;
 /// In `ail_tclInternalDispatch::bDispatchCCAMessages` (`0xbd50c`), right on the
 /// `bl 0x24ea05` (`bIsDataSet`) whose answer gates the delivery `blx r2`: dumps
 /// the match key (`r0`, a 12-byte `{u16@0,2,4, u8@6, u16@8}` service-reference
@@ -299,6 +321,140 @@ fn hexdump(unicorn: &mut Unicorn<'_, Context>, address: u32, len: usize) -> Stri
     }
 }
 
+fn xp_cstr(unicorn: &mut Unicorn<'_, Context>, address: u32) -> String {
+    let mut bytes = [0u8; 48];
+    match unicorn.mem_read(address as u64, &mut bytes) {
+        Ok(()) => {
+            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+            String::from_utf8_lossy(&bytes[..end]).into_owned()
+        }
+        Err(_) => "<unmapped>".to_string(),
+    }
+}
+
+/// Exact-address dispatch for the page-granular `xp-watch` hooks (see
+/// `XP_TARGETS` for why narrow hooks cannot be trusted at these VAs).
+fn xp_watch(unicorn: &mut Unicorn<'_, Context>, tid: u32, address: u64) {
+    let Some((_, tag)) = XP_TARGETS.iter().find(|(a, _)| *a as u64 == address) else {
+        return;
+    };
+    // Per-tag budget so a hot target cannot starve the others; the
+    // self-deduplicating sites (unique `lr` reporting) are exempt.
+    static BUDGET: std::sync::Mutex<Vec<(&'static str, u32)>> =
+        std::sync::Mutex::new(Vec::new());
+    if !matches!(*tag, "err-set" | "traceout") {
+        let mut budget = BUDGET.lock().unwrap();
+        match budget.iter_mut().find(|(t, _)| *t == *tag) {
+            Some(entry) => {
+                entry.1 += 1;
+                if entry.1 > 16 {
+                    return;
+                }
+            }
+            None => budget.push((tag, 1)),
+        }
+    }
+    let r0 = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+    let r1 = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+    let r2 = unicorn.reg_read(RegisterARM::R2).unwrap_or(0);
+    let r3 = unicorn.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+    let lr = (unicorn.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1;
+    let sp = unicorn.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+    match *tag {
+        "err-set" => {
+            // err_vSetError(handler, code, 0, message, line, file): log every
+            // unique (code, lr) once - this names each distinct RDE emitter.
+            static SITES: std::sync::Mutex<Vec<(u32, u32)>> =
+                std::sync::Mutex::new(Vec::new());
+            let line = word(unicorn, sp).unwrap_or(0);
+            let msg = xp_cstr(unicorn, r3);
+            let mut sites = SITES.lock().unwrap();
+            if !sites.contains(&(r1, lr)) && sites.len() < 48 {
+                sites.push((r1, lr));
+                log::info!(
+                    "PROCNAV[{tid}] xp-err-set: code={:#x} lr={lr:#010x} line={line} msg={msg:?}",
+                    r1
+                );
+            }
+        }
+        "traceout" => {
+            let record = r1 as u32;
+            let text_ptr = word(unicorn, record.wrapping_add(0xc)).unwrap_or(0);
+            let text = xp_cstr(unicorn, text_ptr);
+            if text.contains("Code=0x") || text.contains("MsgMan") || text.contains("Unknown") {
+                log::info!(
+                    "PROCNAV[{tid}] xp-traceout: handle={r0:#010x} sev={:#x} lr={lr:#010x} text={text:?}",
+                    word(unicorn, record.wrapping_add(4)).unwrap_or(0)
+                );
+            }
+        }
+        "interpret" => {
+            let p1 = word(unicorn, (r1 as u32).wrapping_add(4)).unwrap_or(0);
+            log::info!(
+                "PROCNAV[{tid}] xp-interpret: mgr={r0:#010x} entry=[{}] req=[{r2:#x} {r3:#x} {} {}] body@{p1:#010x}=[{}]",
+                hexdump(unicorn, r1 as u32, 0x10),
+                word(unicorn, sp).unwrap_or(0),
+                word(unicorn, sp.wrapping_add(4)).unwrap_or(0),
+                hexdump(unicorn, p1, 0x20),
+            );
+        }
+        "getnext-entry" => {
+            // s32GetNextMessage(this, out, r2, tuple r3 + five stack words):
+            // manager channel/vector window plus the six-word request tuple.
+            log::info!(
+                "PROCNAV[{tid}] xp-getnext: mgr={r0:#010x} mgr=[{}] tuple=[{}] extra=[{}]",
+                hexdump(unicorn, r0, 0x38),
+                hexdump(unicorn, sp, 0x18),
+                hexdump(unicorn, sp.wrapping_add(0x18), 0x10),
+            );
+        }
+        "getnext-check" => {
+            log::info!("PROCNAV[{tid}] xp-getnext-check: bCheckParameters={r0:#x}");
+        }
+        "getnext-errbl" => {
+            log::info!(
+                "PROCNAV[{tid}] xp-getnext-errbl: r0={r0:#010x} sp=[{}]",
+                hexdump(unicorn, sp, 0x10)
+            );
+        }
+        "t1-dispatch" => {
+            let r4 = unicorn.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            let svc = word(unicorn, r4.wrapping_add(0x24)).unwrap_or(0);
+            let svc_vt = word(unicorn, svc).unwrap_or(0);
+            log::info!(
+                "PROCNAV[{tid}] xp-t1-dispatch: service={svc:#010x} r1={r1:#x} r2={r2:#x} r3={r3:#x} sp=[{}] wrapper@{r4:#010x} vt={svc_vt:#010x} method={:#010x}",
+                hexdump(unicorn, sp, 8),
+                word(unicorn, svc_vt.wrapping_add(0x20)).unwrap_or(0),
+            );
+        }
+        "ventry-entry" => {
+            log::info!("PROCNAV[{tid}] xp-ventry-entry: this={r0:#010x} arg={r1:#010x} lr={lr:#010x}");
+        }
+        "ventry-step" => {
+            let r4 = unicorn.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            let map = word(unicorn, r4.wrapping_add(0x3c)).unwrap_or(0);
+            log::info!(
+                "PROCNAV[{tid}] xp-ventry-step: this={r4:#010x} vt={:#010x} method={r1:#010x} map@{map:#010x} map=[{}]",
+                word(unicorn, r4).unwrap_or(0),
+                hexdump(unicorn, map.wrapping_add(0x18), 0x18),
+            );
+        }
+        "rde-formatter" => {
+            let s4 = word(unicorn, sp.wrapping_add(4)).unwrap_or(0);
+            let s14 = word(unicorn, sp.wrapping_add(0x14)).unwrap_or(0);
+            log::info!(
+                "PROCNAV[{tid}] xp-rde-formatter: sp={sp:#010x} sp=[{}] s4={s4:#010x}:{:?} s14={s14:#010x}:{:?}",
+                hexdump(unicorn, sp, 0x20),
+                xp_cstr(unicorn, s4),
+                xp_cstr(unicorn, s14),
+            );
+        }
+        _ => {
+            log::info!("PROCNAV[{tid}] xp-{tag}: r0={r0:#010x} lr={lr:#010x}");
+        }
+    }
+}
+
 /// Walk an `fwl_List` (list object at `obj+off`, first node at `[list+4]`,
 /// `next` at `node+4`, payload at `node+8`) and dump up to 16 payloads.
 /// One-shot marker for the fabricated SENSORFI subscription entry (see
@@ -427,10 +583,7 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ("probe-stat-start", PROBE_STAT_START, 2),
         ("probe-stat-created", PROBE_STAT_CREATED, 2),
         ("probe-list-erase", PROBE_LIST_ERASE, 2),
-        ("probe-msgman-type", PROBE_MSGMAN_TYPE, 2),
-        ("probe-ventry-step", PROBE_VENTRY_STEP, 2),
-        ("probe-rde-a", PROBE_RDE_A, 2),
-        ("probe-rde-b", PROBE_RDE_B, 2),
+        ("probe-ctl-thunk", PROBE_CTL_THUNK, 4),
         ("probe-ds-tuple", PROBE_DS_TUPLE, 2),
         ("probe-stat-inited", PROBE_STAT_INITED, 2),
         ("probe-stat-setup", PROBE_STAT_SETUP, 2),
@@ -490,7 +643,7 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         let sd_hot = sd_hot.clone();
         let built_ptr = built_ptr.clone();
         let ail_count = ail_count.clone();
-        let result = unicorn.add_code_hook(address, address + size, move |uc, _, _| {
+        let result = unicorn.add_code_hook(address, address + size, move |uc, addr, _| {
             let tid = uc.get_data().inner.thread_id();
             if name == "power-repost" || (name.starts_with("probe-") && name != "probe-less-u16") {
                 let (counter, limit) = if name.starts_with("probe-new-") {
@@ -727,52 +880,12 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         hexdump(uc, r0, 12)
                     );
                 }
-                "probe-rde-a" | "probe-rde-b" => {
-                    // Report the distinct raising call sites once each (with a
-                    // hit count in the run-end summary would need more plumbing,
-                    // so log the first hit of every unique `lr` up to 32).
-                    static SITES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
-                    let lr = (uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1;
-                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0);
-                    let mut sites = SITES.lock().unwrap();
-                    if !sites.contains(&lr) && sites.len() < 32 {
-                        sites.push(lr);
-                        log::info!(
-                            "PROCNAV[{tid}] {name}: new RDE site lr={lr:#010x} r1={r1:#x} ({})",
-                            if name == "probe-rde-a" { "trace-stream" } else { "extended" }
-                        );
-                    }
-                }
-                "probe-ventry-step" => {
-                    static SEEN: std::sync::atomic::AtomicU32 =
+                "probe-ctl-thunk" => {
+                    static THUNK: std::sync::atomic::AtomicU32 =
                         std::sync::atomic::AtomicU32::new(0);
-                    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
-                        let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
-                        let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
-                        let vtable = word(uc, r4).unwrap_or(0);
-                        let map = word(uc, r4.wrapping_add(0x3c)).unwrap_or(0);
-                        let map_vtable = word(uc, map).unwrap_or(0);
-                        log::info!(
-                            "PROCNAV[{tid}] probe-ventry-step: this={r4:#010x} vt={vtable:#010x} method={r1:#010x} map@{map:#010x} mapvt={map_vtable:#010x} map=[{}] head={}",
-                            hexdump(uc, map.wrapping_add(0x18), 0x18),
-                            word(uc, map).unwrap_or(0)
-                        );
-                    }
-                }
-                "probe-msgman-type" => {
-                    static SEEN: std::sync::atomic::AtomicU32 =
-                        std::sync::atomic::AtomicU32::new(0);
-                    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
-                        let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
-                        let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
-                        let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
-                        let begin = word(uc, r4.wrapping_add(0x20)).unwrap_or(0);
-                        log::info!(
-                            "PROCNAV[{tid}] probe-msgman-type: r0={r0:#x} stream@{r4:#010x}=[{}] tuple=[{}] wire@{begin:#010x}=[{}]",
-                            hexdump(uc, r4, 0x38),
-                            hexdump(uc, sp.wrapping_add(0x14), 0x18),
-                            hexdump(uc, begin, 0x30),
-                        );
+                    if THUNK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                        let lr = (uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1;
+                        log::info!("PROCNAV[{tid}] probe-ctl-thunk: lr={lr:#010x}");
                     }
                 }
                 "probe-list-erase" => {
@@ -1204,6 +1317,26 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         match result {
             Ok(_) => log::info!("PROCNAV: observation hook '{name}' at {address:#x}"),
             Err(error) => log::warn!("PROCNAV: cannot hook {name} at {address:#x}: {error}"),
+        }
+    }
+
+    // Page-granular watchers replacing the narrow hooks that unicorn 2.1.5
+    // silently drops (see `XP_TARGETS`); the callbacks dispatch on the exact
+    // fetch address, so the extra cost is one table lookup per instruction
+    // inside these pages.
+    for (page, span) in XP_PAGES {
+        let address = (base_address + (page - ORIGINAL_BASE)) as u64;
+        let result = unicorn.add_code_hook(
+            address,
+            address + *span as u64,
+            move |uc, addr, _| {
+                let tid = uc.get_data().inner.thread_id();
+                xp_watch(uc, tid, addr);
+            },
+        );
+        match result {
+            Ok(_) => log::info!("PROCNAV: xp-watch page {address:#x}+{span:#x}"),
+            Err(error) => log::warn!("PROCNAV: cannot hook xp page {address:#x}: {error}"),
         }
     }
 

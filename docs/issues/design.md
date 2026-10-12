@@ -1570,3 +1570,26 @@ Consequences for the open threads here:
   them (TIMA defaults); a component that requires its named thread fails
   `bInitInstance` with "failed to find key <NAME>_PRIO" - add the pair to the
   compat file when seen.
+
+## Narrow-range code hooks silently never fire (unicorn-engine 2.1.5)
+- **Status:** worked around (r377/r378, `xp-watch` in `src/libs/procnav.rs`)
+- **Symptom:** observation probes added at `0x2ebd6c`, `0x297f54`, `0x2981e6`,
+  `0x2989c4`, `0x2c4780`, `0x30b98a` (2-4 byte ranges) registered `Ok` but got
+  zero hits for the whole run, while the code demonstrably executed (yield
+  continuations in the monitor log named `0x2989c4` 2180 times).
+- **Isolation (r372-r376):** a *page-range* hook over the same pages fired for
+  every fetch of the exact addresses (`TARGET ... fetched`); swapping the
+  process start order changed nothing; all registrations reported success and
+  share one closure type, so the failure is inside the engine, not the hook
+  list or the guest.
+- **Engine internals:** unicorn 2.x decides hook dispatch at *translation*
+  time (`accel/tcg/translator.c` `HOOK_EXISTS_BOUNDED` per instruction,
+  `translator.c:151` records only TB-granular regions). A narrow range that
+  only overlaps the middle of an already-translated large Thumb TB never gets
+  its per-instruction check emitted, and nothing re-translates it later.
+  The exact cache-history trigger for our runs was not pinned down further.
+- **Workaround:** hook whole 4 KiB pages (`XP_PAGES`) and dispatch on the
+  exact fetch address inside the callback (`XP_TARGETS`/`xp_watch`). Costs a
+  table lookup per instruction inside five hot pages; budget counters keep
+  the log bounded. Live narrow hooks elsewhere keep working - only convert
+  probes that must see mid-TB addresses.
