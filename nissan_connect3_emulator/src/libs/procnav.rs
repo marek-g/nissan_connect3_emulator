@@ -149,6 +149,42 @@ const PROBE_SD_FITS: u32 = 0x0030_b306 - ORIGINAL_BASE;
 const PROBE_SD_MALLOC: u32 = 0x0030_b316 - ORIGINAL_BASE;
 /// In `0x30b2f0`: the return sequence `mov r0,r5` (`r5` = 1 on success).
 const PROBE_SD_FRET: u32 = 0x0030_b324 - ORIGINAL_BASE;
+/// `pc_tclProcessMessage::s32ProcessMessage` entry: the only caller chain that
+/// reaches the property dispatcher (`0x2e5526`) and its registered sinks.
+const PROBE_SD_PROCMSG: u32 = 0x004d_3c38 - ORIGINAL_BASE;
+/// CCA router's tail vtable dispatch (`0xbe448`, `ip = [r4]`, callee `[ip+0x14]`):
+/// dumps the resolved callee - the class-0x45 route's real handler entry.
+const PROBE_SD_RTDISP: u32 = 0x00be_44a - ORIGINAL_BASE;
+/// Property dispatcher entry (`0x2e5526`): walks the live registration list at
+/// `[arg0+0xc]` and calls `[[node]+8]` on a prop/service match - the only road
+/// to the sinks in the static table at `0xa38d78` (incl. `0x68ff8c`).
+const PROBE_DISPATCHER: u32 = 0x002e_5526 - ORIGINAL_BASE;
+/// Registrar `0x2e6824` right after the object probe `bl 0x2e65cc`: `r0 == 1`
+/// means the vtable `[obj]+8` acquire answered and the record insert at
+/// `0x2e6684` runs; anything else silently drops the registration.
+const PROBE_REGPROBE: u32 = 0x002e_6838 - ORIGINAL_BASE;
+/// `bHandleMsgServiceData` gate after `bl 0x2b7624` (`0xbd56e`): `r0` is the
+/// opcode acceptor's answer - 0 drops the message before the ownership walk.
+const PROBE_SD_GATE: u32 = 0x00bd_56e - ORIGINAL_BASE;
+/// Registrar clone `0x2e6948` right after `ldr r0,[pc,#0x138]`/`adds r0,#8`
+/// (`0x2e695e`): dumps what the 'registry object' pointer really resolves to.
+const PROBE_REGOBJ: u32 = 0x002e_695e - ORIGINAL_BASE;
+/// `rtf_tclChannelFactory::pGetCommMemberInfo` return (`0x6558e`): `r0=0` with a
+/// non-null `[factory+0x4c]` list means the service's comm-member record is
+/// missing from the boot directory - the STAT sensor channel open dies here.
+const PROBE_COMMFIND: u32 = 0x0006_558e - ORIGINAL_BASE;
+/// `rtf_tclChannelFactory::vSetCommMemberList` (`0x6563e`): who seeds the
+/// comm-member list (`r1` = list, `r2` = owner) and from where (LR).
+const PROBE_COMMSET: u32 = 0x0006_563e - ORIGINAL_BASE;
+/// STAT member-open `0x1f6d26` step 1: just after `blx` on the found record's
+/// member object `[rec+0x20]->vtable[0x18]` (`ip` = member id, `r7` = old size).
+const PROBE_MEMOPEN1: u32 = 0x001f_6d68 - ORIGINAL_BASE;
+/// STAT member-open step 2: the record-vector slot write after the growth call
+/// (`0x1f6da0`): dumps the resolved member id and the destination vector.
+const PROBE_MEMOPEN2: u32 = 0x001f_6da0 - ORIGINAL_BASE;
+/// Shared return path of the method-table registrar family (`0x2e6904`/`0x2e6948`
+/// and clones all tail-branch here after `bl 0x2e6824`): `r0` = register answer.
+const PROBE_REGISTRAR: u32 = 0x002e_6874 - ORIGINAL_BASE;
 /// Right after `bl 0x247c70` in the repost path: `r0` is the pump object taken from
 /// `adapter+0x54` that the traced send leaf `0x19089e` unwraps (`+0xc` byte must be
 /// non-zero) before it issues the real `0x4b0364` post.
@@ -206,6 +242,7 @@ fn hexdump(unicorn: &mut Unicorn<'_, Context>, address: u32, len: usize) -> Stri
 
 pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let repost_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let reg_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let new_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let sd_hot = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let built_ptr = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -268,6 +305,17 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ("probe-sd-fits", PROBE_SD_FITS, 2),
         ("probe-sd-malloc", PROBE_SD_MALLOC, 2),
         ("probe-sd-fret", PROBE_SD_FRET, 2),
+        ("probe-sd-procmsg", PROBE_SD_PROCMSG, 2),
+        ("probe-sd-rtdisp", PROBE_SD_RTDISP, 2),
+        ("probe-dispatcher", PROBE_DISPATCHER, 2),
+        ("probe-regprobe", PROBE_REGPROBE, 2),
+        ("probe-sd-gate", PROBE_SD_GATE, 2),
+        ("probe-regobj", PROBE_REGOBJ, 2),
+        ("probe-commfind", PROBE_COMMFIND, 2),
+        ("probe-commset", PROBE_COMMSET, 2),
+        ("probe-memopen1", PROBE_MEMOPEN1, 2),
+        ("probe-memopen2", PROBE_MEMOPEN2, 2),
+        ("probe-registrar", PROBE_REGISTRAR, 2),
         ("probe-sd-pump", PROBE_SD_PUMP, 2),
         ("probe-sd-tg1", PROBE_SD_TG1, 2),
         ("probe-sd-tgs", PROBE_SD_TGS, 2),
@@ -279,6 +327,7 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     ] {
         let address = (base_address + offset) as u64;
         let repost_count = repost_count.clone();
+        let reg_count = reg_count.clone();
         let new_count = new_count.clone();
         let sd_hot = sd_hot.clone();
         let built_ptr = built_ptr.clone();
@@ -297,6 +346,8 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         | "probe-sd-fret"
                 ) {
                     (&sd_hot, 420)
+                } else if matches!(name, "probe-registrar" | "probe-regprobe" | "probe-regobj") {
+                    (&reg_count, 1500)
                 } else {
                     (&repost_count, 600)
                 };
@@ -565,6 +616,21 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         log::info!(
                             "PROCNAV[{tid}] probe-sd-binit: init-status={r0:#x} r4={r4:#x} entry-wrapper={wrapper:#x}"
                         );
+                        // The send leaf `0x19089e` validates `[wrapper+0xc]` as the
+                        // message's embedded buffer. The real unit's deep task stack
+                        // leaves a stale non-zero word there (the builder itself never
+                        // writes +0xc); the emulator's deterministic stack leaves 0 and
+                        // the guard then silently drops the post. Point it at the freshly
+                        // allocated data block - the same role the embedded buffer has on
+                        // a fully deserialised wrapper.
+                        if let Some(data) = word(uc, wrapper.wrapping_add(4)) {
+                            if data != 0 {
+                                let _ = uc.mem_write(
+                                    wrapper.wrapping_add(0xc) as u64,
+                                    &data.to_le_bytes(),
+                                );
+                            }
+                        }
                     }
                 }
                 "probe-sd-parse" => {
@@ -586,6 +652,114 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 "probe-sd-fret" => {
                     let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0);
                     log::info!("PROCNAV[{tid}] probe-sd-fret: r5={r5:#x}");
+                }
+                "probe-sd-gate" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    log::info!("PROCNAV[{tid}] probe-sd-gate: acceptor={r0:#x} adapter={r4:#010x}");
+                }
+                "probe-regobj" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0);
+                    // Registry singleton (`0x01215180` literal + 8): dump its live
+                    // contents - vtable, state, and the record head.
+                    let obj = r0.wrapping_add(8);
+                    let vt = word(uc, obj).unwrap_or(0);
+                    let s0 = word(uc, vt).unwrap_or(0);
+                    let s8 = word(uc, vt.wrapping_add(8)).unwrap_or(0);
+                    log::info!(
+                        "PROCNAV[{tid}] probe-regobj: obj={obj:#010x} vt={vt:#010x} slot0={s0:#010x} slot8={s8:#010x} id={r4:#x} {}",
+                        hexdump(uc, obj, 0x20)
+                    );
+                }
+                "probe-commfind" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0);
+                    let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0);
+                    let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0);
+                    let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0);
+                    let list = word(uc, r4.wrapping_add(0x4c)).unwrap_or(0);
+                    let rec = if r5 != 0 {
+                        format!(" {}", hexdump(uc, r5 as u32, 0x30))
+                    } else {
+                        String::new()
+                    };
+                    log::info!(
+                        "PROCNAV[{tid}] probe-commfind: type={r6:#x} sub={r7:#x} list={list:#010x} found={r5:#010x} r0={r0:#x} lr={lr:#010x}{rec}"
+                    );
+                }
+                "probe-commset" => {
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0);
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0);
+                    let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0);
+                    log::info!("PROCNAV[{tid}] probe-commset: list={r1:#010x} owner={r2:#010x} lr={lr:#010x}");
+                }
+                "probe-memopen1" => {
+                    let ip = uc.reg_read(RegisterARM::R12).unwrap_or(0);
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let r6 = word(uc, sp.wrapping_add(0x24)).unwrap_or(0);
+                    let obj = word(uc, r6.wrapping_add(0x20)).unwrap_or(0);
+                    log::info!(
+                        "PROCNAV[{tid}] probe-memopen1: rec={r6:#010x} obj={obj:#010x} memberid={ip:#x} {}",
+                        hexdump(uc, obj, 0x10)
+                    );
+                }
+                "probe-memopen2" => {
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let r4 = word(uc, sp.wrapping_add(0x1c)).unwrap_or(0);
+                    let mid = word(uc, sp.wrapping_add(0x20)).unwrap_or(0);
+                    let lo = word(uc, sp.wrapping_add(0x24)).unwrap_or(0);
+                    let hi = word(uc, sp.wrapping_add(0x28)).unwrap_or(0);
+                    let vec = word(uc, r4).unwrap_or(0);
+                    log::info!(
+                        "PROCNAV[{tid}] probe-memopen2: memberid={mid:#x} lo={lo:#x} hi={hi:#x} vec={vec:#010x}"
+                    );
+                }
+                "probe-sd-procmsg" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCNAV[{tid}] probe-sd-procmsg: r0={r0:#010x} r1={r1:#010x} lr={lr:#010x} obj={}",
+                        hexdump(uc, r0, 0x18)
+                    );
+                }
+                "probe-sd-rtdisp" => {
+                    let ip = uc.reg_read(RegisterARM::R12).unwrap_or(0) as u32;
+                    let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                    let target = word(uc, ip.wrapping_add(0x14)).unwrap_or(0);
+                    log::info!(
+                        "PROCNAV[{tid}] probe-sd-rtdisp: vt={ip:#010x} target={target:#010x} r6={r6:#010x}"
+                    );
+                }
+                "probe-dispatcher" => {
+                    // Entry: `0x2e552e` reloads the object from the *pushed r0*,
+                    // so r0 at entry is the dispatcher object; r1 = msg wrapper.
+                    let obj = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                    let list = word(uc, obj.wrapping_add(0xc)).unwrap_or(0);
+                    log::info!(
+                        "PROCNAV[{tid}] probe-dispatcher: obj={obj:#010x} list={list:#010x} wrapper={r1:#010x} lr={lr:#010x}"
+                    );
+                }
+                "probe-registrar" => {
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    let ans = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    log::info!("PROCNAV[{tid}] probe-registrar: class={r4:#x} answer={ans:#x}");
+                }
+                "probe-regprobe" => {
+                    // Inside `0x2e6824` after `bl 0x2e65cc`; the object (`r6`'s
+                    // incoming value) was pushed first, so it sits at `[sp,#0x14]`.
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    let obj = word(uc, sp.wrapping_add(0x14)).unwrap_or(0);
+                    let vt = word(uc, obj).unwrap_or(0);
+                    let slot = word(uc, vt.wrapping_add(8)).unwrap_or(0);
+                    log::info!(
+                        "PROCNAV[{tid}] probe-regprobe: obj={obj:#010x} vt={vt:#010x} slot8={slot:#010x} probe={r0:#x}"
+                    );
                 }
                 "probe-sd-pump" => {
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -658,6 +832,15 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     log::info!(
                         "PROCNAV[{tid}] svc-data: this={this:#010x} msg={msg:#010x} fields={fields:?} svc={svc:?} prop={prop:?} opcode={opcode:?}",
                     );
+                    if tid == 76 {
+                        let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                        let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                        log::info!(
+                            "PROCNAV[{tid}] svc-data stack lr={lr:#010x} sp={} window={}",
+                            format!("{sp:#010x}"),
+                            hexdump(uc, sp, 0x80)
+                        );
+                    }
                 }
                 "post-ipc" => {
                     let app = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 & 0xffff;
@@ -721,16 +904,22 @@ fn spawn_gps_provider(unicorn: &mut Unicorn<'_, Context>) {
             let mut seq: u16 = 0;
             loop {
                 seq = seq.wrapping_add(1);
-                let blob = gps_status_message(seq);
+                let blob = gps_status_message(seq, 0x45);
+                // The kernel routes an amt post by the blob's target app (`u16` at
+                // envelope + 0xa), not by the provider's own queue: with the STAT
+                // component (22) as target this lands on `mbx_22`, the same queue
+                // the power proxy feeds, and `0xbd50c` decides ownership there.
+                let target = u16::from_le_bytes([blob[0xa], blob[0xb]]);
+                let queue = format!("mbx_{target}");
                 let posted = {
                     let mut guard = namespace.lock().unwrap();
                     crate::common::osal_queues::OsalQueueService::ensure_queue(
                         &mut guard.mq,
-                        "mbx_19",
+                        &queue,
                     );
                     let posted = crate::common::osal_queues::OsalQueueService::guest_post(
                         &mut guard.mq,
-                        "mbx_19",
+                        &queue,
                         blob,
                         0,
                     );
@@ -740,9 +929,9 @@ fn spawn_gps_provider(unicorn: &mut Unicorn<'_, Context>) {
                     posted
                 };
                 if posted {
-                    log::info!("GPS provider: posted GpsDataStatus #{seq} to mbx_19");
+                    log::info!("GPS provider: posted GpsDataStatus #{seq} to {queue}");
                 } else {
-                    log::debug!("GPS provider: mbx_19 full, skipping #{seq}");
+                    log::debug!("GPS provider: {queue} full, skipping #{seq}");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
@@ -754,17 +943,20 @@ fn spawn_gps_provider(unicorn: &mut Unicorn<'_, Context>) {
 }
 
 /// One `GpsDataStatus` snapshot blob: envelope + amt header, zero payload.
-fn gps_status_message(seq: u16) -> Vec<u8> {
+/// `msg_class` selects the amt class byte (`0x45` ServiceData for the AE pump's
+/// re-post pipeline, `0x46` = RELUP data for direct component-queue delivery).
+pub(crate) fn gps_status_message(seq: u16, msg_class: u8) -> Vec<u8> {
     const LEN: usize = 0x80;
     let mut content = vec![0u8; LEN];
     content[0x00..0x02].copy_from_slice(&0xfffeu16.to_le_bytes()); // source app (unknown provider)
-    content[0x02..0x04].copy_from_slice(&0x0013u16.to_le_bytes()); // target app: PROCNAV (19)
+    content[0x02..0x04].copy_from_slice(&0x0016u16.to_le_bytes()); // target app: STAT component (22, mbx_22)
     content[0x04..0x08].copy_from_slice(&(LEN as u32).to_le_bytes()); // snapshot/object length
     // amt message class (read as u8GetValue(0xb) by ail_tclInternalDispatch::
     // bDispatchCCAMessages): 0x45 = ServiceData. 0x40 = state/LPM, 0x41 =
-    // ServiceRegister, 0x42 = Unregister, 0x43 = RegisterConf, 0xff = DebugApp -
-    // class 0x41 mis-injected r214-r216 as a (rejected) ServiceRegister.
-    content[0x0b] = 0x45;
+    // ServiceRegister, 0x42 = Unregister, 0x43 = RegisterConf, 0xff = DebugApp.
+    // The mbx_19 copy uses 0x45 (the AE pump's build pipeline keys off it);
+    // injected component-queue copies are tried as 0x46 (RELUP, r310+).
+    content[0x0b] = msg_class;
     content[0x0c..0x0e].copy_from_slice(&0xfffeu16.to_le_bytes()); // no source sub-id
     content[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes()); // no target sub-id
     content[0x14..0x16].copy_from_slice(&0x000bu16.to_le_bytes()); // serviceId: sensorfi
