@@ -48,6 +48,30 @@ waits, collects small+important first, and **reboots the HU at ALL_DONE =
 pull the stick**. Early pull keeps everything synced so far (progress markers
 `SECTION*_DONE`/`ALL_DONE` in `regdump/.done`).
 
+## Updating a stick that was already written
+
+Only the `logger` file changes between builds — the image layout (ext2, label
+`../../usr/bin/`) does not — so a full re-`dd` is not required. Either:
+
+```sh
+# A) full rewrite (simplest, slow for 1 GiB):
+sudo dd if=regdump.ext2 of=/dev/sdX bs=4M status=progress
+
+# B) in-place swap (fast):
+sudo mount /dev/sdX /mnt/stick            # no-partition stick: /dev/sdX
+sudo rm -rf /mnt/stick/regdump            # MANDATORY, see below
+sudo cp regdump_logger.sh /mnt/stick/logger
+sudo chmod 777 /mnt/stick/logger
+sync && sudo umount /mnt/stick
+```
+
+`rm -rf /mnt/stick/regdump` is **mandatory**: the script's re-entrancy guard
+(`regdump/.done` from a previous run) makes it exit immediately otherwise. The
+label survives a file swap, so the mount-over-/usr/bin exploit still fires.
+
+Verify before inserting: `logger` is `rwxrwxrwx`, no `regdump/` dir, label
+intact (`sudo dumpe2fs -h /dev/sdX 2>/dev/null | grep volume` → `../../usr/bin/`).
+
 ## Host side triage (after mounting the stick)
 
 ```sh
