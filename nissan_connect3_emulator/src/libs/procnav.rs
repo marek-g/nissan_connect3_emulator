@@ -103,6 +103,19 @@ const PROBE_STAT_CREATED: u32 = 0x0199_6a4 - ORIGINAL_BASE;
 // entry probe fires only when that fatal precondition holds, logging the
 // caller (lr) so the offending container can be identified.
 const PROBE_LIST_ERASE: u32 = 0x005a_4360 - ORIGINAL_BASE;
+/// After the null-shape gate inside the `STAT_tclThread::vEntry` message
+/// pipeline (`0x298211`, `r0` = the six-word tuple test of `0x2981c3`): a
+/// failing test is reported as RDE `0x43001c "Unknown type of message"`.
+const PROBE_MSGMAN_TYPE: u32 = 0x0029_8211 - ORIGINAL_BASE;
+/// `STAT_tclThread::vEntry`'s drain call (`blx [vtable+0x54]`, `r0` = the
+/// thread, `[r4+0x3c]` = the message-map object): dumps the thread's
+/// message-map window and the map's current head/tail pair.
+const PROBE_VENTRY_STEP: u32 = 0x0011_dc57 - ORIGINAL_BASE;
+/// Start of the RDE report wrappers (called as `bl 0x30b98b` / `bl 0x30b9bf`
+/// from every trace emitter): the entry `lr` identifies which call site
+/// raised the error and `r1` the RDE code being reported.
+const PROBE_RDE_A: u32 = 0x0030_b98b - ORIGINAL_BASE;
+const PROBE_RDE_B: u32 = 0x0030_b9bf - ORIGINAL_BASE;
 /// In `ail_tclInternalDispatch::bDispatchCCAMessages` (`0xbd50c`), right on the
 /// `bl 0x24ea05` (`bIsDataSet`) whose answer gates the delivery `blx r2`: dumps
 /// the match key (`r0`, a 12-byte `{u16@0,2,4, u8@6, u16@8}` service-reference
@@ -288,6 +301,67 @@ fn hexdump(unicorn: &mut Unicorn<'_, Context>, address: u32, len: usize) -> Stri
 
 /// Walk an `fwl_List` (list object at `obj+off`, first node at `[list+4]`,
 /// `next` at `node+4`, payload at `node+8`) and dump up to 16 payloads.
+/// One-shot marker for the fabricated SENSORFI subscription entry (see
+/// `fabricate_sensorfi_reference`).
+static FABRICATION_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Stand in for the sensorfi server's `RegisterConf` bookkeeping: insert one
+/// service-reference node into the STAT ail object's reference list (`+0x50`)
+/// carrying exactly the tuple `bIsDataSet` (`0x24ea04`) compares against the
+/// provider envelope (`serviceId 0xb @0`, `source app 0xfffe @2`, `functionId
+/// 5 @4`, `available @6`, `source sub-id 0xfffe @8`).  This is the state the
+/// client list would hold after a real `u16RegisterService` round-trip with a
+/// sensorfi server app; that server never runs here and its subscription
+/// config lives in the encrypted ERG, so the entry is fabricated on the host
+/// side (device simulation) instead of patching the guest binary.
+fn fabricate_sensorfi_reference(unicorn: &mut Unicorn<'_, Context>, this: u32) {
+    let mut list = word(unicorn, this.wrapping_add(0x50)).unwrap_or(0);
+    let mmu_arc = {
+        let data = unicorn.get_data();
+        data.mmu.clone()
+    };
+    let node = {
+        let mut alloc = mmu_arc.lock().unwrap();
+        if list == 0 {
+            list = alloc.heap_alloc(
+                unicorn,
+                0x10,
+                unicorn_engine::unicorn_const::Prot::READ
+                    | unicorn_engine::unicorn_const::Prot::WRITE,
+                "[stat-ref-list]",
+            );
+            let _ = unicorn.mem_write(this.wrapping_add(0x50) as u64, &list.to_le_bytes());
+        }
+        alloc.heap_alloc(
+            unicorn,
+            0x20,
+            unicorn_engine::unicorn_const::Prot::READ | unicorn_engine::unicorn_const::Prot::WRITE,
+            "[stat-sensorfi-ref]",
+        )
+    };
+    let head = word(unicorn, list.wrapping_add(4)).unwrap_or(0);
+    // Node: `{prev, next}` header, 16-byte payload at `+8` (the dispatch loop
+    // only follows `+4`, `prev` points back at the list head).
+    let mut node_bytes = Vec::with_capacity(24);
+    node_bytes.extend_from_slice(&list.to_le_bytes()); // prev
+    node_bytes.extend_from_slice(&head.to_le_bytes()); // next
+    node_bytes.extend_from_slice(&[
+        0x0b, 0x00, // +0  serviceId = 0xb (sensorfi)
+        0x0a, 0x00, // +2  typebase id low half (envelope u16 @wire+0x00)
+        0x05, 0x00, // +4  functionId (envelope u16 @wire+0x16)
+        0x01, 0x00, // +6  availability = true
+        0xff, 0xff, // +8  source sub-id wildcard (envelope u16 @wire+0x0e = 0xffff)
+        0x01, 0x00, // +a  registerId
+        0xfe, 0xff, // +c  server app (sentinel)
+        0x00, 0x00, // +e  user sub-id
+    ]);
+    let _ = unicorn.mem_write(node as u64, &node_bytes);
+    let _ = unicorn.mem_write(list.wrapping_add(4) as u64, &node.to_le_bytes());
+    log::info!(
+        "PROCNAV: fabricated sensorfi service-reference {node:#010x} into STAT ail object {this:#010x} (list {list:#010x})"
+    );
+}
+
 fn dump_fwl_list(
     unicorn: &mut Unicorn<'_, Context>,
     obj: u32,
@@ -353,6 +427,10 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ("probe-stat-start", PROBE_STAT_START, 2),
         ("probe-stat-created", PROBE_STAT_CREATED, 2),
         ("probe-list-erase", PROBE_LIST_ERASE, 2),
+        ("probe-msgman-type", PROBE_MSGMAN_TYPE, 2),
+        ("probe-ventry-step", PROBE_VENTRY_STEP, 2),
+        ("probe-rde-a", PROBE_RDE_A, 2),
+        ("probe-rde-b", PROBE_RDE_B, 2),
         ("probe-ds-tuple", PROBE_DS_TUPLE, 2),
         ("probe-stat-inited", PROBE_STAT_INITED, 2),
         ("probe-stat-setup", PROBE_STAT_SETUP, 2),
@@ -648,6 +726,54 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         "PROCNAV[{tid}] probe-ds-tuple: this={this:#010x} key@{r0:#010x}=[{}] a1={r1:#x} a2={r2:#x} a3={r3:#x} a4={arg5:#x}",
                         hexdump(uc, r0, 12)
                     );
+                }
+                "probe-rde-a" | "probe-rde-b" => {
+                    // Report the distinct raising call sites once each (with a
+                    // hit count in the run-end summary would need more plumbing,
+                    // so log the first hit of every unique `lr` up to 32).
+                    static SITES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+                    let lr = (uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1;
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0);
+                    let mut sites = SITES.lock().unwrap();
+                    if !sites.contains(&lr) && sites.len() < 32 {
+                        sites.push(lr);
+                        log::info!(
+                            "PROCNAV[{tid}] {name}: new RDE site lr={lr:#010x} r1={r1:#x} ({})",
+                            if name == "probe-rde-a" { "trace-stream" } else { "extended" }
+                        );
+                    }
+                }
+                "probe-ventry-step" => {
+                    static SEEN: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                        let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                        let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                        let vtable = word(uc, r4).unwrap_or(0);
+                        let map = word(uc, r4.wrapping_add(0x3c)).unwrap_or(0);
+                        let map_vtable = word(uc, map).unwrap_or(0);
+                        log::info!(
+                            "PROCNAV[{tid}] probe-ventry-step: this={r4:#010x} vt={vtable:#010x} method={r1:#010x} map@{map:#010x} mapvt={map_vtable:#010x} map=[{}] head={}",
+                            hexdump(uc, map.wrapping_add(0x18), 0x18),
+                            word(uc, map).unwrap_or(0)
+                        );
+                    }
+                }
+                "probe-msgman-type" => {
+                    static SEEN: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                        let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                        let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                        let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                        let begin = word(uc, r4.wrapping_add(0x20)).unwrap_or(0);
+                        log::info!(
+                            "PROCNAV[{tid}] probe-msgman-type: r0={r0:#x} stream@{r4:#010x}=[{}] tuple=[{}] wire@{begin:#010x}=[{}]",
+                            hexdump(uc, r4, 0x38),
+                            hexdump(uc, sp.wrapping_add(0x14), 0x18),
+                            hexdump(uc, begin, 0x30),
+                        );
+                    }
                 }
                 "probe-list-erase" => {
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -1012,6 +1138,25 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     log::info!(
                         "PROCNAV[{tid}] {name}: this={this:#010x} app={app:?} matched={r6} bvar={r5} refs=[{refs:?}] regs=[{regs:?}]"
                     );
+                    // The real SENSORFI subscription list lives in the encrypted
+                    // NAVAPP.ERG, so the STAT guest never calls
+                    // `u16RegisterService` here and its reference list at `+0x50`
+                    // stays empty - `bIsDataSet` then rejects every GPS message
+                    // before the pump.  Stand in for the (absent) sensorfi server's
+                    // RegisterConf by inserting the reference entry the client
+                    // bookkeeping would hold after a successful round-trip:
+                    // `{serviceId, sourceApp, fn, available, ..., subID}` pinned to
+                    // the provider envelope (svc `0xb`, src app `0xfffe`, fn `5`,
+                    // sub `0xfffe`).  The list is the same singly-linked shape the
+                    // dispatch loop walks (`[list+4]` = first node, `node+4` =
+                    // next, payload at `node+8`).
+                    if name == "probe-sd-refres"
+                        && app == Some(22)
+                        && refs.is_empty()
+                        && !FABRICATION_DONE.swap(true, std::sync::atomic::Ordering::SeqCst)
+                    {
+                        fabricate_sensorfi_reference(uc, this);
+                    }
                 }
                 "probe-sd-dlvchk" => {
                     let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0);
@@ -1100,12 +1245,13 @@ fn spawn_gps_provider(unicorn: &mut Unicorn<'_, Context>) {
             loop {
                 seq = seq.wrapping_add(1);
                 let blob = gps_status_message(seq, 0x45);
-                // The kernel routes an amt post by the blob's target app (`u16` at
-                // envelope + 0xa), not by the provider's own queue: with the STAT
-                // component (22) as target this lands on `mbx_22`, the same queue
-                // the power proxy feeds, and `0xbd50c` decides ownership there.
-                let target = u16::from_le_bytes([blob[0xa], blob[0xb]]);
-                let queue = format!("mbx_{target}");
+                // STAT component (app 22): the CCA router at `0xbd50c` decides
+                // ownership on `mbx_22` and the fabricated service reference
+                // (see `fabricate_sensorfi_reference`) lets `bIsDataSet` match
+                // it there.  (Envelope words now follow the real captured wire
+                // format, so the old "route by the u16 at blob + 0xa" trick no
+                // longer holds - the target is simply this provider's consumer.)
+                let queue = "mbx_22".to_string();
                 let posted = {
                     let mut guard = namespace.lock().unwrap();
                     crate::common::osal_queues::OsalQueueService::ensure_queue(
@@ -1212,18 +1358,23 @@ pub(crate) fn gps_status_message(seq: u16, msg_class: u8) -> Vec<u8> {
     let len = 0x20 + body.len();
     let LEN = len.next_multiple_of(16);
     let mut content = vec![0u8; LEN];
-    content[0x00..0x02].copy_from_slice(&0xfffeu16.to_le_bytes()); // source app (unknown provider)
-    content[0x02..0x04].copy_from_slice(&0x0016u16.to_le_bytes()); // target app: STAT component (22, mbx_22)
+    // Real captured wire (power-proxy, typebase 0x22): word0 = typebase ID,
+    // word1 = body length, word2 = class/dest combo, word3 = destination - and
+    // the null-message shape check (`0x2981c3`, run over the first six words
+    // by `STAT_tclThread::vEntry`'s parse pipeline at `0x2981e7`) demands the
+    // first four words NON-zero and words 4+5 == 0xffffffff, or the message is
+    // declared "Unknown type of message" (RDE 0x43001c) and dropped.
+    content[0x00..0x04].copy_from_slice(&0x0000000au32.to_le_bytes()); // typebase: sensorfi family (msgEntries svc 0xa)
     content[0x04..0x08].copy_from_slice(&(LEN as u32).to_le_bytes()); // snapshot/object length
-    // amt message class (read as u8GetValue(0xb) by ail_tclInternalDispatch::
-    // bDispatchCCAMessages): 0x45 = ServiceData. 0x40 = state/LPM, 0x41 =
-    // ServiceRegister, 0x42 = Unregister, 0x43 = RegisterConf, 0xff = DebugApp.
-    // The mbx_19 copy uses 0x45 (the AE pump's build pipeline keys off it);
-    // injected component-queue copies are tried as 0x46 (RELUP, r310+).
+    content[0x08] = 0x07; // real captures carry 0x07 here (class family byte)
     content[0x0b] = msg_class;
-    content[0x0c..0x0e].copy_from_slice(&0xfffeu16.to_le_bytes()); // no source sub-id
-    content[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes()); // no target sub-id
+    content[0x0c..0x10].copy_from_slice(&0xffff_ffffu32.to_le_bytes()); // sub-ids 0xffff/0xffff (non-zero word3 + the 0xff sentinel word)
+    // amt service envelope fields (the STAT CCA dispatch chain):
     content[0x14..0x16].copy_from_slice(&0x000bu16.to_le_bytes()); // serviceId: sensorfi
+    // `bIsDataSet` (`0x24ea04`) compares the reference entry against getters at
+    // wire `+0x00` (source app), `+0x14`, `+0x16` and `+0x0e`; `0x2c45b1` reads
+    // `+0x16`, so this is the functionId slot (`GpsDataStatus` fn `5`).
+    content[0x16..0x18].copy_from_slice(&0x0005u16.to_le_bytes()); // functionId: GPS data
     content[0x18..0x1a].copy_from_slice(&0x0005u16.to_le_bytes()); // propertyId: GPS data
     content[0x1a] = 0x06; // opCode: Status (server message)
     content[0x1c..0x1e].copy_from_slice(&seq.to_le_bytes()); // cmd counter

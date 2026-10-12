@@ -257,6 +257,15 @@ pub const OSAL_MBX_OPEN: u32 = 0x29;
 /// message *reference* `[type, content_ptr]`), `[+0x10]` = queue depth, `[+0x14]` = inline
 /// name. The caller ignores any out-handle (it re-opens by name), answering 0 is enough.
 pub const OSAL_MBX_CREATE: u32 = 0x2a;
+/// `0x28` (leaf `0x664`, wrapper `0x288c8` region): the runtime-library variant of the
+/// queue create used for the rtf task queues (`STAT_TASK1QUEUE`, `TEA_TASK1QUEUE`).
+/// Pointer-shaped arguments in a four-word block: `[+0]` = name pointer,
+/// `[+4]` = depth, `[+8]` = message size, `[+0xc]` = flags, `[+0x10]` = out-handle.
+/// Unlike `0x2a` the caller consumes the handle (the STAT component stores it at
+/// `ail+0xc0+0x30` where the delivery pump posts, and `STAT_TASK1`'s context keeps it
+/// at `ctx+4` for the receive wait), so an unmodelled create leaves the whole
+/// STAT task queue dead (`handle 0xffffffff` waits forever).
+pub const OSAL_MBX_CREATE_PTR: u32 = 0x28;
 /// `0x2d`: the application message pump's receive (wrapper continuation `0x190a23`).
 /// `[+0]` = pointer to the handle slot the open wrote, `[+4]` = 8-byte receive buffer,
 /// `[+8]` = buffer size, `[+0xc]` = priority out, `[+0x10]` = timeout (`0xffffffff` =
@@ -1201,6 +1210,9 @@ fn complete_osal_service(
         OSAL_SEM_OPEN => Some(complete_osal_sem_open(unicorn, block)),
         OSAL_EVENT_CREATE => Some(complete_osal_event_create(unicorn, service, block)),
         OSAL_MBX_CREATE => Some(complete_osal_mbx_create(unicorn, thread, block)),
+        OSAL_MBX_CREATE_PTR if service == 0x2806_64 => {
+            Some(complete_osal_mbx_create_ptr(unicorn, thread, block))
+        }
         OSAL_MBX_OPEN => Some(complete_osal_mbx_open(unicorn, thread, block)),
         OSAL_MBX_WAIT => complete_osal_mbx_wait(unicorn, thread, block, false),
         // `0x57`: resolve a received message reference `{1, content}` to its data pointer.
@@ -1302,7 +1314,97 @@ fn complete_osal_service(
         // would ping-pong; after eight hops the candidate list is declared exhausted
         // (`-1`), matching a device where nobody subscribed.
         0x2c if service == 0x2c04_64 => {
-            let pump = read_word(unicorn, block).unwrap_or(0);
+            // Two callers share this service.  The STAT component's delivery pump
+            // (`0x577d1`, wrapper veneer `0x2ec28c`) posts an 8-byte message
+            // reference by HANDLE: block = `{handle, ref_ptr, 8, sub-id}`.  The
+            // amt repost chain (`0x249647`) instead passes `{pump, .., body_ptr}`
+            // with a 0x18-byte routing body at `[+0x14]`.  A 0x4000_xxxx handle
+            // in `[+0]` disambiguates.
+            let w0 = read_word(unicorn, block).unwrap_or(0);
+            if (0x4000_0000..0x5000_0000).contains(&w0) {
+                let ref_ptr = read_word(unicorn, block.wrapping_add(4)).unwrap_or(0);
+                let content_ptr = read_word(unicorn, ref_ptr.wrapping_add(4)).unwrap_or(0);
+                let name = osal_state()
+                    .lock()
+                    .unwrap()
+                    .mbx_handles
+                    .iter()
+                    .find(|(_, h)| **h == w0)
+                    .map(|(n, _)| n.clone());
+                let mut posted = false;
+                if let Some(name) = &name {
+                    // The pump posts the 8-byte OSAL message *reference*
+                    // `{1, content}` (wrapper +0xc holds it, getter `0x30b237`);
+                    // copy the message body out of the poster's frame because
+                    // the waiter runs later, on another stack, and resolves a
+                    // `{1, copy}` reference through `0x57` to `copy`.
+                    let content_ptr = read_word(unicorn, ref_ptr.wrapping_add(4)).unwrap_or(0);
+                    // Word-by-word so a body that sits near the end of a mapped
+                    // region still copies up to the boundary instead of failing
+                    // wholesale (a rejected post drops the message silently).
+                    let mut content = vec![0u8; 0x200];
+                    let mut copied = 0usize;
+                    for chunk in 0..(content.len() / 4) {
+                        let ok = unicorn
+                            .mem_read(
+                                (content_ptr as usize + chunk * 4) as u64,
+                                &mut content[chunk * 4..chunk * 4 + 4],
+                            )
+                            .is_ok();
+                        if !ok {
+                            break;
+                        }
+                        copied = (chunk + 1) * 4;
+                    }
+                    if copied >= 8 {
+                        let namespace = unicorn.get_data().namespace.clone();
+                        let mmu_arc = {
+                            let data = unicorn.get_data();
+                            data.mmu.clone()
+                        };
+                        let copy = {
+                            let mut alloc = mmu_arc.lock().unwrap();
+                            alloc.heap_alloc(
+                                unicorn,
+                                0x200,
+                                unicorn_engine::unicorn_const::Prot::READ
+                                    | unicorn_engine::unicorn_const::Prot::WRITE,
+                                "[osal-post-copy]",
+                            )
+                        };
+                        if unicorn.mem_write(copy as u64, &content).is_ok() {
+                            let mut item = Vec::with_capacity(8);
+                            item.extend_from_slice(&1u32.to_le_bytes());
+                            item.extend_from_slice(&copy.to_le_bytes());
+                            let mut guard = namespace.lock().unwrap();
+                            crate::common::osal_queues::OsalQueueService::ensure_queue(
+                                &mut guard.mq, name,
+                            );
+                            posted = crate::common::osal_queues::OsalQueueService::guest_post(
+                                &mut guard.mq,
+                                name,
+                                {
+                                    let mut b = Vec::with_capacity(16);
+                                    b.extend_from_slice(&1u32.to_le_bytes());
+                                    b.extend_from_slice(&8u32.to_le_bytes());
+                                    b.extend_from_slice(&item);
+                                    b
+                                },
+                                0,
+                            );
+                            if posted {
+                                guard.notify_waiters();
+                            }
+                        }
+                    }
+                }
+                log::info!(
+                    "monitor: OSAL[{thread}] post on handle {w0:#x} ({name:?}) ref {ref_ptr:#010x} content {content_ptr:#010x} -> {}",
+                    if posted { "queued" } else { "failed" }
+                );
+                return Some(if posted { 0 } else { -1i32 as u32 });
+            }
+            let pump = w0;
             let body = read_word(unicorn, block.wrapping_add(0x14)).unwrap_or(0);
             let w0 = read_word(unicorn, body).unwrap_or(0);
             let (src_app, dst_app) = (w0 & 0xffff, (w0 >> 16) & 0xffff);
@@ -2011,30 +2113,87 @@ fn complete_osal_mbx_create(unicorn: &mut Unicorn<'_, Context>, thread: u32, blo
     0
 }
 
+/// Handle token for a named queue (stable per name, allocated on first use by
+/// either the create or the open path so both agree on the same value).
+fn osal_mbx_handle(name: &str) -> u32 {
+    let mut state = osal_state().lock().unwrap();
+    match state.mbx_handles.get(name).copied() {
+        Some(handle) => handle,
+        None => {
+            let handle = 0x4000_0000 + state.next_mbx_handle;
+            state.next_mbx_handle += 1;
+            state.mbx_handles.insert(name.to_string(), handle);
+            handle
+        }
+    }
+}
+
+/// Request `0x28` leaf `0x664`: the rtf task-queue create with pointer-shaped
+/// arguments (see [`OSAL_MBX_CREATE_PTR`]). Allocates the per-name handle token
+/// and writes it through `[block + 0x10]`, which is where the STAT component
+/// later reads the post target and `STAT_TASK1`'s context the wait target.
+fn complete_osal_mbx_create_ptr(unicorn: &mut Unicorn<'_, Context>, thread: u32, block: u32) -> u32 {
+    let name_ptr = match read_word(unicorn, block) {
+        Ok(value) if (0x1_0000..0xf000_0000).contains(&value) => value,
+        _ => 0,
+    };
+    let Some(name) = read_identifier(unicorn, name_ptr) else {
+        log::warn!(
+            "monitor: OSAL[{thread}] queue create(ptr) with unreadable name at {name_ptr:#x}"
+        );
+        return 0;
+    };
+    let (count, size) = (
+        read_word(unicorn, block + 4).unwrap_or(0),
+        read_word(unicorn, block + 8).unwrap_or(8),
+    );
+    let out = read_word(unicorn, block + 0x10).unwrap_or(0);
+    let handle = osal_mbx_handle(&name);
+    {
+        let namespace = unicorn.get_data().namespace.clone();
+        let mut guard = namespace.lock().unwrap();
+        let queue_id =
+            crate::common::osal_queues::OsalQueueService::ensure_queue(&mut guard.mq, &name);
+        guard.mq.grow_msgsize(queue_id, size.max(8) as i64 * count.max(1) as i64);
+    }
+    if write_word(unicorn, out, handle).is_err() {
+        log::warn!(
+            "monitor: OSAL[{thread}] cannot write queue create(ptr) handle {handle:#x} into {out:#x}"
+        );
+        return 0;
+    }
+    log::info!(
+        "monitor: OSAL[{thread}] queue create(ptr) name {name:?} size {size} count {count} -> handle {handle:#x}"
+    );
+    0
+}
+
 /// Request `0x29`: open an OSAL message queue by name. The handle is a monitor-side token
 /// (stable per name) written through the out-slot pointer at `block + 0x10`; the pump
 /// later passes a pointer to that slot back to the wait.
 fn complete_osal_mbx_open(unicorn: &mut Unicorn<'_, Context>, thread: u32, block: u32) -> u32 {
-    let Some(name) = read_identifier(unicorn, block + 0x14) else {
-        log::warn!("monitor: OSAL[{thread}] queue open with unreadable name at {:#x}", block + 0x14);
-        return 0;
+    // Leaf 3 (`0x290364`, the rtf task-queue open, used for `STAT_TASK1QUEUE`)
+    // passes the name as a direct pointer in `[+0]` and the out-slot in `[+8]`;
+    // the SCD leaf (`0x290164`) inlines the name at `[+0x14]` with the out-slot
+    // pointer at `[+0x10]`.
+    let direct_name = match read_word(unicorn, block) {
+        Ok(value) if (0x1_0000..0xf000_0000).contains(&value) => read_identifier(unicorn, value),
+        _ => None,
     };
-    let out = match read_word(unicorn, block + 0x10) {
-        Ok(value) if (0x1000..0xf000_0000).contains(&value) => value,
-        _ => 0,
-    };
-    let handle = {
-        let mut state = osal_state().lock().unwrap();
-        match state.mbx_handles.get(&name).copied() {
-            Some(handle) => handle,
-            None => {
-                let handle = 0x4000_0000 + state.next_mbx_handle;
-                state.next_mbx_handle += 1;
-                state.mbx_handles.insert(name.clone(), handle);
-                handle
-            }
+    let (name, out) = match direct_name {
+        Some(name) => (name, read_word(unicorn, block + 8).unwrap_or(0)),
+        None => {
+            let Some(name) = read_identifier(unicorn, block + 0x14) else {
+                log::warn!("monitor: OSAL[{thread}] queue open with unreadable name at {:#x}", block + 0x14);
+                return 0;
+            };
+            (name, match read_word(unicorn, block + 0x10) {
+                Ok(value) if (0x1000..0xf000_0000).contains(&value) => value,
+                _ => 0,
+            })
         }
     };
+    let handle = osal_mbx_handle(&name);
     // One-shot block dump: the open callers use at least two layouts and the AE
     // pumps starve on slots the write-back above apparently misses.
     {
@@ -2075,7 +2234,15 @@ fn complete_osal_mbx_wait(
     at_entry: bool,
 ) -> Option<u32> {
     let slot = read_word(unicorn, block).unwrap_or(0);
-    let handle = read_word(unicorn, slot).unwrap_or(0);
+    // The rtf task-queue waits (`STAT_TASK1`, wrapper `0x3f1b65` -> veneer
+    // `0x2ec2b0`) pass the handle by value in `[+0]`; the AE pumps pass a
+    // pointer to the open's write-back slot.  Monitor handle tokens live in the
+    // 0x4000_0000 range, guest slot pointers never do, so the value disambiguates.
+    let handle = if (0x4000_0000..0x5000_0000).contains(&slot) {
+        slot
+    } else {
+        read_word(unicorn, slot).unwrap_or(0)
+    };
     let (buf, size) = (read_word(unicorn, block + 4).unwrap_or(0), read_word(unicorn, block + 8).unwrap_or(0));
     // The AE pumps carry the target app id in the request block itself (`w7`,
     // offset 0x1c). Their `w0` slot on the bring-up stack gets re-written by the
