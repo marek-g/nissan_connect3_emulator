@@ -18,9 +18,13 @@ Collects everything needed to replace the undecryptable region `.ERG` files
 sudo dd if=regdump.ext2 of=/dev/sdX bs=4M   # double-check sdX!
 ```
 
-Insert the stick **cold**, start the car. The logger waits until procbaselx +
-PROCNAV are up (+30 s settle), collects, then **reboots the HU = done, pull the
-stick**. Map SD can stay in the unit.
+Insert the stick **after the map is visible on screen** (warm). The logger
+fires immediately (registry is already populated), collects, then **reboots
+the HU = done, pull the stick**. Sections run small+important first with a
+`sync` after each (see `SECTION*_DONE` markers in `regdump/.done`), so an
+early pull keeps everything collected so far — the irreplaceable data
+(installed `.reg`/`.ERG`, shm dumps of the decrypted registry, KDS/NOR caps)
+is written before the big, skippable binary copies.
 
 ## Host side triage (after mounting the stick)
 
