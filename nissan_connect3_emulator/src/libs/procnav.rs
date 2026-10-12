@@ -103,6 +103,14 @@ const PROBE_STAT_CREATED: u32 = 0x0199_6a4 - ORIGINAL_BASE;
 // entry probe fires only when that fatal precondition holds, logging the
 // caller (lr) so the offending container can be identified.
 const PROBE_LIST_ERASE: u32 = 0x005a_4360 - ORIGINAL_BASE;
+/// In `ail_tclInternalDispatch::bDispatchCCAMessages` (`0xbd50c`), right on the
+/// `bl 0x24ea05` (`bIsDataSet`) whose answer gates the delivery `blx r2`: dumps
+/// the match key (`r0`, a 12-byte `{u16@0,2,4, u8@6, u16@8}` service-reference
+/// payload copy) and the four message-side comparators (`r1` = `[sp+0x6c]`,
+/// `r2` = `r7`, `r3` = `[sp+0x68]`, `[sp]` = `[sp+0x3c]` from the prologue) so
+/// a fabricated reference entry can be pinned to the exact tuple the STAT pump
+/// compares against.
+const PROBE_DS_TUPLE: u32 = 0x00bd_5d6 - ORIGINAL_BASE;
 const PROBE_STAT_INITED: u32 = 0x0199_6b0 - ORIGINAL_BASE;
 /// Decision point of `s32SetupThreads` (`0x19969a`): `r2` (0 = a config slot was
 /// null), `r6` (configured thread count) and `r1` (the init-config array).
@@ -345,6 +353,7 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ("probe-stat-start", PROBE_STAT_START, 2),
         ("probe-stat-created", PROBE_STAT_CREATED, 2),
         ("probe-list-erase", PROBE_LIST_ERASE, 2),
+        ("probe-ds-tuple", PROBE_DS_TUPLE, 2),
         ("probe-stat-inited", PROBE_STAT_INITED, 2),
         ("probe-stat-setup", PROBE_STAT_SETUP, 2),
         ("probe-less-u16", PROBE_LESS_U16, 2),
@@ -625,6 +634,20 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                             lr & !1
                         );
                     }
+                }
+                "probe-ds-tuple" => {
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let this = word(uc, r4).unwrap_or(0);
+                    let arg5 = word(uc, sp).unwrap_or(0);
+                    log::info!(
+                        "PROCNAV[{tid}] probe-ds-tuple: this={this:#010x} key@{r0:#010x}=[{}] a1={r1:#x} a2={r2:#x} a3={r3:#x} a4={arg5:#x}",
+                        hexdump(uc, r0, 12)
+                    );
                 }
                 "probe-list-erase" => {
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
