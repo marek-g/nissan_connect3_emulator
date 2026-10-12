@@ -116,6 +116,25 @@ const PROBE_FACTORY_OPEN: u32 = 0x0057_140 - ORIGINAL_BASE;
 const PROBE_T19_FACTORY: u32 = 0x0057_f7a - ORIGINAL_BASE;
 const PROBE_T19_COMPONENTS: u32 = 0x0057_f84 - ORIGINAL_BASE;
 const PROBE_T19_RUN: u32 = 0x0057_f8e - ORIGINAL_BASE;
+/// Decision points inside `ail_bHandleMsgServiceData` (`0xbd50c`): after the
+/// field-validity call (`0xbd56e`, zero answer drops to the trace path), after
+/// the handler-scan loop (`0xbd5fa`, `r6` = match flag), the match path
+/// (`0xbd6b8`), the re-post path result (`0xbd64a`) and the two drop exits
+/// (`0xbd6c8` validity-fail, `0xbd7c4` lock-fail).
+const PROBE_SD_UNPACK: u32 = 0x00bd_56e - ORIGINAL_BASE;
+const PROBE_SD_LOOP: u32 = 0x00bd_5fa - ORIGINAL_BASE;
+/// After the per-candidate `ail_tclServiceReference::bIsDataSet` (`0xbd5da`):
+/// `r1`/`r3` carry the message's service id and type, `r0` the match answer.
+const PROBE_SD_CMP: u32 = 0x00bd_5da - ORIGINAL_BASE;
+const PROBE_SD_HIT: u32 = 0x00bd_6b8 - ORIGINAL_BASE;
+const PROBE_SD_POST: u32 = 0x00bd_64a - ORIGINAL_BASE;
+const PROBE_SD_OUT: u32 = 0x00bd_6c8 - ORIGINAL_BASE;
+const PROBE_SD_NOLOCK: u32 = 0x00bd_7c4 - ORIGINAL_BASE;
+/// On the re-post branch: after the source payload accessor (`0xbd604`, `r0`
+/// must be non-null or `0x30b266` drops the built message) and after the
+/// built-message validity check (`0xbd624`, `r0`).
+const PROBE_SD_PAYLOAD: u32 = 0x00bd_604 - ORIGINAL_BASE;
+const PROBE_SD_BUILD: u32 = 0x00bd_624 - ORIGINAL_BASE;
 /// GPS-data sink inside `pc_tclSensorMsgHandler::s32OnStatusMsg` (ARM).
 const GPS_STATUS_SINK: u32 = 0x0068_ff8c - ORIGINAL_BASE;
 
@@ -201,6 +220,15 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ("probe-t19-factory", PROBE_T19_FACTORY, 2),
         ("probe-t19-components", PROBE_T19_COMPONENTS, 2),
         ("probe-t19-run", PROBE_T19_RUN, 2),
+        ("probe-sd-unpack", PROBE_SD_UNPACK, 2),
+        ("probe-sd-loop", PROBE_SD_LOOP, 2),
+        ("probe-sd-cmp", PROBE_SD_CMP, 2),
+        ("probe-sd-hit", PROBE_SD_HIT, 2),
+        ("probe-sd-post", PROBE_SD_POST, 2),
+        ("probe-sd-out", PROBE_SD_OUT, 2),
+        ("probe-sd-nolock", PROBE_SD_NOLOCK, 2),
+        ("probe-sd-payload", PROBE_SD_PAYLOAD, 2),
+        ("probe-sd-build", PROBE_SD_BUILD, 2),
     ] {
         let address = (base_address + offset) as u64;
         let repost_count = repost_count.clone();
@@ -344,7 +372,8 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 | "probe-t19-components"
                 | "probe-t19-run" => {
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
-                    log::info!("PROCNAV[{tid}] {name}: returned {r0:#x}");
+                    let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) & !1;
+                    log::info!("PROCNAV[{tid}] {name}: returned {r0:#x} lr={lr:#010x}");
                 }
                 "probe-oninit-create" => {
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
@@ -392,7 +421,8 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                     let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
                     // Only interesting when the key pointer is unmapped: log exactly
-                    // the calls that would fault two instructions later.
+                    // the calls that would fault two instructions later. (`r1` is a
+                    // plain value at the hot `0x11423c` caller, so check `r0` only.)
                     if word(uc, r0 & !3).is_none() {
                         log::info!(
                             "PROCNAV[{tid}] probe-less-u16: UNMAPPED key {r0:#010x} lr={:#010x}",
@@ -400,13 +430,70 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         );
                     }
                 }
-                "probe-factory-virt" | "probe-factory-open" => {
+                "probe-sd-unpack" | "probe-sd-out" | "probe-sd-nolock" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    log::info!("PROCNAV[{tid}] {name}: r0={r0:#010x}");
+                }
+                "probe-sd-loop" => {
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0);
+                    // r4 = the service-reference container, r6 = match count so far.
+                    // The candidate chain head lives in the adapter vtable slot 0x50;
+                    // nodes are {u16 svc, u16 type, node* next} starting at head->next.
+                    let vt = word(uc, r4).unwrap_or(0);
+                    let head = word(uc, vt.wrapping_add(0x50)).unwrap_or(0);
+                    let mut nodes = Vec::new();
+                    let mut cur = word(uc, head.wrapping_add(4)).unwrap_or(0);
+                    for _ in 0..8 {
+                        if cur == 0 {
+                            break;
+                        }
+                        let pair = word(uc, cur).unwrap_or(0xDEAD);
+                        nodes.push(format!("{pair:#010x}@{cur:#08x}"));
+                        cur = word(uc, cur.wrapping_add(4)).unwrap_or(0);
+                    }
+                    log::info!(
+                        "PROCNAV[{tid}] probe-sd-loop: this={r4:#010x} matched={r6} vt={vt:#010x} head={head:#010x} chain={nodes:?}"
+                    );
+                }
+                "probe-sd-hit" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    log::info!("PROCNAV[{tid}] probe-sd-hit: handler={r0:#010x}");
+                }
+                "probe-sd-cmp" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0);
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0);
+                    let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0);
+                    log::info!(
+                        "PROCNAV[{tid}] probe-sd-cmp: matched={r0:#x} svc={r1:#x} a2={r2:#x} a3={r3:#x}"
+                    );
+                }
+                "probe-sd-post" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    log::info!("PROCNAV[{tid}] probe-sd-post: repost-status={r0:#x}");
+                }
+                "probe-sd-payload" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCNAV[{tid}] probe-sd-payload: payload={r0:#010x} parsed={}",
+                        hexdump(uc, sp.wrapping_add(0x54), 0x20)
+                    );
+                }
+                "probe-sd-build" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    log::info!("PROCNAV[{tid}] probe-sd-build: built={r0:#x}");
+                }
+                "probe-factory-virt" | "probe-factory-open" | "probe-factory-add" => {
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
                     let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0);
                     log::info!("PROCNAV[{tid}] {name}: r0={r0:#010x} r2={r2:#x}");
                 }
                 "svc-data" => {
-                    let msg = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    // `this` is the adapter (r0); the message arrives in r1.
+                    let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let msg = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                     let fields = word(uc, msg.wrapping_add(4));
                     let (svc, prop, opcode) = match fields {
                         Some(base) if base != 0 => (
@@ -417,7 +504,7 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         _ => (None, None, None),
                     };
                     log::info!(
-                        "PROCNAV[{tid}] svc-data: msg={msg:#010x} fields={fields:?} svc={svc:?} prop={prop:?} opcode={opcode:?}",
+                        "PROCNAV[{tid}] svc-data: this={this:#010x} msg={msg:#010x} fields={fields:?} svc={svc:?} prop={prop:?} opcode={opcode:?}",
                     );
                 }
                 "post-ipc" => {

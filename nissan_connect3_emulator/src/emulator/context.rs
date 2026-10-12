@@ -57,6 +57,9 @@ pub struct ContextInner {
     process_exit_code: Cell<Option<i32>>,
     last_run_index: Cell<usize>,
     pending_fault: Cell<Option<PendingFault>>,
+    /// guest address of the OSAL task-loop stub (see `monitor::guest_task_loop_stub`),
+    /// allocated once per process on the first OSAL thread start
+    task_loop_stub: Cell<u32>,
 }
 
 impl ContextInner {
@@ -87,7 +90,17 @@ impl ContextInner {
             process_exit_code: Cell::new(None),
             last_run_index: Cell::new(0),
             pending_fault: Cell::new(None),
+            task_loop_stub: Cell::new(0),
         }
+    }
+
+    /// guest address of the process's OSAL task-loop stub (0 = not allocated yet)
+    pub fn task_loop_stub(&self) -> u32 {
+        self.task_loop_stub.get()
+    }
+
+    pub fn set_task_loop_stub(&self, addr: u32) {
+        self.task_loop_stub.set(addr);
     }
 
     /// record a memory fault (called from the mem hook) for the scheduler to handle

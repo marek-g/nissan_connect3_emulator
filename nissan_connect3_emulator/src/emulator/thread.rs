@@ -399,6 +399,11 @@ fn on_mem_fault(
 
 pub fn add_mem_fault_hooks(unicorn: &mut Unicorn<'_, Context>) {
     use unicorn_engine::unicorn_const::HookType;
+    // FIXME(robustness): the (1, 0) range appears never to match (no `memory fault`
+    // log line and no pending fault is ever observed), so unmapped accesses surface
+    // only as a bare `Execution error` and `Exited(1)`. Widening the range would
+    // route every fault through `handle_mem_fault` (signal frames for guest
+    // SIGSEGV handlers) - intentionally left untouched until that path is tested.
     unicorn
         .add_mem_hook(HookType::MEM_FETCH_UNMAPPED, 1, 0, on_mem_fault)
         .unwrap();
@@ -416,14 +421,14 @@ pub fn add_mem_fault_hooks(unicorn: &mut Unicorn<'_, Context>) {
 /// Dump the full context of the current thread. Only call when the VM is stopped
 /// (i.e. not from inside a hook callback).
 pub fn dump_context(unicorn: &Unicorn<'_, Context>) {
-    println!(
+    log::error!(
         "PC: {:#10x}, LR (return code): {:#10x}, SP: {:#10x}, FP: {:#10x}",
         unicorn.reg_read(RegisterARM::PC).unwrap(),
         unicorn.reg_read(RegisterARM::LR).unwrap(),
         unicorn.reg_read(RegisterARM::SP).unwrap(),
         unicorn.reg_read(RegisterARM::FP).unwrap()
     );
-    println!(
+    log::error!(
         "R0: {:#10x}, R1: {:#10x}, R2: {:#10x}, R3: {:#10x}",
         unicorn.reg_read(RegisterARM::R0).unwrap(),
         unicorn.reg_read(RegisterARM::R1).unwrap(),

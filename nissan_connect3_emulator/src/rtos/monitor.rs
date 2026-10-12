@@ -1479,6 +1479,82 @@ pub fn raise_tse_flag(flag: u32, pattern: u32) {
 /// process heap, `R0` = argument, `LR` = 0 (returning from the entry ends the thread through
 /// the scheduler's null-pc guard), and the entry's ARM/Thumb bit folded into `CPSR`. Mirrors
 /// what `clone` does for Linux-side threads; the entry runs in the caller's address space.
+/// Build (once per process) the OSAL task-loop stub in guest memory and return
+/// its address. The stub mirrors the SCD task-entry trampoline
+/// (`ldr r1,[r0]; ldr r1,[r1,#0x28]; bx r1` - call `vRun()` on the task
+/// descriptor) and adds the re-run loop the real RTOS glue provides: the task
+/// bodies are coroutines whose completion epilogue pops their entry-time `r3`
+/// and branches to it, so `r3` must point at a continuation that calls
+/// `vRun()` again with the descriptor restored in `r0`. Without it every
+/// `*_TASK*` thread returned from its first iteration into pc=0 and the
+/// scheduler terminated it (`Exited(139)`).
+fn guest_task_loop_stub(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+    let stub = {
+        let data = unicorn.get_data();
+        data.inner.task_loop_stub()
+    };
+    if stub != 0 {
+        return stub;
+    }
+    let mmu = {
+        let data = unicorn.get_data();
+        data.mmu.clone()
+    };
+    let addr = {
+        let mut mmu = mmu.lock().unwrap();
+        mmu.heap_alloc(unicorn, 0x1000, Prot::READ | Prot::WRITE | Prot::EXEC, "[osal-task-stub]")
+    };
+    // THUMB: ldr r1,[r0]; ldr r1,[r1,#0x28]; push {r4}; mov r4,r0; blx r1;
+    //        mov r0,r4; ldr r1,[r0]; ldr r1,[r1,#0x28]; blx r1
+    // The bodies re-enter through their entry-time `r3` = the re-run site at
+    // stub+0xa: restore the descriptor from r4 (callee-saved), reload the
+    // vmethod (bodies clobber r1) and call vRun() again.
+    let code: &[u8] = &[
+        0x01, 0x68, 0x89, 0x6a, 0x10, 0xb4, 0x04, 0x46, 0x88, 0x47, 0x20, 0x46, 0x01, 0x68, 0x89,
+        0x6a, 0x88, 0x47,
+    ];
+    if unicorn.mem_write(addr as u64, code).is_err() {
+        log::warn!("monitor: cannot write the OSAL task-loop stub at {addr:#x}");
+        return 0;
+    }
+    log::info!("monitor: OSAL task-loop stub at {addr:#010x}");
+    // trace every first call and re-run through the stub (cheap: only task
+    // threads pass through here, and only on log level debug)
+    for (label, off) in [("first", 0u32), ("re-run", 0xa)] {
+        let base = addr;
+        let tag = label.to_string();
+        unicorn
+            .add_code_hook((base + off) as u64, (base + off + 2) as u64, move |uc, _, _| {
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0);
+                let tid = uc.get_data().thread_id();
+                log::debug!("monitor: task-stub {tag}[{tid}] r0={r0:#010x} r4={r4:#010x}");
+            })
+            .ok();
+    }
+    let data = unicorn.get_data();
+    data.inner.set_task_loop_stub(addr);
+    addr
+}
+
+/// True when `entry` is the SCD task trampoline `ldr r1,[r0]; ldr r1,[r1,#0x28];
+/// bx r1` - the entries whose `vRun()` bodies re-enter through `bx r3`. Other
+/// OSAL entries (e.g. the AE engines calling slot 0x10) run their own pump
+/// loops and must keep their original entry semantics.
+fn is_scd_task_trampoline(unicorn: &mut Unicorn<'_, Context>, entry: u32) -> bool {
+    let mut bytes = [0u8; 6];
+    if unicorn.mem_read((entry & !1) as u64, &mut bytes).is_err() {
+        return false;
+    }
+    let half = |i: usize| u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
+    let ldr = half(1);
+    let imm5 = (ldr >> 6) & 0x1f;
+    let rn = (ldr >> 3) & 7;
+    let rd = ldr & 7;
+    half(0) == 0x6801 && (ldr >> 11) == 0b01101 && imm5 * 4 == 0x28 && rn == 1 && rd == 1
+        && half(2) == 0x4708
+}
+
 fn spawn_guest_thread(unicorn: &mut Unicorn<'_, Context>, entry: u32, arg: u32, stack_size: u32) -> u32 {
     let size = (stack_size.max(0x4000) + 0xfff) & !0xfff;
     let mmu = {
@@ -1490,15 +1566,29 @@ fn spawn_guest_thread(unicorn: &mut Unicorn<'_, Context>, entry: u32, arg: u32, 
         mmu.heap_alloc(unicorn, size, Prot::READ | Prot::WRITE, "osal-thread-stack")
     };
     let sp = (stack + size - 8) & !7;
+    let stub = if is_scd_task_trampoline(unicorn, entry) {
+        guest_task_loop_stub(unicorn)
+    } else {
+        0
+    };
     let parent_context = unicorn.context_init().unwrap();
     unicorn
         .reg_write(RegisterARM::R0 as i32, arg as u64)
         .unwrap();
     unicorn.reg_write(RegisterARM::R13 as i32, sp as u64).unwrap();
     unicorn.reg_write(RegisterARM::R14 as i32, 0).unwrap();
-    unicorn
-        .reg_write(RegisterARM::PC as i32, (entry & !1) as u64)
-        .unwrap();
+    // SCD task bodies are coroutines that return through `bx r3` into their
+    // re-run continuation; with r3 = 0 the first completion branch jumped to
+    // the null page and the scheduler terminated the thread (Exited(139)).
+    // The stub duplicates the entry trampoline (`bx [descriptor->vt+0x28]`)
+    // plus the re-run loop, so start the thread there instead.
+    let start = if stub != 0 {
+        unicorn.reg_write(RegisterARM::R3 as i32, (stub + 0xa) as u64).unwrap();
+        stub
+    } else {
+        entry & !1
+    };
+    unicorn.reg_write(RegisterARM::PC as i32, start as u64).unwrap();
     let cpsr = unicorn.reg_read(RegisterARM::CPSR).unwrap_or(0) as u32;
     let cpsr = if entry & 1 != 0 { cpsr | 0x20 } else { cpsr & !0x20 };
     unicorn.reg_write(RegisterARM::CPSR as i32, cpsr as u64).unwrap();
@@ -1512,7 +1602,7 @@ fn spawn_guest_thread(unicorn: &mut Unicorn<'_, Context>, entry: u32, arg: u32, 
             id: tid,
             status: ThreadStatus::Runnable,
             cpu_context: Some(child_context),
-            pc: entry & !1,
+            pc: start,
             pending_result: None,
             clear_child_tid: None,
         });
@@ -1842,16 +1932,19 @@ fn complete_osal_mbx_wait(
     // guest (app ids, zeroes) after the open write-back, so the id is the only
     // stable routing information; the handle table stays the fallback.
     let app_id = read_word(unicorn, block + 0x1c).unwrap_or(0);
-    let name = if (1..=0xff).contains(&app_id) {
-        Some(format!("mbx_{app_id}"))
+    let (name, from_pump) = if (1..=0xff).contains(&app_id) {
+        (Some(format!("mbx_{app_id}")), true)
     } else {
-        osal_state()
-            .lock()
-            .unwrap()
-            .mbx_handles
-            .iter()
-            .find(|(_, h)| **h == handle)
-            .map(|(n, _)| n.clone())
+        (
+            osal_state()
+                .lock()
+                .unwrap()
+                .mbx_handles
+                .iter()
+                .find(|(_, h)| **h == handle)
+                .map(|(n, _)| n.clone()),
+            false,
+        )
     };
     if buf == 0 || buf > 0xf000_0000 || size < 8 {
         // A wait without a usable receive buffer can never complete; answer it
@@ -1891,7 +1984,16 @@ fn complete_osal_mbx_wait(
     // Proxy-queued power messages take precedence over bridge traffic, exactly
     // like the libosal-side wait hook (`pwr_proxy_service_handle`). The body is
     // pre-encoded in snapshot format so `materialize_snapshot` handles it.
-    let message = match take_pwr_power_message(&name) {
+    //
+    // Only the AE pump waits (app-id resolved) may consume a power message. The
+    // transient bring-up wait (thread 18/16, handle-resolved) shares the queue
+    // name but must not steal the single START_CONF: if it does, the component
+    // adapter's `bOnInit` never runs and the adapter stays in INITIALIZED.
+    let message = match if from_pump {
+        take_pwr_power_message(&name)
+    } else {
+        None
+    } {
         Some(message) => Some(message),
         None => {
             let namespace = unicorn.get_data().namespace.clone();
