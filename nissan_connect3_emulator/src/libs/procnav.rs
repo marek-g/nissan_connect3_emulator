@@ -206,6 +206,39 @@ const PROBE_SD_CPY1: u32 = 0x002b_7aaa - ORIGINAL_BASE;
 const PROBE_SD_BINIT: u32 = 0x002b_7a8a - ORIGINAL_BASE;
 /// GPS-data sink inside `pc_tclSensorMsgHandler::s32OnStatusMsg` (ARM).
 const GPS_STATUS_SINK: u32 = 0x0068_ff8c - ORIGINAL_BASE;
+/// Server-message scan in `ail_bHandleMsgServiceData`: the `bl 0x24ea04` candidate
+/// comparator call site (`0xbd5d6`, THUMB). `r0` = iterator, candidate node =
+/// `[r0+8]`, payload at `node+8` = `{u16@0, u16@2, u16@4, u8 state@6, u16@8}`;
+/// `r1`/`r2`/`r3` carry the message tuple (svc candidate key, src app, reg id).
+const PROBE_SD_REFCMP: u32 = 0x00bd_5d6 - ORIGINAL_BASE;
+/// Client-message scan: the `bl 0x24ee68` registry comparator call site (`0xbd6f6`).
+/// Node payload = `{u16 regid, u16 svc, u16 srcapp, u16 srcsub, u8 state@8}`.
+const PROBE_SD_REGCMP: u32 = 0x00bd_6f6 - ORIGINAL_BASE;
+/// After the server-message reference scan (`0xbd5fa`): `r6` = match flag -
+/// nonzero means the subscription list matched and delivery will be attempted.
+const PROBE_SD_REFRES: u32 = 0x00bd_5fa - ORIGINAL_BASE;
+/// After the client-message registry scan (`0xbd758`): `r6` = match flag.
+const PROBE_SD_REGRES: u32 = 0x00bd_758 - ORIGINAL_BASE;
+/// Delivery branch decision (`0xbd87e`, `cmp r5,#0`): `r5 != 0` takes the road
+/// to the app's message pump through the `vtable[0x20]` call.
+const PROBE_SD_DLVCHK: u32 = 0x00bd_87e - ORIGINAL_BASE;
+/// The actual delivery `blx r2` (`0xbd8b0`): `r0` = inner ail object, `r1` =
+/// message wrapper, `r2` = the app's pump entry (`vtable+0x20`).
+const PROBE_SD_DELIVER: u32 = 0x00bd_8b0 - ORIGINAL_BASE;
+/// `ail_tclAppInterfaceRestricted::u16RegisterService` entry (`0x24a39a`): the
+/// client-side service subscription call - blocks on a semaphore until the
+/// provider app answers with a ServiceRegisterConf.
+const PROBE_REGSVC: u32 = 0x0024_a39a - ORIGINAL_BASE;
+/// `scd_bGetAppIdFromServiceId` entry (`0x34f012`): the service-config database
+/// lookup that resolves a service id to its provider app (fails => 0).
+const PROBE_SCD: u32 = 0x0034_f012 - ORIGINAL_BASE;
+/// `ail_bHandleMsgServiceRegister` entry (`0xbdc36`): provider-side handler of
+/// incoming subscription requests (inserts into the registry list at `[obj+0x58]`).
+const PROBE_MSGREG: u32 = 0x000b_dc36 - ORIGINAL_BASE;
+/// `ail_bHandleMsgServiceRegisterConf` entry (`0xbd918`): client-side handler of
+/// subscription answers - on state 1 it inserts the ServiceReference at `[obj+0x50]`
+/// that the server-message scan above matches against.
+const PROBE_MSGCONF: u32 = 0x000b_d918 - ORIGINAL_BASE;
 
 fn word(unicorn: &mut Unicorn<'_, Context>, address: u32) -> Option<u32> {
     let mut bytes = [0u8; 4];
@@ -240,12 +273,34 @@ fn hexdump(unicorn: &mut Unicorn<'_, Context>, address: u32, len: usize) -> Stri
     }
 }
 
+/// Walk an `fwl_List` (list object at `obj+off`, first node at `[list+4]`,
+/// `next` at `node+4`, payload at `node+8`) and dump up to 16 payloads.
+fn dump_fwl_list(
+    unicorn: &mut Unicorn<'_, Context>,
+    obj: u32,
+    off: u32,
+    width: usize,
+) -> Vec<String> {
+    let list = word(unicorn, obj.wrapping_add(off)).unwrap_or(0);
+    let mut cur = word(unicorn, list.wrapping_add(4)).unwrap_or(0);
+    let mut v = Vec::new();
+    for _ in 0..16 {
+        if cur == 0 {
+            break;
+        }
+        v.push(format!("{}", hexdump(unicorn, cur.wrapping_add(8), width)));
+        cur = word(unicorn, cur.wrapping_add(4)).unwrap_or(0);
+    }
+    v
+}
+
 pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let repost_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let reg_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let new_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let sd_hot = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let built_ptr = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let ail_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     for (name, offset, size) in [
         ("dispatcher", PROPERTY_DISPATCHER, 2u64),
         ("field-helper", PUMP_FIELD_HELPER, 2),
@@ -324,6 +379,16 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ("probe-sd-cpy1", PROBE_SD_CPY1, 2),
         ("probe-sd-binit", PROBE_SD_BINIT, 2),
         ("probe-sd-build", PROBE_SD_BUILD, 2),
+        ("probe-sd-refcmp", PROBE_SD_REFCMP, 2),
+        ("probe-sd-regcmp", PROBE_SD_REGCMP, 2),
+        ("probe-sd-refres", PROBE_SD_REFRES, 2),
+        ("probe-sd-regres", PROBE_SD_REGRES, 2),
+        ("probe-sd-dlvchk", PROBE_SD_DLVCHK, 2),
+        ("probe-sd-deliver", PROBE_SD_DELIVER, 2),
+        ("probe-regsvc", PROBE_REGSVC, 2),
+        ("probe-scd", PROBE_SCD, 2),
+        ("probe-msgreg", PROBE_MSGREG, 2),
+        ("probe-msgconf", PROBE_MSGCONF, 2),
     ] {
         let address = (base_address + offset) as u64;
         let repost_count = repost_count.clone();
@@ -331,6 +396,7 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         let new_count = new_count.clone();
         let sd_hot = sd_hot.clone();
         let built_ptr = built_ptr.clone();
+        let ail_count = ail_count.clone();
         let result = unicorn.add_code_hook(address, address + size, move |uc, _, _| {
             let tid = uc.get_data().inner.thread_id();
             if name == "power-repost" || (name.starts_with("probe-") && name != "probe-less-u16") {
@@ -348,6 +414,20 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     (&sd_hot, 420)
                 } else if matches!(name, "probe-registrar" | "probe-regprobe" | "probe-regobj") {
                     (&reg_count, 1500)
+                } else if matches!(name, "probe-sd-refcmp" | "probe-sd-regcmp") {
+                    (&reg_count, 1500)
+                } else if matches!(
+                    name,
+                    "probe-sd-refres"
+                        | "probe-sd-regres"
+                        | "probe-sd-dlvchk"
+                        | "probe-sd-deliver"
+                        | "probe-regsvc"
+                        | "probe-scd"
+                        | "probe-msgreg"
+                        | "probe-msgconf"
+                ) {
+                    (&ail_count, 900)
                 } else {
                     (&repost_count, 600)
                 };
@@ -863,6 +943,73 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         prop.map(|v| format!("{v:#x}")),
                         hexdump(uc, msg, 0x20),
                     );
+                }
+                "probe-sd-refcmp" | "probe-sd-regcmp" => {
+                    // `r0` = list iterator on stack; the candidate node is `[r0+8]`,
+                    // payload at `node+8`. `r1..r3` + `[sp]` carry the message tuple.
+                    let iter = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let node = word(uc, iter.wrapping_add(8)).unwrap_or(0);
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0);
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0);
+                    let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0);
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let a4 = word(uc, sp).unwrap_or(0);
+                    log::info!(
+                        "PROCNAV[{tid}] {name}: node={node:#010x} data=[{}] tuple=({r1:#x},{r2:#x},{r3:#x},{a4:#x})",
+                        if node != 0 { hexdump(uc, node.wrapping_add(8), 12) } else { "<null>".into() },
+                    );
+                }
+                "probe-sd-refres" | "probe-sd-regres" => {
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0);
+                    let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0);
+                    let this = word(uc, r4).unwrap_or(0);
+                    let app = halfword(uc, this.wrapping_add(0x10));
+                    let refs = dump_fwl_list(uc, this, 0x50, 12);
+                    let regs = dump_fwl_list(uc, this, 0x58, 12);
+                    log::info!(
+                        "PROCNAV[{tid}] {name}: this={this:#010x} app={app:?} matched={r6} bvar={r5} refs=[{refs:?}] regs=[{regs:?}]"
+                    );
+                }
+                "probe-sd-dlvchk" => {
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0);
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let f6c = word(uc, sp.wrapping_add(0x6c)).unwrap_or(0);
+                    log::info!("PROCNAV[{tid}] probe-sd-dlvchk: deliver={r5} f6c={f6c:#010x}");
+                }
+                "probe-sd-deliver" => {
+                    let obj = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    let msg = uc.reg_read(RegisterARM::R1).unwrap_or(0);
+                    let vt = uc.reg_read(RegisterARM::R2).unwrap_or(0);
+                    log::info!(
+                        "PROCNAV[{tid}] PROBE-SD-DELIVER: obj={obj:#010x} msg={msg:#010x} pump={vt:#010x} fields={}",
+                        hexdump(uc, (msg as u32).wrapping_add(4), 0x20),
+                    );
+                }
+                "probe-regsvc" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0);
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0);
+                    let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0);
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0);
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0);
+                    log::info!(
+                        "PROCNAV[{tid}] probe-regsvc: r0={r0:#010x} r1={r1:#x} r2={r2:#x} r3={r3:#x} r4={r4:#010x} r5={r5:#x}"
+                    );
+                }
+                "probe-scd" => {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0);
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0);
+                    log::info!(
+                        "PROCNAV[{tid}] probe-scd: svc={r0:#x} out={r1:#010x} flag={r2:#x}"
+                    );
+                }
+                "probe-msgreg" | "probe-msgconf" => {
+                    let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let obj = word(uc, this).unwrap_or(0);
+                    let app = halfword(uc, obj.wrapping_add(0x10));
+                    log::info!("PROCNAV[{tid}] {name}: this={this:#010x} obj={obj:#010x} app={app:?}");
                 }
                 _ => {}
             }
