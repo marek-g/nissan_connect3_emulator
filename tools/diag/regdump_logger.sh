@@ -238,4 +238,21 @@ df /usr/bin    > "$OUT/98_df_end.txt" 2>&1
 ls -laR "$OUT" > "$OUT/99_collected.txt" 2>&1
 echo "ALL_DONE $(date)" >> "$OUT/.done"
 sync; sync
-reboot
+
+# ---------------------------------------------------------------------------
+# REBOOT GUARD (safety-by-construction, learned the hard way during local
+# testing): only reboot machines that are provably the head unit. Refuse when
+# REGDUMP_NO_REBOOT is set, when the kernel is not the HU's 2.6.34, or when
+# the root is the ext4 eMMC/rootfs combo the HU does NOT have as `rootfs`...
+# simplest robust test: kernel release must start with 2.6.34 .
+# ---------------------------------------------------------------------------
+case "$(uname -r)" in
+    2.6.34*) DO_REBOOT=1 ;;
+    *)       DO_REBOOT=0 ;;
+esac
+[ -n "$REGDUMP_NO_REBOOT" ] && DO_REBOOT=0
+if [ "$DO_REBOOT" = 1 ]; then
+    reboot
+else
+    echo "reboot SKIPPED (not an HU kernel $(uname -r) or REGDUMP_NO_REBOOT set)" >> "$OUT/.done"
+fi
