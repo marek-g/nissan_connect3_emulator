@@ -16,7 +16,6 @@ sed \
     -e 's|^OUT=/usr/bin/regdump$|OUT='"$WORK"'/regdump|' \
     -e 's/^mount -o remount.*$/:/' \
     -e 's|^    dd if=/dev/mem of="\$OUT/iosc.*$|    : stub-dd-iosc|' \
-    -e 's|^        dd if=/dev/mem of="\$OUT/shm.*$|        : stub-dd-sysv|' \
     -e 's|^    cp "/opt/bosch/processes/\$f" "\$OUT/bins/\$f" 2>/dev/null|    : stub-cp-bin|' \
     -e 's|^    reboot$|    : stub-reboot|' \
     "$SRC" > "$SIM"

@@ -131,18 +131,10 @@ done < "$OUT/shm/_files.txt"
 ls -l /dev/shm > "$OUT/shm/NOTE_devshm.txt" 2>&1
 
 cat /proc/sysvipc/shm > "$OUT/shm/NOTE_sysv.txt" 2>/dev/null
-if [ -c /dev/mem ]; then
-    # columns: key pid cuid shm_cpid nattch shmseg address cbytes crn
-    while read s_key s_pid s_cuid s_cpid s_nattch shmseg s_addr size s_crn; do
-        case "$size"     in ''|*[!0-9]*) continue ;; esac
-        case "$shmseg"   in ''|*[!0-9]*) continue ;; esac
-        case "$s_nattch" in ''|0)        continue ;; esac   # attached only
-        [ "$size" -gt 67108864 ] && continue
-        dd if=/dev/mem of="$OUT/shm/sysv_${shmseg}_${size}.bin" bs=4096 \
-           skip=$((shmseg/4096)) count=$((size/4096+1)) 2>/dev/null
-        sync
-    done < /proc/sysvipc/shm
-fi
+# NOTE: on 2.6.34 the shm listing has NO physical-address column (key shmid
+# perms size cpid lpid nattch uid gid cuid cgid atime dtime ctime), so SysV
+# segments cannot be mapped to /dev/mem from here. On this family it does not
+# matter (single tiny segments; registry lives in iosc windows / OSAL-arena).
 
 # on-unit sanity: which files smell like the decrypted registry
 {
