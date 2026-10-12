@@ -11,6 +11,7 @@
 use crate::emulator::context::Context;
 use crate::emulator::thread::{BlockReason, ThreadAction, ThreadStatus};
 use crate::emulator::utils::{pack_u32, unpack_u32};
+use crate::os::syscalls::namespace::SystemNamespace;
 use std::collections::{HashMap, HashSet};
 use std::os::raw::c_void;
 use std::sync::Arc;
@@ -231,6 +232,23 @@ fn write_result(unicorn: &mut Unicorn<'_, Context>, result_ptr: u32, value: u32)
             .mem_write(result_ptr as u64, &pack_u32(value))
             .unwrap();
     }
+}
+
+/// Stand-in for the producer-side notify that libosal's message-queue post
+/// performs: sets the value of the given IOSC events so the blocked consumers
+/// (finish_iosc_wait) pick them up.  Used by host-side fabricators that post
+/// into an OSAL queue without running the guest's producer code.
+pub fn signal_events(state: &mut SystemNamespace, ids: impl IntoIterator<Item = u32>) -> Vec<u32> {
+    let mut signalled = Vec::new();
+    for id in ids {
+        if let Some(event) = state.iosc.events.get_mut(&id) {
+            if event.value == 0 {
+                event.value = 1;
+                signalled.push(id);
+            }
+        }
+    }
+    signalled
 }
 
 // ---- shared memory --------------------------------------------------------

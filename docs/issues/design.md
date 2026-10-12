@@ -1593,3 +1593,57 @@ Consequences for the open threads here:
   table lookup per instruction inside five hot pages; budget counters keep
   the log bounded. Live narrow hooks elsewhere keep working - only convert
   probes that must see mid-TB addresses.
+
+## Fabricated posfi NavPositionStatus: full claim+route chain works (r390-r424)
+- **Status:** working slice (r424): `vHandleNavPosition` + `vProcessNavPositionStatus`
+  execute once per fabricated message on the engine body thread (tid62).
+- **Routing ground truth** (procmapengine.out, Ghidra VA == runtime VA):
+  - `bDispatchCCAMessages` (0x66c8e8): class 0x45 + `param_2 == 0xffffffff`
+    (body-thread pass) claims via `ail_bHandleMsgServiceData` (0x66c128).
+  - op byte at content+0x1a selects the branch: op 6 => `bIsServerMessage`
+    (0x386c60) TRUE => walk of the server-reference list at
+    `*(app_iface+0x50)`; predicate `ail_tclServiceReference::bIsDataSet`
+    (0x66e3d0, observed live at lr 0x66c580) compares the message tuple
+    **(svc u16@+0x14, sub u16@+0x00, reg-id u16@+0x16, u16@+0x0e)** against
+    reference `{+0 svc, +2 sub, +4 reg-id, +8 target-sub}`, msg value 0xffff
+    is a per-slot wildcard.  A truncated 0x00ff in msg+0x0e silently kills
+    the match (r420).
+  - Claim tail: `(**(app_iface) + 0x20)(app_iface, msg)` =
+    `map_tclPortControl_Platform::vOnNewMessage` (0x3a4048), which for class
+    'E' + `bIsClientMessage` (0x386c08; TRUE for op in {0..5,0xd,0x10,0x11})
+    FALSE looks up the client handler in a `bpstl::map<u16,handler*>` at
+    `platform+0xa0` keyed by the message u16 at **content+0x00** via
+    `operator[]` (0x39ef80 - a *missing* key inserts a null-valued node, so
+    one wrong lookup poisons that key for the rest of the run).
+  - bpstl::map node layout (read off operator[]): map+0 -> header node,
+    header+4 = root, node+8 = left, node+0xc = right, node+0x10 = key u16,
+    node+0x14 = value.
+  - Handler registration (platform ctor 0x39f268): map keys **7 = DAPI,
+    1 & 0x16 = Navi, 0x17 = WDB** (heap objects, stored at platform+0xb0/
+    b4/b8).  The posfi server's sub-id is therefore 0x16.
+  - Handler virtual +0x18 = `PortControl_CCAClientHandlerBase::
+    vDispatchMessage` (0x592454): optional `vCheckPropertyRegistration` for
+    handlers whose service vector matches svc, then a static (svc,fn) table
+    `PortControl_CCAClientHandler_Navi::_msgMap` (0x713ffc, group at +4 ->
+    0x713f14, 12-byte entries {svc u16, fn u16, fnptr u32, (off<<1|flag)
+    u32}): **(0x1e, 0x10) -> vHandleNavPosition @ 0x5487b8**.  After the
+    handler returns, `bDelete` frees the message.
+  - `vHandleNavPosition` parses the wire into a `posfi_tclMsgNavPosition
+    Status` and tail-calls the embedded `map_tclNavPropertyHandler`
+    (this+0x44) `.vProcessNavPositionStatus` (0x59216c).
+- **Fabrication recipe** (all host-side, no guest patching): link a 24-byte
+  fwl_List node `{prev=0,next=0,item={svc 0x1e, sub 0x16, regid 0x17,
+  state 0, target 0xffff...}}` into `*(0xa0fc70+0x50)` head (guest
+  `fwl_List::vAdd` no-ops in hook context - its operator_new fails), and
+  post messages into MQB_1024 with envelope sub=0x16, dst=0x400, src=1,
+  class 0x45, svc 0x1e, regid 0x17, fn 0x10, op 6, +0x0c/+0x0e = 0xffff.
+  Host posts must also raise the consumer's IOSC event
+  (`iosc::signal_events`) because the two-stage wait
+  (`OSAL_s32MessageQueueWait` -> `u32GetFromMessageQueue`) needs it; and the
+  one-shot fixup in the CCA_DISPATCH hook must restore the engine's own
+  body-queue handle into app+0x78 (that field is shared with the entry
+  thread's forward target - the early repair seeds it with the entry queue).
+- **Open:** lat/lon of the parsed `posfi_tclMsgNavPositionStatus` (probe
+  object at 0x9020a8f4-style buffer) do not yet move `UpdateMapDataRequest`
+  off the default window - parse offsets and the validity gate in
+  vHandleNavPosition still need mapping (next step).
