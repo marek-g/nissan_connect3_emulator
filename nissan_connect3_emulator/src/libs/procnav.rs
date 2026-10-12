@@ -121,8 +121,26 @@ const XP_TARGETS: &[(u32, &str)] = &[
     (0x0029_89c4, "rde-formatter"),
     (0x002c_4780, "traceout"),
     (0x002e_bd6c, "veneer"),
-    (0x002e_5526, "dispatcher"),
+    (0x0055_8c00 + 0x0c0, "initapp01"),
+    (0x0055_dd80 + 0x058, "initappstat"),
+    (0x0056_004d - 1, "initapptea"),
+    (0x0055_0000 + 0x4f4, "initappfc lbs"),
+    (0x0056_3d80 + 0x058 - 1, "initappwdb"),
+    (0x002e_5526, "propdisp"),
+    (0x002e_5628, "addprop"),
     (0x0030_b98a, "err-set"),
+    (0x004d_3704, "dispctor"),
+    (0x004d_3770, "searchcall"),
+    (0x004d_3838, "dispcore"),
+    (0x0029_8bb0, "stat-dispbuild"),
+    (0x0029_8b44, "ct-open"),
+    (0x0029_8b88, "ct-msgman"),
+    (0x0029_e082, "tea-init"),
+    (0x0029_e084, "tea-initret"),
+    (0x0025_b5d8, "senscomms"),
+    (0x0026_a9a0, "senscluster"),
+    (0x0059_6170, "gpshandler"),
+    (0x0012_0014, "stat-dataset"),
     (0x0068_ff8c, "sink"),
     (0x0011_dbd8, "ventry-entry"),
     (0x0011_dc56, "ventry-step"),
@@ -131,11 +149,19 @@ const XP_TARGETS: &[(u32, &str)] = &[
 /// The pages covering `XP_TARGETS`, one hook each (see the note above).
 const XP_PAGES: &[(u32, u32)] = &[
     (0x0011_d000, 0x1000),
+    (0x0012_0000, 0x1000),
+    (0x0025_b000, 0x1000),
+    (0x0026_a000, 0x1000),
     (0x0029_7000, 0x2000),
     (0x002c_4000, 0x1000),
+    (0x0055_0000, 0x1000),
+    (0x0056_0000, 0x1000),
     (0x002e_5000, 0x1000),
     (0x002e_b000, 0x1000),
+    (0x0029_e000, 0x1000),
     (0x0030_b000, 0x1000),
+    (0x004d_3000, 0x1000),
+    (0x0059_6000, 0x1000),
     (0x0068_f000, 0x1000),
 ];
 
@@ -409,15 +435,35 @@ fn xp_watch(unicorn: &mut Unicorn<'_, Context>, tid: u32, address: u64) {
                 hexdump(unicorn, content, 0x20),
             );
         }
-        "dispatcher" => {
-            let table = r0;
-            let msg = r1 as u32;
-            let fields = word(unicorn, msg.wrapping_add(4)).unwrap_or(0);
+        "propdisp" => {
+            // rtf_tclPropertyDispatcher::s32ProcessMessage(this, svcData):
+            // reaching it at all means MsgDisp found the property route.
             log::info!(
-                "PROCNAV[{tid}] xp-dispatcher: table={table:#010x} msg={msg:#010x} fields={fields:#010x} svc={:#x} prop={:#x} head=[{}]",
-                halfword(unicorn, fields.wrapping_add(0x14)).unwrap_or(0),
-                halfword(unicorn, fields.wrapping_add(0x18)).unwrap_or(0),
-                hexdump(unicorn, msg, 0x10),
+                "PROCNAV[{tid}] xp-propdisp: this={r0:#010x} svcdata={r1:#010x} lr={lr:#010x}"
+            );
+        }
+        "addprop" => {
+            // rtf_tclPropertyDispatcher::vAddProperty(this, property): the
+            // registration path every server component uses at bring-up.
+            log::info!(
+                "PROCNAV[{tid}] xp-addprop: this={r0:#010x} prop={r1:#010x} lr={lr:#010x}"
+            );
+        }
+        "dispctor" => {
+            // rtf_tclMessageDispatcher(thread, outDispatcher, propertyDispatcher,
+            // errorHandler): the third argument decides MsgDisp's property route.
+            log::info!(
+                "PROCNAV[{tid}] xp-dispctor: this={r0:#010x} thread={r1:#010x} outdisp={r2:#010x} propdisp={r3:#010x} lr={lr:#010x}"
+            );
+        }
+        "dispcore" => {
+            // s32DispatchServiceDataMessage entry: dump the dispatcher object
+            // (+0x8 out-dispatcher, +0xc property-dispatcher - the branch gate).
+            let r4 = r0;
+            log::info!(
+                "PROCNAV[{tid}] xp-dispcore: this={r4:#010x} obj=[{}] msg={}",
+                hexdump(unicorn, r4, 0x14),
+                hexdump(unicorn, r1 as u32, 8),
             );
         }
         "sink" => {
@@ -430,6 +476,37 @@ fn xp_watch(unicorn: &mut Unicorn<'_, Context>, tid: u32, address: u64) {
                 halfword(unicorn, msg.wrapping_add(0x16)).unwrap_or(0),
                 hexdump(unicorn, msg, 0x20),
             );
+        }
+        "ct-open" | "ct-msgman" => {
+            // `rtf::tclCommThread::s32Initialize` (r4 = thread app object):
+            // +0x2c factory, +0x30 open answer, +0x34 server-side dispatcher,
+            // +0x38 property dispatcher, +0x3c message dispatcher, +0x40 the
+            // message manager the `vEntry` pump refuses to run without.
+            let r4 = unicorn.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            log::info!(
+                "PROCNAV[{tid}] xp-{tag}: r0={r0:#010x} obj={r4:#010x} fields=[{}]",
+                hexdump(unicorn, r4.wrapping_add(0x2c), 0x18),
+            );
+        }
+        "tea-init" => {
+            // `NaviThread::vEntry` (0x29e000, r7 = thread app object):
+            // `blx [obj+8](obj, 4)` is the component-initialization virtual;
+            // an answer != 1 takes the "nullpointer detected" branch (r382:
+            // tid82/TEA_TASK1) which *skips* the run loop at `blx [obj+0x58]`
+            // - TEA never pumps, so the position computer stays deaf.
+            let obj = unicorn.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+            let vt = word(unicorn, obj).unwrap_or(0);
+            log::info!(
+                "PROCNAV[{tid}] xp-tea-init: obj={obj:#010x} vt={vt:#010x} m8={:#x} m58={:#x} obj=[{}] chans=[{}] globals=[{}]",
+                word(unicorn, vt.wrapping_add(8)).unwrap_or(0),
+                word(unicorn, vt.wrapping_add(0x58)).unwrap_or(0),
+                hexdump(unicorn, obj, 0x48),
+                hexdump(unicorn, obj.wrapping_add(0x3c), 8),
+                hexdump(unicorn, 0x0121_5260, 0x28),
+            );
+        }
+        "tea-initret" => {
+            log::info!("PROCNAV[{tid}] xp-tea-initret: r0={r0:#010x}");
         }
         "getnext-entry" => {
             // s32GetNextMessage(this, out, r2, tuple r3 + five stack words):
@@ -535,9 +612,9 @@ fn fabricate_sensorfi_reference(unicorn: &mut Unicorn<'_, Context>, this: u32) {
     node_bytes.extend_from_slice(&list.to_le_bytes()); // prev
     node_bytes.extend_from_slice(&head.to_le_bytes()); // next
     node_bytes.extend_from_slice(&[
-        0x0b, 0x00, // +0  serviceId = 0xb (sensorfi)
+        0x0a, 0x00, // +0  serviceId = 0xa (sensorfi; STAT map svc key, wire u16 @+0x14)
         0x0a, 0x00, // +2  typebase id low half (envelope u16 @wire+0x00)
-        0x05, 0x00, // +4  functionId (envelope u16 @wire+0x16)
+        0x01, 0x80, // +4  functionId 0x8001 property-status (envelope u16 @wire+0x16)
         0x01, 0x00, // +6  availability = true
         0xff, 0xff, // +8  source sub-id wildcard (envelope u16 @wire+0x0e = 0xffff)
         0x01, 0x00, // +a  registerId
@@ -1536,12 +1613,14 @@ pub(crate) fn gps_status_message(seq: u16, msg_class: u8) -> Vec<u8> {
     content[0x0b] = msg_class;
     content[0x0c..0x10].copy_from_slice(&0xffff_ffffu32.to_le_bytes()); // sub-ids 0xffff/0xffff (non-zero word3 + the 0xff sentinel word)
     // amt service envelope fields (the STAT CCA dispatch chain):
-    content[0x14..0x16].copy_from_slice(&0x000bu16.to_le_bytes()); // serviceId: sensorfi
+    content[0x14..0x16].copy_from_slice(&0x000au16.to_le_bytes()); // serviceId: sensorfi (STAT_tclThread::_msgEntries svc key)
     // `bIsDataSet` (`0x24ea04`) compares the reference entry against getters at
-    // wire `+0x00` (source app), `+0x14`, `+0x16` and `+0x0e`; `0x2c45b1` reads
-    // `+0x16`, so this is the functionId slot (`GpsDataStatus` fn `5`).
-    content[0x16..0x18].copy_from_slice(&0x0005u16.to_le_bytes()); // functionId: GPS data
-    content[0x18..0x1a].copy_from_slice(&0x0005u16.to_le_bytes()); // propertyId: GPS data
+    // wire `+0x00` (source app), `+0x14`, `+0x16` and `+0x0e`; the MSGMAN map
+    // key (r388: `pfFindMessageMap` u8 class `0x45`/u16 `+0x14`/u16 fn/u8 `+0x1a`)
+    // expects sensorfi fn `0x8001` for the property-status family, so both
+    // function slots carry it.
+    content[0x16..0x18].copy_from_slice(&0x8001u16.to_le_bytes()); // functionId: property status 1
+    content[0x18..0x1a].copy_from_slice(&0x8001u16.to_le_bytes()); // propertyId: status 1 (`s32OnUsedDataSetStatus` checks `u16GetValue(0x18) == 0x8001`)
     content[0x1a] = 0x06; // opCode: Status (server message)
     content[0x1c..0x1e].copy_from_slice(&seq.to_le_bytes()); // cmd counter
     content[0x20..0x20 + body.len()].copy_from_slice(&body); // CIR payload

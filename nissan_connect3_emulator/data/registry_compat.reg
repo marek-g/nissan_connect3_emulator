@@ -462,12 +462,16 @@
 "DYN2_PRIO"=dword:0000004b
 "DYN2_STCK"=dword:00002710
 
-; The sensorfi service (0xb) the GPS provider answers. scd_bGetAppIdFromServiceId
-; (via scd_tclServiceAppMap::bReadData) walks PROCESS/*/*/SERVICES/* comparing
-; SERVICEID; with no entry publishing 0xb PROCNAV drops every GpsDataStatus right
-; after the amt field reads (r215 trace: accept -> field helper x2 -> registry
-; ioctl -> discard). APPID 21 is an external provider id: replies would route to
-; mbx_21, which the host queue store creates on demand and nothing must consume.
+; The sensorfi service the GPS provider answers. r388 ground truth:
+; STAT_tclThread::_msgEntries keys every sensorfi handler by service 0xa
+; (fn 0x8001/0x8008 property-status family, fn 0x201 method result), so the
+; published SERVICEID must be 0xa or `pfFindMessageMap` never hits. scd_
+; bGetAppIdFromServiceId (via scd_tclServiceAppMap::bReadData) walks
+; PROCESS/*/*/SERVICES/* comparing SERVICEID; with no entry publishing it
+; PROCNAV drops every GpsDataStatus right after the amt field reads (r215
+; trace: accept -> field helper x2 -> registry ioctl -> discard). APPID 21 is
+; an external provider id: replies would route to mbx_21, which the host queue
+; store creates on demand and nothing must consume.
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\SENSORFI]
 "APPID"=dword:00000015
 "MAXMCOUNT"=dword:00000078
@@ -480,4 +484,4 @@
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\SENSORFI\APP_CONFIG]
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\SENSORFI\SERVICES\SENSORFI]
-"SERVICEID"=dword:0000000b
+"SERVICEID"=dword:0000000a
