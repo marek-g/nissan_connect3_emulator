@@ -14,7 +14,7 @@
 set -e
 cd "$(dirname "$0")"
 
-SIZE_KB=131072   # 128 MB
+SIZE_KB=1048576   # 1 GiB: worst case shm dumps (600 MiB budget) + mtd caps + bins + logs
 IMG=regdump.ext2
 SRC=regdump_logger.sh
 
