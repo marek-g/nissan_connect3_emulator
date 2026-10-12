@@ -153,3 +153,33 @@ Side note (flakiness): run quality now hinges on the AE pump (tid77) reaching it
 wait - in starved runs it idles in the `0x5036e`/`0x2016e` IO cycle and never consumes
 `mbx_19`; the STAT-path delivery is unaffected by that (r345+), but old good-run checks
 based on tid77 counters need to use `probe-sd-hit` on tid76 instead.
+
+### r346: sink gap root cause = empty STAT subscription lists; ERG attack concluded
+
+Twelve new observation probes (`probe-sd-refcmp/regcmp/refres/regres/dlvchk/deliver`,
+`probe-regsvc`, `probe-scd`, `probe-msgreg`, `probe-msgconf` in `src/libs/procnav.rs`)
+pin the root cause: STAT's ail object (tid76, `0x90069400`) has **both the
+ServiceReference (`+0x50`) and ServiceRegistry (`+0x58`) lists empty**, and
+`u16RegisterService` (`0x24a39a`) fires **zero times in the whole run** - nothing ever
+subscribes to the GPS service, so every `GpsDataStatus` dies in the no-match branch of
+`ail_bHandleMsgServiceData` (delivery would otherwise happen at `0xbd8b0` through the
+app pump, see the corrected model in git history of this file). The old "HIT destroys
+the message" note above is superseded: opcode 6-0xe server messages are matched against
+the ServiceReference list via `bIsDataSet` (`0x24ea04`); wildcards only for 0xffff
+fields.
+
+Why the subscription never starts: PROCNAV's scd lookups (`PROCESS/NAVAPP/FC_STAT`,
+`FC_TEA`, `NAVAPP`, `WDB`, `APP03`, `SENSORFI`, `DATA_SERVER` + `SERVICES/SERVICEID`,
+`APP_CONFIG`, `AIF_CONFIG`) all miss because that subtree ships in the **encrypted
+region files** (`ni2k_eur/NAVAPP.ERG`), which the emulator cannot decrypt - see
+`docs/reverse_engineering/erg_registry_crypto.md` for the format, the
+`KDS(entry 0x1216/0x1217) XOR mask` key chain and why the key is unobtainable from our
+dumps. Same log also floods `PROCESS/CONFIG/PROCNAVI/SERVICES` misses: PROCNAV resolves
+service -> app through scd (`scd_bGetAppIdFromServiceId` `0x34f012`, observed
+`svc=0xb/0x44/0x1e/...`), so those SERVICES keys are on the critical path too.
+
+Next step (registry path, no ERG needed): extend `data/registry_compat.reg` with the
+FC_STAT/FC_TEA/NAVAPP/WDB/APP03/SENSORFI/DATA_SERVER blocks (layout proven from
+procmw.reg: `APPID`, `AIF_CONFIG`, `APP_CONFIG`, `APP_THREAD`,
+`SERVICES/<block>/SERVICEID`) and load `StartConfig1/2/3.reg` (ADR3 variants of the
+process table, currently not in `DEFAULT_REGISTRY_FILES`).
