@@ -8,29 +8,27 @@ use unicorn_engine::{RegisterARM, Unicorn};
 pub fn print_mmu(unicorn: &Unicorn<'_, Context>) {
     let data = unicorn.get_data();
     let mmu = data.inner.mmu.lock().unwrap();
-    println!("------------------ MMU (emulator regions):");
-    println!("{}", mmu.display_mapped());
+    // fault autopsy must survive a SIGTERM'd process (stdout is block-buffered)
+    log::error!("------------------ MMU (emulator regions):\n{}", mmu.display_mapped());
 }
 
 pub fn print_stack(unicorn: &Unicorn<'_, Context>) {
     let mut sp = unicorn.reg_read(RegisterARM::SP).unwrap();
+    let start = sp;
     let fp = unicorn.reg_read(RegisterARM::FP).unwrap();
-    println!(
-        "------------------ STACK at {:#010x}, FP: {:#010x}:",
-        sp, fp
-    );
+    let mut line = String::new();
     for _ in 0..20 {
         let mut mem = [0u8; 4];
         // a thread dying on a corrupt/unmapped stack must not take the whole host
         // thread down while printing its own autopsy
         if unicorn.mem_read(sp, &mut mem).is_err() {
-            println!("<unmapped at {sp:#010x}>");
+            line.push_str(&format!("<unmapped at {sp:#010x}>"));
             break;
         }
-        print!("{:#010x} ", unpack_u32(&mem));
+        line.push_str(&format!("{:#010x} ", unpack_u32(&mem)));
         sp += 4;
     }
-    println!();
+    log::error!("------------------ STACK at {start:#010x}, FP: {fp:#010x}: {line}");
 }
 
 pub fn disasm(unicorn: &Unicorn<'_, Context>, address: u32, len: u32) {
@@ -44,10 +42,9 @@ pub fn disasm(unicorn: &Unicorn<'_, Context>, address: u32, len: u32) {
 
     let mut vec = vec![0u8; len as usize];
     if unicorn.mem_read(address as u64, &mut vec).is_err() {
-        println!("------------------ DISASM {address:#010x}: unmapped");
+        log::error!("------------------ DISASM {address:#010x}: unmapped");
         return;
     }
     let disasm = cs.disasm_all(&vec, address as u64).unwrap();
-    println!("------------------ DISASM at {:#010x}:", address);
-    println!("{}", disasm);
+    log::error!("------------------ DISASM at {:#010x}:\n{}", address, disasm);
 }
