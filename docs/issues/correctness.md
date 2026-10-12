@@ -183,3 +183,28 @@ FC_STAT/FC_TEA/NAVAPP/WDB/APP03/SENSORFI/DATA_SERVER blocks (layout proven from
 procmw.reg: `APPID`, `AIF_CONFIG`, `APP_CONFIG`, `APP_THREAD`,
 `SERVICES/<block>/SERVICEID`) and load `StartConfig1/2/3.reg` (ADR3 variants of the
 process table, currently not in `DEFAULT_REGISTRY_FILES`).
+
+## Fabricated GPS blob kills the STAT pump (null-store fault at 0x5a43f0)
+
+Symptom (run r348, `EMU_SENSORFI=1`): STAT adapter thread (tid 76, app 22)
+processes one provider message, releases the Bosch-Mailbox lock
+(`tkse_set_flg`, svc `0x1022xxxx`) and dies immediately:
+`Execution error: WRITE_UNMAPPED @ 0x5a43f0` + `exited(1)` (fault-kill, per the
+thread.rs FIXME the bare-fault path always reports code 1). TEA (tid 77) dies
+the same way; the remaining PROCNAV threads park fine. Without the provider
+(run r349) **all PROCNAV threads stay alive** (76-82 blocked in mbx/TSE waits),
+so the fault is caused by our 0x44-byte `gps_status_message()` blob, not by
+emulator code: a Thumb copy helper (`ldrb/cmp/beq; ldr r0,[r7]; strb r6,[r0]`)
+dereferences a NULL result of the amt field-getter chain (`probe-check-getter:
+r0=0x109 own=None` just before the crash) - the real
+`cmb_sensorfi_tclMsgGpsDataStatus` (>0x100 B, var-data vector @ +0x78) is
+required. Fix in the provider (data), not in the guest.
+
+## navbin mount silently empty after /tmp cleanup (run r347, fixed)
+
+`/opt/bosch/navbin` was served from `/tmp/opencode/nissan_emu/navbin`; once
+/tmp was wiped, `vStartProc(PROCNAV.OUT)` logged success but no thread ever
+started (only 4 "Start program" lines). The mount is now repo-local
+(`nissan_connect3_emulator/data/navbin`, override `EMU_NAVBIN_DIR`, binary
+gitignored, regenerate with `tools/extract_procnav.sh`) and `main()` logs an
+ERROR at startup when `PROCNAV.OUT` is missing.

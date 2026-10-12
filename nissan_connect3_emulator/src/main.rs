@@ -46,6 +46,24 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     pretty_env_logger::init();
     seed_dynamic_ffs()?;
 
+    // Self-diagnostic: an empty navbin silently produces a PROCNAV-less boot
+    // (spawn logs "succeeded", but no thread ever starts) - see run r347.
+    {
+        let navbin = std::env::var_os("EMU_NAVBIN_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("data")
+                    .join("navbin")
+            });
+        if !navbin.join("PROCNAV.OUT").is_file() {
+            log::error!(
+                "EMU_NAVBIN_DIR={} has no PROCNAV.OUT - run tools/extract_procnav.sh, PROCNAV will not start",
+                navbin.display()
+            );
+        }
+    }
+
     // mounted file systems
     let map_card_path =
         "/home/marek/Ext/reverse_engineering/NissanMaps/Firmware/NISSAN Connect LCN3 V7 2022_2023";
@@ -118,13 +136,21 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         // the DAPI protocol - is not part of the head-unit image. It ships on the
         // map card in `CRYPTNAV/DNL/BIN/NAV/COMMON/`, but there it is a `ULI `
         // container, not an ELF, so the loader cannot run it. Unpacked with the
-        // LX monitor's own decompressor (nissan_connect3_map_conv
-        // src/elf_decompressor/uli_unpack.py) and served from this directory.
+        // LX monitor's own decompressor (see tools/extract_procnav.sh) and served
+        // from the repo-local `data/navbin/` - not from /tmp, whose cleanup once
+        // silently killed every PROCNAV thread (run r347). Override with
+        // EMU_NAVBIN_DIR.
         MountPoint {
             mount_point: "/opt/bosch/navbin".to_string(),
-            file_system: Box::new(OsFileSystem::new(PathBuf::from(
-                "/tmp/opencode/nissan_emu/navbin",
-            ))),
+            file_system: Box::new(OsFileSystem::new(
+                std::env::var_os("EMU_NAVBIN_DIR")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join("data")
+                            .join("navbin")
+                    }),
+            )),
             is_read_only: true,
         },
         // volatile temp-fs
