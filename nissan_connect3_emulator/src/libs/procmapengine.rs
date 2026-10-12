@@ -85,6 +85,45 @@ const MAP_JOB_QUEUE_ADD_ELEMENT_AFTER_POST: u32 = 0x004a_4370 - ORIGINAL_BASE;
 const MAP_JOB_QUEUE_ADD_ELEMENT_RETURN: u32 = 0x004a_42d0 - ORIGINAL_BASE;
 const MAP_JOB_QUEUE_ADD_ELEMENT_RETURN_ALT: u32 = 0x004a_42d4 - ORIGINAL_BASE;
 const MAP_JOB_QUEUE_ADD_ELEMENT_PRE_CRASH: u32 = 0x004a_4380 - ORIGINAL_BASE;
+// ail_tclInternalDispatch::vOnServerApplicationStatus: the mbx_1024 self-loop
+// posts originate inside it (return address 0x66869c). Observe the
+// (service, serverApp, state) tuples it is being fed.
+const AIL_ON_SERVER_APP_STATUS: u32 = 0x0066_8578 - ORIGINAL_BASE;
+// PortControl_CCAClientHandler_Navi::vHandleNavPosition - the consumer of
+// `posfi_tclMsgNavPositionStatus` (svc 0x1e, fn 0x10, op 6 per its accessor
+// thunks; the client-function map at file VA 0x70bf20 keys {fn 0x10, svc 0x1e}
+// straight onto it).  Feeds the CCP and triggers UpdateMapDataRequest.
+const NAVI_HANDLER_VHANDLE_NAV_POSITION: u32 = 0x0054_87b8 - ORIGINAL_BASE;
+// ail_bHandleMsgServiceData - the body-thread claim function reached from
+// bDispatchCCAMessages' 0x45 branch; routes service data to registered
+// client handlers by service id.
+const AIL_HANDLE_MSG_SERVICE_DATA: u32 = 0x0066_c128 - ORIGINAL_BASE;
+// map_tclPortControl_Platform::vOnNewMessage - the app-interface +0x20
+// virtual the claim tail-calls; looks the client handler up in the map at
+// platform+0xa0 keyed by the message's u16 at content+0x00.
+const PORTCONTROL_VON_NEW_MESSAGE: u32 = 0x003a_4048 - ORIGINAL_BASE;
+// ail_tclServiceReference::bIsDataSet(4-arg, wildcard) and
+// ail_tclServiceReference::u8GetServiceState - the walk predicates of the
+// claim path's server-reference loop (0x66c568/0x66c594); observing them
+// live shows the exact tuple compared and the state byte for the fabricated
+// posfi reference.  ail_tclServiceRegistry::u8GetServiceState covers the
+// other walk.
+const AIL_REF_IS_DATASET_FN: u32 = 0x0066_e3d0 - ORIGINAL_BASE;
+const AIL_REF_GET_STATE_FN: u32 = 0x0066_e940 - ORIGINAL_BASE;
+const AIL_REGISTRY_GET_STATE_FN: u32 = 0x0066_e444 - ORIGINAL_BASE;
+// map_tclNavPropertyHandler::vProcessNavPositionStatus(handler, msg) - called
+// with the fully parsed message object; dump the object to map wire offsets.
+const NAV_HANDLER_VPROCESS_NAV_POS: u32 = 0x0059_216c - ORIGINAL_BASE;
+// map_tclMapDataManager::UpdateMapDataRequest(prio, freq, u32, rect{minlon,
+// maxlon, minlat, maxlat}) - the direct consequence of a consumed position.
+const MAP_DATA_MANAGER_UPDATE_REQUEST: u32 = 0x0050_494c - ORIGINAL_BASE;
+// map_tclPortControl_Platform ctor: caches the platform object so the Navi
+// client handler can be found in its handler vector (member +0x94 vector of
+// PortControl_CCAClientHandlerBase*, Navi identified by its vtable).
+const PORTCONTROL_PLATFORM_CTOR: u32 = 0x0039_f268 - ORIGINAL_BASE;
+// Navi client handler vtable (Ghidra VA 0x6bb898 == the runtime value stored
+// at handler +0x00).
+const NAVI_CLIENT_HANDLER_VTABLE: u32 = 0x006b_b898;
 const SURFACE_FLIP_ENTRY: u32 = 0x0055_20d8 - ORIGINAL_BASE;
 const RC_JOB_CREATE_VIEW_FINAL: u32 = 0x004c_a780 - ORIGINAL_BASE;
 const RC_JOB_RENDER_PIXMAP_INSTANCE_RESULT: u32 = 0x004d_62e8 - ORIGINAL_BASE;
@@ -206,6 +245,18 @@ static MAP_JOB_QUEUE_ADD_ENTRY_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_JOB_QUEUE_AFTER_POST_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_JOB_QUEUE_PRE_CRASH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static SURFACE_FLIP_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static AIL_SERVER_APP_STATUS_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static AIL_IPC_POST_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static AIL_B_POST_IPC_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static NAV_POSITION_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static NAV_PROCESS_POS_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static HANDLE_SERVICE_DATA_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static VON_NEW_MESSAGE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static REF_WALK_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_DATA_UPDATE_REQUEST_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static PORTCONTROL_PLATFORM: AtomicU32 = AtomicU32::new(0);
+static NAVI_REGISTER_KICK_PENDING: AtomicU32 = AtomicU32::new(0);
+static MAP_WAIT_HANDLE_FIXUP: AtomicU32 = AtomicU32::new(0);
 static RENDER_LOOP_QUEUE_STATE_LAST: AtomicU32 = AtomicU32::new(0xffff_ffff);
 static RENDER_LOOP_QUEUE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static RENDER_CONTROL_ADD_JOB_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -252,6 +303,7 @@ static MAP_DATA_DAPI_REGISTER_PENDING: AtomicBool = AtomicBool::new(false);
 static MAP_DATA_MEDIUM_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static MAP_DATA_MEDIUM_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
 static CCA_BODY_FORWARD_SUPPRESSED: AtomicU32 = AtomicU32::new(0);
+static CCA_BODY_PASS_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static INIT_MAP_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static CCA_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static PORTCONTROL_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -353,6 +405,20 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     MAP_JOB_QUEUE_AFTER_POST_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_JOB_QUEUE_PRE_CRASH_TRACE_COUNT.store(0, Ordering::Relaxed);
     SURFACE_FLIP_TRACE_COUNT.store(0, Ordering::Relaxed);
+    AIL_SERVER_APP_STATUS_TRACE_COUNT.store(0, Ordering::Relaxed);
+    AIL_IPC_POST_TRACE_COUNT.store(0, Ordering::Relaxed);
+    AIL_B_POST_IPC_TRACE_COUNT.store(0, Ordering::Relaxed);
+    NAV_POSITION_TRACE_COUNT.store(0, Ordering::Relaxed);
+    NAV_PROCESS_POS_TRACE_COUNT.store(0, Ordering::Relaxed);
+    HANDLE_SERVICE_DATA_TRACE_COUNT.store(0, Ordering::Relaxed);
+    VON_NEW_MESSAGE_TRACE_COUNT.store(0, Ordering::Relaxed);
+    REF_WALK_TRACE_COUNT.store(0, Ordering::Relaxed);
+    MAP_DATA_UPDATE_REQUEST_TRACE_COUNT.store(0, Ordering::Relaxed);
+    PORTCONTROL_PLATFORM.store(0, Ordering::Relaxed);
+    NAVI_REGISTER_KICK_PENDING.store(0, Ordering::Relaxed);
+    MAP_WAIT_HANDLE_FIXUP.store(0, Ordering::Relaxed);
+    POSFI_REF_BLOB.store(0, Ordering::Relaxed);
+    POSFI_REF_INSERTED.store(0, Ordering::Relaxed);
     RENDER_LOOP_QUEUE_STATE_LAST.store(0xffff_ffff, Ordering::Relaxed);
     RENDER_LOOP_QUEUE_TRACE_COUNT.store(0, Ordering::Relaxed);
     RENDER_CONTROL_ADD_JOB_TRACE_COUNT.store(0, Ordering::Relaxed);
@@ -368,6 +434,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     MAP_DATA_MAINLOOP_JOB_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_DATA_REQUEST_TRACE_COUNT.store(0, Ordering::Relaxed);
     CCA_BODY_FORWARD_SUPPRESSED.store(0, Ordering::Relaxed);
+    CCA_BODY_PASS_TRACE_COUNT.store(0, Ordering::Relaxed);
     PROCMAP_GUEST_CALL_STUB.store(0, Ordering::Relaxed);
     INIT_MAP_TRACE_COUNT.store(0, Ordering::Relaxed);
     CCA_TRACE_COUNT.store(0, Ordering::Relaxed);
@@ -390,9 +457,64 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     // PWR_APP_INITIALIZED without touching any guest code paths.
     let cca_dispatch_addr = base_address + CCA_DISPATCH;
     unicorn
-        .add_code_hook(cca_dispatch_addr as u64, cca_dispatch_addr as u64, |uc, _, _| {
+        .add_code_hook(cca_dispatch_addr as u64, cca_dispatch_addr as u64, move |uc, _, _| {
             let queue = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            // One-shot: the early CCA-startup repair seeds the body-thread
+            // wait / entry-thread forward target (app+0x78) with the entry
+            // queue because MQB_1024 does not exist yet at that point.  The
+            // engine assigns its own body-queue handle there as soon as the
+            // body thread opens it (r414: first wait used 0x40093a20), and
+            // both threads re-read the field every loop iteration - restore
+            // the engine's value once the body queue is known so the entry
+            // thread forwards onto MQB_1024 (guest post -> IOSC event ->
+            // u32Get) and the body thread waits there with its claiming
+            // pass, exactly as on the unit.
+            if MAP_WAIT_HANDLE_FIXUP.load(Ordering::Relaxed) == 0 {
+                let mqb = crate::libs::libosal_linux::message::MQB_1024_INFO
+                    .load(Ordering::Relaxed);
+                if mqb != 0 && mqb != u32::MAX {
+                    let app = read_u32_or_invalid(uc, base_address + MAP_ENGINE_GLOBAL);
+                    if app < 0xf000_0000 {
+                        let current = read_u32_or_invalid(uc, app + APP_IPC_WAIT_PARAM_OFFSET);
+                        if current != mqb && current < 0xf000_0000 {
+                            if uc
+                                .mem_write(
+                                    (app + APP_IPC_WAIT_PARAM_OFFSET) as u64,
+                                    &mqb.to_le_bytes(),
+                                )
+                                .is_ok()
+                            {
+                                MAP_WAIT_HANDLE_FIXUP.store(1, Ordering::Relaxed);
+                                log::info!(
+                                    "PROCMAPENGINE: restored body-queue handle {mqb:#x} into map app {app:#x} wait/forward param (was {current:#x})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             if queue == u32::MAX {
+                // The body thread's claiming pass (param_2 == 0xffffffff).
+                // r421 showed tid62 consuming the posfi wake message with
+                // zero claim-probe hits, so log every body-pass dispatch's
+                // envelope to find where the message is dropped.
+                let count = CCA_BODY_PASS_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 24 {
+                    let thread = uc.get_data().inner.thread_id();
+                    let wrapper = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let header = read_u32_or_invalid(uc, wrapper.wrapping_add(4));
+                    log::info!(
+                        "PROCMAPENGINE: body-pass dispatch wrapper={wrapper:#x} content={header:#x} sub={:#x} dst={:#x} src={:#x} class={:#x} svc={:#x} regid={:#x} op={:#x} thread=[{thread}] trace={}",
+                        read_u32_or_invalid(uc, header) & 0xffff,
+                        (read_u32_or_invalid(uc, header) >> 16) & 0xffff,
+                        read_u32_or_invalid(uc, header + 8) & 0xffff,
+                        read_u32_or_invalid(uc, header + 0xb) & 0xff,
+                        read_u32_or_invalid(uc, header + 0x14) & 0xffff,
+                        read_u32_or_invalid(uc, header + 0x16) & 0xffff,
+                        (read_u32_or_invalid(uc, header + 0x18) >> 16) & 0xff,
+                        count + 1
+                    );
+                }
                 return;
             }
 
@@ -405,6 +527,16 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             let wrapper = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let header = read_u32_or_invalid(uc, wrapper.wrapping_add(4));
             let msg_class = read_u16_or_invalid(uc, header.wrapping_add(0xb)) & 0xff;
+            // CCA traffic (register, register-conf, service-status,
+            // service-data) keeps its forward target: repair_map_ipc_wait_param
+            // pointed the app's wait/forward handle (app+0x78) at the entry
+            // queue, and the body thread re-reads that field after every
+            // message, so both AIL threads wait on mbx_1024 - the entry
+            // thread's same-queue forward is picked up by the body thread's
+            // claiming pass (param_2=0xffffffff) instead of a queue nobody
+            // drains.  An earlier experiment redirected service-data forwards
+            // to MQB_1024 and starved exactly that (r404/r409: one claim,
+            // then all forwards stranded).
             if matches!(msg_class, 0x42..=0x45) {
                 return;
             }
@@ -1671,6 +1803,357 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
             .unwrap();
     }
 
+    let b_post_ipc = base_address + (0x0066_0ea0u32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(b_post_ipc as u64, b_post_ipc as u64, move |uc, _, _| {
+            let count = AIL_B_POST_IPC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count >= 24 && count % 20_000 != 0 {
+                return;
+            }
+            let thread = uc.get_data().inner.thread_id();
+            let svc = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
+            let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+            log::info!(
+                "PROCMAPENGINE: bPostIpcMessage svc={:#x} r2={:#x} msg={:#x} lr={:#x} thread=[{}] trace={}",
+                svc,
+                r2,
+                r3,
+                lr,
+                thread,
+                count + 1
+            );
+        })
+        .unwrap();
+
+    let ipc_post_trace = base_address + AIL_POST_IPC_MESSAGE;
+    unicorn
+        .add_code_hook(ipc_post_trace as u64, ipc_post_trace as u64, move |uc, _, _| {
+            let count = AIL_IPC_POST_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count >= 24 && count % 20_000 != 0 {
+                return;
+            }
+            let thread = uc.get_data().inner.thread_id();
+            let appid = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let queue = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let msgobj = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+            let handle = read_u32_or_invalid(uc, msgobj + 4);
+            let msg_type = read_u32_or_invalid(uc, handle);
+            let content = read_u32_or_invalid(uc, handle + 4);
+            let mut words = Vec::new();
+            if handle < 0xf000_0000 {
+                for i in 0..14u32 {
+                    words.push(format!("{:08x}", read_u32_or_invalid(uc, handle + i * 4)));
+                }
+            }
+            log::info!(
+                "PROCMAPENGINE: ail_bIpcMessagePost app={:#x} queue={:#x} lr={:#x} handle={:#x} type={} content={:#x} [{}] thread=[{}] trace={}",
+                appid,
+                queue,
+                lr,
+                handle,
+                msg_type,
+                content,
+                words.join(" "),
+                thread,
+                count + 1
+            );
+        })
+        .unwrap();
+
+    // posfi NavPositionStatus consumption chain (observer probes): the
+    // dispatcher hands svc 0x1e / fn 0x10 / op 6 messages to vHandleNavPosition,
+    // which parses them, feeds the NavPropertyHandler (CCP) and re-arms the map
+    // data request window.  Log each stage plus the parsed-object shape so a
+    // fabricated provider message can be validated end to end.
+    let vhandle_nav_position = base_address + NAVI_HANDLER_VHANDLE_NAV_POSITION;
+    unicorn
+        .add_code_hook(vhandle_nav_position as u64, vhandle_nav_position as u64, move |uc, _, _| {
+            let count = NAV_POSITION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count >= 12 {
+                return;
+            }
+            let thread = uc.get_data().inner.thread_id();
+            let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let handle = read_u32_or_invalid(uc, message + 4);
+            log::info!(
+                "PROCMAPENGINE: vHandleNavPosition msg={:#x} handle={:#x} opcode={:#x} seq={:#x} thread=[{}] trace={}",
+                message,
+                handle,
+                read_u32_or_invalid(uc, handle + 0x1a) & 0xff,
+                read_u32_or_invalid(uc, handle + 0x1c) & 0xffff,
+                thread,
+                count + 1
+            );
+        })
+        .unwrap();
+
+    let handle_service_data = base_address + AIL_HANDLE_MSG_SERVICE_DATA;
+    unicorn
+        .add_code_hook(handle_service_data as u64, handle_service_data as u64, move |uc, _, _| {
+            let count = HANDLE_SERVICE_DATA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count >= 12 {
+                return;
+            }
+            let thread = uc.get_data().inner.thread_id();
+            let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let handle = read_u32_or_invalid(uc, message + 4);
+            // Dump the client-side service registry list (dispatch+0x58) once:
+            // bIsDataSet matches entries' {+0x00, +0x02, +0x04, +0x08} against
+            // the message tuple, so the entry contents tell which message
+            // fields must carry what.
+            let dispatch = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            if count == 0 && dispatch < 0xf000_0000 {
+                // the claim tail calls (**(app_iface) + 0x20)(app_iface, msg);
+                // log that virtual's target so its routing can be traced.
+                let app_iface = read_u32_or_invalid(uc, dispatch);
+                let vtable = read_u32_or_invalid(uc, app_iface);
+                log::info!(
+                    "PROCMAPENGINE: claim vtable trace: dispatch={dispatch:#x} app_iface={app_iface:#x} vtable={vtable:#x} +0x20->{:#x}",
+                    read_u32_or_invalid(uc, vtable + 0x20)
+                );
+            }
+            if matches!(count, 0 | 6) && dispatch < 0xf000_0000 {
+                // app interface is dispatch+0x00; the AIL lists are
+                // app_iface+0x4c (async service requests), +0x50 (server
+                // service references) and +0x58 (client service registry).
+                let app_iface = read_u32_or_invalid(uc, dispatch);
+                for (list_off, list_name) in [
+                    (0x4cu32, "requests"),
+                    (0x50, "server-refs"),
+                    (0x58, "client-registry"),
+                    (0x70, "async-reqs"),
+                ] {
+                    let list_head = read_u32_or_invalid(uc, app_iface + list_off);
+                    let mut node = read_u32_or_invalid(uc, list_head + 4);
+                    let mut idx = 0u32;
+                    while (0x1000..0xf000_0000).contains(&node) && idx < 12 {
+                        let mut words = Vec::new();
+                        for i in 0..8u32 {
+                            words.push(format!("{:08x}", read_u32_or_invalid(uc, node + 8 + i * 4)));
+                        }
+                        log::info!(
+                            "PROCMAPENGINE: {list_name} entry[{idx}] node={node:#x} [{}] trace={}",
+                            words.join(" "),
+                            count + 1
+                        );
+                        let next = read_u32_or_invalid(uc, node + 4);
+                        if next == node {
+                            break;
+                        }
+                        node = next;
+                        idx += 1;
+                    }
+                }
+            }
+            log::info!(
+                "PROCMAPENGINE: ail_bHandleMsgServiceData msg={:#x} handle={:#x} sub={:#x} class={:#x} regid={:#x} svc={:#x} fn={:#x} thread=[{}] trace={}",
+                message,
+                handle,
+                read_u32_or_invalid(uc, handle) & 0xffff,
+                read_u32_or_invalid(uc, handle + 0xb) & 0xff,
+                read_u32_or_invalid(uc, handle + 0xe) & 0xffff,
+                read_u32_or_invalid(uc, handle + 0x14) & 0xffff,
+                read_u32_or_invalid(uc, handle + 0x18) & 0xffff,
+                thread,
+                count + 1
+            );
+        })
+        .unwrap();
+
+    // map_tclPortControl_Platform::vOnNewMessage: the client dispatch tail of
+    // the claim path.  Logs the lookup key (message u16 at content+0x00) and
+    // enumerates the client-handler map at platform+0xa0 so the correct key
+    // for the posfi handler can be identified.
+    let von_new_message = base_address + PORTCONTROL_VON_NEW_MESSAGE;
+    unicorn
+        .add_code_hook(von_new_message as u64, von_new_message as u64, move |uc, _, _| {
+            let count = VON_NEW_MESSAGE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count >= 12 {
+                return;
+            }
+            let thread = uc.get_data().inner.thread_id();
+            let platform = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let handle = read_u32_or_invalid(uc, message + 4);
+            log::info!(
+                "PROCMAPENGINE: vOnNewMessage platform={platform:#x} msg={message:#x} handle={handle:#x} sub={:#x} class={:#x} svc={:#x} fn={:#x} thread=[{thread}] trace={}",
+                read_u32_or_invalid(uc, handle) & 0xffff,
+                read_u32_or_invalid(uc, handle + 0xb) & 0xff,
+                read_u32_or_invalid(uc, handle + 0x14) & 0xffff,
+                read_u32_or_invalid(uc, handle + 0x18) & 0xffff,
+                count + 1
+            );
+            if count < 3 && platform < 0xf000_0000 {
+                // bpstl::map<u16, CCAClientHandlerBase*> at platform+0xa0.
+                // Dump the header words, then walk the red-black tree with
+                // both classic libstdc++ node layouts to enumerate keys.
+                let map = platform + 0xa0;
+                let mut words = Vec::new();
+                for i in 0..6u32 {
+                    words.push(format!("{:08x}", read_u32_or_invalid(uc, map + i * 4)));
+                }
+                log::info!("PROCMAPENGINE: client-handler map {map:#x} header [{map_words}]", map_words = words.join(" "));
+                // map<unsigned_short,handler*>:: node layout read off
+                // operator[] (0x39ef80): map+0 -> header node, header+4 =
+                // root, node+8 = left, node+0xc = right, node+0x10 = key
+                // (u16), node+0x14 = mapped handler pointer.
+                let header = read_u32_or_invalid(uc, map);
+                let root = read_u32_or_invalid(uc, header + 4);
+                if (0x1000..0xf000_0000).contains(&root) {
+                    let mut stack: Vec<u32> = Vec::new();
+                    let mut node = root;
+                    let mut visited = 0u32;
+                    while visited < 16 {
+                        while (0x1000..0xf000_0000).contains(&node) {
+                            stack.push(node);
+                            node = read_u32_or_invalid(uc, node + 8);
+                        }
+                        let Some(entry) = stack.pop() else { break };
+                        log::info!(
+                            "PROCMAPENGINE: handler-map node={entry:#x} key={:#x} value={:#x}",
+                            read_u32_or_invalid(uc, entry + 0x10) & 0xffff,
+                            read_u32_or_invalid(uc, entry + 0x14)
+                        );
+                        visited += 1;
+                        node = read_u32_or_invalid(uc, entry + 0xc);
+                    }
+                }
+            }
+        })
+        .unwrap();
+
+    // ail_tclServiceReference::bIsDataSet - the claim walk's predicate (the
+    // server-ref loop calls it with (svc, sub-id, reg-id, +0x0e) and 0xffff
+    // wildcards).  Log every call's tuple, the entry's stored fields and the
+    // caller LR so a non-match can be pinned to the mismatching slot.
+    let ref_is_dataset = base_address + AIL_REF_IS_DATASET_FN;
+    unicorn
+        .add_code_hook(ref_is_dataset as u64, ref_is_dataset as u64, move |uc, _, _| {
+            let count = REF_WALK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count >= 40 {
+                return;
+            }
+            let thread = uc.get_data().inner.thread_id();
+            let entry = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let p1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
+            let p2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32 & 0xffff;
+            let p3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32 & 0xffff;
+            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+            let p4 = read_u32_or_invalid(uc, sp) & 0xffff;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            log::info!(
+                "PROCMAPENGINE: ref bIsDataSet entry={entry:#x} tuple=({p1:#x},{p2:#x},{p3:#x},{p4:#x}) entry_words=[{:#x},{:#x},{:#x},{:#x}] state={:#x} lr={lr:#x} thread=[{thread}] trace={}",
+                read_u32_or_invalid(uc, entry) & 0xffff,
+                (read_u32_or_invalid(uc, entry) >> 16) & 0xffff,
+                read_u32_or_invalid(uc, entry + 4) & 0xffff,
+                (read_u32_or_invalid(uc, entry + 4) >> 16) & 0xffff,
+                (read_u32_or_invalid(uc, entry + 4) >> 16) & 0xff,
+                count + 1
+            );
+        })
+        .unwrap();
+
+    let vprocess_nav_pos = base_address + NAV_HANDLER_VPROCESS_NAV_POS;    unicorn
+        .add_code_hook(vprocess_nav_pos as u64, vprocess_nav_pos as u64, move |uc, _, _| {
+            let count = NAV_PROCESS_POS_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count >= 4 {
+                return;
+            }
+            let thread = uc.get_data().inner.thread_id();
+            let handler = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let object = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let mut words = Vec::new();
+            if object < 0xf000_0000 {
+                for i in 0..24u32 {
+                    words.push(format!("{:08x}", read_u32_or_invalid(uc, object + i * 4)));
+                }
+            }
+            log::info!(
+                "PROCMAPENGINE: vProcessNavPositionStatus handler={:#x} object={:#x} [{}] thread=[{}] trace={}",
+                handler,
+                object,
+                words.join(" "),
+                thread,
+                count + 1
+            );
+        })
+        .unwrap();
+
+    let update_map_data_request = base_address + MAP_DATA_MANAGER_UPDATE_REQUEST;
+    unicorn
+        .add_code_hook(
+            update_map_data_request as u64,
+            update_map_data_request as u64,
+            move |uc, _, _| {
+                let count =
+                    MAP_DATA_UPDATE_REQUEST_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count >= 24 {
+                    return;
+                }
+                let thread = uc.get_data().inner.thread_id();
+                let mut args = Vec::new();
+                for reg in [
+                    RegisterARM::R0,
+                    RegisterARM::R1,
+                    RegisterARM::R2,
+                    RegisterARM::R3,
+                ] {
+                    args.push(format!("{:#x}", uc.reg_read(reg).unwrap_or(0) as u32));
+                }
+                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                let stack: Vec<String> = (0..4)
+                    .map(|i| format!("{:#x}", read_u32_or_invalid(uc, sp + i * 4)))
+                    .collect();
+                log::info!(
+                    "PROCMAPENGINE: UpdateMapDataRequest r0-r3=[{}] stack=[{}] thread=[{}] trace={}",
+                    args.join(" "),
+                    stack.join(" "),
+                    thread,
+                    count + 1
+                );
+            },
+        )
+        .unwrap();
+
+    // Cache the PortControl platform object for the Navi registration kick.
+    let platform_ctor = base_address + PORTCONTROL_PLATFORM_CTOR;
+    unicorn
+        .add_code_hook(platform_ctor as u64, platform_ctor as u64, move |uc, _, _| {
+            let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            PORTCONTROL_PLATFORM.store(this, Ordering::Relaxed);
+            log::info!("PROCMAPENGINE: map_tclPortControl_Platform constructed at {:#x}", this);
+        })
+        .unwrap();
+
+    let on_server_app_status = base_address + AIL_ON_SERVER_APP_STATUS;
+    unicorn
+        .add_code_hook(
+            on_server_app_status as u64,
+            on_server_app_status as u64,
+            move |uc, _, _| {
+                let count = AIL_SERVER_APP_STATUS_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count >= 24 && count % 50_000 != 0 {
+                    return;
+                }
+                let thread = uc.get_data().inner.thread_id();
+                let svc = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
+                let server_app = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32 & 0xffff;
+                let state = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32 & 0xff;
+                log::info!(
+                    "PROCMAPENGINE: vOnServerApplicationStatus svc={:#x} server_app={:#x} state={:#x} thread=[{}] trace={}",
+                    svc,
+                    server_app,
+                    state,
+                    thread,
+                    count + 1
+                );
+            },
+        )
+        .unwrap();
+
     let pre_crash = base_address + MAP_JOB_QUEUE_ADD_ELEMENT_PRE_CRASH;
     unicorn
         .add_code_hook(pre_crash as u64, pre_crash as u64, move |uc, _, _| {
@@ -2029,23 +2512,155 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     }
                 }
             }
+            // Navi client handler (posfi 0x1e consumer): its bInit ran at
+            // startup and created the four client service handlers, but the
+            // registration pass lives in vOnNewAppState, which only fires when
+            // the AIL app state transitions to 3/4 - and the PortControl
+            // platform never gets that notification here.  Run the same
+            // registration loop host-side once: walk the platform's handler
+            // vector for the Navi vtable and vRegisterService each pending
+            // client service handler (svc at +4, register-id sentinel 0xffff
+            // at +0xc, exactly as vOnNewAppState iterates them).
+            let platform = PORTCONTROL_PLATFORM.load(Ordering::Relaxed);
+            if platform != 0 && platform < 0xf000_0000 {
+                // Handler vector of PortControl_CCAClientHandlerBase* (4-byte
+                // elements) at platform +0x94..+0x9c.
+                let begin = read_u32_or_invalid(uc, platform + 0x94);
+                let end = read_u32_or_invalid(uc, platform + 0x9c);
+                let span = end.saturating_sub(begin);
+                if begin < 0xf000_0000 && span > 0 && span <= 8 * 4 {
+                    let mut offset = 0u32;
+                    while offset < span {
+                        let candidate = read_u32_or_invalid(uc, begin.saturating_add(offset));
+                        if read_u32_or_invalid(uc, candidate) == NAVI_CLIENT_HANDLER_VTABLE {
+                            if NAVI_REGISTER_KICK_PENDING
+                                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::Relaxed)
+                                .is_err()
+                            {
+                                break;
+                            }
+                            // vOnNewAppState's loop: client service handler
+                            // vector at handler +0xc..+0x10, vRegisterService
+                            // on every entry (bInit already populated it).
+                            let svc_begin = read_u32_or_invalid(uc, candidate + 0xc);
+                            let svc_end = read_u32_or_invalid(uc, candidate + 0x10);
+                            let svc_span = svc_end.saturating_sub(svc_begin);
+                            let mut registered = 0u32;
+                            if svc_begin < 0xf000_0000 && svc_span > 0 && svc_span <= 16 * 4 {
+                                let mut svc_off = 0u32;
+                                while svc_off < svc_span {
+                                    let service_handler = read_u32_or_invalid(
+                                        uc,
+                                        svc_begin.saturating_add(svc_off),
+                                    );
+                                    let service_id =
+                                        read_u16_or_invalid(uc, service_handler + 4) & 0xffff;
+                                    let reg_id =
+                                        read_u16_or_invalid(uc, service_handler + 0xc) & 0xffff;
+                                    if reg_id == 0xffff {
+                                        let function =
+                                            base_address + MAP_DATA_CLIENT_VREGISTER_SERVICE;
+                                        if call_guest_function(
+                                            uc,
+                                            send_request_entry,
+                                            function,
+                                            [service_handler, 0, 0, 0],
+                                        ) {
+                                            registered += 1;
+                                            log::info!(
+                                                "PROCMAPENGINE: fired Navi client service registration for svc {:#x} handler {:#x}",
+                                                service_id,
+                                                service_handler
+                                            );
+                                            // posfi has no live provider here
+                                            // (on the unit PROCNAV's posfi
+                                            // server answers the REGISTER), so
+                                            // DAPI's ADM never confirms svc
+                                            // 0x1e and the dispatcher never
+                                            // claims inbound NavPositionStatus.
+                                            // Feed the engine the RegisterConf
+                                            // it would get from the unit's ADM:
+                                            // class-0x43 envelope whose sub-id
+                                            // slot (+0x00) is the *server app
+                                            // id*, +0x0e the target sub-id,
+                                            // +0x14 the service, +0x16 the
+                                            // assigned register-id, +0x18 the
+                                            // status (1 = OK, which makes
+                                            // vUnknownRegisterConf insert the
+                                            // ServiceReference the claim walk
+                                            // matches).  Server app and client
+                                            // sub-id come from the handler
+                                            // object itself so the async
+                                            // request lookup matches.
+                                            if service_id == 0x1e {
+                                                let server_app = read_u16_or_invalid(
+                                                    uc,
+                                                    service_handler + 6,
+                                                ) & 0xffff;
+                                                let client_sub = read_u16_or_invalid(
+                                                    uc,
+                                                    service_handler + 0xa,
+                                                ) & 0xffff;
+                                                log::info!(
+                                                    "PROCMAPENGINE: posfi handler {:#x} server_app={:#x} sub8={:#x} client_sub={:#x}",
+                                                    service_handler,
+                                                    server_app,
+                                                    read_u16_or_invalid(uc, service_handler + 8)
+                                                        & 0xffff,
+                                                    client_sub
+                                                );
+                                                post_posfi_register_conf(
+                                                    uc,
+                                                    server_app,
+                                                    client_sub,
+                                                );
+                                                insert_posfi_service_reference(
+                                                    uc, send_request_entry,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    svc_off += 4;
+                                }
+                            }
+                            log::info!(
+                                "PROCMAPENGINE: Navi client handler {:#x} registration pass done ({} services fired)",
+                                candidate,
+                                registered
+                            );
+                            break;
+                        }
+                        offset += 4;
+                    }
+                }
+            }
             let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 200 && !register_fired {
                 let handler = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let message_vtable = read_u32_or_invalid(uc, message);
+                let (vt4, vt8, vtc, vt10) = if message_vtable < 0xf000_0000 {
+                    (
+                        read_u32_or_invalid(uc, message_vtable + 4),
+                        read_u32_or_invalid(uc, message_vtable + 8),
+                        read_u32_or_invalid(uc, message_vtable + 0xc),
+                        read_u32_or_invalid(uc, message_vtable + 0x10),
+                    )
+                } else {
+                    (0, 0, 0, 0)
+                };
                 log::info!(
                     "PROCMAPENGINE map-data trace SendCCARequest entry at {:#x}: handler={:#x} message={:#x} message_vtable={:#x} handler_service={:#x} handler_function={:#x} vt[4]={:#x} vt[8]={:#x} vt[c]={:#x} vt[10]={:#x}",
                     send_request_entry,
                     handler,
                     message,
                     message_vtable,
-                    read_u32_or_invalid(uc, handler + 4) & 0xffff,
-                    read_u32_or_invalid(uc, handler + 6) & 0xffff,
-                    read_u32_or_invalid(uc, message_vtable + 4),
-                    read_u32_or_invalid(uc, message_vtable + 8),
-                    read_u32_or_invalid(uc, message_vtable + 0xc),
-                    read_u32_or_invalid(uc, message_vtable + 0x10)
+                    read_u32_or_invalid(uc, handler.saturating_add(4)) & 0xffff,
+                    read_u32_or_invalid(uc, handler.saturating_add(6)) & 0xffff,
+                    vt4,
+                    vt8,
+                    vtc,
+                    vt10
                 );
             }
         })
@@ -3143,6 +3758,200 @@ fn add_dapi_register_diag_hooks(unicorn: &mut Unicorn<'_, Context>, base_address
             })
             .unwrap();
     }
+}
+
+/// Stand in for the ADM's RegisterConf for the posfi client registration
+/// (service 0x1e): on the unit PROCNAV's posfi server registers the service
+/// and DAPI's ADM confirms client registrations against it; neither the
+/// server nor its service directory entry exists here, so the engine's Navi
+/// client handler would never receive its register-id and inbound
+/// NavPositionStatus messages could not be routed.  Field layout per
+/// ail_tclOneThreadAppInterface::vUnknownRegisterConf (0x665d40): u16@+0x00
+/// = server app id (the ADM routes the conf by it), u16@+0x0e = target
+/// sub-id, u16@+0x14 = service id, u16@+0x16 = assigned register-id,
+/// u8@+0x18 = status (1 = OK; only status 1 inserts the ServiceReference
+/// into app_iface+0x50 that ail_bHandleMsgServiceData's claim walk matches)
+/// and {+0x1a, +0x1c, +0x1e} = service version triple.  Server app id and
+/// client sub-id are taken from the handler object so the async-request
+/// lookup (bIsAnswer) finds the pending registration.
+fn post_posfi_register_conf(unicorn: &mut Unicorn<'_, Context>, server_app: u32, target_sub: u32) {
+    const POSFI_REGISTER_ID: u16 = 0x17;
+    let mut content = vec![0u8; 0x20];
+    content[0x00..0x04]
+        .copy_from_slice(&(((0x0400u32 << 16) | server_app & 0xffff) as u32).to_le_bytes());
+    content[0x04..0x08].copy_from_slice(&(0x20u32).to_le_bytes());
+    content[0x08] = 0x02; // source app: DAPI (the ADM)
+    content[0x0b] = 0x43; // class: RegisterConf
+    content[0x0e..0x10].copy_from_slice(&(target_sub as u16).to_le_bytes());
+    content[0x10..0x14].copy_from_slice(&0x0000_0fa0u32.to_le_bytes());
+    content[0x14..0x16].copy_from_slice(&0x001eu16.to_le_bytes()); // service id
+    content[0x16..0x18].copy_from_slice(&POSFI_REGISTER_ID.to_le_bytes()); // assigned register-id
+    content[0x18] = 0x01; // status: OK
+    content[0x1a..0x1c].copy_from_slice(&0x0001u16.to_le_bytes()); // version major
+    content[0x1c..0x1e].copy_from_slice(&0x0001u16.to_le_bytes()); // version middle
+    content[0x1e..0x20].copy_from_slice(&0x0001u16.to_le_bytes()); // version minor
+    let mut blob = Vec::with_capacity(8 + content.len());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(content.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&content);
+    let namespace = unicorn.get_data().namespace.clone();
+    let mut guard = namespace.lock().unwrap();
+    crate::common::osal_queues::OsalQueueService::ensure_queue(&mut guard.mq, "mbx_1024");
+    let posted = crate::common::osal_queues::OsalQueueService::guest_post(
+        &mut guard.mq,
+        "mbx_1024",
+        blob,
+        0,
+    );
+    if posted {
+        guard.notify_waiters();
+    }
+    drop(guard);
+    log::info!(
+        "PROCMAPENGINE: injected posfi RegisterConf (server_app={server_app:#x} target_sub={target_sub:#x} reg-id {POSFI_REGISTER_ID:#x} status OK) into mbx_1024 (posted={posted})"
+    );
+}
+
+static POSFI_REF_BLOB: AtomicU32 = AtomicU32::new(0);
+static POSFI_REF_INSERTED: AtomicU32 = AtomicU32::new(0);
+
+/// Stand in for the ServiceReference a status-OK RegisterConf would create:
+/// the engine's client-claim walk in ail_bHandleMsgServiceData matches
+/// inbound service data against the list at app_iface+0x50, but that list is
+/// only fed through the *asynchronous* registration path (async request at
+/// app_iface+0x70 + status-1 conf); the engine's Navi client handlers
+/// register synchronously, so the fabricated conf is dropped with
+/// "asynchronous answer not awaited" and no reference ever appears.
+///
+/// Adding the reference goes through fwl_List::vAdd, whose operator_new
+/// silently fails on this emulated process (no working plain malloc from the
+/// hook context), so mirror the engine's own list-linking instead: nodes are
+/// 24 bytes {+0 prev, +4 next, +8 16-byte item} hung on a head of
+/// {+4 first, +8 last, +0xc count}.  Item fields follow
+/// ail_tclServiceReference's ctor as read by the walk's bIsDataSet:
+/// {+0x00 service, +0x02 server app, +0x04 register-id, +0x06 state}
+/// against message {+0x14, +0x00, +0x16, +0x0e} (0xffff = wildcard), with
+/// state 0 = AVAILABLE required by the claim.
+fn insert_posfi_service_reference(unicorn: &mut Unicorn<'_, Context>, _original_pc: u32) {
+    if POSFI_REF_INSERTED.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let base_address = PROCMAP_BASE.load(Ordering::Relaxed);
+    let app = read_u32_or_invalid(unicorn, base_address + MAP_ENGINE_GLOBAL);
+    let list = read_u32_or_invalid(unicorn, app + 0x50);
+    if app >= 0xf000_0000 || list >= 0xf000_0000 {
+        log::warn!("PROCMAPENGINE: posfi service-reference insert skipped (app={app:#x} list={list:#x})");
+        return;
+    }
+    let mut node = POSFI_REF_BLOB.load(Ordering::Relaxed);
+    if node == 0 {
+        let mmu_arc = {
+            let data = unicorn.get_data();
+            data.mmu.clone()
+        };
+        let addr =
+            mmu_arc.lock().unwrap().heap_alloc(unicorn, 32, Prot::READ | Prot::WRITE, "[posfi-ref]");
+        if addr == 0 {
+            log::warn!("PROCMAPENGINE: no guest memory for posfi service reference");
+            return;
+        }
+        node = addr;
+        POSFI_REF_BLOB.store(addr, Ordering::Relaxed);
+    }
+    let count = read_u32_or_invalid(unicorn, list + 0xc);
+    if count >= 0x0010_0000 {
+        log::warn!("PROCMAPENGINE: posfi service-reference insert skipped (list {list:#x} count {count:#x})");
+        return;
+    }
+    let last = read_u32_or_invalid(unicorn, list + 8);
+    let mut bytes = vec![0u8; 24];
+    bytes[0x08] = 0x1e; // item service id: posfi
+    // The claim walk compares the message's u16 at +0x00 against this slot
+    // (bIsDataSet param_2, observed live at 0x66c580).  That field must
+    // carry the sub-id the Navi client handler is registered under (0x16,
+    // engine ctor 0x39f268), matching the sub-id the provider stamps into
+    // the message, so the walk and the platform+0xa0 handler lookup agree.
+    bytes[0x0a] = 0x16;
+    bytes[0x0c] = 0x17; // item register-id (matches provider messages)
+    bytes[0x0e] = 0x00; // item service state: AVAILABLE
+    bytes[0x10..0x18].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    if count == 0 {
+        // first = last = node, prev = next = 0, count = 1
+        if !write_u32(unicorn, node, 0) || !write_u32(unicorn, node + 4, 0) {
+            return;
+        }
+        if !write_u32(unicorn, list + 4, node) || !write_u32(unicorn, list + 8, node) {
+            return;
+        }
+    } else if last < 0xf000_0000 {
+        // append behind the current last node (mirrors vAdd's second branch)
+        bytes[0x00..0x04].copy_from_slice(&last.to_le_bytes());
+        if !write_u32(unicorn, last + 4, node) {
+            return;
+        }
+        if !write_u32(unicorn, list + 8, node) {
+            return;
+        }
+    } else {
+        return;
+    }
+    if unicorn.mem_write(node as u64, &bytes).is_err() {
+        log::warn!("PROCMAPENGINE: failed to write posfi service reference node at {node:#x}");
+        return;
+    }
+    if !write_u32(unicorn, list + 0xc, count + 1) {
+        return;
+    }
+    POSFI_REF_INSERTED.store(1, Ordering::Relaxed);
+    log::info!(
+        "PROCMAPENGINE: linked posfi service reference {{svc 0x1e, reg-id 0x17, state AVAILABLE}} into list {list:#x} (node {node:#x}, count {} -> {})",
+        count,
+        count + 1
+    );
+
+    // The body thread's very first receive (wait + u32GetFromMessageQueue on
+    // the MQB queue) only completes when a real message arrives: without one
+    // it strands in the IOSC event wait and never reaches its second wait
+    // iteration - where it would re-read the repaired handle (app+0x78) and
+    // join the entry thread on the claiming pass of mbx_1024 (r410).  Post
+    // one posfi message into MQB_1024: it doubles as the first claim test
+    // against the freshly linked reference.
+    let blob = crate::libs::procnav::nav_position_status_message(0x7ff0);
+    let namespace = unicorn.get_data().namespace.clone();
+    let threads = unicorn.get_data().threads.clone();
+    let mut guard = namespace.lock().unwrap();
+    crate::common::osal_queues::OsalQueueService::ensure_queue(&mut guard.mq, "MQB_1024");
+    let posted = crate::common::osal_queues::OsalQueueService::guest_post(
+        &mut guard.mq,
+        "MQB_1024",
+        blob,
+        0,
+    );
+    if posted {
+        // libosal's producer-side post sets the consumer's registered IOSC
+        // event; a host-side post must do the same or the body thread's
+        // u32GetFromMessageQueue waits forever on it (r410).  Set every IOSC
+        // event one of this process' threads is currently blocked on - the
+        // thread list is per process, so this touches no other app.
+        let mut ids = Vec::new();
+        for thread in threads.lock().unwrap().iter() {
+            if let crate::emulator::thread::ThreadStatus::Blocked(
+                crate::emulator::thread::BlockReason::IoscEvent { id, .. },
+            ) = thread.status
+            {
+                ids.push(id);
+            }
+        }
+        let signalled = crate::os::dev::iosc::signal_events(&mut guard, ids);
+        guard.notify_waiters();
+        if !signalled.is_empty() {
+            log::info!(
+                "PROCMAPENGINE: signalled IOSC events {signalled:?} for the body thread's queue receive"
+            );
+        }
+    }
+    drop(guard);
+    log::info!("PROCMAPENGINE: posted posfi wake message into MQB_1024 (posted={posted})");
 }
 
 fn call_guest_function(

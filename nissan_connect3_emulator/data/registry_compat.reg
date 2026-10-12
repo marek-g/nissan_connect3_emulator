@@ -485,3 +485,25 @@
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\SENSORFI\SERVICES\SENSORFI]
 "SERVICEID"=dword:0000000a
+
+; posfi (navigation position) service publication. The map engine's PortControl
+; Navi client handler registers as client of service 0x1e (bInit registers
+; {0x1e fn 0x10/0x13, 0x2c, 0x1f, 0x37}); scd/ADM service-to-app resolution
+; walks PROCESS/*/*/SERVICES/*, so without this entry the REGISTER for 0x1e
+; can never be answered and the engine never routes NavPositionStatus to
+; vHandleNavPosition (the only feed of the CCP that anchors the map view).
+; APPID mirrors SENSORFI's external-provider id so the REGISTER is posted to
+; the host queue store (mbx_21) instead of an app that would reject it.
+[HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\POSFI]
+"APPID"=dword:00000015
+"MAXMCOUNT"=dword:00000078
+"MAXMSIZE"=dword:00000008
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\POSFI\AIF_CONFIG]
+"MSG_COUNT_INTERMEDIATE_MBX"=dword:00000050
+"WATCHDOG_INTERVALL"=dword:00000000
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\POSFI\APP_CONFIG]
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\POSFI\SERVICES\POSFI]
+"SERVICEID"=dword:0000001e

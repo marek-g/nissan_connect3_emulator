@@ -23,6 +23,21 @@ static SYNTH_PWR_START_CONF_CONTENT: AtomicU32 = AtomicU32::new(0);
 static SYNTH_PWR_STATE_REQ_SENT: AtomicBool = AtomicBool::new(false);
 static SYNTH_PWR_STATE_REQ_CONTENT: AtomicU32 = AtomicU32::new(0);
 static SYNTH_PWR_CVM_SIGNAL_CHANGED_SENT: AtomicBool = AtomicBool::new(false);
+/// Guest OSAL handle (queue-info pointer) under which any thread has opened
+/// `MQB_1024` (the map engine's body-thread queue).  Captured here because
+/// the procmapengine hooks must restore it into the engine's wait/forward
+/// field after the early repair_map_ipc_wait_param clobbers that field with
+/// the entry-queue handle (r414: the body thread then leaves its MQB queue
+/// after its first message and starves the claiming pass).
+pub static MQB_1024_INFO: AtomicU32 = AtomicU32::new(0);
+// Sequence number of the last posfi NavPositionStatus seen by the engine's
+// pump plus how often it was delivered: the entry thread forwards it back
+// onto mbx_1024 (sub-id 7) until the body thread's claiming pass picks it
+// up, so a few re-deliveries per sequence are *wanted*; only a message that
+// bounces far beyond that (claim failing) is dropped so it cannot starve
+// the queue.
+static POSFI_LAST_DELIVERED_SEQ: AtomicU32 = AtomicU32::new(0xffff_ffff);
+static POSFI_SEQ_DELIVERIES: AtomicU32 = AtomicU32::new(0);
 static SYNTH_PWR_CVM_SIGNAL_CHANGED_CONTENT: AtomicU32 = AtomicU32::new(0);
 static SYNTH_MAP_PWR_START_CONF_SENT: AtomicBool = AtomicBool::new(false);
 static SYNTH_MAP_PWR_START_CONF_CONTENT: AtomicU32 = AtomicU32::new(0);
@@ -193,6 +208,9 @@ fn handle_queue_api(
         }
         _ => {
             let decoded = decode_queue_handle(unicorn, r0);
+            if decoded.name == "MQB_1024" {
+                MQB_1024_INFO.store(r0, Ordering::Relaxed);
+            }
             if api_name == "OSAL_s32MessageQueuePost" {
                 let words = [
                     read_u32_or_invalid(unicorn, r1),
@@ -420,7 +438,14 @@ fn fallback_create_params(name: &str) -> Option<(u32, u32)> {
 
     if let Some(id) = name.strip_prefix("mbx_") {
         let id = id.parse::<u32>().ok()?;
-        return Some(if id == 265 { (800, 8) } else { (120, 8) });
+        return Some(match id {
+            // The map engine's dispatch mailbox (app id 1024) carries full DAPI
+            // envelopes - forwarded posfi NavPositionStatus messages are ~0xa0
+            // bytes - so the host queue must size for those, not for refs.
+            1024 => (120, 0x110),
+            265 => (800, 8),
+            _ => (120, 8),
+        });
     }
 
     None
@@ -2007,7 +2032,66 @@ fn bridge_mbx_queue(
                 let message = if served_by_other {
                     None
                 } else {
-                    OsalQueueService::pop_guest_message(&mut state.mq, queue_id, usize::MAX)
+                    // The map engine livelock: an error response whose
+                    // register-id is 0xfffe matches no client handler, so
+                    // `bDispatchCCAMessages` re-posts it to mbx_1024 forever
+                    // (subtype-7 re-posts carry sub-id 0x0007, class 0x45 and
+                    // reg-id 0xfffe at content +0x00/+0x0a/+0x0e).  On the unit
+                    // such a message is routed and consumed; here the
+                    // registration handshake that would hand out a routable id
+                    // never completes, so the re-post is pure livelock and it
+                    // also starves the queue for every other message.  Drop it
+                    // at delivery instead of handing it back to the pump.
+                    let mut message =
+                        OsalQueueService::pop_guest_message(&mut state.mq, queue_id, usize::MAX);
+                    if name == "mbx_1024" {
+                        let mut dropped = 0usize;
+                        while let Some(blob) = message.as_ref().map(|m| &m.data) {
+                            // content starts at blob[8]: sub-id @ +0x00,
+                            // class @ +0x0b, register-id @ +0x0e, service
+                            // @ +0x14, seq @ +0x1c (all relative to content).
+                            let bounces = blob.len() >= 0x28
+                                && u16::from_le_bytes([blob[8], blob[9]]) == 0x0007
+                                && blob[0x13] == 0x45
+                                && u16::from_le_bytes([blob[0x16], blob[0x17]]) == 0xfffe;
+                            let posfi = blob.len() >= 0x28
+                                && blob[0x13] == 0x45
+                                && u16::from_le_bytes([blob[0x1c], blob[0x1d]]) == 0x001e;
+                            let posfi_repeat = posfi && {
+                                let seq =
+                                    u16::from_le_bytes([blob[0x24], blob[0x25]]) as u32;
+                                if POSFI_LAST_DELIVERED_SEQ.load(Ordering::Relaxed) != seq {
+                                    POSFI_LAST_DELIVERED_SEQ.store(seq, Ordering::Relaxed);
+                                    POSFI_SEQ_DELIVERIES.store(1, Ordering::Relaxed);
+                                    false
+                                } else {
+                                    POSFI_SEQ_DELIVERIES.fetch_add(1, Ordering::Relaxed) >= 4
+                                }
+                            };
+                            if !bounces && !posfi_repeat {
+                                break;
+                            }
+                            drop(message);
+                            dropped += 1;
+                            message =
+                                OsalQueueService::pop_guest_message(&mut state.mq, queue_id, usize::MAX);
+                        }
+                        if dropped > 0 {
+                            static MBX1024_LIVELOCK_DROPS: std::sync::atomic::AtomicU32 =
+                                std::sync::atomic::AtomicU32::new(0);                            let total = MBX1024_LIVELOCK_DROPS.fetch_add(
+                                dropped as u32,
+                                Ordering::Relaxed,
+                            );
+                            if total < 8 || total % 500 == 0 {
+                                log::info!(
+                                    "[LIBOSAL-MBX] mbx_1024 dropped {} unroutable reg-id 0xfffe error re-posts (total {})",
+                                    dropped,
+                                    total + dropped as u32
+                                );
+                            }
+                        }
+                    }
+                    message
                 };
                 if message.is_some() {
                     state.notify_waiters();

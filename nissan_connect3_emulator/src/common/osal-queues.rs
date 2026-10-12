@@ -204,6 +204,16 @@ impl OsalQueueService {
             None => mq.rtos_open_or_create(&name, spec.maxmsg, spec.msgsize.max(requested_msgsize)),
         };
 
+        // The host queue table is bookkeeping, not guest-visible mq metadata
+        // (the guest's open sizes its own table separately), so a queue first
+        // touched via `ensure_queue`'s default may legally grow when a later
+        // poster needs more room - e.g. posfi status envelopes on mbx_1024.
+        if let Some(queue) = mq.queues.get_mut(&id) {
+            if queue.msgsize < requested_msgsize {
+                queue.msgsize = requested_msgsize;
+            }
+        }
+
         if mq.queues.get(&id).map(|queue| queue.msgsize).unwrap_or(0) < requested_msgsize {
             return false;
         }

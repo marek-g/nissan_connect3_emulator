@@ -1459,6 +1459,7 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         .unwrap_or(true)
     {
         spawn_gps_provider(unicorn);
+        spawn_posfi_provider(unicorn);
     }
 }
 
@@ -1624,6 +1625,119 @@ pub(crate) fn gps_status_message(seq: u16, msg_class: u8) -> Vec<u8> {
     content[0x1a] = 0x06; // opCode: Status (server message)
     content[0x1c..0x1e].copy_from_slice(&seq.to_le_bytes()); // cmd counter
     content[0x20..0x20 + body.len()].copy_from_slice(&body); // CIR payload
+    let mut blob = Vec::with_capacity(8 + LEN);
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(LEN as u32).to_le_bytes());
+    blob.extend_from_slice(&content);
+    blob
+}
+
+/// Stand in for the posfi server (the position computer inside PROCNAV never
+/// constructs its sensor handler, so nothing publishes `posfi_
+/// tclMsgNavPositionStatus` here).  The message is posted straight into the map
+/// engine's dispatch mailbox `mbx_1024`, where the PortControl Navi client
+/// handler consumes it (`vHandleNavPosition` keys on svc `0x1e` / fn `0x10` /
+/// op `6`, pinned by the class accessor thunks `0x600324/0x600334/0x600344` and
+/// by the engine's client function map entry {fn 0x10, svc 0x1e} ->
+/// `vHandleNavPosition` at `0x5507b8`).  Consuming it seeds the engine's CCP
+/// and re-arms `UpdateMapDataRequest` with a real map window - the input the
+/// `0x305` GetBlockIDs failures are missing.
+///
+/// The first revision posts a *pattern* const block (dword i = 0xF0000000+i)
+/// so the vProcessNavPositionStatus probe dump maps wire offset -> parsed
+/// object slot before real Krakow coordinates are placed at the right fields.
+fn spawn_posfi_provider(unicorn: &mut Unicorn<'_, Context>) {
+    let namespace = unicorn.get_data().namespace.clone();
+    let result = std::thread::Builder::new()
+        .name("posfi-provider".into())
+        .spawn(move || {
+            // Give the engine time to open mbx_1024 and finish AIL bring-up.
+            std::thread::sleep(std::time::Duration::from_secs(12));
+            let mut seq: u16 = 0;
+            loop {
+                seq = seq.wrapping_add(1);
+                let blob = nav_position_status_message(seq);
+                let queue = "mbx_1024".to_string();
+                let posted = {
+                    let mut guard = namespace.lock().unwrap();
+                    crate::common::osal_queues::OsalQueueService::ensure_queue(
+                        &mut guard.mq,
+                        &queue,
+                    );
+                    let posted = crate::common::osal_queues::OsalQueueService::guest_post(
+                        &mut guard.mq,
+                        &queue,
+                        blob,
+                        0,
+                    );
+                    if posted {
+                        guard.notify_waiters();
+                    }
+                    posted
+                };
+                if posted {
+                    log::info!("posfi provider: posted NavPositionStatus #{seq} to {queue}");
+                } else if seq % 20 == 1 {
+                    log::info!("posfi provider: {queue} refused NavPositionStatus #{seq}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+        });
+    match result {
+        Ok(_) => log::info!("PROCNAV: posfi NavPositionStatus provider started"),
+        Err(error) => log::warn!("PROCNAV: cannot start posfi provider: {error}"),
+    }
+}
+
+/// One `posfi_tclMsgNavPositionStatus` snapshot blob (pattern phase).  The amt
+/// envelope mirrors `gps_status_message` (class @ +0xb, service @ +0x14,
+/// function @ +0x16/+0x18, opcode @ +0x1a); the payload is the u32 typebase
+/// header word the generic `fi` driver consumes first, then the class' 130-byte
+/// (`movs r1, #0x82` in oRead `0x600f8c`) packed const block as a
+/// recognisable pattern.
+pub(crate) fn nav_position_status_message(seq: u16) -> Vec<u8> {
+    let mut body = Vec::with_capacity(0x90);
+    body.extend_from_slice(&0u32.to_le_bytes()); // typebase header word (typebase+4)
+    for i in 0..33u32 {
+        // 130 bytes of pattern (the last dword is 2 bytes pattern + 2 zero).
+        let word = 0xf000_0000u32.wrapping_add(i);
+        body.extend_from_slice(&word.to_le_bytes());
+    }
+    body.truncate(4 + 130);
+    let len = 0x20 + body.len();
+    let LEN = len.next_multiple_of(16);
+    let mut content = vec![0u8; LEN];
+    // Mirror the DAPI->engine ServiceData envelope, with the client-side
+    // claim walk (ail_bHandleMsgServiceData 0x66c1bc branch, matching the
+    // app_iface+0x50 server-ref list) and the engine's client dispatch
+    // (map_tclPortControl_Platform::vOnNewMessage, which looks the client
+    // handler up in platform+0xa0 keyed by the message's u16 at +0x00) in
+    // mind: destination app 0x400 at +0x02 is mandatory, and +0x00 must
+    // carry the sub-id the client handler is registered under.  The engine
+    // ctor (0x39f268) registers map keys 7=DAPI, 1 & 0x16=Navi, 0x17=WDB,
+    // and vHandleNavPosition (0x5487b8) lives in PortControl_CCAClient
+    // _Handler_Navi, so the posfi server's sub-id is 0x16.
+    content[0x00..0x04].copy_from_slice(&0x0400_0016u32.to_le_bytes());
+    content[0x04..0x08].copy_from_slice(&(LEN as u32).to_le_bytes());
+    content[0x08] = 0x01; // source app: 1 (the unit's posfi server, PROCNAV)
+    content[0x0b] = 0x45; // class: ServiceData
+    // Claim-walk tuple (observed live at 0x66c580): (svc@+0x14, sub@+0x00,
+    // regid@+0x16, +0x0e) vs reference {+0 service, +2 sub, +4 regid,
+    // +8 target-sub}; 0xffff message values are wildcards.  r420 proved a
+    // truncated 0x00ff here killed the match, so both sub slots carry the
+    // full 0xffff sentinel.
+    content[0x0c..0x10].copy_from_slice(&0xffff_ffffu32.to_le_bytes()); // sub-ids: wildcards
+    content[0x10..0x14].copy_from_slice(&0x0001_5f90u32.to_le_bytes());
+    content[0x14..0x16].copy_from_slice(&0x001eu16.to_le_bytes()); // serviceId: posfi
+    // Raw disassembly of ail_bHandleMsgServiceData (ldrh r8,[r1,#0x16] at
+    // 0x66c158) shows the client-side registry match reads the *register-id*
+    // from +0x16 (not a version field), so carry the id our fabricated
+    // RegisterConf assigned to the Navi client handler.
+    content[0x16..0x18].copy_from_slice(&0x0017u16.to_le_bytes()); // register-id
+    content[0x18..0x1a].copy_from_slice(&0x0010u16.to_le_bytes()); // functionId: NavPositionStatus
+    content[0x1a] = 0x06; // opCode: Status
+    content[0x1c..0x1e].copy_from_slice(&seq.to_le_bytes());
+    content[0x20..0x20 + body.len()].copy_from_slice(&body);
     let mut blob = Vec::with_capacity(8 + LEN);
     blob.extend_from_slice(&1u32.to_le_bytes());
     blob.extend_from_slice(&(LEN as u32).to_le_bytes());
