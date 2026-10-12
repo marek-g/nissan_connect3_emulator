@@ -1230,10 +1230,27 @@ fn complete_osal_service(
         OSAL_MBX_FIELD => {
             let content = read_word(unicorn, block + 4).unwrap_or(0);
             if (0x1000..0xf000_0000).contains(&content) {
+                // A receive buffer that holds a posted reference `{1, inner}`
+                // (what our queue model delivers into the waiter's slot) is
+                // dereferenced once: the real OSAL wait hands the *token* to
+                // the channel, the channel stores it, and `bEnableAccess`
+                // (`0x30b27e` -> this wrapper) resolves token -> data before
+                // `u8GetValue` reads the class byte at `data + 0xb` (r379:
+                // answering the buffer itself made STAT_TASK1 read zeros there
+                // and reject every message as "Unknown type of message").
+                let mut answer = content;
+                let mut via = "";
+                if read_word(unicorn, content).unwrap_or(0) == 1 {
+                    let inner = read_word(unicorn, content.wrapping_add(4)).unwrap_or(0);
+                    if (0x1000..0xf000_0000).contains(&inner) {
+                        answer = inner;
+                        via = " (dereferenced)";
+                    }
+                }
                 log::info!(
-                    "monitor: OSAL[{thread}] message reference {content:#x} -> data {content:#x}"
+                    "monitor: OSAL[{thread}] message reference {content:#x} -> data {answer:#x}{via}"
                 );
-                Some(content)
+                Some(answer)
             } else if (0x30b2f0..0x30b340).contains(&(read_word(unicorn, block + 0xc)
                 .unwrap_or(0)
                 & !1))
