@@ -274,6 +274,9 @@ pub const OSAL_MBX_FIELD: u32 = 0x57;
 /// immediately forces the `0x57` malloc fallback, which the emulator does model.
 /// Left un-emulated the probe parks its caller in an 85-tick retry storm.
 pub const OSAL_MEM_FITS: u32 = 0x55;
+/// cmd 44 on object `0x64` (full service `0x2c0464`): post a built service-data
+/// message to the component's pump object (see `complete_osal_service`).
+pub const OSAL_IO_POST: u32 = 0x2c;
 /// cmd 72 (shim `0xbd80` -> `0x5e88`): a stub leaf that unconditionally returns `3`, so the
 /// truthful answer is `3` rather than the catch-all's `0`.
 pub const OSAL_UNSUPPORTED3: u32 = 0x48;
@@ -721,6 +724,7 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool 
                 | OSAL_MBX_OPEN
                 | OSAL_MBX_FIELD
                 | OSAL_MEM_FITS
+                | OSAL_IO_POST
                 | OSAL_STATUS_FLAG
                 | OSAL_TRACE
                 | OSAL_IOSC_SERVICE
@@ -1288,6 +1292,54 @@ fn complete_osal_service(
                 "monitor: OSAL[{thread}] service {service:#x} capacity probe at {block:#x} -> not fitted"
             );
             Some(0)
+        }
+        // `0x2c0464` (traced leaf `0x19089e`): post the built service-data message to
+        // the component's pump object. Block = `{pump, &wrapper+0xc, 8, 2, cont,
+        // data, trace-str, svc}`. `data` (`block[5]`) is the 0x18-byte serialized
+        // body: `w0 = src app | dst app << 16` - the kernel routes it to
+        // `mbx_{dst}`. Capped: a consumer that misses its ownership chain re-posts
+        // the same body back "to the kernel", so without a real owner the exchange
+        // would ping-pong; after eight hops the candidate list is declared exhausted
+        // (`-1`), matching a device where nobody subscribed.
+        0x2c if service == 0x2c04_64 => {
+            let pump = read_word(unicorn, block).unwrap_or(0);
+            let body = read_word(unicorn, block.wrapping_add(0x14)).unwrap_or(0);
+            let w0 = read_word(unicorn, body).unwrap_or(0);
+            let (src_app, dst_app) = (w0 & 0xffff, (w0 >> 16) & 0xffff);
+            static SENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 8 && (1..=0xff).contains(&dst_app) && dst_app != src_app {
+                let namespace = unicorn.get_data().namespace.clone();
+                let mut guard = namespace.lock().unwrap();
+                let queue = format!("mbx_{dst_app}");
+                crate::common::osal_queues::OsalQueueService::ensure_queue(&mut guard.mq, &queue);
+                let mut content = vec![0u8; 0x18];
+                let blob = if unicorn.mem_read(body as u64, &mut content).is_ok() {
+                    let mut b = Vec::with_capacity(8 + 0x18);
+                    b.extend_from_slice(&1u32.to_le_bytes());
+                    b.extend_from_slice(&0x18u32.to_le_bytes());
+                    b.extend_from_slice(&content);
+                    b
+                } else {
+                    crate::libs::procnav::gps_status_message(n as u16, 0x45)
+                };
+                if crate::common::osal_queues::OsalQueueService::guest_post(
+                    &mut guard.mq,
+                    &queue,
+                    blob,
+                    0,
+                ) {
+                    guard.notify_waiters();
+                    log::info!(
+                        "monitor: OSAL[{thread}] pump post on {pump:#x}: body {body:#010x} src {src_app:#x} -> routed to {queue}"
+                    );
+                }
+            } else {
+                log::debug!(
+                    "monitor: OSAL[{thread}] pump post on {pump:#x}: body {body:#010x} src {src_app:#x} dst {dst_app:#x} -> no candidate (-1)"
+                );
+            }
+            Some(-1i32 as u32)
         }
         // `0x48` (shim `0xbd80` -> leaf `0x5e88`): a stub that always returns 3.
         OSAL_UNSUPPORTED3 => {

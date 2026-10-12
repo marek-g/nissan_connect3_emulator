@@ -375,9 +375,10 @@ pub fn run_process_loop(
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        // Deadline values tick every pass, so compare the situation without them
-        // (but keep the thread ids and block reasons legible in the report itself).
-        let park_report = thread_state.clone();
+        // The report doubles as the dedup key: keep them identical so a steady
+        // state prints exactly one line (deadline ticks live inside `reason.name()`
+        // only for non-parked states, which are short-lived anyway).
+        let park_report = thread_state;
         if last_park_report.as_deref() != Some(park_report.as_str()) {
             log::info!(
                 "SCHED: parked {}, threads: {}",
@@ -564,26 +565,29 @@ fn park_duration(unicorn: &Unicorn<'_, Context>) -> Duration {
     let data = unicorn.get_data();
     let threads = data.threads.lock().unwrap();
 
-    let next = threads.iter().find_map(|t| match &t.status {
-        ThreadStatus::Blocked(BlockReason::CoroutineExit { deadline, .. }) => *deadline,
-        ThreadStatus::Blocked(BlockReason::FutexWait { deadline, .. }) => *deadline,
-        ThreadStatus::Blocked(BlockReason::FutexWaitShared { deadline, .. }) => *deadline,
-        ThreadStatus::Blocked(BlockReason::SleepUntil(until)) => Some(*until),
-        ThreadStatus::Blocked(
-            BlockReason::MqSend { deadline, .. } | BlockReason::MqReceive { deadline, .. },
-        ) => *deadline,
-        ThreadStatus::Blocked(BlockReason::OsalQueueReceive { deadline, .. }) => *deadline,
-        ThreadStatus::Blocked(
-            BlockReason::IoscMutex { deadline, .. }
-            | BlockReason::IoscEvent { deadline, .. }
-            | BlockReason::IoscSemaphore { deadline, .. }
-            | BlockReason::MonitorYield { deadline, .. }
-            | BlockReason::InotifyRead { deadline, .. }
-            | BlockReason::SocketRead { deadline, .. }
-            | BlockReason::SignalWait { deadline, .. },
-        ) => *deadline,
-        _ => None,
-    });
+    let next = threads
+        .iter()
+        .filter_map(|t| match &t.status {
+            ThreadStatus::Blocked(BlockReason::CoroutineExit { deadline, .. }) => *deadline,
+            ThreadStatus::Blocked(BlockReason::FutexWait { deadline, .. }) => *deadline,
+            ThreadStatus::Blocked(BlockReason::FutexWaitShared { deadline, .. }) => *deadline,
+            ThreadStatus::Blocked(BlockReason::SleepUntil(until)) => Some(*until),
+            ThreadStatus::Blocked(
+                BlockReason::MqSend { deadline, .. } | BlockReason::MqReceive { deadline, .. },
+            ) => *deadline,
+            ThreadStatus::Blocked(BlockReason::OsalQueueReceive { deadline, .. }) => *deadline,
+            ThreadStatus::Blocked(
+                BlockReason::IoscMutex { deadline, .. }
+                | BlockReason::IoscEvent { deadline, .. }
+                | BlockReason::IoscSemaphore { deadline, .. }
+                | BlockReason::MonitorYield { deadline, .. }
+                | BlockReason::InotifyRead { deadline, .. }
+                | BlockReason::SocketRead { deadline, .. }
+                | BlockReason::SignalWait { deadline, .. },
+            ) => *deadline,
+            _ => None,
+        })
+        .min();
 
     match next {
         Some(deadline) if deadline > now => deadline.duration_since(now).min(POLL_INTERVAL),
