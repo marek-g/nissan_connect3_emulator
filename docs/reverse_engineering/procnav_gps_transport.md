@@ -206,3 +206,44 @@ valid OSAL handle, read/ioctl/close) against the emulator's existing registry
 (`common/registry.rs`); the sensorfi `IOControl(0xb)` answer (and every later service/app
 lookup, comm-member resolution, etc.) rides on top of that. This is a core OSAL-IO feature,
 not a sensorfi-specific shim - sensorfi is just the first thing it unblocks.
+## r315-r347: honest delivery achieved; remaining gap localized to the receive pump
+The registry-IO prerequisite above is now satisfied (opens/ioctl work) and the pipeline was
+rebuilt on honest wire semantics (r341/r345 = reference good runs):
+
+- **Provider**: the host GPS provider builds the same `0x80`-content snapshot but targets
+  app `22` (the STAT component queue `mbx_22`, where `probe-drop-stub` observed
+  `dst=Some(22)` traffic). The kernel emulation delivers by that target - the AE pump
+  (`mbx_19`) is no longer the injection point.
+- **Consumption**: tid76 (STAT task) receives svc=`0xb` prop=`5` opcode=`6` and
+  `bHandleMsgServiceData` (`0xbd50c`) now **matches its ownership chain** (10-14
+  `probe-sd-hit` per run): the component's kernel registrations (monitor cmds `0x44`/`0x56`/
+  `0x57` on the OSAL service object, ~400 registrar runs) do populate the adapter chain.
+  The opcode acceptor (`0x2b7624`, opcodes 6/7/8/a/b) and the STAT channel opens
+  (`0x1f6d26`/`0x1f6ea0`, comm-member find in `rtf_tclChannelFactory::pGetCommMemberInfo`
+  `0x6555c`) all succeed.
+- **HIT == destroy**: the hit path (`0xbd6b8: bl 0x291954`) bottoms out at `0x30b21c`, which
+  only writes the `0x800000b6` vt marker + zeroes. No handler is invoked - definitively
+  re-verified. The router tail vtable dispatch (`0xbe446`, `[[r4]+0x14]`) is a stub for the
+  STAT adapter (`0x7f5d5c` -> `movs r0,#0x7d`), and the class-0x46 (RELUP) route destroys
+  the message too (no svc-data, no repost).
+- **Repost body format** (`0x2c0464`, block `w5`): the built body is exactly `0x18` bytes:
+  `w0 = src_app | dst_app << 16`, `w1 = 0x18`, `w2 = len<<16 | class(0x45)`, `w3 = src`,
+  `w5 (u16) = serviceId`. The repost builder stamps `dst = its own app`, so a chain-hit
+  repost self-targets; the monitor arm routes by `dst` once (8-hop cap) then answers `-1`
+  (exhausted candidates), matching a device where no subscriber exists.
+- **The sink's real driver**: the static table at `0xa38c68` (stride `0x10`, incl.
+  `0x68ff8c` at `0xa38d78`) is a **cmb message-class table** (`{vtable, typeId, size,
+  0x20012}`, GPS status typeId = `0x764`), i.e. `0x68ff8c` is a class method
+  (`oRead`/`onReceive`) of `cmb_fi_tcl_GpsBigdata`-family - invoked by the commcon receive
+  pump after deserialising a message of that typeId. The only in-app caller chain is
+  `pc_tclProcessMessage::s32ProcessMessage` (`0x4d3c38`, method id `0x16250d` in the map at
+  `0x8bdf44`) -> property dispatcher `0x2e5526` (registry singleton `0x01215188`, vt
+  `0x7f5afc`, acquire slot `0x2e6b82` works) - and it has **zero call sites in any run**.
+  Method ids are never referenced by code (computed from messages), so the missing driver
+  is the amt/commcon receive pump for RELUP pushes, not a code path inside the CCA router.
+
+Next step: find/restore the commcon receive pump that PROCNAV normally runs per session
+(candidate: the `0x3f0464`/`0x550364` amt commands on the service object, the `0x13` event
+flag waits, or a dormant per-channel pump thread spawned by `rtf_tclChannelFactory`), then
+deliver a typeId-`0x764` message through it so `0x68ff8c` fires and NavPosition publishing
+can be verified.
