@@ -1,8 +1,24 @@
 use crate::emulator::context::Context;
 use crate::emulator::thread::{BlockReason, ThreadAction};
-use crate::emulator::utils::{pack_u32, pack_u64, unpack_u32};
+use crate::emulator::utils::{pack_u32, unpack_u32};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 use unicorn_engine::{RegisterARM, Unicorn};
+
+/// The clocks the unit counts from power-on (`CLOCK_MONOTONIC` and its raw
+/// variant): the emulator's own start is its boot time.  Reporting host wall
+/// clock here would make the guest's `tv_sec * 1000` millisecond conversion wrap
+/// inside `u32`, so every elapsed-time comparison in every process would jump.
+fn clock_value(clock_id: u32) -> Duration {
+    if matches!(clock_id, 1 | 4) {
+        static BOOT: OnceLock<Instant> = OnceLock::new();
+        BOOT.get_or_init(Instant::now).elapsed()
+    } else {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+    }
+}
 
 pub fn clock_gettime(unicorn: &mut Unicorn<'_, Context>, clock_id: u32, time_spec: u32) -> u32 {
     log::trace!(
@@ -13,18 +29,23 @@ pub fn clock_gettime(unicorn: &mut Unicorn<'_, Context>, clock_id: u32, time_spe
         time_spec,
     );
 
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap();
+    let now = clock_value(clock_id);
 
+    // ARM EABI `struct timespec` is `{ time_t tv_sec; long tv_nsec; }` with both
+    // members 32 bits wide, so the two fields are written as separate words: the
+    // 64-bit form used to overwrite `tv_nsec` with the (zero) high half of
+    // `tv_sec`, which quantised every sub-second elapsed-time reading in the
+    // guest to whole seconds (`OSAL_ClockGetElapsedTime` reported 0 for up to a
+    // second at a time and the map engine kept re-pointing its camera because of
+    // it).
     unicorn
-        .mem_write(time_spec as u64, &pack_u64(now.as_secs()))
+        .mem_write(time_spec as u64, &pack_u32(now.as_secs() as u32))
         .unwrap();
 
     unicorn
         .mem_write(
-            (time_spec + 8) as u64,
-            &pack_u64((now.as_nanos() % 1000000000u128) as u64),
+            (time_spec + 4) as u64,
+            &pack_u32((now.as_nanos() % 1000000000u128) as u32),
         )
         .unwrap();
 

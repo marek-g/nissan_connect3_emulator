@@ -279,6 +279,37 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         "exit_exception_handler",
         stub_zero as CodeStubHandler,
     );
+    // `OSAL_ClockGetElapsedTime()` (0x4851_9ae4) computes
+    // `monotonic_milliseconds - reference`, the reference being read from a
+    // process clock object through a global (`clock_gettime(CLOCK_MONOTONIC)`,
+    // falling back to `gettimeofday`, then `rsb r0, [r1,#8], ip`).  Engine code
+    // compares elapsed times - the PortControl Navi handler's stress-test ladder
+    // re-points the map camera at a hard-coded position for as long as those
+    // elapsed values look fresh - so record what the guest clock really returns.
+    {
+        let address = base_address + (0x4851_9b3c - 0x484d_8000);
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+                static HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                use std::sync::atomic::Ordering;
+                let hits = HITS.fetch_add(1, Ordering::Relaxed);
+                if hits >= 12 {
+                    return;
+                }
+                let elapsed = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                let host_ms = crate::libs::dapi::emu_t0_elapsed_ms() as u32;
+                log::info!(
+                    "0x{:x} [{}] [LIBOSAL] OSAL_ClockGetElapsedTime() = {} (host t0 {} ms, caller {:#x})",
+                    address - base_address + 0x484d_8000,
+                    uc.get_data().inner.thread_id(),
+                    elapsed as i32,
+                    host_ms,
+                    lr,
+                );
+            })
+            .unwrap();
+    }
     hook_core_code(unicorn, base_address);
     hook_io_code(unicorn, base_address);
     hook_registry_code(unicorn, base_address);
