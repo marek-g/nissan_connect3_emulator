@@ -271,6 +271,15 @@ static RENDER_CONTROL_GET_VIEW_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_DATA_MAINLOOP_STATE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_DATA_MAINLOOP_JOB_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_DATA_REQUEST_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_DATA_ADDJOB_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_DATA_ADDJOB_BRANCH_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Address of the fabricated posfi (request=4) MDM job, set when
+/// CreateMDMJobMapDataRequest returns it, so later probes can follow that
+/// exact job object through the map-data queue.
+static MAP_DATA_POSFI_JOB: AtomicU32 = AtomicU32::new(0);
+static MAP_DATA_PMDR_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_DATA_PMDR_GATE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static MAP_DATA_TRIGGER_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_DATA_HANDLE_REQUEST_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_DATA_DAPI_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static AIL_MAIL_VALIDITY_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -433,6 +442,12 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     MAP_DATA_MAINLOOP_STATE_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_DATA_MAINLOOP_JOB_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_DATA_REQUEST_TRACE_COUNT.store(0, Ordering::Relaxed);
+    MAP_DATA_ADDJOB_TRACE_COUNT.store(0, Ordering::Relaxed);
+    MAP_DATA_ADDJOB_BRANCH_TRACE_COUNT.store(0, Ordering::Relaxed);
+    MAP_DATA_POSFI_JOB.store(0, Ordering::Relaxed);
+    MAP_DATA_PMDR_TRACE_COUNT.store(0, Ordering::Relaxed);
+    MAP_DATA_PMDR_GATE_TRACE_COUNT.store(0, Ordering::Relaxed);
+    MAP_DATA_TRIGGER_TRACE_COUNT.store(0, Ordering::Relaxed);
     CCA_BODY_FORWARD_SUPPRESSED.store(0, Ordering::Relaxed);
     CCA_BODY_PASS_TRACE_COUNT.store(0, Ordering::Relaxed);
     PROCMAP_GUEST_CALL_STUB.store(0, Ordering::Relaxed);
@@ -2399,6 +2414,259 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         })
         .unwrap();
 
+    // AddJobToMapDataManagerQueue (0x503414) path probes (r433): the
+    // fabricated posfi UpdateMapDataRequest(4,...) job is queued and the
+    // NOIOSCM event posted, yet the mainloop's GetElement never hands it
+    // out (no PerformMapDataRequest request=4).  Determine whether the
+    // job took the AddElement path, the backup-list branch (DAT_0078f800
+    // != 0 -> 0x5035c4), or the queue-null/semaphore early return
+    // (0x50353c), and what fill state AddElement reported.
+    {
+        const ADDJOB_QUEUE_ENTRY: u32 = 0x0050_3414 - ORIGINAL_BASE;
+        const ADDJOB_BACKUP_BRANCH: u32 = 0x0050_35c4 - ORIGINAL_BASE;
+        const ADDJOB_EARLY_RETURN: u32 = 0x0050_353c - ORIGINAL_BASE;
+        const ADDJOB_ADDELEMENT_RET: u32 = 0x0050_34c0 - ORIGINAL_BASE;
+        const ADDJOB_DAT_0078F800: u32 = 0x0050_39a4 - ORIGINAL_BASE;
+        let addjob_entry = base_address + ADDJOB_QUEUE_ENTRY;
+        unicorn
+            .add_code_hook(addjob_entry as u64, addjob_entry as u64, move |uc, _, _| {
+                let count = MAP_DATA_ADDJOB_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                if job >= 0xf000_0000 {
+                    return;
+                }
+                let request = read_u32_or_invalid(uc, job + 0x24);
+                if count >= 400 || (request == 5 && count % 50 != 0) {
+                    return;
+                }
+                let thread = uc.get_data().inner.thread_id();
+                let backup_got = read_u32_or_invalid(uc, base_address + ADDJOB_DAT_0078F800);
+                log::info!(
+                    "PROCMAPENGINE map-data trace AddJob entry at {addjob_entry:#x}: job={job:#x} type={:#x} request={request} param={:#x} backup_flag={:08x} thread=[{thread}] count={count}",
+                    read_u32_or_invalid(uc, job + 8),
+                    read_u32_or_invalid(uc, job + 0x28) & 0xff,
+                    read_u32_or_invalid(uc, backup_got),
+                );
+            })
+            .unwrap();
+        for (name, offset) in [
+            ("backup-list", ADDJOB_BACKUP_BRANCH),
+            ("early-return0", ADDJOB_EARLY_RETURN),
+        ] {
+            let addr = base_address + offset;
+            unicorn
+                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                    let count = MAP_DATA_ADDJOB_BRANCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if count >= 20 {
+                        return;
+                    }
+                    let job = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                    let request = if job < 0xf000_0000 {
+                        read_u32_or_invalid(uc, job + 0x24)
+                    } else {
+                        0xffff_ffff
+                    };
+                    log::info!(
+                        "PROCMAPENGINE map-data trace AddJob {name} taken at {addr:#x}: job={job:#x} request={request} count={count}"
+                    );
+                })
+                .unwrap();
+        }
+        let addelement_ret = base_address + ADDJOB_ADDELEMENT_RET;
+        unicorn
+            .add_code_hook(addelement_ret as u64, addelement_ret as u64, move |uc, _, _| {
+                let count = MAP_DATA_ADDJOB_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                let job = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                if job >= 0xf000_0000 {
+                    return;
+                }
+                let request = read_u32_or_invalid(uc, job + 0x24);
+                if count >= 400 || (request == 5 && count % 50 != 0) {
+                    return;
+                }
+                let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE map-data trace AddJob AddElement-> at {addelement_ret:#x}: job={job:#x} request={request} r0={:#x} w1c={:#x} w18={:#x}",
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    read_u32_or_invalid(uc, sp + 0x1c),
+                    read_u32_or_invalid(uc, sp + 0x18),
+                );
+            })
+            .unwrap();
+    }
+
+    // CreateMDMJobMapDataRequest::Create (0x4b9d30) allocation outcome
+    // (r434): the posfi UpdateMapDataRequest(4,...) never reached
+    // AddJobToMapDataManagerQueue, so Create must have returned NULL -
+    // heap-null branch (0x4b9df4) or _Internal_Alloc(0x44) failure is
+    // caught right after the bl at 0x4b9d6c.
+    {
+        const MDMJOB_CREATE_ALLOC_RESULT: u32 = 0x004b_9d6c - ORIGINAL_BASE;
+        const MDMJOB_CREATE_HEAP_NULL: u32 = 0x004b_9df4 - ORIGINAL_BASE;
+        for (name, offset) in [
+            ("alloc-result", MDMJOB_CREATE_ALLOC_RESULT),
+            ("heap-null", MDMJOB_CREATE_HEAP_NULL),
+        ] {
+            let addr = base_address + offset;
+            unicorn
+                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                    let prio = uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32;
+                    let job = if name == "heap-null" {
+                        0
+                    } else {
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32
+                    };
+                    if prio == 4 && job != 0 {
+                        MAP_DATA_POSFI_JOB.store(job, Ordering::Relaxed);
+                    }
+                    // Successful prio=5 (default view) creations are the
+                    // flood; only failures and other priorities matter.
+                    if job != 0 && prio == 5 {
+                        return;
+                    }
+                    let count =
+                        MAP_DATA_ADDJOB_BRANCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if count >= 40 {
+                        return;
+                    }
+                    let thread = uc.get_data().inner.thread_id();
+                    log::info!(
+                        "PROCMAPENGINE map-data trace MDMJob Create {name} at {addr:#x}: prio={prio} job={job:#x} thread=[{thread}] count={count}"
+                    );
+                })
+                .unwrap();
+        }
+    }
+
+    // PerformMapDataRequest (0x50c93c) gate probes (r439): GetElement hands
+    // the fabricated request=4 job to the mainloop (kernel-verified), yet no
+    // DapiGetBlockIDs with the Krakow rect follows, so the request must stop
+    // inside PerformMapDataRequest.  After the prologue the rect lives in
+    // r10/r6/r11/r8 (stack args at sp+0x80..0x8c), the prio in r7 and the
+    // scale in s16/r2; the gates return at 0x50c9b0 (width too small),
+    // 0x50cb18 (height too small) and 0x50c9b8 (rect == 0x7fffffff), and the
+    // priority dispatch at 0x50ca54 sends prio 5 to 0x50cf58 but prio 4 to
+    // its own branch at 0x50cb48.
+    {
+        const PMDR_ENTRY: u32 = 0x0050_c978 - ORIGINAL_BASE;
+        const PMDR_INVALID_RECT: u32 = 0x0050_c9b8 - ORIGINAL_BASE;
+        const PMDR_WIDTH_SMALL: u32 = 0x0050_c9b0 - ORIGINAL_BASE;
+        const PMDR_HEIGHT_SMALL: u32 = 0x0050_cb18 - ORIGINAL_BASE;
+        const PMDR_PRIO4_PATH: u32 = 0x0050_cb48 - ORIGINAL_BASE;
+        const PMDR_PRIO5_PATH: u32 = 0x0050_cf58 - ORIGINAL_BASE;
+
+        let pmdr_entry = base_address + PMDR_ENTRY;
+        unicorn
+            .add_code_hook(pmdr_entry as u64, pmdr_entry as u64, move |uc, _, _| {
+                let count = MAP_DATA_PMDR_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                let prio = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                if count >= 800 || (prio == 5 && count % 50 != 0) {
+                    return;
+                }
+                let thread = uc.get_data().inner.thread_id();
+                let r10 = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
+                let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                let r11 = uc.reg_read(RegisterARM::R11).unwrap_or(0) as u32;
+                let r8 = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE map-data trace PerformMapDataRequest at {pmdr_entry:#x}: prio={prio} param={:#x} scale={:#x} ts={:#x} rect=[{r10:#08x} {r6:#08x} {r11:#08x} {r8:#08x}] width={} height={} thread=[{thread}] count={count}",
+                    uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
+                    (r6 as i32).wrapping_sub(r10 as i32),
+                    (r8 as i32).wrapping_sub(r11 as i32),
+                );
+            })
+            .unwrap();
+
+        for (name, offset) in [
+            ("invalid-rect-return", PMDR_INVALID_RECT),
+            ("width-small-return", PMDR_WIDTH_SMALL),
+            ("height-small-return", PMDR_HEIGHT_SMALL),
+            ("prio4-path", PMDR_PRIO4_PATH),
+            ("prio5-path", PMDR_PRIO5_PATH),
+        ] {
+            let addr = base_address + offset;
+            unicorn
+                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                    let prio = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                    // the prio=5 default-view path is known good and floods
+                    if prio == 5 {
+                        return;
+                    }
+                    let count = MAP_DATA_PMDR_GATE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if count >= 60 {
+                        return;
+                    }
+                    let thread = uc.get_data().inner.thread_id();
+                    log::info!(
+                        "PROCMAPENGINE map-data trace PerformMapDataRequest {name} at {addr:#x}: prio={prio} thread=[{thread}] count={count}"
+                    );
+                })
+                .unwrap();
+        }
+    }
+
+    // TriggerHandleMapDataRequest (0x504824): the prio-4 (car cursor) branch
+    // of PerformMapDataRequest ends with TriggerHandleMapDataRequest(false),
+    // which queues a "HandleMapDataRequestInvisibleData" MDM job - the job
+    // that is supposed to turn the stored request into GetBlockIDs calls.
+    {
+        const TRIGGER_HANDLE_MAP_DATA_REQUEST: u32 = 0x0050_4824 - ORIGINAL_BASE;
+        let addr = base_address + TRIGGER_HANDLE_MAP_DATA_REQUEST;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = MAP_DATA_TRIGGER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                let visible = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 & 0xff;
+                if count >= 400 {
+                    return;
+                }
+                let thread = uc.get_data().inner.thread_id();
+                log::info!(
+                    "PROCMAPENGINE map-data trace TriggerHandleMapDataRequest at {addr:#x}: visible={visible} thread=[{thread}] count={count}"
+                );
+            })
+            .unwrap();
+    }
+
+    // IntHandleMapDataRequest (0x5116d4) request selection (r441): the
+    // invisible-data job runs but never reaches GetBlockIDs for the car-cursor
+    // request, so dump what GetHighestPriorityRequest (bl at 0x5116e0) actually
+    // picked: kind (+0), data type (+4), handled-state (+0x74), the LeftToFetch
+    // sentinels (+0x1f4/+0x1f8) and the rect, plus whether it is the static
+    // ms_sMapDataReqCarsor (0x7904e4) the prio-4 branch had just updated.
+    {
+        const INT_HANDLE_GET_HIGHEST_PRIO_RESULT: u32 = 0x0051_16e4 - ORIGINAL_BASE;
+        const MAP_DATA_REQ_CARSOR: u32 = 0x0079_04e4 - ORIGINAL_BASE;
+        let addr = base_address + INT_HANDLE_GET_HIGHEST_PRIO_RESULT;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = MAP_DATA_TRIGGER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count >= 60 {
+                    return;
+                }
+                let request = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                let visible_flag_ptr = read_u32_or_invalid(uc, sp + 0x38);
+                let carsor = base_address + MAP_DATA_REQ_CARSOR;
+                let thread = uc.get_data().inner.thread_id();
+                log::info!(
+                    "PROCMAPENGINE map-data trace IntHandleMapDataRequest picked at {addr:#x}: request={request:#x} carsor={carsor:#x} visible_flag={} kind={} data_type={:#x} state={} f1f4={:#x} f1f8={:#x} rect=[{:08x} {:08x} {:08x} {:08x}] thread=[{thread}] count={count}",
+                    read_u32_or_invalid(uc, visible_flag_ptr) & 0xff,
+                    read_u32_or_invalid(uc, request),
+                    read_u32_or_invalid(uc, request + 4) & 0xff,
+                    read_u32_or_invalid(uc, request + 0x74),
+                    read_u32_or_invalid(uc, request + 500),
+                    read_u32_or_invalid(uc, request + 0x1f8),
+                    read_u32_or_invalid(uc, request + 0x60),
+                    read_u32_or_invalid(uc, request + 0x64),
+                    read_u32_or_invalid(uc, request + 0x68),
+                    read_u32_or_invalid(uc, request + 0x6c),
+                );
+            })
+            .unwrap();
+    }
+
     let request_call_addr = base_address + MAP_DATA_JOB_MAP_DATA_REQUEST_CALL;
     unicorn
         .add_code_hook(
@@ -2406,8 +2674,14 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             request_call_addr as u64,
             move |uc, _, _| {
                 let count = MAP_DATA_REQUEST_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-                if count < 200 {
-                    let request = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                // Same lesson as the UpdateMapDataRequest probe (r431): the
+                // request=5 default-window flood saturates the budget, so
+                // throttle it and keep every other request id visible.
+                let request = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                if count >= 600 || (request == 5 && count >= 10) {
+                    return;
+                }
+                {
                     let priority = (uc.reg_read(RegisterARM::R1).unwrap_or(0) & 0xff) as u32;
                     let scale = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
                     let data_type = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
@@ -3057,21 +3331,39 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         unicorn
             .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
                 let count = MAP_DATA_MAINLOOP_STATE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-                if count < 100 {
-                    let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
-                    let state = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
-                    let thread = uc.get_data().inner.thread_id();
-                    let job_type = read_u32_or_invalid(uc, job + 8);
-                    log::info!(
-                        "PROCMAPENGINE map-data trace {} GetElement at {:#x}: job={:#x} queue_state={:#x} job_type={:#x} thread=[{}]",
-                        name,
-                        addr,
-                        job,
-                        state,
-                        job_type,
-                        thread
-                    );
+                let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                // r438: the request=4 posfi job is delivered to the mainloop's
+                // EnqueueElements (kernel-verified) but never executed, and the
+                // plain 100-entry budget went blind long before the fabricated
+                // position request arrives - track the posfi pointer itself and
+                // sample the rest.
+                let posfi = MAP_DATA_POSFI_JOB.load(Ordering::Relaxed);
+                let job_type_now = read_u32_or_invalid(uc, job + 8);
+                let interesting = job_type_now != 0x45 && job_type_now != 0x83;
+                if !(posfi != 0 && job == posfi) && !interesting && count % 50 != 0 {
+                    return;
                 }
+                if job_type_now == 0x45 && count % 50 != 0 && !(posfi != 0 && job == posfi) {
+                    return;
+                }
+                let state = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                let thread = uc.get_data().inner.thread_id();
+                let job_type = read_u32_or_invalid(uc, job + 8);
+                let queue_slot = read_u32_or_invalid(uc, base_address + 0x0050_399c - ORIGINAL_BASE);
+                let queue = read_u32_or_invalid(uc, queue_slot);
+                log::info!(
+                    "PROCMAPENGINE map-data trace {} GetElement at {:#x}: job={:#x} queue_state={:#x} job_type={:#x} thread=[{}] count={count} queue={:#x} qstate={} qcount={} head={:#x} posfi={posfi:#x}",
+                    name,
+                    addr,
+                    job,
+                    state,
+                    job_type,
+                    thread,
+                    queue,
+                    read_u32_or_invalid(uc, queue),
+                    read_u32_or_invalid(uc, queue + 4),
+                    read_u32_or_invalid(uc, queue + 8),
+                );
             })
             .unwrap();
     }
