@@ -175,6 +175,8 @@ const MAP_DATA_DATASET_ID_VALIDATED_GLOBAL: u32 = 0x0078_f874 - ORIGINAL_BASE;
 static EXAMINE_TRACE_STEPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static EXAMINE_TRACE_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xffff_ffff);
 static EXAMINE_TRACE_ARMS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Same for one `ail_bHandleMsgServiceRegisterConf` processing.
+static CONF_TRACE_ARMS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const MAP_DATA_FASTMAP_AVAILABLE_GLOBAL: u32 = 0x0078_f7f8 - ORIGINAL_BASE;
 const MAP_DATA_STOP_LOADING_GLOBAL: u32 = 0x0078_f7a0 - ORIGINAL_BASE;
 /// Dataset id of the inserted card, taken from the CRYPTNAV volume's
@@ -3596,12 +3598,34 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     } else {
                         (0, admin)
                     };
-                    if offset == 0x0066_963c - ORIGINAL_BASE
-                        && admin == 2
-                        && EXAMINE_TRACE_ARMS.fetch_add(1, Ordering::Relaxed) < 2
-                    {
+                    let is_status = offset == 0x0066_963c - ORIGINAL_BASE && admin == 2;
+                    let is_conf = offset == 0x0066_82bc - ORIGINAL_BASE;
+                    let budget_ok = if is_conf {
+                        CONF_TRACE_ARMS.fetch_add(1, Ordering::Relaxed) < 2
+                    } else {
+                        EXAMINE_TRACE_ARMS.fetch_add(1, Ordering::Relaxed) < 2
+                    };
+                    if (is_status && budget_ok) || (is_conf && budget_ok) {
                         EXAMINE_TRACE_TID.store(uc.get_data().inner.thread_id(), Ordering::Relaxed);
                         EXAMINE_TRACE_STEPS.store(500, Ordering::Relaxed);
+                        if is_conf {
+                            // Dump the sync-answer list (`*this + 0x5c`) that the
+                            // conf handler gates the reference append on.
+                            let thisp = read_u32_or_invalid(uc, reference);
+                            let sync = read_u32_or_invalid(uc, thisp.wrapping_add(0x5c));
+                            let refs = read_u32_or_invalid(uc, thisp.wrapping_add(0x50));
+                            let refs_head = read_u32_or_invalid(uc, refs.wrapping_add(4));
+                            log::info!(
+                                "PROCMAPENGINE conf-entry t={}ms thread=[{}] app_iface={:#x} sync_list+0x5c={:#x} head+4={:#x} refs+0x50={:#x} head+4={:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                uc.get_data().inner.thread_id(),
+                                thisp,
+                                sync,
+                                read_u32_or_invalid(uc, sync.wrapping_add(4)),
+                                read_u32_or_invalid(uc, thisp.wrapping_add(0x50)),
+                                refs_head,
+                            );
+                        }
                     }
                     let header = read_u32_or_invalid(uc, message.wrapping_add(4));
                     log::info!(
