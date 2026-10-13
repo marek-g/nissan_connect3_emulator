@@ -2539,16 +2539,27 @@ pub(crate) fn post_engine_fastmap_service_status(
     if ENGINE_STATUS_SENT.swap(true, Ordering::Relaxed) {
         return false;
     }
-    // r575: publishing state 1 then state 3 made the engine's client handler
-    // flip 0 -> 1 -> 3, and `OnUpdateServiceStateDAPIFastmap` (running seconds
-    // later on the MDM queue) treats anything but state 1 as unavailable - it
-    // zeroed `ms_bFastmapServiceAvailable` instead of opening the channels.
-    // State 1 is the AMT "available" value (the engine itself sends status 2
-    // for "registration denied"), so publish it once and leave it there.
-    let accepted = post_engine_status_to(unicorn, 0x0026, register_id, 1);
+    // r575/r576 semantics, from the engine's own getters:
+    // `map_tclIClientServiceHandler::bIsServiceAvailable` (0x5902f0) is true
+    // ONLY while the state byte at handler+0xe is 0, and the base
+    // `map_tclClientPropertyRegHandler::vServiceStateChanged` (0x5931e0)
+    // (re-)subscribes the property (vtable+0x10 -> vUpRegOrGet -> UpReg on the
+    // wire) only on state 0 - every other value returns without sending
+    // anything. r576 confirmed the notification carries the raw wire byte:
+    // publishing 1 flipped the handler 0 -> 1, which made
+    // bIsServiceAvailable() false and the MDM job close fastmap again. The
+    // synthetic client reference is created with state 0 already, so a lone
+    // 0-publish would be a no-change no-notification. Publish 1 first
+    // (harmless: the MDM job it triggers just closes an already-closed
+    // fastmap), then the real state 0 - that second transition notifies
+    // `vOnServiceStateChange(0)`, sets handler+0xe = 0 (available) and fires
+    // the property 0x401 UpReg toward DAPI.
+    let first = post_engine_status_to(unicorn, 0x0026, register_id, 1);
+    let accepted = post_engine_status_to(unicorn, 0x0026, register_id, 0);
     log::info!(
-        "[LIBOSAL-MBX] synthesized directory ServiceStatus(svc 0x26 regid {:#x}, state 1) into mbx_1024: {}",
+        "[LIBOSAL-MBX] synthesized directory ServiceStatus(svc 0x26 regid {:#x}, state 1 then 0) into mbx_1024: {} {}",
         register_id,
+        first,
         accepted
     );
     accepted
