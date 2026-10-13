@@ -129,6 +129,88 @@ fn stamp_registration_id(queue: &str, body: &mut [u8]) {
         );
     }
 }
+/// Give DAPI's map-data answers the unique id the *receiver* can claim them with.
+///
+/// The claim walk on both sides is `ail_tclServiceReference::bIsDataSet` (0x66e3d0):
+/// it compares the message's unique id (content +0x0e, the word the mbx_7
+/// normalization clears to zero on purpose) against the slot the receiver's service
+/// reference stores at +0x08, and its 0xffff wildcard only covers the message
+/// argument, so the stored slot has to compare equal to what the peer really sends.
+/// DAPI sends `AIL_NO_UNIQUE_ID` (0xfffe) there while MAPENGINE's client reference for
+/// the DAPI map service (0x26) keeps unique id 0, because its async register path
+/// (`bRegisterAsyncExecute` 0x660f74 / `vHandleAsyncRegisterConf` 0x665720) never
+/// assigns that slot from the conf.  DAPI's answers therefore could not be claimed and
+/// the block ids never reached the request; patching the slot in the *engine's*
+/// reference instead made the engine's own `GetBlockIDs` requests fail their validity
+/// check (`ail_enCheckClientMailValidity` 0x66dd00 refused them, `enPostMessage`
+/// 0x661a3c answered 7, so only the first two requests were ever sent - r551).
+/// Normalizing the answer field per receiver, the same way `mbx_7` does, satisfies the
+/// claim walk of both peers at once and leaves guest memory alone.
+fn stamp_unique_id_for_receiver(queue: &str, body: &mut [u8]) {
+    /// Content offset of the unique id the claim walk compares.
+    const UNIQUE_ID_OFFSET: usize = 0x0e;
+    const NO_UNIQUE_ID: u16 = 0xfffe;
+    /// DAPI's application id, the peer whose answers carry `AIL_NO_UNIQUE_ID`.
+    const DAPI_APP_ID: u16 = 0x7;
+    /// The map-data service whose answers the engine's `GetBlockIDs` waits for.
+    const DAPI_MAP_SERVICE: u16 = 0x26;
+    const MAPENGINE_APP_ID: u16 = 0x0400;
+
+    if queue == "mbx_7"
+        || body.len() <= UNIQUE_ID_OFFSET + 1
+        || body[0x0b] != 0x45
+        || u16::from_le_bytes([body[UNIQUE_ID_OFFSET], body[UNIQUE_ID_OFFSET + 1]]) != NO_UNIQUE_ID
+        || u16::from_le_bytes([body[0x14], body[0x15]]) != DAPI_MAP_SERVICE
+    {
+        return;
+    }
+    let peer = u16::from_le_bytes([body[0], body[1]]);
+    let other = u16::from_le_bytes([body[0x02], body[0x03]]);
+    let src = u16::from_le_bytes([body[0x08], body[0x09]]);
+    if ![peer, other, src].contains(&DAPI_APP_ID) || ![peer, other, src].contains(&MAPENGINE_APP_ID)
+    {
+        return;
+    }
+    body[UNIQUE_ID_OFFSET..UNIQUE_ID_OFFSET + 2].copy_from_slice(&0u16.to_le_bytes());
+    static STAMPS: AtomicU32 = AtomicU32::new(0);
+    if STAMPS.fetch_add(1, Ordering::Relaxed) < 12 {
+        log::info!(
+            "[LIBOSAL-MBX] cleared the unique id of DAPI's service {DAPI_MAP_SERVICE:#06x} answer on {queue} (peer={peer:#06x} other={other:#06x} src={src:#06x}) so MAPENGINE can claim it"
+        );
+    }
+}
+
+/// Temporary: show the id fields of every DAPI map-service ServiceData that passes,
+/// so the offsets `stamp_unique_id_for_receiver` keys on can be verified.
+fn trace_dapi_map_service_data(queue: &str, body: &[u8]) {
+    if body.len() <= 0x1a || body[0x0b] != 0x45 {
+        return;
+    }
+    if u16::from_le_bytes([body[0x14], body[0x15]]) != 0x26 {
+        return;
+    }
+    let count = UNIQUE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count >= 60 {
+        return;
+    }
+    let words = [0x00u32, 0x02, 0x08, 0x0a, 0x0c, 0x0e, 0x16, 0x18]
+        .iter()
+        .map(|&i| {
+            format!(
+                "{:#06x}",
+                u16::from_le_bytes([body[i as usize], body[i as usize + 1]])
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    log::info!(
+        "[LIBOSAL-MBX] DAPI map ServiceData on {queue}: opcode={:#04x} words[0,2,8,a,c,e,16,18]=[{words}]",
+        body[0x1a]
+    );
+}
+
+static UNIQUE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
 static SYNTH_PWR_CVM_SIGNAL_CHANGED_CONTENT: AtomicU32 = AtomicU32::new(0);
 static SYNTH_MAP_PWR_START_CONF_SENT: AtomicBool = AtomicBool::new(false);
 static SYNTH_MAP_PWR_START_CONF_CONTENT: AtomicU32 = AtomicU32::new(0);
@@ -2046,6 +2128,8 @@ fn bridge_mbx_queue(
             // each (client queue, service) pair an id when its conf arrives and stamp that
             // id into every provider message delivered to the same pair afterwards.
             stamp_registration_id(name, &mut body);
+            trace_dapi_map_service_data(name, &body);
+            stamp_unique_id_for_receiver(name, &mut body);
             if body.len() >= 0x18
                 && u16::from_le_bytes([body[0], body[1]]) == 0x0400
                 && matches!(body[0xb], 0x41 | 0x42 | 0x44 | 0x45)
