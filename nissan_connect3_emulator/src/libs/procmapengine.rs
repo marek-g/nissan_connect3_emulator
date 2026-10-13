@@ -2390,15 +2390,39 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 return;
             }
             let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            // The answer's block-id array (`fi_tclVisitorMessage::s32GetData` in
+            // `vHandleGetBlockIDs` deserialized it just before this `Execute`): a
+            // begin/end pointer pair at `job + 0x30`/`job + 0x34` with 12-byte
+            // `fmp_tclUniqueID` elements (`(end - begin) >> 2 * -0x55555555` in
+            // `Execute` is a divide by 12). `job + 0x24` is the array's vptr.
+            let begin = read_u32_or_invalid(uc, this + 0x30);
+            let end = read_u32_or_invalid(uc, this + 0x34);
+            let count = if begin != u32::MAX && end != u32::MAX && end > begin && (end - begin) % 12 == 0 {
+                ((end - begin) / 12) as u64
+            } else {
+                u64::from(u32::MAX)
+            };
+            let uid0 = if begin != u32::MAX && (0x10000..0x6000_0000).contains(&begin) {
+                read_u32_or_invalid(uc, begin)
+            } else {
+                u32::MAX
+            };
+            let uid1 = if count > 1 {
+                read_u32_or_invalid(uc, begin + 12)
+            } else {
+                0
+            };
             log::info!(
-                "PROCMAPENGINE map-data trace HandleGetBlockIDs::Execute at {:#x}: t={}ms thread=[{}] job={:#x} mdm_ref={:#x} answer_code={:#x} block_count={}",
+                "PROCMAPENGINE map-data trace HandleGetBlockIDs::Execute at {:#x}: t={}ms thread=[{}] job={:#x} mdm_ref={:#x} answer_code={:#x} block_count={} uid0={:#x} uid1={:#x}",
                 execute,
                 crate::libs::dapi::emu_t0_elapsed_ms(),
                 uc.get_data().inner.thread_id(),
                 this,
                 read_u16_or_invalid(uc, this + 0x1e),
                 read_u32_or_invalid(uc, this + 0xc),
-                read_u32_or_invalid(uc, this + 0x24),
+                count,
+                uid0,
+                uid1,
             );
         })
         .unwrap();
@@ -2771,10 +2795,20 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
         unicorn
             .add_code_hook(add as u64, add as u64, move |uc, _, _| {
                 let logs = ADD_LOGS.fetch_add(1, Ordering::Relaxed);
-                if logs >= 800 {
+                if logs >= 1500 {
                     return;
                 }
                 let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                // One call site floods the render control queue with a per-frame job;
+                // keep the first few of those and spend the rest of the budget on the
+                // other jobs, so a late MapObjectsUpdate job cannot be crowded out of
+                // the log (r545 filled all 800 lines within 10 s).
+                let caller = ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                    .wrapping_sub(base_address)
+                    .wrapping_add(ORIGINAL_BASE);
+                if caller == 0x004c_7270 && logs >= 3 {
+                    return;
+                }
                 let queue = read_u32_or_invalid(uc, rc_queue_global);
                 // `map_tclJobQueue::AddElement` (0x4a4284) does not link the element: it
                 // posts the element *pointer* into the queue's incoming-job OSAL message
@@ -3075,6 +3109,30 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                             .wrapping_sub(base_address)
                             .wrapping_add(ORIGINAL_BASE),
                     );
+                    // The unsolicited `fn=0x103` map-service requests (seen ~0.6 s
+                    // after every `GetBlockIDs` answer) have no Ghidra-side handler
+                    // name yet; dump their serialized body (block ids live past the
+                    // 0x1c-byte header) so the method can be identified from its
+                    // content.
+                    if service == 0x26 && opcode == 2 && function != 2 {
+                        static BODY_LOGS: AtomicU32 = AtomicU32::new(0);
+                        if BODY_LOGS.fetch_add(1, Ordering::Relaxed) < 40 {
+                            let mut bytes = [0u8; 128];
+                            let body = match uc.mem_read((header + 0x1c) as u64, &mut bytes) {
+                                Ok(()) => bytes
+                                    .iter()
+                                    .map(|b| format!("{b:02x}"))
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
+                                Err(_) => "<unreadable>".to_string(),
+                            };
+                            log::info!(
+                                "PROCMAPENGINE map-data trace fn={:#x} request body at {:#x}: [{body}]",
+                                function,
+                                header + 0x1c,
+                            );
+                        }
+                    }
                 })
                 .unwrap();
         }
