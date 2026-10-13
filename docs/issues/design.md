@@ -1738,3 +1738,58 @@ Consequences for the open threads here:
   360/2^32 degrees (1 deg = 11930464.57), while the fabricated position put
   `0x1cdde1` (19.91809e5) into the same slot.  The posfi wire coordinates and
   thus the Krakow rect have to be re-encoded before DAPI can answer them.
+
+## Why the map area in the GUI is black (r462-r465, 2026-10-13)
+
+Two separate things were conflated here; only the first is real.
+
+**The shared map surface works.** procmapengine renders into EGL surface
+`0x5f4d4150` ("MAP", 800x480), the emulator reads it back into
+`MAP_SURFACE_BYTES`, and `write_map_surface_to_guest` copies it into the guest
+buffer that prochmi imports. The HMI-side probe confirms the bytes arrive:
+`svg map surface probe base=0x908ea000 midpx=[cc, ce, d9, ff] row240_nonblack=800`.
+(Read back through GL the same pixel is `[d9, ce, cc, ff]`, i.e. our upload is
+swapping R/B relative to the engine's readback - a real but cosmetic bug.)
+
+**What prochmi actually does** (r464, single occurrence at the emulated EA-hide):
+
+    GUI_DM_EAManager::updateEAHide -> GUI_GL_LayerSync::copyLayer -> getLayers
+      -> svg layer_by_name("MAP_View1") = 0x5f4c0001
+      -> GUI_GL_LayerCopy::copy(0, 0x5f4c0001)
+      -> svg layer_status / layer_error / resource_error
+      -> GUI_GL_Texture(this, 0x320, 0x1e0, data=0x908ea000)   <- the map texture
+      -> glTexImage2D(..., w=800, h=480, data=0x0)             <- allocation only
+
+So the layer texture is allocated once with a NULL client pointer and never
+re-filled, exactly as the old comment in `prochmi.rs` said. `refresh_texture_*`
+tried to keep it current but read the texture name through
+`manager+0x130 -> *layer_copy -> *texture`, which walks into the LayerCopy
+*vtable*, i.e. yielded name 0, and the refresh returned early forever. The
+engine's pixels therefore never reached any texture the HMI samples.
+
+r465 fixes the identification: the map texture is recognised from the upload
+whose source pointer is inside the shared map surface
+(`note_map_layer_texture`), and every 30 frames `refresh_texture_from_map_surface`
+now uploads the live surface into it. The probe read-back proves the texture
+content is correct: `snapshot-readback tex=24 center=[d9, ce, cc, ff]`.
+
+**Remaining blocker: prochmi never draws that texture.** The frame is still
+black in the map region, and the region is *opaque* black (`glClear` colour
+0,0,0,1), so no alpha-based compositing can reveal the map either. Two open
+questions, in order:
+
+1. Where does the black come from? It is drawn content, not the clear: with the
+   clear alpha forced to 0 the frame still had `opaque=380800` and only 3200
+   `alpha=0` pixels, arranged as a fine diagonal hatch. Either that hatch is the
+   map window itself (dithered transparency), or the page draws an opaque
+   background layer that on real hardware sits *above* the map layer.
+2. What makes prochmi sample the layer texture at all? `GUI_GL_LayerCopy::copy`
+   ran once (during the hide handshake); the per-frame draw path that would bind
+   tex 0x18 and blend it has not been located. Needs `prochmi_out.out` in Ghidra
+   (`GUI_GL_LayerCopy`, `GUI_GL_OpenGL::mixLayers`, `GUI_DM_EAManager`).
+
+**Rejected approach, do not repeat:** treating pure black as a colour key
+(punch-through) does make the map appear behind the widgets, but it also eats
+every black label drawn over the map window ("FM1", "Starting navigation.",
+"50 m") and looks terrible; limiting the key to flat black leaves a diagonal
+hatch of dashes. Both variants were tried and reverted in r464/r465.

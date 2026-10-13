@@ -759,6 +759,10 @@ fn probe_clears() -> bool {
     *V.get_or_init(|| std::env::var("EMU_GPU_PROBE_CLEARS").is_ok())
 }
 
+// True (the default) when the HMI's own window surface is cleared as a
+// compositor layer would be, i.e. transparently, so the map layer underneath
+// can show through.  Set EMU_GPU_HMI_CLEAR_OPAQUE to compare against the
+
 fn hmi_capture_prefix() -> Option<String> {
     std::env::var("EMU_GPU_HMI_CAPTURE_PREFIX")
         .ok()
@@ -2577,6 +2581,57 @@ fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     0
 }
 
+/// Texture name most recently bound on the HMI target, mirrored from the guest
+/// `glBindTexture` calls (the guest and host names are identical there).
+static HMI_LAST_BOUND_TEXTURE: AtomicU32 = AtomicU32::new(0);
+
+/// The texture prochmi imports procmap's map surface into.  `GUI_GL_Texture`
+/// allocates exactly one 800x480 texture with a NULL data pointer and the
+/// display engine fills it on the real unit; the import happens once, so without
+/// help the layer keeps whatever it was allocated with (black) and the HMI
+/// paints an opaque black rectangle over the map.  Recognise the texture by its
+/// unique size and keep it fed from `MAP_SURFACE_BYTES`.
+static MAP_LAYER_TEXTURE: AtomicU32 = AtomicU32::new(0);
+
+pub fn map_layer_texture() -> u32 {
+    MAP_LAYER_TEXTURE.load(Ordering::Acquire)
+}
+
+/// True when `addr` points into the guest copy of the shared map surface.
+fn map_surface_contains(addr: u32) -> bool {
+    map_surface_bases()
+        .lock()
+        .map(|bases| {
+            bases.values().any(|&base| {
+                addr >= base && addr < base.wrapping_add(MAP_SURFACE_SIZE as u32)
+            })
+        })
+        .unwrap_or(false)
+}
+
+// Recognise prochmi's map-layer texture: the unique 800x480 upload on the HMI
+// target, or any upload whose source is the shared map surface itself.
+fn note_map_layer_texture(
+    unicorn: &mut Unicorn<'_, Context>,
+    width: i32,
+    height: i32,
+    data_addr: u32,
+) {
+    if current_gpu_target() != GpuTarget::Hmi {
+        return;
+    }
+    if !(map_surface_contains(data_addr)
+        || (width == MAP_SURFACE_WIDTH as i32 && height == MAP_SURFACE_HEIGHT as i32))
+    {
+        return;
+    }
+    let name = HMI_LAST_BOUND_TEXTURE.load(Ordering::Relaxed);
+    if name == 0 || MAP_LAYER_TEXTURE.swap(name, Ordering::AcqRel) == name {
+        return;
+    }
+    log::info!("GPU: map layer texture of the HMI is {:#x}", name);
+}
+
 fn route_tex_image2d(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let target = ureg(unicorn, RegisterARM::R0);
     let level = ureg(unicorn, RegisterARM::R1) as i32;
@@ -2600,6 +2655,7 @@ fn route_tex_image2d(unicorn: &mut Unicorn<'_, Context>) -> u32 {
         kind,
         data_addr
     );
+    note_map_layer_texture(unicorn, width, height, data_addr);
     let data = texture_bytes(unicorn, format, kind, width, height, data_addr);
     gpu_tex_image2d(
         target, level, internal, width, height, border, format, kind, data,
@@ -2617,6 +2673,7 @@ fn route_tex_sub_image2d(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let format = stack_arg(unicorn, 2);
     let kind = stack_arg(unicorn, 3);
     let data_addr = stack_arg(unicorn, 4);
+    note_map_layer_texture(unicorn, width, height, data_addr);
     let data = texture_bytes(unicorn, format, kind, width, height, data_addr);
     gpu_tex_sub_image2d(target, level, x, y, width, height, format, kind, data);
     0
@@ -2688,11 +2745,11 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
             return Some(0);
         }
         "glBindTexture" => {
-            gpu_void_v2(
-                gl::BindTexture,
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-            );
+            let name = ureg(unicorn, RegisterARM::R1);
+            if name != 0 && current_gpu_target() == GpuTarget::Hmi {
+                HMI_LAST_BOUND_TEXTURE.store(name, Ordering::Relaxed);
+            }
+            gpu_void_v2(gl::BindTexture, ureg(unicorn, RegisterARM::R0), name);
             return Some(0);
         }
         "glBlendEquation" => {

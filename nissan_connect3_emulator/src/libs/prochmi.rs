@@ -2060,12 +2060,8 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
                     // the HMI.
                     let frames = LSYNC_REFRESH_FRAMES.fetch_add(1, Ordering::Relaxed);
                     if frames % 30 == 0 {
-                        let manager = LSYNC_EA_MANAGER.load(Ordering::Relaxed);
-                        let layer_copy = read_u32(uc, manager + 0x130);
-                        let texture = read_u32(uc, layer_copy);
-                        let tex_name = read_u32(uc, texture);
                         crate::gpu::refresh_texture_from_map_surface(
-                            tex_name,
+                            crate::gpu::map_layer_texture(),
                             SVG_MAP_WIDTH as i32,
                             SVG_MAP_HEIGHT as i32,
                         );
