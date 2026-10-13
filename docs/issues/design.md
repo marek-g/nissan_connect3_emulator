@@ -1660,3 +1660,25 @@ Consequences for the open threads here:
   drives the engine's map window.  Open: the MDM job queue created by that
   call is still not consumed (no DapiGetBlockIDs for the Krakow job; the
   early default-window request=5 chain still ends in the DAPI 0x305).
+- **r428-r432 (kick self-inflicted MDM murder + list watchdog):** the DAPI
+  svc-0x26 and Navi kicks both ran inside the bSendCCARequest entry hook;
+  `call_guest_function` saves the hijacked registers once (LR = restore
+  stub), so queuing a second hijack while the first still runs corrupts
+  both frames - the resumed GetBlockIDs job entered bSendCCARequest with
+  r1=0 and the READ_UNMAPPED at 0x591b00 killed the map-data mainloop
+  (tid63 exited(1)) in EVERY kick-era run (r410-r427).  Fix: at most one
+  guest call per hook event (`!register_fired` gate) - tid63 now survives,
+  the DAPI 0x26 service registers for real (service_state 0), and the
+  request=5 chain runs 100+ times.  Second discovery: the engine's live
+  svc-0x26 registration REBUILDS the app_iface+0x50 server-ref list and
+  detaches the host-linked posfi node (claim silently dies); the
+  handle_service_data hook now runs `ensure_posfi_ref_linked`, a watchdog
+  that re-links the node at the tail whenever the forward walk misses it.
+  r432: 12 claims + 12 vHandleNavPosition + the Krakow
+  `UpdateMapDataRequest(4,0,5.0,0,...)` (trace=133 - earlier r0=5 floods
+  hid it behind the 24-entry probe budget) + bbox flips to
+  [0x1cdde1..0x1feb21]x[0x4ba05e..0x4d26fe].  Open: the request=4 job is
+  queued (NOIOSCM event posts visible) but no PerformMapDataRequest
+  request=4 / Krakow-rect DapiGetBlockIDs observed yet (request=5 probes
+  saturate the budgets; needs request-type-filtered probes or the view-
+  rect path - tid65 keeps re-requesting the default window).

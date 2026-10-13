@@ -1876,6 +1876,7 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                 return;
             }
             let thread = uc.get_data().inner.thread_id();
+            let handler = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let handle = read_u32_or_invalid(uc, message + 4);
             log::info!(
@@ -1887,12 +1888,38 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                 thread,
                 count + 1
             );
+            if count < 3 && (0x1000..0xf000_0000).contains(&handler) {
+                // The window gate in the gate body compares the parsed
+                // longitude/latitude against this handler's bounding box at
+                // +0x70 (lon min) +0x74 (lon max) +0x78 (lat min) +0x7c
+                // (lat max); log it so a silently pre-initialized window is
+                // visible.
+                log::info!(
+                    "PROCMAPENGINE: vHandleNavPosition window-gate this={handler:#x} bbox=[{:08x} {:08x} {:08x} {:08x}]",
+                    read_u32_or_invalid(uc, handler + 0x70),
+                    read_u32_or_invalid(uc, handler + 0x74),
+                    read_u32_or_invalid(uc, handler + 0x78),
+                    read_u32_or_invalid(uc, handler + 0x7c)
+                );
+            }
         })
         .unwrap();
 
     let handle_service_data = base_address + AIL_HANDLE_MSG_SERVICE_DATA;
     unicorn
         .add_code_hook(handle_service_data as u64, handle_service_data as u64, move |uc, _, _| {
+            // Watchdog: the engine's live registrations can detach the
+            // fabricated posfi reference from the server-ref list; re-link
+            // it before this message's claim walk runs (r429).
+            {
+                let dispatch = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                if dispatch < 0xf000_0000 {
+                    let app_iface = read_u32_or_invalid(uc, dispatch);
+                    if app_iface < 0xf000_0000 {
+                        ensure_posfi_ref_linked(uc, app_iface);
+                    }
+                }
+            }
             let count = HANDLE_SERVICE_DATA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 12 {
                 return;
@@ -1927,6 +1954,23 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                     (0x70, "async-reqs"),
                 ] {
                     let list_head = read_u32_or_invalid(uc, app_iface + list_off);
+                    if list_off == 0x50 {
+                        // Link-state diagnostics (r429): the engine's own
+                        // svc 0x26 registration detached the host-linked
+                        // posfi reference (first moved to the engine node),
+                        // so log the raw list head and the posfi node's own
+                        // prev/next to see how the chain is rebuilt.
+                        let posfi = POSFI_REF_BLOB.load(Ordering::Relaxed);
+                        log::info!(
+                            "PROCMAPENGINE: server-refs list {list_head:#x} raw [{:08x} {:08x} {:08x} {:08x}] posfi_node={posfi:#x} prev={:08x} next={:08x}",
+                            read_u32_or_invalid(uc, list_head),
+                            read_u32_or_invalid(uc, list_head + 4),
+                            read_u32_or_invalid(uc, list_head + 8),
+                            read_u32_or_invalid(uc, list_head + 0xc),
+                            read_u32_or_invalid(uc, posfi),
+                            read_u32_or_invalid(uc, posfi + 4)
+                        );
+                    }
                     let mut node = read_u32_or_invalid(uc, list_head + 4);
                     let mut idx = 0u32;
                     while (0x1000..0xf000_0000).contains(&node) && idx < 12 {
@@ -2033,7 +2077,7 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
     unicorn
         .add_code_hook(ref_is_dataset as u64, ref_is_dataset as u64, move |uc, _, _| {
             let count = REF_WALK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if count >= 40 {
+            if count >= 200 {
                 return;
             }
             let thread = uc.get_data().inner.thread_id();
@@ -2094,7 +2138,12 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
             move |uc, _, _| {
                 let count =
                     MAP_DATA_UPDATE_REQUEST_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-                if count >= 24 {
+                // r431: the posfi window call (r0=4) stayed invisible
+                // because the flood of default r0=5 requests ate the whole
+                // 24-entry budget first.  Log only a handful of those and
+                // every other priority.
+                let r0_now = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                if count >= 200 || (r0_now == 5 && count >= 8) {
                     return;
                 }
                 let thread = uc.get_data().inner.thread_id();
@@ -2525,8 +2574,17 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             // vector for the Navi vtable and vRegisterService each pending
             // client service handler (svc at +4, register-id sentinel 0xffff
             // at +0xc, exactly as vOnNewAppState iterates them).
+            //
+            // Serialization (r428): call_guest_function only saves the caller
+            // registers once (LR = restore stub), so a second call queued
+            // while the first still runs corrupts both frames - the engine
+            // then resumed the GetBlockIDs job with r1=0 and died in
+            // bSendCCARequest (READ_UNMAPPED 0x591b00), killing the map-data
+            // mainloop (tid63 exited(1)) in every kick-era run.  Fire at most
+            // one guest call per hook event; the posfi kick runs on the next
+            // entry to this hook.
             let platform = PORTCONTROL_PLATFORM.load(Ordering::Relaxed);
-            if platform != 0 && platform < 0xf000_0000 {
+            if !register_fired && platform != 0 && platform < 0xf000_0000 {
                 // Handler vector of PortControl_CCAClientHandlerBase* (4-byte
                 // elements) at platform +0x94..+0x9c.
                 let begin = read_u32_or_invalid(uc, platform + 0x94);
@@ -2561,7 +2619,18 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                         read_u16_or_invalid(uc, service_handler + 4) & 0xffff;
                                     let reg_id =
                                         read_u16_or_invalid(uc, service_handler + 0xc) & 0xffff;
-                                    if reg_id == 0xffff {
+                                    // Only register svc 0x1e (posfi): that is
+                                    // the one service the fabricated provider
+                                    // feeds.  Registering the sibling Navi
+                                    // services (0x1f/0x2c/0x37, r412-r427)
+                                    // made DAPI's ADM remember requests whose
+                                    // engine-side message slots stayed empty,
+                                    // and the later tail-call entered
+                                    // bSendCCARequest (0x591af0) with
+                                    // message=NULL -> READ_UNMAPPED at
+                                    // 0x591b00, silently killing the map-data
+                                    // mainloop thread (tid63 exited(1)).
+                                    if reg_id == 0xffff && service_id == 0x1e {
                                         let function =
                                             base_address + MAP_DATA_CLIENT_VREGISTER_SERVICE;
                                         if call_guest_function(
@@ -2991,14 +3060,16 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 if count < 100 {
                     let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                     let state = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                    let thread = uc.get_data().inner.thread_id();
                     let job_type = read_u32_or_invalid(uc, job + 8);
                     log::info!(
-                        "PROCMAPENGINE map-data trace {} GetElement at {:#x}: job={:#x} queue_state={:#x} job_type={:#x}",
+                        "PROCMAPENGINE map-data trace {} GetElement at {:#x}: job={:#x} queue_state={:#x} job_type={:#x} thread=[{}]",
                         name,
                         addr,
                         job,
                         state,
-                        job_type
+                        job_type,
+                        thread
                     );
                 }
             })
@@ -3836,8 +3907,59 @@ static POSFI_REF_INSERTED: AtomicU32 = AtomicU32::new(0);
 /// {+0x00 service, +0x02 server app, +0x04 register-id, +0x06 state}
 /// against message {+0x14, +0x00, +0x16, +0x0e} (0xffff = wildcard), with
 /// state 0 = AVAILABLE required by the claim.
-fn insert_posfi_service_reference(unicorn: &mut Unicorn<'_, Context>, _original_pc: u32) {
-    if POSFI_REF_INSERTED.load(Ordering::Relaxed) != 0 {
+// Keep the fabricated posfi service reference linked into the engine's
+// server-reference list (app_iface+0x50).  The engine's own svc 0x26
+// registration (r429, live once DAPI answers the register handshake)
+// rebuilds that list and detaches the host-linked node, after which no
+// NavPositionStatus message can claim.  Re-link at the tail whenever the
+// watchdog walk fails to find the node; the node body (+8..+20) already
+// carries the tuple fields, so only the prev/next links and list tail are
+// rewritten.  Safe to run from any hook: the emulator is serialized.
+fn ensure_posfi_ref_linked(unicorn: &mut Unicorn<'_, Context>, app_iface: u32) {
+    let node = POSFI_REF_BLOB.load(Ordering::Relaxed);
+    if node == 0 || node >= 0xf000_0000 {
+        return;
+    }
+    let list = read_u32_or_invalid(unicorn, app_iface + 0x50);
+    if list >= 0xf000_0000 {
+        return;
+    }
+    let mut walk = read_u32_or_invalid(unicorn, list + 4);
+    let mut steps = 0u32;
+    while (0x1000..0xf000_0000).contains(&walk) && walk != list && steps < 16 {
+        if walk == node {
+            return;
+        }
+        walk = read_u32_or_invalid(unicorn, walk + 4);
+        steps += 1;
+    }
+    let last = read_u32_or_invalid(unicorn, list + 8);
+    if (0x1000..0xf000_0000).contains(&last) && last != list {
+        if !write_u32(unicorn, node, last) {
+            return;
+        }
+        if !write_u32(unicorn, last + 4, node) {
+            return;
+        }
+    } else if !write_u32(unicorn, node, 0) {
+        return;
+    } else if !write_u32(unicorn, list + 4, node) {
+        return;
+    }
+    if !write_u32(unicorn, node + 4, 0) {
+        return;
+    }
+    if !write_u32(unicorn, list + 8, node) {
+        return;
+    }
+    let count = read_u32_or_invalid(unicorn, list + 0xc);
+    if count < 0x1000_0000 {
+        write_u32(unicorn, list + 0xc, count + 1);
+    }
+    log::info!("PROCMAPENGINE: re-linked posfi service reference into list {list:#x}");
+}
+
+fn insert_posfi_service_reference(unicorn: &mut Unicorn<'_, Context>, _original_pc: u32) {    if POSFI_REF_INSERTED.load(Ordering::Relaxed) != 0 {
         return;
     }
     let base_address = PROCMAP_BASE.load(Ordering::Relaxed);
