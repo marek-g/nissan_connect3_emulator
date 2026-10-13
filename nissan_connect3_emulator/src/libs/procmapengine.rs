@@ -3441,6 +3441,33 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     read_u32_or_invalid(uc, request + 0x68),
                     read_u32_or_invalid(uc, request + 0x6c),
                 );
+                // The arbitration only ever picks the camera record, so compare the
+                // two static request records field by field: whichever field differs
+                // is the reason `ms_sMapDataReqCarsor` is never a candidate.
+                for (name, record) in [
+                    ("camera", base_address + 0x0078_fcd4u32 - ORIGINAL_BASE),
+                    ("carsor", carsor),
+                ] {
+                    static RECORD_DUMPS: AtomicU32 = AtomicU32::new(0);
+                    if read_u32_or_invalid(uc, carsor + 0x60) == 0
+                        || RECORD_DUMPS.fetch_add(1, Ordering::Relaxed) >= 12
+                    {
+                        continue;
+                    }
+                    log::info!(
+                        "PROCMAPENGINE map-data trace request record {name} at {record:#x}: kind={} data_type={:#x} view={} state={} f1f4={:#x} f1f8={:#x} rect=[{:08x} {:08x} {:08x} {:08x}]",
+                        read_u32_or_invalid(uc, record) & 0xff,
+                        read_u32_or_invalid(uc, record + 4) & 0xff,
+                        read_u32_or_invalid(uc, record + 0x200),
+                        read_u32_or_invalid(uc, record + 0x74),
+                        read_u32_or_invalid(uc, record + 0x1f4),
+                        read_u32_or_invalid(uc, record + 0x1f8),
+                        read_u32_or_invalid(uc, record + 0x60),
+                        read_u32_or_invalid(uc, record + 0x64),
+                        read_u32_or_invalid(uc, record + 0x68),
+                        read_u32_or_invalid(uc, record + 0x6c),
+                    );
+                }
             })
             .unwrap();
     }
