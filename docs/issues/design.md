@@ -2504,3 +2504,29 @@ router; seed table 0x713ea8 maps key `(fn<<16)|svc`: 0x1010026->Open,
 0x1030026->GetBlockIDs, 0x1040026->LoadBlocks, 0x4010026->
 vHandleDatablocksChanged) plus its `vOnUnhandledMessage` (0x5923e8) swallow
 arm, to find where the 23 answers die and why the 2 jobs never run.
+
+## r579: the whole MDM->RC pipeline runs; loss moved to texture/scene delivery
+
+r579 (probes at `MapData_AddJobToQueue`/`MDMHandleLoadBlocks::Execute`/
+`vDispatchMessage`):
+
+* `vDispatchMessage` (0x592454, message-map router, key = (svc,fn) u16 pair at
+  inner+0x14/+0x18, seed table 0x713ea8) dispatches **all** answers: 3x
+  fn 0x101, 21x fn 0x103, 23x fn 0x104, 1x fn 0x401 (the property UpRegConf) -
+  r578's "23 lost answers" was a probe-visibility artifact, not a wire loss.
+* `MapData_AddJobToQueue` (0x53a094) enqueues 23 `map_tclJobMDMHandleLoadBlocks`
+  jobs (vtable 0x6a3b48), and **`Execute` runs all 23**, each carrying
+  `result_blocks=2` and called from the MDM drain loop (lr=0x50bf34).
+  `MapData_AddJobToQueue` refuses jobs while `ms_eMapEngineState` (0x7907ac) is
+  0/4/5 with 0xffab63 - not triggered here (state 2).
+* 24 `map_tclJobRCMapObjectsUpdate` (vtable 0x6abe80, Execute 0x4d37e0) reach
+  the render queue, pass `IsExecutable` and are taken by thread 69 - the MDM
+  answer path fully delivers map objects to the render control.
+* Still: MAP surface publish stays uniform `cc ce d9` (384000/384000), zero
+  glDraw* from procmapengine.  The loss is now inside the render tail:
+  r580 probes `RCMapObjectsUpdate::Execute` (object loop needs `this+0x54`
+  vector non-null), `DTM_FBO_Handler::bCheckForTextureUpdateBasedOnNewMO`
+  (0x556170, gated on `DTM_TextureCache_Manager::ms_poFBOHandler` 0x71ae94 != 0
+  - the FBO/texture cache is host-side GL infrastructure the emulator may never
+  have created) and `map_tclSceneManager::MapObjectsUpdate` (0x4357c8, needs
+  `ms_pkSceneManager` 0x790788 != 0).
