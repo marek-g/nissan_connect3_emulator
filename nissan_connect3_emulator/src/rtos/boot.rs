@@ -76,8 +76,15 @@ impl Default for RtosBootConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            // The usable GUI needs all four: the HMI, the DAPI data server, the
+            // navigation processor that feeds it map data requests, and the map
+            // engine that draws them.  Order is the boot order of the unit's
+            // process manager as far as the emulator depends on it (the HMI first,
+            // the engine last so its hooks see the already-running services).
             commands: vec![
                 StartProcessCommand::start_proc("/opt/bosch/processes/prochmi_out.out"),
+                StartProcessCommand::start_proc("/opt/bosch/processes/DAPIAPP.OUT"),
+                StartProcessCommand::start_proc("/opt/bosch/navbin/PROCNAV.OUT"),
                 StartProcessCommand::start_proc("/opt/bosch/processes/procmapengine.out"),
             ],
             start_queue: queues::OSAL_CB_HDR_LI_MAIN.to_string(),
