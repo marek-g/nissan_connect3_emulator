@@ -5337,6 +5337,113 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             .unwrap();
     }
 
+    // Job-queue tail of the LoadBlocks answer path: vHandleLoadBlocks creates
+    // `map_tclJobMDMHandleLoadBlocks` (Create thunk 0x4a59f8 -> Create 0x4b60b4,
+    // vtable 0x6a3b48) and queues it via map_tclPortControl::MapData_AddJobToQueue
+    // (0x53a094); the MDM thread then runs Execute (0x4b5420, vtable+0x24) which
+    // maps the channel shared memory, hands the decoded blocks to the render
+    // control and releases the channel slot. r578 proved the handler runs but
+    // the job never reaches any queue (no log line carries vtable 0x6a3b48), so
+    // watch entry of queue-add and of Execute to find where they vanish.
+    {
+        let statics = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let queued = std::sync::Arc::clone(&statics);
+        let addr = base_address + 0x0053_a094u32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = queued.fetch_add(1, Ordering::Relaxed);
+                if count < 200 {
+                    let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let vtable = read_u32_or_invalid(uc, job);
+                    log::info!(
+                        "PROCMAPENGINE map-data trace AddJobToQueue entry at {:#x}: job={:#x} vtable={:#x} lr={:#x}",
+                        addr,
+                        job,
+                        vtable,
+                        uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
+                    );
+                }
+            })
+            .unwrap();
+        let executed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let addr = base_address + 0x004b_5420u32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = executed.fetch_add(1, Ordering::Relaxed);
+                if count < 200 {
+                    let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let mdm_ref = read_u16_or_invalid(uc, this + 0x1e);
+                    let begin = read_u32_or_invalid(uc, this + 0x34);
+                    let end = read_u32_or_invalid(uc, this + 0x38);
+                    log::info!(
+                        "PROCMAPENGINE map-data trace MDMHandleLoadBlocks::Execute entry at {:#x}: this={:#x} mdm_ref={:#x} result_blocks={} lr={:#x}",
+                        addr,
+                        this,
+                        mdm_ref,
+                        end.saturating_sub(begin) / 0x18,
+                        uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
+                    );
+                }
+            })
+            .unwrap();
+    }
+
+    // Message-map router `PortControl_CCAClientHandlerBase::vDispatchMessage`
+    // (0x592454): keys are (u16 svc @inner+0x14, u16 fn @inner+0+0x18) pairs
+    // (the map's static seed table at 0x713ea8 holds {0x70006, 0x140006,
+    // 0x1010026 -> vHandleOpenFastMapChannel, 0x1030026 -> vHandleGetBlockIDs,
+    // 0x1040026 -> vHandleLoadBlocks, 0x201/0x2020026, 0x4010026 ->
+    // vHandleDatablocksChanged}). r578 saw 25 fn=0x104 answers arrive in
+    // ail_bHandleMsgServiceData but only 2 vHandleLoadBlocks runs, so log every
+    // dispatch with a svc-0x26 key plus the unmatched (empty-map-walk) exit.
+    {
+        let dispatch_watch = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let page_lo = base_address + (0x0059_2000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                let entry_hit = original == 0x0059_2454;
+                // vOnUnhandledMessage (0x5923e8): reached from the walk's
+                // empty-tree arm (0x5924e8) - the message is deleted here.
+                let unhandled_hit = original == 0x0059_23e8;
+                if !entry_hit && !unhandled_hit {
+                    return;
+                }
+                let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let msg = if entry_hit {
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32
+                } else {
+                    // vOnUnhandledMessage(&copy): same r1 slot.
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32
+                };
+                let inner = read_u32_or_invalid(uc, msg.wrapping_add(4));
+                let svc = read_u16_or_invalid(uc, inner.wrapping_add(0x14));
+                let fnid = read_u16_or_invalid(uc, inner.wrapping_add(0x18));
+                if svc != 0x26 {
+                    return;
+                }
+                let count = dispatch_watch.fetch_add(1, Ordering::Relaxed);
+                if count >= 300 {
+                    return;
+                }
+                let opcode = read_u32_or_invalid(uc, inner.wrapping_add(0x1a)) & 0xff;
+                let mdm_ref = read_u16_or_invalid(uc, inner.wrapping_add(0x1c));
+                log::info!(
+                    "PROCMAPENGINE map-data trace vDispatchMessage {} at {:#x}: this={:#x} svc=0x{:x} fn=0x{:x} opcode={:#x} mdm_ref={:#x}",
+                    if entry_hit { "entry" } else { "UNHANDLED" },
+                    original,
+                    this,
+                    svc,
+                    fnid,
+                    opcode,
+                    mdm_ref
+                );
+            })
+            .unwrap();
+    }
+
     for (name, call_offset, result_offset) in [
         (
             "IntGetBlockIDs",
