@@ -2305,3 +2305,55 @@ three gate globals.
 Note the DAPIAPP-side registry we fabricated has `APP_CONFIG/MAP/FASTMAP_ENABLED=1`
 already; the engine-side `PROCESS/MAP/MAPENGINE` section does not exist in
 `registry_compat.reg` at all.
+
+## 2026-10-13: ServiceStatus publish reaches the engine but no client reference exists to apply it to (r567-r571)
+
+r567 (old binary, entry probes): the MDM data gate *passes* from t=13s -
+`ms_u32DatasetID == ms_u32DatasetID_Validated = 0x68d7a36d` (written by the
+emulator's `initialize_map_data_medium`, which is why the r568 watchpoints stay
+silent for it: host-side `write_u32` bypasses guest hooks),
+`ms_bFastmapServiceAvailable = 1` (guest write, `pc=0x504604` inside
+`LockFreeFastMapChannel` at t=59.5s - i.e. `IntHandleMapDataRequest` does reach
+its channel grab at decompile line 190, but with all three channel-info slots
+CLOSED it fails and no `MapData_LoadBlocks` is ever sent; `MapData_LoadBlocks`
+@0x53a1f8 and `vHandleLoadBlocks` @0x53f378 stay at 0 hits).
+`ms_asFastMapChannelInfo[i].shm` is non-null *iff*
+`Registry_Read_FastMapChannelConfig` succeeds - and it has **built-in defaults**
+(channel names `FM_T_1d`/`FM_T_2d`/`FM_T_3d`, sizes 0x180000/0x180000/0x25800)
+and `Init` still creates the OSAL shared memory even with no registry keys, so
+registry FASTMAP keys are *not* the blocker. `/dev/shm` + fd-mmap + ftruncate
+are all emulated (`mman.rs` backs `/dev/shm/*` with one host buffer), and DAPI's
+server side exists (`dap_map_tclWorker::u16ProcessOpenChannel` @0x84b310 attaches
+the shm by name via `dap_tclChannelController::u16CreateSharedMemChannel`,
+answers with the channel handle; `u16ProcessLoadBlocks` @0x849894 errors
+"invalid channel handle" until then; `FASTMAP_ENABLED` is already 1 in
+`registry_compat.reg`).
+
+The single missing link is the **directory's AVAILABLE publish**:
+`map_tclMapDataManager::Init` zeroes `ms_bFastmapServiceAvailable`, and only
+`OnUpdateServiceStateDAPIFastmap` (0x512400) opens the channels; that runs from
+`map_tclClientServiceHandler::vOnServiceStateChange` (0x590390) which runs from
+`PortControl_CCAClientHandlerBase::vOnServiceState` (0x592604) - 0 hits in every
+run. DAPI publishes class-0x44 `amt_tclServiceStatus` at startup but with state
+byte 0 at wire +0x18 (its AIL only publishes what its own registry holds), and
+`ail_bExamineInfluenceToAdministration` case 2 ignores 0
+(`vSetServiceState` is called with the raw state only for other values, and the
+availability fan-out `local_bc` is set only for state 1/2).
+
+Fix attempt (committed): transport fabricates the directory pair - state 1 then
+state 3 (state 1 admits only opcodes 4/0xd per `ail_enCheckClientMailValidity`,
+state 3 admits all) - into `mbx_1024` when the first answered GetBlockIDs
+crosses. r569: the engine *consumed* both messages (2x `ExamineInfluence
+admin=0x2 svc=0x26` at t=46.8s) but `vSetServiceState`/`bIsDataSet` never fired.
+
+Why (static, `ExamineInfluence` tail at 0x66a1d4): the apply loop iterates the
+**dispatch's client-reference list** (`**(this+0x50)`+4 chain) and calls
+`ail_tclServiceReference::bIsDataSet(serverApp, svc, regid)` per entry; a 0-hit
+`bIsDataSet` means the list is empty. It is populated *only* by
+`ail_bHandleMsgServiceRegisterConf` (0x6682bc), which appends a reference
+iff (a) conf status byte (+0x18) == 1 **and** (b) an entry in the *sync answer*
+list (`**(this+0x5c)`+4) matches `bIsWaitForRegister(serverApp, svc, unique)`.
+The wire shows two confs for svc 0x26 to the engine: DAPI's original
+(regid ffff, unique 0, **status 4**) and a stamped one (regid 1, unique fffe,
+status 1). r571's page-watch on 0x66a1d4 dumps the list node + lookup tuple to
+pin down whether the append (waiter match) ever succeeded.
