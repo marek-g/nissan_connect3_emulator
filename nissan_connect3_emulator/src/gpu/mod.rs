@@ -744,10 +744,14 @@ fn poll_events(backend: &mut Backend) -> bool {
             }
             Event::Window { win_event, .. } => {
                 if let sdl2::event::WindowEvent::Resized(width, height) = win_event {
-                    if width > 0 && height > 0 {
-                        unsafe {
-                            gl::Viewport(0, 0, width, height);
-                        }
+                    // Only a log: `glViewport` here would apply the *logical*
+                    // window size to whichever context happens to be current,
+                    // while the frame blit sets the viewport from
+                    // `SDL_GL_GetDrawableSize` (the drawable's real pixel size)
+                    // on every swap anyway.
+                    let hits = WINDOW_RESIZE_EVENT_LOGS.fetch_add(1, Ordering::Relaxed);
+                    if hits < 40 {
+                        log::info!("GPU: window resized event to {}x{}", width, height);
                     }
                 }
             }
@@ -1305,15 +1309,73 @@ fn composite_hmi_over_map(backend: &mut Backend) {
 // Present the CPU-composited 800x480 RGBA `backend.hmi_pixels` to the SDL
 // window. GLES 2 has no glDrawPixels / fixed-function pipeline, so we upload
 // the pixels to a texture and draw a fullscreen quad with our helper shader.
+static WINDOW_SIZE_SIGNATURE: AtomicU64 = AtomicU64::new(u64::MAX);
+static WINDOW_SIZE_LOGS: AtomicU32 = AtomicU32::new(0);
+static WINDOW_RESIZE_EVENT_LOGS: AtomicU32 = AtomicU32::new(0);
+static WINDOW_BLITS: AtomicU32 = AtomicU32::new(0);
+
+// Reproduce a user resize without anyone at the keyboard: `EMU_GPU_TEST_RESIZE`
+// set to `WIDTHxHEIGHT` resizes the window once, shortly after the first frames,
+// so the logical/drawable size behaviour can be read from the log.
+fn test_window_resize(backend: &mut Backend) {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    let blits = WINDOW_BLITS.fetch_add(1, Ordering::Relaxed);
+    if DONE.load(Ordering::Relaxed) || blits < 60 {
+        return;
+    }
+    let Ok(spec) = std::env::var("EMU_GPU_TEST_RESIZE") else {
+        return;
+    };
+    let Some((w, h)) = spec.split_once('x') else {
+        return;
+    };
+    let (Ok(w), Ok(h)) = (w.trim().parse::<i32>(), h.trim().parse::<i32>()) else {
+        return;
+    };
+    DONE.store(true, Ordering::Relaxed);
+    unsafe {
+        sys::SDL_SetWindowSize(backend.window_raw, w, h);
+    }
+    log::info!("GPU: test resize requested to {}x{}", w, h);
+}
+
 fn blit_hmi_pixels_to_window(backend: &mut Backend) {
     if backend.composite_program == 0 {
         return;
     }
     let mut draw_w = 800i32;
     let mut draw_h = 480i32;
+    let mut win_w = 800i32;
+    let mut win_h = 480i32;
     unsafe {
+        sys::SDL_GetWindowSize(backend.window_raw, &mut win_w, &mut win_h);
         sys::SDL_GL_GetDrawableSize(backend.window_raw, &mut draw_w, &mut draw_h);
     }
+    // The window geometry the compositor gave us and the size of the GL drawable
+    // behind it are two different numbers whenever SDL applies a HiDPI/scaling
+    // factor, and the viewport has to follow the drawable.  Log both (and the
+    // ratio) so a wrong-looking window scale can be attributed instead of guessed.
+    let signature = win_w as u64
+        | (win_h as u64) << 16
+        | (draw_w as u64) << 32
+        | ((draw_h as u64) << 48);
+    if WINDOW_SIZE_SIGNATURE.swap(signature, Ordering::Relaxed) != signature {
+        let hits = WINDOW_SIZE_LOGS.fetch_add(1, Ordering::Relaxed);
+        if hits < 40 {
+            log::info!(
+                "GPU: window size logical={}x{} drawable={}x{} ratio={:.3}:{:.3} viewport={}x{}",
+                win_w,
+                win_h,
+                draw_w,
+                draw_h,
+                if win_w == 0 { 0.0 } else { draw_w as f32 / win_w as f32 },
+                if win_h == 0 { 0.0 } else { draw_h as f32 / win_h as f32 },
+                draw_w.max(1),
+                draw_h.max(1)
+            );
+        }
+    }
+    test_window_resize(backend);
     unsafe {
         gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
         gl::Viewport(0, 0, draw_w.max(1), draw_h.max(1));
