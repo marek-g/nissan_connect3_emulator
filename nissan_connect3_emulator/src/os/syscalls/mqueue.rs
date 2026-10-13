@@ -298,6 +298,23 @@ pub fn mq_timedsend(
         let Some(queue) = state.mq.queues.get_mut(&mqdes) else {
             return EBADF;
         };
+        // r437: the procmapengine job queues are 4-byte pointer queues; the
+        // map-data mainloop drained every message except the fabricated posfi
+        // job, so watch occupancy on every send to catch a silent drop.
+        if queue.name.contains("NOIOSC") {
+            log::info!(
+                "MQ trace send: [{}] name={} id={:#x} len={:#x} prio={} fill={}/{} msgsize={:#x} nonblock={}",
+                unicorn.get_data().thread_id(),
+                queue.name,
+                mqdes,
+                msg_len,
+                msg_prio,
+                queue.messages.len(),
+                queue.maxmsg,
+                queue.msgsize,
+                queue.nonblock,
+            );
+        }
         if (msg_len as i64) > queue.msgsize {
             return EMSGSIZE;
         }
@@ -399,15 +416,58 @@ fn do_mq_timedreceive(
         };
         // the buffer must be able to hold any message (kernel check)
         if (msg_len as i64) < queue.msgsize {
+            if queue.name.contains("NOIOSC") {
+                log::info!(
+                    "MQ trace recv EMSGSIZE: [{}] name={} id={:#x} buf_len={:#x} msgsize={:#x}",
+                    unicorn.get_data().thread_id(),
+                    queue.name,
+                    mqdes,
+                    msg_len,
+                    queue.msgsize,
+                );
+            }
             return EMSGSIZE;
         }
     }
 
     let message = {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
+        if let Some(queue) = state.mq.queues.get(&mqdes) {
+            if queue.name.contains("NOIOSC") {
+                log::info!(
+                    "MQ trace recv: [{}] name={} id={:#x} buf_len={:#x} fill_before={} max={} msgsize={:#x}",
+                    unicorn.get_data().thread_id(),
+                    queue.name,
+                    mqdes,
+                    msg_len,
+                    queue.messages.len(),
+                    queue.maxmsg,
+                    queue.msgsize,
+                );
+            }
+        }
         state.mq.pop_message(mqdes)
     };
     if let Some(message) = message {
+        if message.data.len() == 4 {
+            let name = unicorn
+                .get_data()
+                .namespace
+                .lock()
+                .unwrap()
+                .mq
+                .queues
+                .get(&mqdes)
+                .map(|queue| queue.name.clone())
+                .unwrap_or_default();
+            if name.contains("NOIOSC") {
+                log::info!(
+                    "MQ trace deliver: [{}] name={name} id={mqdes:#x} value={:08x}",
+                    unicorn.get_data().thread_id(),
+                    u32::from_le_bytes(message.data[..4].try_into().unwrap()),
+                );
+            }
+        }
         unicorn.mem_write(msg_ptr as u64, &message.data).unwrap();
         if prio_ptr != 0 {
             unicorn
@@ -701,6 +761,28 @@ pub fn finish_mq_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, now: Instant
 
             match message {
                 Some(message) => {
+                    // r437: follow the procmapengine job pointers across the
+                    // blocked-waiter delivery path (the entry log of
+                    // mq_timedreceive cannot see deliveries made here).
+                    if message.data.len() == 4 {
+                        let name = unicorn
+                            .get_data()
+                            .namespace
+                            .lock()
+                            .unwrap()
+                            .mq
+                            .queues
+                            .get(&queue_id)
+                            .map(|queue| queue.name.clone())
+                            .unwrap_or_default();
+                        if name.contains("NOIOSC") {
+                            log::info!(
+                                "MQ trace deliver: [{}] name={name} id={queue_id:#x} value={:08x}",
+                                tid,
+                                u32::from_le_bytes(message.data[..4].try_into().unwrap()),
+                            );
+                        }
+                    }
                     unicorn.mem_write(msg_ptr as u64, &message.data).unwrap();
                     if prio_ptr != 0 {
                         unicorn

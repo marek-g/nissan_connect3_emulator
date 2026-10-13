@@ -1682,3 +1682,35 @@ Consequences for the open threads here:
   request=4 / Krakow-rect DapiGetBlockIDs observed yet (request=5 probes
   saturate the budgets; needs request-type-filtered probes or the view-
   rect path - tid65 keeps re-requesting the default window).
+- **r437-r442 (posfi request reaches PerformMapDataRequest; starvation found):**
+  tracing the kernel mqueue layer (`MQ trace send/recv/deliver`, filtered to the
+  `NOIOSC*` pointer queues) plus gate probes inside `PerformMapDataRequest`
+  proves the fabricated position request now travels the whole engine chain:
+  `UpdateMapDataRequest(4,0,5.0f,0,Krakow)` -> `CreateMDMJobMapDataRequest`
+  (job prio=4 at +0x24) -> `AddJobToMapDataManagerQueue` -> `AddElement` ->
+  `OSAL_s32MessageQueuePost(NOIOSCM, &jobptr, 4)` -> **kernel mq id 0x418**
+  (msgsize 4, maxmsg 1000, blocking - nothing is ever dropped) -> the MDM
+  mainloop's `EnqueueElements` blocks in `OSAL_s32MessageQueueWait` and the
+  waiter-wakeup path (`finish_mq_wait`) hands the pointer over -> `GetElement`
+  returns it (probe: `job=0x90ba1a70 job_type=0x45 posfi match`) -> `Execute`
+  -> `PerformMapDataRequest` with `rect=[1cdde1 1feb21 4ba05e 4d26fe]`
+  width=200000 height=100000 (both >= 1000 gates pass) -> **prio-4 branch at
+  0x50cb48** (kind 4 = `ms_sMapDataReqCarsor`, Ghidra's `param_2 == 4`), which
+  resets that static request (state +0x74=0, +0x1f4/+0x1f8 = 0xffffffff,
+  MDMRefCounter +0x200=0), enlarges its rect by detail level and ends with
+  `TriggerHandleMapDataRequest(false)` (kind 4 -> bVar4=false, "invisible").
+  That queues a `map_tclJobMDMHandleMapDataRequestInvisibleData` job (type 0x6e,
+  vtable 0x6a3e78, `Execute` 0x4b6510 -> `HandleMapDataRequest('\0')`), which
+  runs - and then `GetHighestPriorityRequest()` (0x5107f4) returns the **kind=5
+  AcCam view request** (0x78fcd4, data_type 1, state 1, sentinels 0xefffffff =
+  mid-flight) instead of the freshly armed car-cursor request, because the AcCam
+  static is scanned first and only counts as finished at state 7.  tid65 keeps
+  re-arming the kind=5 request (its `UpdateMapDataRequest(5,...)` flood with the
+  default window resets state to 0) and `GetBlockIDs` never completes it (the
+  DAPI map-data service still answers the CCA request with an error), so the
+  car-cursor request is starved forever.  Remaining blocker is therefore NOT in
+  the job plumbing any more: it is `GetBlockIDs`/DAPI map-data provisioning (the
+  0x305 `ServiceDataError` from the unanswered `DYN<n>MBX` service replies).
+  Probe traps hit on the way (all "budget proved nothing"): the
+  `PerformMapDataRequest` bl-site filter had an inner `count < 200` that hid the
+  request=4 line, and the `GetElement` probe's 100-entry cap went blind at t~6s.
