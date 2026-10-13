@@ -48,6 +48,14 @@ const SVG_GET_LAYER_ERROR: u32 = 0x00fb_6c38 - ORIGINAL_BASE;
 const SVG_GET_RESOURCE_ERROR: u32 = 0x00fb_6a10 - ORIGINAL_BASE;
 const SVG_APPLY_LAYER_IN_SYNC: u32 = 0x00fb_6e90 - ORIGINAL_BASE;
 const SVG_WAIT_LAYER_VSYNC: u32 = 0x00fb_6cc8 - ORIGINAL_BASE;
+const SVG_ENABLE_LAYER: u32 = 0x00fb_6e84 - ORIGINAL_BASE;
+const SVG_DISABLE_LAYER: u32 = 0x00fb_6a1c - ORIGINAL_BASE;
+const SVG_SET_LAYER_WINDOW_DATA: u32 = 0x00fb_64dc - ORIGINAL_BASE;
+const SVG_SET_LAYER_ORDER: u32 = 0x00fb_6e30 - ORIGINAL_BASE;
+const SVG_SET_LAYER_BACKGROUND_COLOR: u32 = 0x00fb_6404 - ORIGINAL_BASE;
+const SVG_SCALE_LAYER: u32 = 0x00fb_6548 - ORIGINAL_BASE;
+const SVG_ENABLE_LAYER_SETTINGS: u32 = 0x00fb_671c - ORIGINAL_BASE;
+const SVG_DISABLE_LAYER_SETTINGS: u32 = 0x00fb_65c0 - ORIGINAL_BASE;
 const SVG_MAP_LAYER_HANDLE: u32 = 0x5f4c_0001;
 const SVG_MAP_SURFACE_HANDLE: u32 = 0x5f4d_4150;
 const SVG_MAP_WIDTH: u16 = 800;
@@ -190,6 +198,21 @@ static LSYNC_HIDE_TICKS: AtomicU32 = AtomicU32::new(0);
 static LSYNC_REFRESH_FRAMES: AtomicU32 = AtomicU32::new(0);
 static LSYNC_MSGBOX_TICKS: AtomicU32 = AtomicU32::new(0);
 static GL_LAYER_COPY_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+// Inputs of GUI_GL_OpenGL::mixLayers that decide whether the HMI layer is
+// cleared opaque (bit 0) or with a premultiplied alpha (bit 1: an external
+// application layer copy is active).  0xffff = not observed yet.
+static MIX_LAYERS_STATE: AtomicU32 = AtomicU32::new(0xffff);
+static MIX_LAYERS_STATE_HITS: AtomicU32 = AtomicU32::new(0);
+// The emulator is the display engine for the svg layer API: it has to remember
+// which external layers the HMI enabled and where, the same way the hardware
+// layer compositor would.  Only the map layer (SVG_MAP_LAYER_HANDLE) is fed to
+// the compositor so far.
+static SVG_LAYER_ENABLED: AtomicBool = AtomicBool::new(false);
+static SVG_LAYER_X: AtomicU32 = AtomicU32::new(0);
+static SVG_LAYER_Y: AtomicU32 = AtomicU32::new(0);
+static SVG_LAYER_W: AtomicU32 = AtomicU32::new(0);
+static SVG_LAYER_H: AtomicU32 = AtomicU32::new(0);
+static SVG_LAYER_CONTROL_HITS: AtomicU32 = AtomicU32::new(0);
 
 static HMI_MAINLOOP_DIAG_COUNT: AtomicU32 = AtomicU32::new(0);
 static HMI_FIS_INIT_DONE: AtomicBool = AtomicBool::new(false);
@@ -407,6 +430,7 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     }
 
     install_svg_map_surface_hooks(unicorn, base_address);
+    install_svg_layer_control_hooks(unicorn, base_address);
 
     force_display_manager_dirty(unicorn, base_address);
     force_ea_manager_background(unicorn, base_address);
@@ -1338,62 +1362,26 @@ fn post_lsync_map_announcement(unicorn: &mut Unicorn<'_, Context>, original_pc: 
                 log::info!("PROCHMI: emulated procmap LayerSync reply burst complete");
             }
         }
-        // On the real unit the HMI hides the map view as soon as a blocking
-        // popup takes over; EAManager then snapshots the map layer into
-        // EAManager's GUI_GL_LayerCopy (updateEAHide state 5 ->
-        // LayerSync::copyLayer). Drive that hide request ourselves once the
-        // emulated show flow has completed.
+        // Nothing else is driven by hand: the hide/snapshot flow used to be
+        // forced here (poking the EAWStatus command byte and the manager dirty
+        // flag), but that made the HMI hide the very layer we want to see and
+        // switched it into snapshot-on-hide mode.  The natural main loop keeps
+        // pumping EAManager::update, and the svg layer control hooks now record
+        // what the HMI asks the display engine to do.
         10 => {
-            let entry = LSYNC_EA_ENTRY.load(Ordering::Relaxed);
             let manager = LSYNC_EA_MANAGER.load(Ordering::Relaxed);
-            if entry != 0 && manager != 0 && read_u32(unicorn, entry + 0x24) == 3 {
-                // Equivalent of requestEAHide(): mark the EAWStatus slot's
-                // command field (slot base = entry - 0xc, +0x2c) as HIDE and
-                // dirty the manager. A guest call into requestEAHide proved
-                // fatal for the GUI thread, so poke the state directly.
-                let _ = write_u32(unicorn, entry + 0x20, 1);
-                let _ = write_u8(unicorn, manager + 0x12c, 1);
-                LSYNC_MAP_STAGE.store(11, Ordering::Relaxed);
-                log::info!(
-                    "PROCHMI: flagged EA0 hide for map snapshot manager={:#x} entry={:#x}",
-                    manager,
-                    entry
-                );
-            }
-        }
-        // EAManager::update keeps being pumped by the natural GUI main loop;
-        // only the clTimerHelper hide expiry is missing under emulation.
-        // Emulate timer event 1 (state 4 -> 5), whose updateEAHide case 5
-        // runs LayerSync::copyLayer to snapshot the map layer.
-        11 => {
             let entry = LSYNC_EA_ENTRY.load(Ordering::Relaxed);
-            let manager = LSYNC_EA_MANAGER.load(Ordering::Relaxed);
-            let ticks = LSYNC_HIDE_TICKS.fetch_add(1, Ordering::Relaxed);
-            if manager == 0 {
-                LSYNC_MAP_STAGE.store(99, Ordering::Relaxed);
-                log::info!("PROCHMI: EA hide monitor gave up (no manager)");
-            } else if read_u32(unicorn, manager + 0x130) != 0 {
-                LSYNC_MAP_STAGE.store(99, Ordering::Relaxed);
-                log::info!(
-                    "PROCHMI: map layer snapshot texture ready manager={:#x} ticks={}",
-                    manager,
-                    ticks
-                );
-            } else if ticks > 2000 {
-                LSYNC_MAP_STAGE.store(99, Ordering::Relaxed);
-                log::info!("PROCHMI: EA hide monitor timed out ticks={}", ticks);
-            } else if read_u32(unicorn, entry + 0x24) == 4 && ticks > 20 {
-                // Do NOT force the hide expiry (entry+0x24 4 -> 5): that runs
-                // LayerSync::copyLayer, which switches the map layer into its
-                // snapshot-on-hide mode, and prochmi then stops compositing the
-                // live layer - which is exactly what made the map flash once and
-                // go black.  Left alone, the EA entry stays in state 4.
-                LSYNC_MAP_STAGE.store(99, Ordering::Relaxed);
-                log::info!(
-                    "PROCHMI: EA entry {:#x} stays in state 4 (no forced hide); map layer kept live",
-                    entry
-                );
-            }
+            LSYNC_MAP_STAGE.store(99, Ordering::Relaxed);
+            log::info!(
+                "PROCHMI: map layer show flow complete, leaving EA state machine alone manager={:#x} entry={:#x} state={}",
+                manager,
+                entry,
+                if entry == 0 {
+                    0
+                } else {
+                    read_u32(unicorn, entry + 0x24)
+                }
+            );
         }
         _ => {}
     }
@@ -1833,6 +1821,78 @@ fn install_svg_map_surface_hooks(unicorn: &mut Unicorn<'_, Context>, base_addres
     }
 }
 
+/// The svg layer entry points are stubs that jump into libsvg; on the unit they
+/// program the hardware layer compositor.  Under emulation the emulator *is*
+/// that compositor, so the layer control calls have to be intercepted: the map
+/// layer's enabled state and window are exactly what a display engine needs to
+/// know to composite `MAP_SURFACE_BYTES` below the HMI layer.  Answering with
+/// "no error" (r0 = 0) is also what `LayerCopy::copy` and `setLayersVisible`
+/// check before they go on.
+fn install_svg_layer_control_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    for (offset, kind) in [
+        (SVG_ENABLE_LAYER, "enable_layer"),
+        (SVG_DISABLE_LAYER, "disable_layer"),
+        (SVG_SET_LAYER_WINDOW_DATA, "set_window_data"),
+        (SVG_SET_LAYER_ORDER, "set_order"),
+        (SVG_SET_LAYER_BACKGROUND_COLOR, "set_bg_color"),
+        (SVG_SCALE_LAYER, "scale_layer"),
+        (SVG_ENABLE_LAYER_SETTINGS, "enable_settings"),
+        (SVG_DISABLE_LAYER_SETTINGS, "disable_settings"),
+    ] {
+        let addr = base_address + offset;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let handle = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                let stack0 = read_u32(uc, sp);
+                if handle == SVG_MAP_LAYER_HANDLE {
+                    match kind {
+                        "enable_layer" => SVG_LAYER_ENABLED.store(true, Ordering::Relaxed),
+                        "disable_layer" => SVG_LAYER_ENABLED.store(false, Ordering::Relaxed),
+                        _ => {}
+                    }
+                    publish_svg_map_layer_window();
+                }
+                let hits = SVG_LAYER_CONTROL_HITS.fetch_add(1, Ordering::Relaxed);
+                if hits < 40 {
+                    log::info!(
+                        "PROCHMI: SVG layer control {} handle={:#x} map_layer={} r1={:#x} r2={:#x} r3={:#x} stack0={:#x} enabled={}",
+                        kind,
+                        handle,
+                        handle == SVG_MAP_LAYER_HANDLE,
+                        r1,
+                        r2,
+                        r3,
+                        stack0,
+                        SVG_LAYER_ENABLED.load(Ordering::Relaxed)
+                    );
+                }
+                // The layer functions return void on this ABI; callers only
+                // look at svgGetLayerError(), which the status hooks keep at 0.
+                uc.reg_write(RegisterARM::R0, 0).unwrap();
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0);
+                uc.reg_write(RegisterARM::PC, lr).unwrap();
+            })
+            .unwrap();
+    }
+}
+
+/// Hand the display-engine state of the map layer (window requested by the HMI
+/// through `LayerSync::setLayersVisible`, plus the enable/disable calls) to the
+/// GPU compositor.
+fn publish_svg_map_layer_window() {
+    crate::gpu::set_map_layer_window(
+        SVG_LAYER_ENABLED.load(Ordering::Relaxed),
+        SVG_LAYER_X.load(Ordering::Relaxed),
+        SVG_LAYER_Y.load(Ordering::Relaxed),
+        SVG_LAYER_W.load(Ordering::Relaxed),
+        SVG_LAYER_H.load(Ordering::Relaxed),
+    );
+}
+
 fn force_ea_manager_background(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let addr = base_address + GUI_DM_EA_MANAGER_GET_BACKGROUND;
     unicorn
@@ -2083,6 +2143,77 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
                             SVG_MAP_WIDTH as i32,
                             SVG_MAP_HEIGHT as i32,
                         );
+                    }
+                }
+                if name == "GUI_GL_OpenGL::mixLayers" {
+                    // mixLayers(gl, layer_copy, &transparent): the opaque-black
+                    // clear only happens when gl+0x140 is set, and the
+                    // alpha-0 (premultiplied) clear only when the derived
+                    // blend flag is false, i.e. when a layer copy is active or
+                    // the background view (view 0) is absent.  Both inputs are
+                    // logged here so the black map area can be attributed.
+                    let gl = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let layer_copy = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let opaque_bg = read_u32(uc, gl + 0x140);
+                    let signature = (opaque_bg != 0) as u32 | ((layer_copy != 0) as u32) << 1;
+                    let last = MIX_LAYERS_STATE.swap(signature, Ordering::Relaxed);
+                    let hits = MIX_LAYERS_STATE_HITS.fetch_add(1, Ordering::Relaxed);
+                    if last != signature || hits < 4 {
+                        log::info!(
+                            "PROCHMI: mixLayers gl={:#x} layer_copy={:#x} opaque_bg={:#x} texture={:#x} count={}",
+                            gl,
+                            layer_copy,
+                            opaque_bg,
+                            if layer_copy == 0 {
+                                0
+                            } else {
+                                read_u32(uc, layer_copy)
+                            },
+                            hits
+                        );
+                    }
+                }
+                if name == "GUI_GL_LayerSync::setLayersVisible" {
+                    // setLayersVisible(layer_sync, ea, visible, rect).  The rect
+                    // is what the HMI tells the display engine the external
+                    // layer covers, so it is the region the emulator has to
+                    // composite the map surface into.  Log both plausible
+                    // layouts (4 x u32 and 4 x u16 GUI_Rect) until the field
+                    // width is confirmed by the values themselves.
+                    let ea = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let visible = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    let rect = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                    if ea == 0 {
+                        let words = [
+                            read_u32(uc, rect),
+                            read_u32(uc, rect + 4),
+                            read_u32(uc, rect + 8),
+                            read_u32(uc, rect + 12),
+                        ];
+                        log::info!(
+                            "PROCHMI: setLayersVisible ea=0 visible={} rect={:#x} words=[{:#x},{:#x},{:#x},{:#x}] halves=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                            visible,
+                            rect,
+                            words[0],
+                            words[1],
+                            words[2],
+                            words[3],
+                            words[0] & 0xffff,
+                            words[0] >> 16,
+                            words[1] & 0xffff,
+                            words[1] >> 16,
+                            words[2] & 0xffff,
+                            words[2] >> 16,
+                            words[3] & 0xffff,
+                            words[3] >> 16
+                        );
+                        if visible != 0 {
+                            SVG_LAYER_X.store(words[0], Ordering::Relaxed);
+                            SVG_LAYER_Y.store(words[1], Ordering::Relaxed);
+                            SVG_LAYER_W.store(words[2], Ordering::Relaxed);
+                            SVG_LAYER_H.store(words[3], Ordering::Relaxed);
+                        }
+                        publish_svg_map_layer_window();
                     }
                 }
                 if name == "GUI_GL_LayerSync::requestViewStatus"
