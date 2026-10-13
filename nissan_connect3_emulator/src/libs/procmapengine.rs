@@ -2694,6 +2694,103 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
         })
         .unwrap();
 
+    // Steps between "AIL accepted the message" and "the RenFI method ran", so a
+    // rejected camera request can be pinned to one of them: `vOnNewMessage` of the
+    // port-control handler (claim vtable slot +0x20, 0x3a4048), the client/server
+    // test it uses (`bIsClientMessage` 0x386c08) and the method's own entry
+    // (`u32SetCameraParameters` 0x523eac).
+    for (offset, label) in [
+        (0x003a_4048u32 - ORIGINAL_BASE, "portControl::vOnNewMessage"),
+        (0x0038_6c08u32 - ORIGINAL_BASE, "bIsClientMessage"),
+        (0x0052_3eacu32 - ORIGINAL_BASE, "u32SetCameraParameters"),
+    ] {
+        let addr = base_address + offset;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                static HITS: [AtomicU32; 3] = [
+                    AtomicU32::new(0),
+                    AtomicU32::new(0),
+                    AtomicU32::new(0),
+                ];
+                let index = if offset == 0x0038_6c08 - ORIGINAL_BASE {
+                    1
+                } else if offset == 0x0052_3eac - ORIGINAL_BASE {
+                    2
+                } else {
+                    0
+                };
+                let hits = HITS[index].fetch_add(1, Ordering::Relaxed);
+                if hits >= 60 {
+                    return;
+                }
+                if index == 2 {
+                    // u32SetCameraParameters(camera_object, parameters): dump what
+                    // the engine actually feeds the camera and what the two
+                    // map-data request rectangles hold around the call, so "the
+                    // command never arrived" is distinguishable from "the camera
+                    // was set but the view rectangle refused to move".
+                    let params = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let words: Vec<u32> =
+                        (0..12u32).map(|i| read_u32_or_invalid(uc, params + i * 4)).collect();
+                    let view_rect = [
+                        read_u32_or_invalid(uc, base_address + (0x0078_fcd4u32 - ORIGINAL_BASE)),
+                        read_u32_or_invalid(uc, base_address + (0x0078_fcd8u32 - ORIGINAL_BASE)),
+                        read_u32_or_invalid(uc, base_address + (0x0078_fcdcu32 - ORIGINAL_BASE)),
+                        read_u32_or_invalid(uc, base_address + (0x0078_fce0u32 - ORIGINAL_BASE)),
+                    ];
+                    let signature = words
+                        .iter()
+                        .fold(0u32, |acc, word| acc ^ word.rotate_left(7))
+                        ^ view_rect[0];
+                    static LAST: AtomicU32 = AtomicU32::new(0xffff_ffff);
+                    if LAST.swap(signature, Ordering::Relaxed) == signature {
+                        return;
+                    }
+                    log::info!(
+                        "PROCMAPENGINE map-data trace u32SetCameraParameters t={}ms thread=[{}] obj={:#x} params={:#x} words=[{}] view_rect=[{:#x},{:#x},{:#x},{:#x}] lr={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0),
+                        params,
+                        words
+                            .iter()
+                            .map(|word| format!("{:#x}", word))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        view_rect[0],
+                        view_rect[1],
+                        view_rect[2],
+                        view_rect[3],
+                        (uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32)
+                            .wrapping_sub(base_address)
+                            .wrapping_add(ORIGINAL_BASE)
+                            & !1,
+                    );
+                    return;
+                }
+                let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let header = read_u32_or_invalid(uc, message + 4);
+                log::info!(
+                    "PROCMAPENGINE map-data trace {} t={}ms thread=[{}] hits={} r0={:#x} r1={:#x} header={:#x} svc={:#x} fn={:#x} opcode={:#x} lr={:#x}",
+                    label,
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    hits,
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0),
+                    message,
+                    header,
+                    read_u16_or_invalid(uc, header + 0x14),
+                    read_u16_or_invalid(uc, header + 0x18),
+                    read_u8_or_invalid(uc, header + 0x1a) as u32,
+                    (uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32)
+                        .wrapping_sub(base_address)
+                        .wrapping_add(ORIGINAL_BASE)
+                        & !1,
+                );
+            })
+            .unwrap();
+    }
+
     // Every re-arm of a map-data request: `UpdateMapDataRequest(prio, type,
     // scale, flags, rect)` - the rectangle arrives by value in the four stack
     // words above the return address - and `PerformMapDataRequest` tears the

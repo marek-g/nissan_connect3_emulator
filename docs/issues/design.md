@@ -1845,3 +1845,43 @@ because `OpenGL+0x140` is non-zero, i.e. prochmi believes it owns an opaque
 background; once our svg emulation answers its layer configuration calls without
 error, the transparent-hole clear (`0x00000000`) is the branch that should run,
 and then the map shows through the hole exactly like on the unit.
+
+## The view rectangle comes from the camera parameters, not from the CCP (r472-r474)
+
+`u32SetCameraParameters` (`0x523eac`, Thumb) does run - 60+ times, from
+`lr=0x4d7518` on thread 65 (the engine's render/job thread), starting at
+t~1.6 s - so the view is driven continuously without any RenFI traffic. Its
+parameter block (r1) reads:
+
+```text
+  +0x00 u32 viewId                0x0 (second call site: 0x2)
+  +0x04 u32 scale/meter           0x32 = 50  (matches the "50 m" scale bar)
+  +0x08 u32 heading/flag          0xffffffff (second call site: 0xffff471c)
+  +0x0c u32 pitch/tilt pair       0xb400b4 (two u16: 180,180)
+  +0x10 u32 0
+  +0x14 u32 count                 1 (second call site: 3)
+  +0x18 s32 longitude             0xc4f45dfb  = -83.13 deg
+  +0x1c s32 latitude              0x1e3b77c6  = +42.54 deg
+```
+
+The second call site carries no coordinates at all (`+0x18/+0x1c` = 0). The map
+data request struct at `0x78fcd4` holds `[prio=5, type=1, scale=0x3f000000
+(0.5f), rect.x1=0xc4f3257b, ...]`, i.e. the rectangle is derived from those
+`(-83.13, 42.54)` coordinates - the engine's power-on position.
+
+That is why the view never follows the car: `posfi_tclMsgExtrapolatedPositions`
+*does* fill the CCP with Krakow (`0xe29fa46`, `0x23999b77`), but the camera
+parameters handed to `u32SetCameraParameters` still carry the power-on
+coordinates, so `UpdateMapDataRequest` keeps asking for a rectangle in Michigan
+where the Europe-only card (`sd2-GENJ_EU_I.A v2`) can never have blocks, and DAPI
+answers `ServiceDataError 0x305`.
+
+RenFI experiment (r472): the fabricated `rendererfi` request (service `0x300`,
+function `0x5a`, opcode 2, 31-byte payload) *is* accepted by the AIL layer -
+`ail_bHandleMsgServiceData ... svc=0x300 fn=0x5a` and the body-pass dispatch both
+show it - but it lands on the handler object the claim walk chose for
+sub-id `0x16` (`handle=0x92eec000`, the same object that serves posfi), and
+`vHandleRenFIMessages` `0x3a359c` (function entry, so a reliable hook) never
+runs. `bIsClientMessage` `0x386c08` never runs either, so the request is dropped
+before the RenFI dispatcher: the server-side registration/dispatch for service
+`0x300` has to be found before this message can do anything.
