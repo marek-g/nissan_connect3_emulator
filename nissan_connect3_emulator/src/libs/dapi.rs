@@ -261,6 +261,7 @@ pub fn dapiapp_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     hook_service_data_scan(unicorn, base_address);
     hook_service_state_setter(unicorn, base_address);
     hook_registry_guard(unicorn, base_address);
+    hook_error_job_origin(unicorn, base_address);
     hook_service_status_handler(unicorn, base_address);
     hook_device_manager_init(unicorn, base_address);
     hook_device_manager_flow(unicorn, base_address);
@@ -841,6 +842,243 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
             })
             .unwrap();
     }
+}
+
+/// Where the map-data worker decides to answer with an error instead of data.
+///
+/// Every DAPI error answer is built on the same path:
+/// `LISA_tclBasicWorker::vSetAndCreateDapiErrorJob(&result, code)` ->
+/// `vTraceAndSetErrorJob(&result, code)` ->
+/// `u16TransformDapLiFiErrorCodeToDapiErrorCode(code)` ->
+/// `dap_tclJob::bInitErrorResponse(job, request, dapi_code)`, and
+/// `dap_tclCommunicationContext::bReceiveInternalMsg` then turns that error job
+/// into the `amt_tclServiceDataError` the client receives. The transform shows
+/// where a client-visible code comes from (DAPI 0x305 <- LiFi 0x3001/0x3002 and
+/// 0x3008/0x3009, 0x215 <- 0x1004/0x100c/0x100d, 0x218 <- 0x1002..0x1003 and
+/// >0x22f, 0x204 <- >0x2000, else 0xd), so logging the *input* code together
+/// with the failing call site names the data-access check that refused to
+/// answer procmapengine's GetBlockIDs request.
+fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    for (off, tag) in [
+        (0x00be_a5a8u32, "vSetAndCreateDapiErrorJob"),
+        (0x00be_a554u32, "vTraceAndSetErrorJob"),
+    ] {
+        let address = base_address + (off - ORIGINAL_BASE);
+        let tag: &'static str = tag;
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+                static COUNT: AtomicU32 = AtomicU32::new(0);
+                if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
+                    return;
+                }
+                let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+                let word = |addr: u32| -> u32 {
+                    let mut buf = [0u8; 4];
+                    uc.mem_read(addr as u64, &mut buf)
+                        .map(|_| u32::from_le_bytes(buf))
+                        .unwrap_or(0)
+                };
+                let this = read(RegisterARM::R0);
+                // `this + 0x76c` is the job the worker answers, `this + 8` the
+                // request it came from; job+0x20 is the job type (4 = CCA
+                // map-data service) and job+0x12 the u16 CCA service id.
+                let answer_job = word(this + 0x76c);
+                let request_job = word(this + 8);
+                log::warn!(
+                    "DAPI error-job {} worker={:#x} vtable={:#x} code={:#x} answer_job={:#x}(type={:#x} svc={:#x}) request_job={:#x}(type={:#x} svc={:#x}) lr={:#x}",
+                    tag,
+                    this,
+                    word(this),
+                    read(RegisterARM::R2) & 0xffff,
+                    answer_job,
+                    word(answer_job + 0x20),
+                    word(answer_job + 0x12) & 0xffff,
+                    request_job,
+                    word(request_job + 0x20),
+                    word(request_job + 0x12) & 0xffff,
+                    read(RegisterARM::LR) & !1,
+                );
+            })
+            .unwrap();
+    }
+
+    // `dap_tclJob::poCreateErrorResult(request, code)`: the generic factory that
+    // turns a failed request into the error answer (the code is passed to
+    // `bInitErrorResponse` unchanged, so it is already a DAPI code, not a LiFi
+    // one). Its caller is the layer that decided to fail the request, which is
+    // what the LR names here.
+    let create_error = base_address + (0x00b5_5d00u32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(create_error as u64, create_error as u64, move |uc, _, _| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
+                return;
+            }
+            let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+            let mut buf = [0u8; 4];
+            let request = read(RegisterARM::R0);
+            let request_type = match uc.mem_read((request + 0x20) as u64, &mut buf) {
+                Ok(()) => u32::from_le_bytes(buf),
+                Err(_) => 0xffff_ffff,
+            };
+            let request_svc = match uc.mem_read((request + 0x12) as u64, &mut buf) {
+                Ok(()) => u32::from_le_bytes(buf) & 0xffff,
+                Err(_) => 0xffff,
+            };
+            log::warn!(
+                "DAPI poCreateErrorResult request={:#x} request_type={:#x} request_svc={:#x} code={:#x} lr={:#x}",
+                request,
+                request_type,
+                request_svc,
+                read(RegisterARM::R1) & 0xffff,
+                read(RegisterARM::LR) & !1,
+            );
+        })
+        .unwrap();
+
+    // The translated code that actually reaches the client, plus its setter.
+    let init_error = base_address + (0x00b5_4878u32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(init_error as u64, init_error as u64, move |uc, _, _| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
+                return;
+            }
+            let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+            let mut buf = [0u8; 4];
+            let job = read(RegisterARM::R0);
+            let job_type = uc
+                .mem_read((job + 0x20) as u64, &mut buf)
+                .map(|_| u32::from_le_bytes(buf))
+                .unwrap_or(0xffff_ffff);
+            log::warn!(
+                "DAPI bInitErrorResponse job={:#x} type={:#x} dapi_code={:#x} lr={:#x}",
+                job,
+                job_type,
+                read(RegisterARM::R2) & 0xffff,
+                read(RegisterARM::LR) & !1,
+            );
+        })
+        .unwrap();
+
+    // `dap_map_tclWorker::u16SendUniqueIdList(state)`: the map worker's answer
+    // path for a GetBlockIDs request. Whether it runs at all separates "DAPI
+    // never got to the block-id lookup" from "the lookup produced nothing".
+    let unique_ids = base_address + (0x0084_a2f8u32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(unique_ids as u64, unique_ids as u64, move |uc, _, _| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) >= 40 {
+                return;
+            }
+            let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
+            let mut buf = [0u8; 4];
+            let this = read(RegisterARM::R0);
+            let job = {
+                uc.mem_read((this + 8) as u64, &mut buf)
+                    .map(|_| u32::from_le_bytes(buf))
+                    .unwrap_or(0)
+            };
+            log::warn!(
+                "DAPI map-worker u16SendUniqueIdList this={:#x} job={:#x} lr={:#x}",
+                this,
+                job,
+                read(RegisterARM::LR) & !1,
+            );
+        })
+        .unwrap();
+
+    // Step-by-step inside `u16SendUniqueIdList`. These are mid-function sites in
+    // already-translated code, and unicorn 2.x only emits the per-instruction
+    // hook check while a translation block is generated, so a narrow range on a
+    // hot function registers `Ok` but is never called (AGENTS.md). Hook the whole
+    // 4 KiB page and dispatch on the fetch address instead.
+    //
+    // The first two targets also capture the deserialized request:
+    // `fastmapfi_tclMsgGetBlockIDsMethodStart` is constructed at 0x84a310 (r0 is
+    // the message) and filled by `bGetDapFiMsgFromAction`, so the words dumped
+    // one instruction later are exactly what DAPI read out of procmapengine's
+    // GetBlockIDs request (dataset id, data type, map scale, bbox).
+    let page_lo = base_address + (0x0084_a000u32 - ORIGINAL_BASE);
+    let page_hi = page_lo + 0xfff;
+    let stash = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let stashed_msg = std::sync::Arc::clone(&stash);
+    unicorn
+        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+            use std::sync::atomic::Ordering as Ord;
+            static HITS: std::sync::OnceLock<
+                std::sync::Mutex<std::collections::HashMap<u32, u32>>,
+            > = std::sync::OnceLock::new();
+            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+            let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+            if original == 0x0084_a310 {
+                stashed_msg.store(
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    Ord::Relaxed,
+                );
+                return;
+            }
+            let label = match original {
+                0x0084_a344 => "after bGetDapFiMsgFromAction (1=deserialized)",
+                0x0084_a3d4 => "after u16CheckDatasetIdLocked (0xffff=ok)",
+                0x0084_a424 => "after bIsRnwRegProfOutlinesValid_Locked (1=valid)",
+                0x0084_a434 => "after bIsRsRegProfOutlinesValid_Locked (1=valid)",
+                0x0084_a4cc => "after u16Lock (0xffff=ok)",
+                0x0084_a4e4 => "after bIsLinkedTableInitialized",
+                0x0084_a4fc => "after u16InitLinkedTable (0xffff=ok)",
+                0x0084_a514 => "after bIsInitIdxCache",
+                0x0084_a524 => "after bInitIdxCache (0=ok)",
+                0x0084_a5a8 => "after u16CheckBBox (0xffff=ok, 0x218=invalid/too huge)",
+                0x0084_a5dc => "after u16GenerateUniqueIds (0xffff=ok)",
+                0x0084_a63c => "after u16Unlock (0xffff=ok)",
+                0x0084_a7c0 => "after u16SendResponse (answer sent)",
+                0x0084_a8cc => "after u16ProcessLoadRegProfOutlines (RNW outlines)",
+                0x0084_a908 => "after u16ProcessLoadRsRegProfOutlines (RS outlines)",
+                _ => return,
+            };
+            let seen = {
+                let mut counts = HITS.get_or_init(Default::default).lock().unwrap();
+                if counts.len() > 40 {
+                    return;
+                }
+                *counts.entry(original).or_insert(0) += 1;
+                *counts.get(&original).unwrap()
+            };
+            if seen > 3 {
+                return;
+            }
+            let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            if original == 0x0084_a344 {
+                let msg = stash.load(Ord::Relaxed);
+                let mut words = Vec::with_capacity(16);
+                for offset in (0..0x40).step_by(4) {
+                    let mut buf = [0u8; 4];
+                    words.push(
+                        uc.mem_read((msg + offset) as u64, &mut buf)
+                            .map(|_| u32::from_le_bytes(buf))
+                            .unwrap_or(0xffff_ffff),
+                    );
+                }
+                log::warn!(
+                    "DAPI blockids-step {:#x}: {} r0={:#x} request_msg={:#x} words={:x?}",
+                    original,
+                    label,
+                    result,
+                    msg,
+                    words,
+                );
+                return;
+            }
+            log::warn!(
+                "DAPI blockids-step {:#x}: {} r0={:#x}",
+                original,
+                label,
+                result,
+            );
+        })
+        .unwrap();
 }
 
 /// Trace the registry scan inside `ail_bHandleMsgServiceData` that decides

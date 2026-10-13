@@ -1654,31 +1654,35 @@ fn spawn_posfi_provider(unicorn: &mut Unicorn<'_, Context>) {
             // Give the engine time to open mbx_1024 and finish AIL bring-up.
             std::thread::sleep(std::time::Duration::from_secs(12));
             let mut seq: u16 = 0;
+            let queue = "mbx_1024".to_string();
             loop {
                 seq = seq.wrapping_add(1);
-                let blob = nav_position_status_message(seq);
-                let queue = "mbx_1024".to_string();
-                let posted = {
-                    let mut guard = namespace.lock().unwrap();
-                    crate::common::osal_queues::OsalQueueService::ensure_queue(
-                        &mut guard.mq,
-                        &queue,
-                    );
-                    let posted = crate::common::osal_queues::OsalQueueService::guest_post(
-                        &mut guard.mq,
-                        &queue,
-                        blob,
-                        0,
-                    );
-                    if posted {
-                        guard.notify_waiters();
+                // The car-position message first (it is the one that moves the
+                // CCP/camera), then the NavPositionStatus snapshot.
+                for blob in [
+                    extrapolated_positions_message(seq),
+                    nav_position_status_message(seq),
+                ] {
+                    let posted = {
+                        let mut guard = namespace.lock().unwrap();
+                        crate::common::osal_queues::OsalQueueService::ensure_queue(
+                            &mut guard.mq,
+                            &queue,
+                        );
+                        let posted = crate::common::osal_queues::OsalQueueService::guest_post(
+                            &mut guard.mq,
+                            &queue,
+                            blob,
+                            0,
+                        );
+                        if posted {
+                            guard.notify_waiters();
+                        }
+                        posted
+                    };
+                    if !posted && seq % 20 == 1 {
+                        log::info!("posfi provider: {queue} refused a message (#{seq})");
                     }
-                    posted
-                };
-                if posted {
-                    log::info!("posfi provider: posted NavPositionStatus #{seq} to {queue}");
-                } else if seq % 20 == 1 {
-                    log::info!("posfi provider: {queue} refused NavPositionStatus #{seq}");
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1000));
             }
@@ -1757,6 +1761,91 @@ pub(crate) fn nav_position_status_message(seq: u16) -> Vec<u8> {
     // RegisterConf assigned to the Navi client handler.
     content[0x16..0x18].copy_from_slice(&0x0017u16.to_le_bytes()); // register-id
     content[0x18..0x1a].copy_from_slice(&0x0010u16.to_le_bytes()); // functionId: NavPositionStatus
+    content[0x1a] = 0x06; // opCode: Status
+    content[0x1c..0x1e].copy_from_slice(&seq.to_le_bytes());
+    content[0x20..0x20 + body.len()].copy_from_slice(&body);
+    let mut blob = Vec::with_capacity(8 + LEN);
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(LEN as u32).to_le_bytes());
+    blob.extend_from_slice(&content);
+    blob
+}
+
+/// One `posfi_tclMsgExtrapolatedPositionsStatus` blob - the message that actually
+/// moves the car.  `vHandleExtrapolatedPositions` (`0x5498f8`, engine client
+/// function map entry {svc `0x1e`, fn `0x13`} at `0x713f18`) deserializes it with
+/// FI version 10 into `map_tclJobRCHandleExtrapolatedPositions` (message object at
+/// job `+0x20`), whose `Execute` (`0x4d14cc`) is the *only* caller of
+/// `map_tclMapCCA::BeginUpdate` (`0x54d1b0`) - the sole writer of the CCP array
+/// the renderer samples in `Render` (`0x528cd4` -> `GetCurrentCCP` `0x4ef094`) and
+/// the value `u32SetCameraParameters` centres the drawn view on.  r456 proved
+/// `posfi_tclMsgNavPositionStatus` does not touch the CCP (it only arms the
+/// prio-4 car-cursor request), which is why the camera kept requesting the
+/// engine's power-on rectangle around `(-83.45, 42.5)` - outside the
+/// `sd2-GENJ_EU_I.A v2` dataset on the card, where no block can ever exist.
+///
+/// Payload layout (little endian: `fi_tclInContext` byte order 0 - the type's
+/// `enGetByteOrder` thunk `0x38ad70` returns 0 - indexes
+/// `fi_tclIOContextBase::acou8FourByteOrder` at `0x6dec74` = `0,1,2,3`; primitive
+/// widths from the per-type `oRead` stream slots, `+0x8` = 1 byte, `+0xc` = 2,
+/// `+0x14` = 4; vectors are a u32 count followed by the elements, and the FI
+/// version the engine passes is 10, so the `> 0xe` gated u32 the writer emits is
+/// *not* consumed by this reader):
+///
+/// ```text
+///   0  u32  DataSetId                     (msg+0x08)
+///   4  u8   ExtrapolationReliability      (msg+0x14)
+///   5  u32  POSIX seconds                 (fi_tcl_PosixExactTime -> msg+0x24,
+///   9  u16  milliSecond                    the timestamp Execute hands to
+///  11  u16  position interval in ms        BeginUpdate, i.e. 0x54d1b0's
+///  13  u32  extrapolated position count    param_1..param_3: start ts, step, count)
+///  17  s32  longitude    -| fi_tcl_ExtrapolatedPosition: PositionWGS84 first
+///  21  s32  latitude     -| (lon @element+0x0c, lat @+0x14 - the two dwords
+///  25  ... 20 bytes        Execute copies into the map_trCCP entries), then the
+///                          eight scalars (s16 EAU/s16 MEMUSecond/s32 MEMU/...)
+///                          the reader pulls one after another = 28 bytes total.
+///  45  u32  ExtrapolatedOCDesc count   (kept empty)
+///  49  u32  NavClusterDesc count       (kept empty)
+/// ```
+///
+/// Everything behind the coordinates is zero on purpose: a wrong guess about the
+/// element's trailing fields then reads as "0 more elements" instead of a huge
+/// vector count, so a mismatch shows up as a rejected message (the probe at
+/// `0x549bf4` reports `-1`) rather than as a wild allocation.
+pub(crate) fn extrapolated_positions_message(seq: u16) -> Vec<u8> {
+    let mut body = Vec::with_capacity(0x80);
+    body.extend_from_slice(&0u32.to_le_bytes()); // DataSetId (0 = "as received")
+    body.push(1); // ExtrapolationReliability: extrapolated, but valid
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as u32)
+        .unwrap_or(0);
+    body.extend_from_slice(&seconds.to_le_bytes()); // POSIX seconds
+    body.extend_from_slice(&0u16.to_le_bytes()); // milliSecond
+    body.extend_from_slice(&1000u16.to_le_bytes()); // one position per second
+    body.extend_from_slice(&1u32.to_le_bytes()); // one extrapolated position
+    body.extend_from_slice(&map_units(19.91809).to_le_bytes()); // Longitude (Krakow)
+    body.extend_from_slice(&map_units(50.06254).to_le_bytes()); // Latitude (Krakow)
+    body.extend_from_slice(&[0u8; 20]); // heading + the element's remaining scalars
+    body.extend_from_slice(&0u32.to_le_bytes()); // no ExtrapolatedOCDesc entries
+    body.extend_from_slice(&0u32.to_le_bytes()); // no NavClusterDesc entries
+    body.resize(body.len() + 0x40, 0); // slack, see the layout comment
+    let len = 0x20 + body.len();
+    let LEN = len.next_multiple_of(16);
+    let mut content = vec![0u8; LEN];
+    // Envelope identical to `nav_position_status_message` (same posfi server, same
+    // sub-id `0x16` the engine's PortControl Navi client handler is registered
+    // under), only the function id differs: `0x13` selects
+    // `vHandleExtrapolatedPositions` in the client function map.
+    content[0x00..0x04].copy_from_slice(&0x0400_0016u32.to_le_bytes());
+    content[0x04..0x08].copy_from_slice(&(LEN as u32).to_le_bytes());
+    content[0x08] = 0x01; // source app: 1 (PROCNAV, the posfi server)
+    content[0x0b] = 0x45; // class: ServiceData
+    content[0x0c..0x10].copy_from_slice(&0xffff_ffffu32.to_le_bytes()); // sub-id wildcards
+    content[0x10..0x14].copy_from_slice(&0x0001_5f90u32.to_le_bytes());
+    content[0x14..0x16].copy_from_slice(&0x001eu16.to_le_bytes()); // serviceId: posfi
+    content[0x16..0x18].copy_from_slice(&0x0017u16.to_le_bytes()); // register-id
+    content[0x18..0x1a].copy_from_slice(&0x0013u16.to_le_bytes()); // functionId: ExtrapolatedPositions
     content[0x1a] = 0x06; // opCode: Status
     content[0x1c..0x1e].copy_from_slice(&seq.to_le_bytes());
     content[0x20..0x20 + body.len()].copy_from_slice(&body);

@@ -651,6 +651,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
 
     add_map_view_hooks(unicorn, base_address);
     add_map_data_main_loop_trace_hooks(unicorn, base_address);
+    add_get_block_ids_answer_trace_hooks(unicorn, base_address);
 
     let force_early_active = std::env::var("EMU_PROCMAPENGINE_FORCE_ACTIVE_STATE")
         .is_ok_and(|value| !value.is_empty() && value != "0");
@@ -2349,6 +2350,406 @@ fn add_job_queue_wait_skip_hook(unicorn: &mut Unicorn<'_, Context>, base_address
                     triggered
                 );
             }
+        })
+        .unwrap();
+}
+
+/// Follow DAPI's GetBlockIDs answer through the MDM job that applies it.
+///
+/// `PortControl_CCAClientHandler_DAPI::vHandleGetBlockIDs` (0x53e7ac) only
+/// deserializes the answer when the ServiceData opcode is 7; opcode 8 is turned
+/// into `amt_tclServiceDataError` and its code stored in the job, anything else
+/// stores 0xffab26. The job's `Execute` (0x4b4028) then looks the requesting
+/// map-data request up again by the MDM ref counter it stored at `job + 0x1e`
+/// (`map_tclMapDataManager::GetDAPIRequestingMapDataRequest`, 0x5072b4) and, when
+/// that lookup fails, throws the answer away with 0xffab14 at 0x4b4a98 - so
+/// either step can silently swallow the block ids. These probes print the job
+/// code, the ref counter, and the resolved request with its state/queue fields.
+fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static ANSWER_COUNT: AtomicU32 = AtomicU32::new(0);
+
+    // `map_tclJobMDMHandleGetBlockIDs::Execute` entry.
+    let execute = base_address + (0x004b_4028u32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(execute as u64, execute as u64, move |uc, _, _| {
+            let count = ANSWER_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count >= 60 {
+                return;
+            }
+            let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            log::info!(
+                "PROCMAPENGINE map-data trace HandleGetBlockIDs::Execute at {:#x}: t={}ms thread=[{}] job={:#x} mdm_ref={:#x} answer_code={:#x} block_count={}",
+                execute,
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                this,
+                read_u16_or_invalid(uc, this + 0x1e),
+                read_u32_or_invalid(uc, this + 0xc),
+                read_u32_or_invalid(uc, this + 0x24),
+            );
+        })
+        .unwrap();
+
+    // Result of `GetDAPIRequestingMapDataRequest`: `r0` is the request (0 means
+    // the answer is dropped).
+    let resolved = base_address + (0x004b_403cu32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(resolved as u64, resolved as u64, move |uc, _, _| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
+                return;
+            }
+            let request = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            log::info!(
+                "PROCMAPENGINE map-data trace HandleGetBlockIDs request lookup at {:#x}: request={:#x} kind={:#x} state={:#x} refcounter={:#x} sentinel=[{:#x},{:#x}] fastmap_ch={:#x}",
+                resolved,
+                request,
+                read_u32_or_invalid(uc, request),
+                read_u32_or_invalid(uc, request + 0x74),
+                read_u16_or_invalid(uc, request + 0x200),
+                read_u32_or_invalid(uc, request + 0x1f4),
+                read_u32_or_invalid(uc, request + 0x1f8),
+                read_u8_or_invalid(uc, request + 0x1fc),
+            );
+        })
+        .unwrap();
+
+    // The drop path itself.
+    let dropped = base_address + (0x004b_4a98u32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(dropped as u64, dropped as u64, move |uc, _, _| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
+                return;
+            }
+            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+            let this = read_u32_or_invalid(uc, sp + 0x44);
+            log::warn!(
+                "PROCMAPENGINE map-data trace HandleGetBlockIDs DROPPED answer at {:#x}: job={:#x} mdm_ref={:#x} answer_code={:#x}",
+                dropped,
+                this,
+                read_u16_or_invalid(uc, this + 0x1e),
+                read_u32_or_invalid(uc, this + 0xc),
+            );
+        })
+        .unwrap();
+
+    // Every write to the MDM ref counter (`request + 0x200`, the u16
+    // `mdm_sMapDataRequest::u16MDMRefCounter`) of the statically allocated
+    // requests. `GetDAPIRequestingMapDataRequest` matches an incoming answer on
+    // exactly this field, so a write that clears or changes it between the
+    // request and its answer silently orphans the answer (0xffab14 path above).
+    for (request, name) in [
+        (0x0078_fcd4u32, "AcCam/view"),
+        (0x0079_04e4u32, "car cursor"),
+        (0x0079_06f4u32, "image block"),
+    ] {
+        use unicorn_engine::unicorn_const::HookType;
+        let field = base_address + (request - ORIGINAL_BASE) + 0x200;
+        unicorn
+            .add_mem_hook(HookType::MEM_WRITE, field as u64, field as u64 + 1, move |uc, _t, address, size, value| {
+                static COUNT: AtomicU32 = AtomicU32::new(0);
+                if COUNT.fetch_add(1, Ordering::Relaxed) >= 200 {
+                    return true;
+                }
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCMAPENGINE map-data trace refcounter WRITE {} t={}ms thread=[{}] field={:#x} size={} value={:#x} pc={:#x} request_state={:#x} sentinels=[{:#x},{:#x}]",
+                    name,
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    address,
+                    size,
+                    value,
+                    pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                    read_u32_or_invalid(uc, (address - 0x200 + 0x74) as u32),
+                    read_u32_or_invalid(uc, (address - 0x200 + 0x1f4) as u32),
+                    read_u32_or_invalid(uc, (address - 0x200 + 0x1f8) as u32),
+                );
+                true
+            })
+            .unwrap();
+    }
+
+    // Who resets a live request: `PerformResetMapDataRequest` clears the request
+    // state and the ref counter, orphaning the answer that is on its way. Its
+    // callers are MDM jobs, `Stop`, `Init`, `OnUpdateDatasetId` and
+    // `OnUpdateServiceStateDAPIFastmap` (a DAPI service-state change), so log the
+    // caller and the value that triggered it.
+    for (off, name) in [
+        (0x0050_ea68u32, "PerformResetMapDataRequest"),
+        (0x0051_2400u32, "OnUpdateServiceStateDAPIFastmap"),
+        (0x0051_2230u32, "OnUpdateDatasetId"),
+        (0x0050_f3acu32, "map_tclMapDataManager::Stop"),
+    ] {
+        let address = base_address + (off - ORIGINAL_BASE);
+        let name: &'static str = name;
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+                static COUNT: AtomicU32 = AtomicU32::new(0);
+                if COUNT.fetch_add(1, Ordering::Relaxed) >= 40 {
+                    return;
+                }
+                log::warn!(
+                    "PROCMAPENGINE map-data trace {} t={}ms thread=[{}] this={:#x} r1={:#x} lr={:#x}",
+                    name,
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                    (uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1,
+                );
+            })
+            .unwrap();
+    }
+
+    // The car-position channel: `vHandleExtrapolatedPositions` (client map entry
+    // {svc 0x1e, fn 0x13} at 0x713f18) deserializes a
+    // `posfi_tclMsgExtrapolatedPositionsStatus` into an RC job, whose `Execute`
+    // (0x4d14cc) feeds `map_tclMapCCA::BeginUpdate` - that is what actually moves
+    // the CCP the renderer draws and the camera follows. Without it the view stays
+    // at the engine's power-on default (-83.0/42.5), which is outside the
+    // (`sd2-GENJ_EU_I.A v2`) dataset on the card, so no real block can ever be
+    // drawn. Log the deserialization result and the fields the RC job got.
+    let extrap_deserialized = base_address + (0x0054_9bf4u32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(extrap_deserialized as u64, extrap_deserialized as u64, move |uc, _, _| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) >= 12 {
+                return;
+            }
+            let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let job = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+            // The message object occupies job+0x20..+0x80; `Execute` reads the
+            // POSIX time at +0x44/+0x48, a u16 at +0x50 and the position array as
+            // [begin, end) at +0x58/+0x5c (88-byte elements).
+            let mut words = Vec::with_capacity(24);
+            for offset in (0x20..0x80u32).step_by(4) {
+                words.push(read_u32_or_invalid(uc, job + offset));
+            }
+            log::warn!(
+                "PROCMAPENGINE map-data trace ExtrapolatedPositions deserialized t={}ms thread=[{}] result={:#x} job={:#x} msg=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}] lr={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                result,
+                job,
+                words[0],
+                words[1],
+                words[2],
+                words[3],
+                words[4],
+                words[5],
+                words[6],
+                words[7],
+                words[8],
+                words[9],
+                words[10],
+                words[11],
+                words[12],
+                words[13],
+                words[14],
+                words[15],
+                words[16],
+                words[17],
+                words[18],
+                words[19],
+                (uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1,
+            );
+            let begin = words[(0x58 - 0x20) / 4];
+            let end = words[(0x5c - 0x20) / 4];
+            if begin != 0 && end > begin {
+                let mut element = Vec::with_capacity(0x58 / 4);
+                for offset in (0..0x58u32).step_by(4) {
+                    element.push(read_u32_or_invalid(uc, begin + offset));
+                }
+                log::warn!(
+                    "PROCMAPENGINE map-data trace ExtrapolatedPositions first element at {:#x}: {:x?}",
+                    begin,
+                    element,
+                );
+            }
+        })
+        .unwrap();
+
+    // Does the CCP really move? `map_tclJobRCHandleExtrapolatedPositions::Execute`
+    // fills the CCA's interpolation array (`BeginUpdate` at 0x54d1b0 hands back the
+    // array pointer, one `map_trCCP {x, y, heading}` per position) and then swaps
+    // `m_u8CurrentCCAInstance`, which is what makes the renderer see it. Hook right
+    // after `EndUpdate` (bl at 0x4d1738, `r7` = the CCA instance that was just
+    // filled) and dump the instance plus the array it now publishes.
+    let cca_filled = base_address + (0x004d_173cu32 - ORIGINAL_BASE);
+    let cca_instance_global = base_address + (0x0078_f668u32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(cca_filled as u64, cca_filled as u64, move |uc, _, _| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) >= 8 {
+                return;
+            }
+            let cca = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+            let start = read_u32_or_invalid(uc, cca);
+            let end = read_u32_or_invalid(uc, cca + 4);
+            let step = read_u32_or_invalid(uc, cca + 8);
+            let array = read_u32_or_invalid(uc, cca + 0x10);
+            let count = read_u32_or_invalid(uc, cca + 0x14);
+            let mut entries = Vec::new();
+            for index in 0..count.min(3) {
+                for offset in [0u32, 4, 8] {
+                    entries.push(read_u32_or_invalid(uc, array + index * 0xc + offset));
+                }
+            }
+            log::warn!(
+                "PROCMAPENGINE map-data trace CCP filled t={}ms thread=[{}] cca={:#x} ts=[{:#x}..{:#x}] step={:#x} count={:#x} array={:#x} entries=[{:x?}] instance={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                cca,
+                start,
+                end,
+                step,
+                count,
+                array,
+                entries,
+                read_u8_or_invalid(uc, cca_instance_global),
+            );
+        })
+        .unwrap();
+
+    // `map_tclJobRCContinuousScrolling::Execute` (0x4c9898) - the job that turns
+    // on "continuous scrolling", i.e. the map view following the CCP - refuses to
+    // run (`0xffab00`) while `map_tclMapEngineControl::ms_eMapEngineState` is 0, 4
+    // or 5. r458 proved the CCP itself is fine (it holds Krakow, 0xe29fa46 /
+    // 0x23999b77) while the camera (`u32SetCameraParameters`) still asks for the
+    // power-on rectangle, so watch every state transition with the writing site.
+    {
+        use unicorn_engine::unicorn_const::HookType;
+        let state = base_address + (0x0079_07acu32 - ORIGINAL_BASE);
+        unicorn
+            .add_mem_hook(HookType::MEM_WRITE, state as u64, state as u64 + 3, move |uc, _t, address, size, value| {
+                static COUNT: AtomicU32 = AtomicU32::new(0);
+                if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
+                    return true;
+                }
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE map-data trace MapEngineState WRITE t={}ms thread=[{}] size={} value={:#x} pc={:#x} lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    size,
+                    value,
+                    pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                    (uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32)
+                        .wrapping_sub(base_address)
+                        .wrapping_add(ORIGINAL_BASE)
+                        & !1,
+                );
+                true
+            })
+            .unwrap();
+    }
+
+    // The HMI controls the view through the engine's *server* side service
+    // (`map_tclPortControl_Platform::vHandleRenFIMessages` 0x3a359c, called from
+    // `vOnNewMessage`; rendererfi): continuous scrolling, camera, scale,
+    // language... Log which method the HMI actually calls, so a missing
+    // follow-the-car command is distinguishable from one the engine refused.
+    let renfi = base_address + (0x003a_359cu32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(renfi as u64, renfi as u64, move |uc, _, _| {
+            static SEEN: std::sync::OnceLock<std::sync::Mutex<Vec<[u32; 3]>>> =
+                std::sync::OnceLock::new();
+            let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            // `amt_tclBaseMessage`'s header lives behind the object's +0x04
+            // pointer (cf. `*(char *)(*(int *)(param_2 + 4) + 0x1a)` in
+            // `RndFI_HandleContinuousScrolling`).
+            let header = read_u32_or_invalid(uc, message + 4);
+            let key = [
+                read_u16_or_invalid(uc, header + 0x14),
+                read_u16_or_invalid(uc, header + 0x18),
+                read_u8_or_invalid(uc, header + 0x1a) as u32,
+            ];
+            let is_new = {
+                let mut seen = SEEN.get_or_init(Default::default).lock().unwrap();
+                if seen.contains(&key) {
+                    false
+                } else {
+                    if seen.len() < 64 {
+                        seen.push(key);
+                    }
+                    true
+                }
+            };
+            if !is_new {
+                return;
+            }
+            log::info!(
+                "PROCMAPENGINE map-data trace RenFI method t={}ms thread=[{}] svc={:#x} fn={:#x} opcode={:#x} message={:#x} lr={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                key[0],
+                key[1],
+                key[2],
+                message,
+                (uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1,
+            );
+        })
+        .unwrap();
+
+    // Every re-arm of a map-data request: `UpdateMapDataRequest(prio, type,
+    // scale, flags, rect)` - the rectangle arrives by value in the four stack
+    // words above the return address - and `PerformMapDataRequest` tears the
+    // pending request down (state 0, ref counter 0) whenever those parameters
+    // differ from the ones in flight. Two callers with different rectangles - the
+    // HMI's own view and the position feed - therefore take turns orphaning each
+    // other's request, and no DAPI answer can be matched any more. Log who arms
+    // what, and what the request currently holds.
+    let update = base_address + (0x0050_494cu32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(update as u64, update as u64, move |uc, _, _| {
+            static LAST: std::sync::OnceLock<std::sync::Mutex<[u32; 7]>> =
+                std::sync::OnceLock::new();
+            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+            let prio = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let kind = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xff;
+            let scale_bits = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let stamp = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+            let rect = [
+                read_u32_or_invalid(uc, sp),
+                read_u32_or_invalid(uc, sp + 4),
+                read_u32_or_invalid(uc, sp + 8),
+                read_u32_or_invalid(uc, sp + 0xc),
+            ];
+            // Only log when the arm parameters actually change: the render loop
+            // re-arms with the same rectangle on every frame and that flood hides
+            // the changes that matter (the position feed taking over). The 4th
+            // register (`stamp` = type * 1000 + OSAL_ClockGetElapsedTime()) is left
+            // out of the comparison because it changes on every call.
+            let changed = {
+                let mut last = LAST.get_or_init(Default::default).lock().unwrap();
+                let current = [prio, kind, scale_bits, rect[0], rect[1], rect[2], rect[3]];
+                let changed = *last != current;
+                if changed {
+                    *last = current;
+                }
+                changed
+            };
+            if !changed {
+                return;
+            }
+            log::info!(
+                "PROCMAPENGINE map-data trace UpdateMapDataRequest at {:#x}: t={}ms thread=[{}] prio={:#x} type={:#x} scale={:.3} stamp={:#x} rect=[{:#x},{:#x},{:#x},{:#x}] lr={:#x}",
+                update,
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                prio,
+                kind,
+                f32::from_bits(scale_bits),
+                stamp,
+                rect[0],
+                rect[1],
+                rect[2],
+                rect[3],
+                (uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1,
+            );
         })
         .unwrap();
 }
@@ -4546,6 +4947,14 @@ fn read_u16_or_invalid(unicorn: &mut Unicorn<'_, Context>, address: u32) -> u32 
     let mut bytes = [0u8; 2];
     match unicorn.mem_read(address as u64, &mut bytes) {
         Ok(()) => u16::from_le_bytes(bytes) as u32,
+        Err(_) => 0xffff_ffff,
+    }
+}
+
+fn read_u8_or_invalid(unicorn: &mut Unicorn<'_, Context>, address: u32) -> u32 {
+    let mut bytes = [0u8; 1];
+    match unicorn.mem_read(address as u64, &mut bytes) {
+        Ok(()) => bytes[0] as u32,
         Err(_) => 0xffff_ffff,
     }
 }
