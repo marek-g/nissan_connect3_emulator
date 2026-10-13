@@ -1946,7 +1946,7 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                     let app_iface = read_u32_or_invalid(uc, dispatch);
                     if app_iface < 0xf000_0000 {
                         ensure_posfi_ref_linked(uc, app_iface);
-                        ensure_service_reference_unique_ids(uc, app_iface);
+                        ensure_dapi_map_service_reference(uc, app_iface);
                     }
                 }
             }
@@ -3006,6 +3006,234 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 .unwrap();
         }
 
+        // The engine's DAPI `GetBlockIDs` requests stop being sent after the second one:
+        // `ail_tclAppInterfaceRestricted::enPostMessage` (0x661a3c) answers 7 whenever
+        // `ail_enCheckClientMailValidity` (0x66dd00) refuses the message, i.e. when the
+        // client handler's service-reference list has no entry whose server app id and
+        // register id match the message header (16), or when the entry's service state
+        // does not allow the message opcode (2 for state 1 with an opcode that is neither
+        // 4 nor 0xd, 17 for state 2).  Log header, list and verdict.
+        {
+            let site = base_address + (0x0066_dd00u32 - ORIGINAL_BASE);
+            unicorn
+                .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+                    static ENTRY_LOGS: AtomicU32 = AtomicU32::new(0);
+                    let logs = ENTRY_LOGS.fetch_add(1, Ordering::Relaxed);
+                    if logs >= 300 {
+                        return;
+                    }
+                    let msg = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    let list = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                    // `r3` is `ail_tclAppInterfaceRestricted + 0x50`, the client
+                    // service-reference list this check walks.
+                    ensure_dapi_map_service_reference(uc, list.wrapping_sub(0x50));
+                    let header = read_u32_or_invalid(uc, msg.wrapping_add(4));
+                    let src = read_u16_or_invalid(uc, header.wrapping_add(0x0));
+                    let dst = read_u16_or_invalid(uc, header.wrapping_add(0x02));
+                    let sub = read_u16_or_invalid(uc, header.wrapping_add(0x0c));
+                    let service = read_u16_or_invalid(uc, header.wrapping_add(0x14));
+                    let register_id = read_u16_or_invalid(uc, header.wrapping_add(0x16));
+                    let function = read_u16_or_invalid(uc, header.wrapping_add(0x18));
+                    let opcode = read_u8_or_invalid(uc, header.wrapping_add(0x1a));
+                    // `list + 4` is the first node, `node + 4` the next one and the
+                    // `ail_tclServiceReference` object starts at `node + 8`, where byte
+                    // +0x06 is the service state.
+                    let mut references = Vec::new();
+                    let mut node = read_u32_or_invalid(uc, list.wrapping_add(4));
+                    for _ in 0..8 {
+                        if node == 0 || node == 0xffff_ffff {
+                            break;
+                        }
+                        let reference = node.wrapping_add(8);
+                        references.push(format!(
+                            "state={:#x} words={}",
+                            read_u8_or_invalid(uc, reference.wrapping_add(6)),
+                            (0..7u32)
+                                .map(|i| format!("{:#x}", read_u32_or_invalid(uc, reference.wrapping_add(i * 4))))
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        ));
+                        node = read_u32_or_invalid(uc, node.wrapping_add(4));
+                    }
+                    log::info!(
+                        "PROCMAPENGINE map-data trace client mail check t={}ms thread=[{}] app={:#x} msg={:#x} header={:#x} src={:#x} dst={:#x} sub={:#x} svc={:#x} reg={:#x} fn={:#x} opcode={:#x} list={:#x} refs=[{}] lr={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        (uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32) & 0xffff,
+                        msg,
+                        header,
+                        src,
+                        dst,
+                        sub,
+                        service,
+                        register_id,
+                        function,
+                        opcode,
+                        list,
+                        references.join(" | "),
+                        ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                            .wrapping_sub(base_address)
+                            .wrapping_add(ORIGINAL_BASE),
+                    );
+                })
+                .unwrap();
+        }
+        for (offset, label) in [
+            (0x0066_de18u32 - ORIGINAL_BASE, "client mail check verdict"),
+            (0x0066_de80u32 - ORIGINAL_BASE, "client mail check no-reference"),
+            (0x0066_df04u32 - ORIGINAL_BASE, "client mail check state1"),
+        ] {
+            static VERDICT_LOGS: AtomicU32 = AtomicU32::new(0);
+            let site = base_address + offset;
+            unicorn
+                .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+                    let logs = VERDICT_LOGS.fetch_add(1, Ordering::Relaxed);
+                    if logs >= 300 {
+                        return;
+                    }
+                    let stack = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE map-data trace {} t={}ms thread=[{}] code={:#x} state={:#x} opcode={:#x} reg={:#x}",
+                        label,
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        (uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32) & 0xffff,
+                        read_u32_or_invalid(uc, stack.wrapping_add(0x14)),
+                        read_u32_or_invalid(uc, stack.wrapping_add(0x10)),
+                        read_u32_or_invalid(uc, stack.wrapping_add(0xc)),
+                    );
+                })
+                .unwrap();
+        }
+
+        // `ail_enCheckClientMailValidity` only lets a request (opcode 2) through while the
+        // `ail_tclServiceReference` state is neither 1 nor 2, and the constructor leaves a
+        // freshly created reference at 1 (`ail_tclServiceReference` 0x66e2ec).  State 0 is
+        // reached through `vSetServiceState`, whose only caller is the administration
+        // dispatch that turns `amt_tclServiceStatus` / `amt_tclServiceUnregister` messages
+        // into state changes.  Log the references, who creates them and who changes their
+        // state, so the "second GetBlockIDs is refused with 7" window has an owner.
+        for (offset, label) in [
+            (0x0066_e43cu32 - ORIGINAL_BASE, "service reference state set"),
+            (0x0066_e2ecu32 - ORIGINAL_BASE, "service reference created"),
+            (0x0066_82bcu32 - ORIGINAL_BASE, "MsgServiceRegisterConf"),
+            (0x0066_963cu32 - ORIGINAL_BASE, "ExamineInfluenceToAdministration"),
+        ] {
+            static STATE_LOGS: AtomicU32 = AtomicU32::new(0);
+            let site = base_address + offset;
+            unicorn
+                .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+                    let logs = STATE_LOGS.fetch_add(1, Ordering::Relaxed);
+                    if logs >= 600 {
+                        return;
+                    }
+                    let reference = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    // For the two `ail_tclServiceReference` sites r0 is the reference
+                    // (+0x00 service, +0x02 server app, +0x04 register id, +0x06 state,
+                    // +0x08 sub id); for the message sites r1 is the message whose header
+                    // pointer sits at +0x04.
+                    let admin = (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32) & 0xff;
+                    let state = if offset == 0x0066_e43c - ORIGINAL_BASE {
+                        admin
+                    } else {
+                        read_u8_or_invalid(uc, reference.wrapping_add(6))
+                    };
+                    // `MsgServiceRegisterConf(this, msg)` and `vSetServiceState(this, value)`
+                    // take their second argument in r1, `ExamineInfluenceToAdministration`
+                    // takes the admin type in r1 and the message in r2.
+                    let (message, admin) = if offset == 0x0066_963c - ORIGINAL_BASE {
+                        (
+                            uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+                            admin,
+                        )
+                    } else if offset == 0x0066_82bc - ORIGINAL_BASE {
+                        (message, 0xff)
+                    } else {
+                        (0, admin)
+                    };
+                    let header = read_u32_or_invalid(uc, message.wrapping_add(4));
+                    log::info!(
+                        "PROCMAPENGINE map-data trace {} t={}ms thread=[{}] ref={:#x} ref_words={:#x?} state={:#x} admin={:#x} header={:#x} src={:#x} dst={:#x} class={:#x} svc={:#x} reg={:#x} opcode={:#x} lr={:#x}",
+                        label,
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        reference,
+                        (0..9u32)
+                            .map(|i| format!("{:#x}", read_u32_or_invalid(uc, reference.wrapping_add(i * 4))))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        state,
+                        admin,
+                        header,
+                        read_u16_or_invalid(uc, header),
+                        read_u16_or_invalid(uc, header.wrapping_add(2)),
+                        read_u16_or_invalid(uc, header.wrapping_add(0x0c)),
+                        read_u16_or_invalid(uc, header.wrapping_add(0x14)),
+                        read_u16_or_invalid(uc, header.wrapping_add(0x16)),
+                        read_u8_or_invalid(uc, header.wrapping_add(0x1a)),
+                        ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                            .wrapping_sub(base_address)
+                            .wrapping_add(ORIGINAL_BASE),
+                    );
+                })
+                .unwrap();
+        }
+
+        // The narrow hooks on `ail_tclServiceReference`'s constructor (0x66e2ec, leaves the
+        // service state at 1) and on `vSetServiceState` (0x66e43c) never fired although the
+        // reference the client list holds for the DAPI map service (0x26) demonstrably
+        // changed, so they are watched through their page instead (docs/issues/design.md).
+        // `vReset` (0x66e4b4) and the setter at 0x66e504 are watched as well: they are the
+        // other places that rewrite a reference's service / register / sub id.
+        {
+            let page = base_address + (0x0066_e000u32 - ORIGINAL_BASE);
+            unicorn
+                .add_code_hook(page as u64, (page + 0xfff) as u64, move |uc, _, _| {
+                    static REF_LOGS: AtomicU32 = AtomicU32::new(0);
+                    let offset = (uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32)
+                        .wrapping_sub(base_address)
+                        .wrapping_add(ORIGINAL_BASE);
+                    let label = match offset {
+                        0x0066_e2ec => "service reference created",
+                        0x0066_e43c => "service reference state set",
+                        0x0066_e4b4 => "service reference reset",
+                        0x0066_e504 => "service reference ids set",
+                        // liveness markers: both are called by the client mail check above,
+                        // so a zero count here means the page hook itself never dispatches
+                        0x0066_e444 => "service reference state read (liveness)",
+                        0x0066_e3d0 => "service reference match test (liveness)",
+                        _ => return,
+                    };
+                    let logs = REF_LOGS.fetch_add(1, Ordering::Relaxed);
+                    if logs >= 400 {
+                        return;
+                    }
+                    let reference = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE map-data trace {} t={}ms thread=[{}] ref={:#x} words={} r1={:#x} r2={:#x} r3={:#x} lr={:#x}",
+                        label,
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        reference,
+                        (0..9u32)
+                            .map(|i| format!(
+                                "{:#x}",
+                                read_u32_or_invalid(uc, reference.wrapping_add(i * 4))
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32) & 0xffff,
+                        (uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32) & 0xffff,
+                        (uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32) & 0xffff,
+                        ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                            .wrapping_sub(base_address)
+                            .wrapping_add(ORIGINAL_BASE),
+                    );
+                })
+                .unwrap();
+        }
+
         static EXEC_LOGS: AtomicU32 = AtomicU32::new(0);
         let exec = base_address + (0x004d_74c4u32 - ORIGINAL_BASE);
         unicorn
@@ -3067,7 +3295,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     (flags, words)
                 };
                 log::info!(
-                    "PROCMAPENGINE map-data trace render control SetCameraParameters t={}ms thread=[{}] view_id={:#x} params={:#x} words=[{}] autozoom={:#x} az_flags={:#x} az_words=[{:#x?}] open_views=[{:#x?}] lr={:#x}",
+                    "PROCMAPENGINE map-data trace render control SetCameraParameters t={}ms thread=[{}] view_id={:#x} params={:#x} words=[{}] autozoom={:#x} az_flags={:#x} az_words={} open_views={} lr={:#x}",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     uc.get_data().inner.thread_id(),
                     view_id,
@@ -3079,8 +3307,16 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                         .join(","),
                     autozoom,
                     az_flags,
-                    az_words,
-                    views,
+                    az_words
+                        .iter()
+                        .map(|w| format!("{w:#x}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    views
+                        .iter()
+                        .map(|w| format!("{w:#x}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
                     ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
                         .wrapping_sub(base_address)
                         .wrapping_add(ORIGINAL_BASE),
@@ -5609,57 +5845,105 @@ fn ensure_posfi_ref_linked(unicorn: &mut Unicorn<'_, Context>, app_iface: u32) {
     log::info!("PROCMAPENGINE: re-linked posfi service reference into list {list:#x}");
 }
 
-/// Keep the engine's service-reference records claimable by DAPI.
+/// Keep a client service reference for the DAPI map service in the engine's AIL list.
 ///
-/// The claim walk (`ail_tclServiceReference::bIsDataSet`, 0x66e3d0) matches an
-/// incoming ServiceData against a reference on (service id, server app,
-/// register id, unique id).  Its 0xffff wildcard is implemented only for the
-/// message arguments (`param == 0xffff || this[slot] == param`), so the stored
-/// slot has to compare equal to what the peer really sends.  The async register
-/// path never assigns that slot: `bRegisterAsyncExecute` (0x660f74) builds the
-/// outgoing ServiceRegister with zeros in its trailing words (the log shows
-/// `sub12=0xfffe sub14=0x0000`) and `vHandleAsyncRegisterConf` (0x665720) only
-/// flags the request entry and calls back into the client handler, so the
-/// reference DAPI's answer is matched against holds unique id 0 while every
-/// ServiceData DAPI sends carries `AIL_NO_UNIQUE_ID` (0xfffe).  Each map-data
-/// answer was therefore dropped as unclaimable and the engine answered with a
-/// ServiceDataError instead of handing the block ids to the request (r443:
-/// `tuple=(0x26,0x7,0x1,0xfffe)` vs `compared=[0x26,0x7,0x1,0x0]`, GetBlockIDs
-/// stuck at state 1, which in turn starves the car-cursor request).
-///
-/// Only unassigned references of the DAPI application are touched and only with
-/// the sentinel that peer actually uses; no claim that could already match
-/// changes (no message in a run carries unique id 0), so no existing route can
-/// regress.  This maintains registration bookkeeping the emulator already owns
-/// (the same list the fabricated posfi reference lives in), never the apps.
-fn ensure_service_reference_unique_ids(unicorn: &mut Unicorn<'_, Context>, app_iface: u32) {
-    /// DAPI's application id: the peer whose ServiceData answers carry 0xfffe.
+/// Whether the engine's registration of the DAPI map service (0x26) takes the
+/// synchronous path - `ail_bHandleMsgServiceRegisterConf` (0x6682bc) stores the
+/// reference the client's later messages are checked against - or the asynchronous one
+/// - `vHandleAsyncRegisterConf` (0x665720) only flags the pending request and calls back
+/// into the client handler - is a race between the engine's register call and the conf.
+/// With the asynchronous result `ail_enCheckClientMailValidity` (0x66dd00) finds no
+/// entry for (0x26, DAPI) and refuses every `GetBlockIDs` request with 0x10, which
+/// `enPostMessage` (0x661a3c) reports as 7, so no map data is ever asked for (r561);
+/// the synchronous result works (r557).  This registration bookkeeping is already
+/// emulator-owned - the posfi entry in this very list is fabricated the same way - so
+/// make the entry the conf implies exist either way: the service id, DAPI's app id, the
+/// register id from the conf, service state available and unique id 0, which is what the
+/// engine's own requests carry and, after the transport cleared `AIL_NO_UNIQUE_ID` from
+/// DAPI's answers (`stamp_unique_id_for_receiver` in libosal), what its answers carry
+/// too.  Note that the unique id must *not* be set to 0xfffe: the claim walk compares
+/// that slot against the message and the engine's own requests carry 0, so doing it here
+/// instead of in the messages blocks the requests (r551).
+fn ensure_dapi_map_service_reference(unicorn: &mut Unicorn<'_, Context>, app_iface: u32) {
+    /// DAPI's application id, the server of the map service.
     const DAPI_APP_ID: u32 = 0x7;
 
+    let register_id = MAP_DATA_REGISTER_ID.load(Ordering::Relaxed);
+    if register_id == 0xffff {
+        // No conf seen yet: there is nothing a client reference could point at, and an
+        // entry with a register id DAPI never handed out gets "unknown register" back.
+        return;
+    }
     let list = read_u32_or_invalid(unicorn, app_iface + 0x50);
     if list >= 0xf000_0000 {
         return;
     }
+    let count = read_u32_or_invalid(unicorn, list + 0xc);
+    if count >= 0x0010_0000 {
+        return;
+    }
+    let mut last = read_u32_or_invalid(unicorn, list + 8);
     let mut node = read_u32_or_invalid(unicorn, list + 4);
     let mut steps = 0u32;
     while (0x1000..0xf000_0000).contains(&node) && node != list && steps < 16 {
         let item = node + 8;
-        let service = read_u32_or_invalid(unicorn, item) & 0xffff;
-        let server_app = read_u32_or_invalid(unicorn, item + 2) & 0xffff;
-        let unique = read_u32_or_invalid(unicorn, item + 8) & 0xffff;
-        if service != 0
-            && service != 0xffff
-            && server_app == DAPI_APP_ID
-            && unique == 0
-            && write_u16(unicorn, item + 8, 0xfffe)
+        if read_u16_or_invalid(unicorn, item) == MAP_DATA_DAPI_SERVICE_ID
+            && read_u16_or_invalid(unicorn, item + 2) == DAPI_APP_ID
         {
-            log::info!(
-                "PROCMAPENGINE: service reference {item:#x} (service {service:#x}, DAPI) had no unique id, set 0xfffe to match DAPI's messages"
-            );
+            return;
         }
+        last = node;
         node = read_u32_or_invalid(unicorn, node + 4);
         steps += 1;
     }
+    let mmu_arc = {
+        let data = unicorn.get_data();
+        data.mmu.clone()
+    };
+    let node = mmu_arc.lock().unwrap().heap_alloc(
+        unicorn,
+        32,
+        Prot::READ | Prot::WRITE,
+        "[dapi-map-svc-ref]",
+    );
+    if node == 0 {
+        log::warn!("PROCMAPENGINE: no guest memory for the DAPI map service reference");
+        return;
+    }
+    // Node layout as `vAdd` builds it: +0x00 previous, +0x04 next, +0x08 the
+    // `ail_tclServiceReference` itself (+0x00 service, +0x02 server app, +0x04 register
+    // id, +0x06 state, +0x08 unique id, then the version wildcards).
+    let mut bytes = vec![0u8; 24];
+    bytes[0x08..0x0a].copy_from_slice(&(MAP_DATA_DAPI_SERVICE_ID as u16).to_le_bytes());
+    bytes[0x0a..0x0c].copy_from_slice(&(DAPI_APP_ID as u16).to_le_bytes());
+    bytes[0x0c..0x0e].copy_from_slice(&(register_id as u16).to_le_bytes());
+    bytes[0x12..0x18].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    if count == 0 {
+        if !write_u32(unicorn, node, 0) || !write_u32(unicorn, node + 4, 0) {
+            return;
+        }
+        if !write_u32(unicorn, list + 4, node) || !write_u32(unicorn, list + 8, node) {
+            return;
+        }
+    } else if last < 0xf000_0000 {
+        bytes[0x00..0x04].copy_from_slice(&last.to_le_bytes());
+        if !write_u32(unicorn, last + 4, node) || !write_u32(unicorn, list + 8, node) {
+            return;
+        }
+    } else {
+        return;
+    }
+    if unicorn.mem_write(node as u64, &bytes).is_err() {
+        log::warn!("PROCMAPENGINE: failed to write the DAPI map service reference at {node:#x}");
+        return;
+    }
+    if !write_u32(unicorn, list + 0xc, count + 1) {
+        return;
+    }
+    log::info!(
+        "PROCMAPENGINE: linked client service reference {{svc {MAP_DATA_DAPI_SERVICE_ID:#x}, app {DAPI_APP_ID:#x}, reg-id {register_id:#x}, state AVAILABLE, unique id 0}} into list {list:#x} (node {node:#x}, count {count} -> {})",
+        count + 1
+    );
 }
 
 fn insert_posfi_service_reference(unicorn: &mut Unicorn<'_, Context>, _original_pc: u32) {    if POSFI_REF_INSERTED.load(Ordering::Relaxed) != 0 {

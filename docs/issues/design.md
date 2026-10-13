@@ -2208,3 +2208,52 @@ probes.  `render queue add` (400/800), `render job executed` (30/139/200) and
 `vOnNewMessage/bIsClientMessage/u32SetCameraParameters` loop) each looked like "the pipeline
 stopped here" while the probe had simply stopped logging.  Log per-*value-change* or with a
 cap that the run cannot reach, and re-check the cap before believing a silent tail.
+
+## Resolved: the DAPI map-data round trip (unique id, sync-vs-async registration) - 2026-10-13
+
+`DapiGetBlockIDs` used to fail with `0xffab28` after the *second* request in a run.  The
+chain is `map_tclPortControl_Platform::DAPI_GetBlockIDs_MapData2D` (0x38f918) ->
+`PortControl_CCAClientHandler_DAPI::GetBlockIDs_MapData2D` (0x53dcb0) ->
+`map_tclClientServiceHandler::bSendServiceDataMsg` (0x590508) ->
+`ail_tclAppInterfaceRestricted::enPostMessage` (0x661a3c), and `enPostMessage` answers 7
+whenever `ail_enCheckClientMailValidity` (0x66dd00) refuses the message.  That check walks
+the app interface's client service-reference list (`ail_tclAppInterfaceRestricted + 0x50`,
+`node + 8` = the `ail_tclServiceReference`, fields +0x00 service, +0x02 server app, +0x04
+register id, +0x06 service state, +0x08 unique id) and matches it with
+`ail_tclServiceReference::bIsDataSet` (0x66e3d0): each of the four filters matches when it
+is 0xffff *or* equals the stored slot - the wildcard is only implemented for the *message*
+argument, so a stored slot has to compare equal to what the peer really sends.  Verdict:
+0x10 = no entry matched, 2 = state 1 with an opcode that is neither 4 nor 0xd, 0x11 =
+state 2.  Two separate bugs in the emulator's registration bookkeeping hid behind that:
+
+* **unique id.**  DAPI sends `AIL_NO_UNIQUE_ID` (0xfffe) in the field the walk compares
+  (message +0x0e), while the engine's own requests carry 0 and the client reference keeps
+  0 because the async register path never stores it from the conf.  An earlier repair set
+  the *stored* slot to 0xfffe, which fixed the claim of incoming answers and at the same
+  time broke the outgoing requests - that is the "only two requests per run" symptom.
+  The repair now lives where the mbx_7 normalization already lives, in the transport:
+  `stamp_unique_id_for_receiver` (libosal) clears the field in DAPI's map-service answers
+  so both peers' walk matches the value their own references naturally hold (r562: 6
+  requests sent, 6 answers claimed, 3 of them matched to the live request, 2
+  `map_tclJobRCMapObjectsUpdate` jobs queued through `RndFI_AddJobToQueue`).
+* **sync vs async registration.**  Whether the reference for service 0x26 exists at all
+  was a race: the synchronous path (`ail_bHandleMsgServiceRegisterConf` 0x6682bc) stores
+  it, the asynchronous one (`vHandleAsyncRegisterConf` 0x665720) does not, so some runs
+  sent requests (r557) and some never did (r561, list holds only the fabricated posfi
+  entry).  `ensure_dapi_map_service_reference` now keeps the entry the conf implies in the
+  list (idempotent walk first), the same way the posfi reference is maintained.
+
+Measurement notes.  `map_tclJobMDMHandleGetBlockIDs::Execute` (0x4b4028) looks the answer's
+`mdm_ref` up with `map_tclMapDataManager::GetDAPIRequestingMapDataRequest` (0x5072b4) and
+answers `0xffab14` + a `RCJobSetDataBlocksChangedStatus` when no request is in the DAPI
+state with that reference counter: DAPI answers these requests ~45 s after they were made
+(one burst at t=51 s for requests from t=5-15 s), so answers whose request already moved on
+are dropped legitimately - judge the pipeline by the *late* answers, not the early ones.
+Three more probes with fixed caps produced false "stopped here" readings (see the earlier
+note); the newest offenders were the 60-hit cap in the `{6000, 60, 60}` array around
+`u32SetCameraParameters`, which had been hiding the fact that the camera *is* applied
+(r551: `u32SetCameraParameters` gets lon `0xe29fa46` lat `0x23999b77` scale 100 and the
+DAPI request rectangle follows to `[0xe280000,0xe2b0000,0x23990000,0x239b0000]`).
+Finally: run the emulator pinned (`taskset -c 3`).  Unpinned it repeatedly lost an order of
+magnitude (t=4.9 s of guest time in 100 s wall) while a background process held ~50 % of one
+core; pinned, 60 s of wall gives t=58 s.
