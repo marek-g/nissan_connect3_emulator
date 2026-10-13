@@ -2401,3 +2401,35 @@ AIL API vtable). Async registrations instead complete via
 `*this+0x50`. r574 traces one conf processing (entry dump of the +0x5c/+0x50
 lists + fetch sequence) to identify which path the engine's svc-0x26
 registration actually took and why no reference exists.
+
+## Resolved: the fabricated directory ServiceStatus now flips the client reference and wakes the FastMap job (r575-r576, 2026-10-13)
+
+The engine's client reference for (serverApp 7, svc 0x26, regid 1) *does* exist
+in the `app_iface+0x50` list by t≈30 s (synthetic node from
+`ensure_dapi_map_service_reference`, layout u16[+0]=svc, [+2]=serverApp,
+[+4]=regid, [+6]=state, [+8]=unique - confirmed by `bIsDataSet` @0x66e3d0
+decoding). The first fabricated publishes failed only on the **sub-id field**:
+the walk compares message +0x0e against ref+8 with **0xffff as the only
+wildcard** (0xfffe = "none" matches nothing). Writing 0xffff at +0x0e fixed the
+whole chain (r575):
+
+```
+t=47673 vSetServiceState(ref=0x930f0008, 1)   -> handler 0xb7e9b8 state 0->1
+t=47719 PortControl vOnServiceState(svc 0x26) -> vOnServiceStateChange
+        -> property handler 0xb7e9f8 (property id 0x401) vServiceStateChanged(1)
+t=50428 map_tclJobMDMOnUpdateServiceStateDAPIFastmap::Execute (first MDM job ever!)
+```
+
+State semantics learned the hard way (r575): publishing `1` then `3` flips the
+handler 0->1->3, and `OnUpdateServiceStateDAPIFastmap` (running seconds later
+off the MDM queue) treats **only state 1 as available** - with state 3 it
+*wrote `ms_bFastmapServiceAvailable = 0`* (pc 0x512444) and closed everything
+again. The engine's own "registration denied" publish uses status 2 (erase
+path), so AMT states here are {1 = available, 2 = unavailable}; the directory
+publish is therefore a single, persistent status=1 (r576).
+
+Open follow-ups visible in r575: the MDM job ran before any `OpenFastMapChannel`
+wire message appeared; the next question is whether the job (or the 0x401
+property subscription it drives) then emits CCA fn 0x101 to DAPI and gets the
+channel handle back (`dap_map_tclWorker::u16ProcessOpenChannel` side is ready,
+`/dev/shm` + fd-mmap are emulated).
