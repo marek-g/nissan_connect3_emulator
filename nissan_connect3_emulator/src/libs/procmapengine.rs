@@ -2680,53 +2680,74 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
         })
         .unwrap();
 
-    // Page-range watch (narrow hooks cannot be trusted mid-TB, see AGENTS.md)
-    // on the ServiceState-apply loop tail of `ail_bExamineInfluenceToAdministration`:
-    // at 0x66a1d4 the candidate node (`[sp,#0xdc]`) is loaded before the null
-    // check, and the bIsDataSet lookup tuple is `([sp,#0x20], r11, [sp,#0x28])`.
-    // A null node means the dispatch's client-reference list (AIL conf handler
-    // appends at `**(this+0x50)`+4) never got an entry, which is exactly the
-    // case where a ServiceStatus publish is silently dropped.
+    // Physical case-2 path of `ail_bExamineInfluenceToAdministration` (the
+    // decompiler blends it with the ARM appclose tail, so instrument the real
+    // fetch addresses via a page-range watch):
+    //   0x669ba0  switch entry: dumps the raw 0x44 fields
+    //             (serverApp=+0x00, svc=+0x14, regid=+0x16, subid=+0x0e)
+    //   0x669c38  `sub_66df4c(appIface+0x54-list, appIface+0x2c-lock, msg.svc)`
+    //             - a service-state registry lookup whose failure routes to
+    //             "service not registered" error handling instead of the
+    //             state apply, so its input + result are the decisive data.
     {
-        let page_base = base_address + (0x0066_a000u32 - ORIGINAL_BASE);
-        let target = (base_address + (0x0066_a1d4u32 - ORIGINAL_BASE)) as u64;
+        let page_base = base_address + (0x0066_9000u32 - ORIGINAL_BASE);
+        let t_entry = (base_address + (0x0066_9ba0u32 - ORIGINAL_BASE)) as u64;
+        let t_lookup = (base_address + (0x0066_9c38u32 - ORIGINAL_BASE)) as u64;
+        let t_found = (base_address + (0x0066_a21cu32 - ORIGINAL_BASE)) as u64;
+        let t_notfound = (base_address + (0x0066_9c60u32 - ORIGINAL_BASE)) as u64;
         unicorn
             .add_code_hook(page_base as u64, page_base as u64 + 0xfff, move |uc, address, _| {
-                if address != target {
+                let kind = if address == t_entry {
+                    0u8
+                } else if address == t_lookup {
+                    1u8
+                } else if address == t_found {
+                    2u8
+                } else if address == t_notfound {
+                    3u8
+                } else {
                     return;
-                }
+                };
                 static HITS: AtomicU32 = AtomicU32::new(0);
-                if HITS.fetch_add(1, Ordering::Relaxed) >= 40 {
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 60 {
                     return;
                 }
                 let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
-                let node = read_u32_or_invalid(uc, sp.wrapping_add(0xdc));
-                let a1 = read_u16_or_invalid(uc, sp.wrapping_add(0x20));
-                let a2 = (uc.reg_read(RegisterARM::R11).unwrap_or(0) as u32) & 0xffff;
-                let a3 = read_u16_or_invalid(uc, sp.wrapping_add(0x28));
-                let fields = if node != 0 && node < 0xf000_0000 {
-                    (0..4u32)
-                        .map(|i| {
-                            format!(
-                                "{:#x}",
-                                read_u32_or_invalid(uc, node.wrapping_add(i * 4))
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(",")
-                } else {
-                    "-".to_string()
-                };
-                log::info!(
-                    "PROCMAPENGINE fastmap trace status-loop t={}ms thread=[{}] node={:#x} fields=[{}] want=[{:#x},{:#x},{:#x}]",
-                    crate::libs::dapi::emu_t0_elapsed_ms(),
-                    uc.get_data().inner.thread_id(),
-                    node,
-                    fields,
-                    a1,
-                    a2,
-                    a3,
-                );
+                match kind {
+                    0 => {
+                        let header = read_u32_or_invalid(uc, sp.wrapping_add(0x18));
+                        log::info!(
+                            "PROCMAPENGINE fastmap trace status-case2 t={}ms thread=[{}] header={:#x} fields=[app={:#x},svc={:#x},reg={:#x},sub={:#x},status={:#x}]",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            uc.get_data().inner.thread_id(),
+                            header,
+                            read_u16_or_invalid(uc, header),
+                            read_u16_or_invalid(uc, header.wrapping_add(0x14)),
+                            read_u16_or_invalid(uc, header.wrapping_add(0x16)),
+                            read_u16_or_invalid(uc, header.wrapping_add(0x0e)),
+                            read_u8_or_invalid(uc, header.wrapping_add(0x18)),
+                        );
+                    }
+                    1 => {
+                        let app_iface = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                        log::info!(
+                            "PROCMAPENGINE fastmap trace status-lookup t={}ms thread=[{}] app_iface={:#x} list+0x54={:#x} lock+0x2c={:#x} want_svc={:#x}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            uc.get_data().inner.thread_id(),
+                            app_iface,
+                            read_u32_or_invalid(uc, app_iface.wrapping_add(0x54)),
+                            read_u32_or_invalid(uc, app_iface.wrapping_add(0x2c)),
+                            (uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32) & 0xffff,
+                        );
+                    }
+                    2 | 3 => log::info!(
+                        "PROCMAPENGINE fastmap trace status-lookup-{} t={}ms thread=[{}]",
+                        if kind == 2 { "found" } else { "notfound" },
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    ),
+                    _ => {}
+                }
             })
             .unwrap();
     }
