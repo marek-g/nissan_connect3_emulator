@@ -3407,6 +3407,56 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             .unwrap();
     }
 
+    // Which test in `PerformMapDataRequest`'s prio-4 branch sends the car-cursor
+    // record into the clearing path instead of the queueing one.  The code here is
+    // Thumb and mid-TB, so hook the whole page and dispatch on the fetch address
+    // (a narrow hook of this kind has repeatedly registered fine and never fired).
+    {
+        let page_begin = base_address + 0x0050_c000u32 - ORIGINAL_BASE;
+        let page_end = base_address + 0x0050_d000u32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(page_begin as u64, page_end as u64, move |uc, _, size| {
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let offset = pc.wrapping_sub(base_address) + ORIGINAL_BASE;
+                if !matches!(offset, 0x0050_cd24..=0x0050_cd2c) {
+                    return;
+                }
+                let hits = HITS.fetch_add(1, Ordering::Relaxed);
+                if hits >= 24 {
+                    return;
+                }
+                let carsor = base_address + 0x0079_04e4u32 - ORIGINAL_BASE;
+                let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                let words: Vec<u32> =
+                    (0..24u32).map(|i| read_u32_or_invalid(uc, sp + i * 4)).collect();
+                // Passes for the camera rectangle reach this code constantly; only the
+                // ones carrying the posfi car box (longitude ~0x0e2xxxxx) matter here.
+                if !words.iter().any(|word| (0xfff0_0000 & word) == 0x0e20_0000) {
+                    return;
+                }
+                log::info!(
+                    "PROCMAPENGINE map-data trace prio4-branch at {:#x} t={}ms thread=[{}] hits={} r0={:#x} r4={:#x} r6={:#x} r9={:#x} carsor_state={} f1f4={:#x} stack=[{}] size={}",
+                    offset,
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    hits,
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32,
+                    read_u32_or_invalid(uc, carsor + 0x74),
+                    read_u32_or_invalid(uc, carsor + 0x1f4),
+                    (0..12u32)
+                        .map(|i| format!("{:#x}", read_u32_or_invalid(uc, sp + i * 4)))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    size,
+                );
+            })
+            .unwrap();
+    }
+
     // IntHandleMapDataRequest (0x5116d4) request selection (r441): the
     // invisible-data job runs but never reaches GetBlockIDs for the car-cursor
     // request, so dump what GetHighestPriorityRequest (bl at 0x5116e0) actually

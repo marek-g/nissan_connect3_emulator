@@ -1708,6 +1708,19 @@ fn map_units(degrees: f64) -> i32 {
     (degrees * (4_294_967_296f64 / 360.0)).round() as i32
 }
 
+/// Two Krakow points the simulated car alternates between, one second apart.  The
+/// engine re-arms the car-cursor map-data request only when the reported position
+/// leaves the box it stored (longitude +-100000, latitude +-50000 map units), so a
+/// fixed position arms it exactly once and never again; stepping the car keeps new
+/// requests coming, exactly as a moving vehicle would.
+fn car_position(seq: u16) -> (f64, f64) {
+    if seq % 2 == 0 {
+        (19.91809, 50.06254)
+    } else {
+        (20.00500, 50.09500)
+    }
+}
+
 pub(crate) fn nav_position_status_message(seq: u16) -> Vec<u8> {
     // fi_tcl visitor payload (r424/r425 object dumps): the NavPositionStatus
     // wire is a flat sequential encoding - DataSetId u32, PositionWGS84
@@ -1728,8 +1741,8 @@ pub(crate) fn nav_position_status_message(seq: u16) -> Vec<u8> {
     // (0.17, 0.42) degrees in the ocean and answer without blocks.
     let mut body = Vec::with_capacity(0x2c0);
     body.extend_from_slice(&0u32.to_le_bytes()); // DataSetId
-    body.extend_from_slice(&map_units(19.91809).to_le_bytes()); // Longitude (Krakow)
-    body.extend_from_slice(&map_units(50.06254).to_le_bytes()); // Latitude (Krakow)
+    body.extend_from_slice(&map_units(car_position(seq).0).to_le_bytes()); // Longitude
+    body.extend_from_slice(&map_units(car_position(seq).1).to_le_bytes()); // Latitude
     body.resize(0x2c0, 0x01);
     let len = 0x20 + body.len();
     let LEN = len.next_multiple_of(16);
@@ -1825,8 +1838,8 @@ pub(crate) fn extrapolated_positions_message(seq: u16) -> Vec<u8> {
     body.extend_from_slice(&0u16.to_le_bytes()); // milliSecond
     body.extend_from_slice(&1000u16.to_le_bytes()); // one position per second
     body.extend_from_slice(&1u32.to_le_bytes()); // one extrapolated position
-    body.extend_from_slice(&map_units(19.91809).to_le_bytes()); // Longitude (Krakow)
-    body.extend_from_slice(&map_units(50.06254).to_le_bytes()); // Latitude (Krakow)
+    body.extend_from_slice(&map_units(car_position(seq).0).to_le_bytes()); // Longitude
+    body.extend_from_slice(&map_units(car_position(seq).1).to_le_bytes()); // Latitude
     body.extend_from_slice(&[0u8; 20]); // heading + the element's remaining scalars
     body.extend_from_slice(&0u32.to_le_bytes()); // no ExtrapolatedOCDesc entries
     body.extend_from_slice(&0u32.to_le_bytes()); // no NavClusterDesc entries
