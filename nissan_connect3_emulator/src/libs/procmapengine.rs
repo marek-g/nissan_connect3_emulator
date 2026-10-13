@@ -5454,6 +5454,59 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             .unwrap();
     }
 
+    // r580: procmapengine's GL traffic is shader/state setup plus exactly the
+    // per-frame `glClear(ccced9)` - the view render runs but no texture/FBO
+    // work.  Inside `RCMapObjectsUpdate::Execute` the per-object branch points
+    // decide that: 0x4d3870 sees `vcall+0x138` (r0: 1 = "new MO relevant for
+    // this view"?), 0x4d3888 sees `vcall+0x1a8` (0 = skip texture update), and
+    // 0x4d38a0 is the texture-update call itself.  Page-watch the function's
+    // 4 KiB block (mid-TB narrow hooks lie, AGENTS.md) and log r0 + the object
+    // each time, plus `DTM_Texture_Helper::bInit_Textures` (0x55817c) to see
+    // whether the texture subsystem ever initialized.
+    {
+        let branch = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let page_lo = base_address + (0x004d_3000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                let label = match original {
+                    0x004d_3870 => "after MO vcall+0x138 (1=relevant)",
+                    0x004d_3888 => "after MO vcall+0x1a8 (0=skip)",
+                    0x004d_38a0 => "GO texture update (bl bCheckForTextureUpdateBasedOnNewMO)",
+                    0x004d_383c => "skip-object tail (vcall+0x1ac only)",
+                    _ => return,
+                };
+                let count = branch.fetch_add(1, Ordering::Relaxed);
+                if count >= 120 {
+                    return;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE render trace MO-loop {label} at {original:#x}: r0={r0:#x} mo={r4:#x}"
+                );
+            })
+            .unwrap();
+        let texinit = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let addr = base_address + 0x0055_817cu32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = texinit.fetch_add(1, Ordering::Relaxed);
+                if count >= 8 {
+                    return;
+                }
+                log::info!(
+                    "PROCMAPENGINE render trace DTM_Texture_Helper::bInit_Textures entry at {:#x}: this={:#x} lr={:#x}",
+                    addr,
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
+                );
+            })
+            .unwrap();
+    }
+
     // Message-map router `PortControl_CCAClientHandlerBase::vDispatchMessage`
     // (0x592454): keys are (u16 svc @inner+0x14, u16 fn @inner+0+0x18) pairs
     // (the map's static seed table at 0x713ea8 holds {0x70006, 0x140006,
