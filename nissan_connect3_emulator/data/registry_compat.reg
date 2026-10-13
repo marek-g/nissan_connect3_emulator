@@ -507,3 +507,46 @@
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\POSFI\SERVICES\POSFI]
 "SERVICEID"=dword:0000001e
+
+; The device-manager FI media-info status message announces the navigation medium under the
+; name `/dev/cryptnav` (measured in `dap_tclMediaInfoCtrl`: one entry, type 6 = fully
+; available), and DAPI registers a medium only when a manager was told that name through
+; APP_CONFIG/DEVICES: `vEvalDeviceConfig` (0x822630) reads `DEVICE_NAV_n` (medium name,
+; string), `DEVICE_NAV_n_PRM` (device path, string) and `DEVICE_NAV_n_MAX_NUM_FD` (dword)
+; and passes them to `bAddNavDevice`.  With the key missing (the firmware's real DAPI
+; region registry `ni2k_*/DAPIAPP.ERG` is encrypted) every manager keeps empty medium
+; names, so the regionselection context never holds a medium, `GETREGIONOUTLINES` answers
+; 0x305, the region-profile outlines never load and no `GetBlockIDs` request can ever be
+; answered with block ids.
+[HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\PROCDAPI\DAPIAPP\APP_CONFIG\DEVICES]
+"DEFAULT_DEV"="/dev/cryptnav"
+"DEVICE_ONLINE_LINKING"="/dev/cryptnav"
+; Deliberately no DEVICE_ONLINE_LINK_PRM / DEVICE_ONLINE_LINK_MAXNUM_FD: `vEvalDeviceConfig`
+; stores the medium name in the configuration field either way, but only when all three are
+; present it also calls `bAddNavDevice` - and registering a second nav device for the same
+; medium breaks the map worker's rnw reference (`this + 0x180` stops being a valid rnw
+; communication object), so the `type=0x6 fct=0x84` GetRegProfOutline sub-job is never
+; routed, `DATA/CONNECT/RNW/NAV_ROOT.DAT` is never read and the rnw region profiles stay
+; invalid, which is what `u16SendUniqueIdList` needs before it can answer block ids.
+"DEVICE_OL_SOURCE_DEVICE"="/dev/cryptnav"
+"DEVICE_NAV_1"="/dev/cryptnav"
+"DEVICE_NAV_1_PRM"="/dev/media/sda1"
+"DEVICE_NAV_1_MAX_NUM_FD"=dword:00000004
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\DAPIAPP\DATA_SERVER\APP_CONFIG\DEVICES]
+"DEFAULT_DEV"="/dev/cryptnav"
+"DEVICE_ONLINE_LINKING"="/dev/cryptnav"
+"DEVICE_OL_SOURCE_DEVICE"="/dev/cryptnav"
+"DEVICE_NAV_1"="/dev/cryptnav"
+"DEVICE_NAV_1_PRM"="/dev/media/sda1"
+"DEVICE_NAV_1_MAX_NUM_FD"=dword:00000004
+"DEVICE_NAV_2"="/dev/cryptnav"
+"DEVICE_NAV_2_PRM"="/dev/media/sda1"
+"DEVICE_NAV_2_MAX_NUM_FD"=dword:00000004
+; `rs_tclManager`'s constructors (0x858d40 / 0x858e58) take their two medium names from the
+; configuration: `+0x470` (the medium regionselection reads region outlines from) is
+; `dap_tclConfiguration::szGetOnlineLinkDev()` = `DEVICE_ONLINE_LINKING`, and `+0x474` is
+; `szGetOLSourceDevice()` = `DEVICE_OL_SOURCE_DEVICE`.  A name only becomes a medium if the
+; device manager also announces it, so both point at the announced `/dev/cryptnav`.
+"DEVICE_ONLINE_LINKING"="/dev/cryptnav"
+"DEVICE_OL_SOURCE_DEVICE"="/dev/cryptnav"
