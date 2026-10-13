@@ -658,8 +658,13 @@ fn init_backend() -> Result<Backend, String> {
                 gl::UNSIGNED_BYTE,
                 core::ptr::null(),
             );
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
-            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+            let filter = if scale_filter_is_nearest() {
+                gl::NEAREST
+            } else {
+                gl::LINEAR
+            };
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, filter as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, filter as i32);
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
             gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
             let quad: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
@@ -803,6 +808,25 @@ fn make_target_current(backend: &mut Backend, target: GpuTarget) {
 fn vap_legacy() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("EMU_VAP_LEGACY").is_ok())
+}
+
+/// Window upscale filter for the 800x480 panel image: `nearest` (the default)
+/// shows panel pixels as blocks with no smoothing, `EMU_GPU_SCALE_FILTER=linear`
+/// restores bilinear smoothing.
+fn scale_filter_is_nearest() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        let wanted = std::env::var("EMU_GPU_SCALE_FILTER")
+            .unwrap_or_else(|_| "nearest".to_string())
+            .trim()
+            .to_ascii_lowercase();
+        let nearest = wanted != "linear" && wanted != "bilinear" && wanted != "smooth";
+        log::info!(
+            "GPU: window scale filter = {} (EMU_GPU_SCALE_FILTER=linear for smoothing)",
+            if nearest { "nearest" } else { "linear" }
+        );
+        nearest
+    })
 }
 
 fn probe_clears() -> bool {
