@@ -1953,3 +1953,54 @@ there is no timer and no `closePopup`/`closeAllPopups` call behind this popup, a
 `GUI_MessageBox::HideDialog` 0x0237_3634 would need the popup id in
 `receiver+0x210`. So the popup is a symptom of the missing PROCNAV service offer,
 not of the camera.
+
+## What actually moves the engine camera, and what resets it (r477-r488, 2026-10-13)
+
+`u32SetCameraParameters` 0x523eac is driven by `map_tclJobRCSetCameraParameters::Execute`
+0x4d74c4, and the jobs come from `CreateRCJobSetCameraParameters` 0x4c5ac0.  Hooking that
+creator shows exactly two producers in our runs:
+
+* `MDBC_CreateDefaultView` (return 0x489ea0) once at engine start, parameters all zero;
+* `MapEngine_TriggerPixmapViewRender` 0x53b36c (return 0x53b478), which builds the
+  parameter block on its own stack frame from constants in its literal pool: viewId 0,
+  scale 0x32 (50 m), pitch/heading 0xffff (invalid), screen centre (180, 180), movement 1,
+  and longitude/latitude `0xc4f45dfb` / `0x1e3b77c6` = (-83.13, 42.54) at 0x53b7a8/0x53b7ac.
+  Those are the power-on coordinates every run keeps requesting from DAPI, and no data
+  file is involved - they are immediates in the engine's text.
+
+The link register at that call site points into the heap (a linker glue veneer ending in
+`ldmfd sp!, {r0-r3, pc}` at 0x90f68000), so the caller has to be identified by its xrefs:
+only the debug channel (`vChannelMgr` case 0xb, never fires in our runs) and the PC
+stress-test ladder inside `PortControl_CCAClientHandler_Navi::vHandleExtrapolatedPositions`
+0x5498f8 are left, and that ladder is gated by `C_B_RUN_STRESS_TEST_PC == 1` plus
+comparisons of `OSAL_ClockGetElapsedTime()` against `arStressTestCases_PC` thresholds.
+With the guest clock working (see the clock_gettime fix) the ladder fires in a burst at
+t~3 s and then roughly every 14 s instead of on every posfi message.
+
+Consequence for the map: because our HMI never sends a RenFI camera request, nothing ever
+overwrites the position this stress path writes, so the view rectangle stays on the hard-
+coded pair and DAPI keeps being asked for blocks that the Europe card cannot have.
+
+## Where the handler table is (`posfi`/`dapi`/`0x37` client dispatch)
+
+`0x00713ee0` holds a static table of 12-byte entries `{u16 functionId, u16 serviceId,
+u32 handler, u32 zero}` - this is what the `switch` in `map_tclPortControl_Platform::
+vOnNewMessage`'s non-client branch and the client function map work from:
+
+| functionId | service | handler |
+|---|---|---|
+| 0x201 / 0x202 / 0x401 | 0x26 (dapi) | 0x53f0b0 / 0x53edc0 / 0x53f6f4 |
+| 0x13 | 0x1e (posfi) | 0x5498f8 `vHandleExtrapolatedPositions` |
+| 0x10 | 0x1e (posfi) | 0x5487b8 `vHandleNavPosition` |
+| 1 / 5 / 7 | 0x37 | 0x542b8c / 0x5450f0 / 0x5482c0 |
+
+There is no entry for service 0x300: the rendererfi branch really is the hardcoded
+`hdr[0x14] == 0x300` test inside `vOnNewMessage` (r3 loaded at 0x3a4108), and our
+fabricated 0x300 requests never reach that function at all, so the claim walk in
+`ail_bHandleMsgServiceData` drops them before dispatch.
+
+`vHandleNavPosition` 0x5487b8 (the message we already deliver successfully) needs opcode 6,
+deserialises `posfi_tclMsgNavPositionStatus` version 10 and, when the coordinates leave the
+handler's stored box (`this+0x70..0x7c`), re-arms
+`UpdateMapDataRequest(4, 0, 5.0f, 0, lon +-100000, lat +-50000)` - the only rectangle the
+posfi feed can move.
