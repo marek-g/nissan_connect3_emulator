@@ -2129,3 +2129,38 @@ then fills `+0x1a0`/`+0x70` or `+0x354`/`+0x78` and the outline request can be a
 Once RS outlines load, `u16SendUniqueIdList` proceeds to `u16Lock` -> `bIsInitIdxCache` ->
 `u16CheckBBox` -> `u16GenerateUniqueIds` -> `u16SendResponse`, and the engine gets block ids
 for the rectangle it asks about.
+
+## The media-info broadcast does reach the regionselection manager (r504)
+
+`rs_tclManager::u16InterpretBroadcast` (0x858880) receives, twice each, function id **0x83**
+(media info) and 0x84 (device info) - messages of `job[0x15] == 6`, arriving at t=1.74 s and
+t=1.97 s on thread 43 - and still the media slots of the context are empty at t=4.7 s
+(`media_at_1a0 = 0`, name `NULL`).  So the message is not missing, it is *processed without
+registering a medium*.
+
+`rs_tclManager::u16InterpretMediaInfoMsg` (0x8580fc) decides with
+`dap_tclMediaInfoCtrl::bIsMediaAvailable(ctrl, *(manager + 0x470))`,
+`dap_tclMediaInfoCtrl::bIsNavMediaAccessable(ctrl, *(manager + 0x474))` (it requires the
+state to be **6**) and `dap_tclMediaInfoCtrl::u32GetFullAvailMediaId(ctrl, *(manager +
+0x474))`, and it loads the expected medium names through
+`rs_tclDataContext::u16LoadLinkMedCfgProtected` / `u16ReloadLinkContentData` and
+`rs_tclBackupCntrl::u16LoadConfig` (a backup config on the link device, with
+`u16DetermineNextName` / `u16WriteDataBlock` / `u16Swap` around it).  In other words the
+regionselection component registers a medium only for the medium *names* its "link medium
+config" lists, only while that medium reports state 6 (fully available), and it keeps its own
+backup config on the link device.
+
+Related card content: `MEDIUM.CFG` (media level) declares a single database -
+`DATABASE_CONFIG{'TCF' | '/CFG/TIMA/' | '' | '1.0' | '0'}` - while `DATASET.CFG` (dataset
+level) declares `RNW /RNW/ NAV_ROOT.DAT`, `LID`, `MAP`, `TTC`, `TMC`, `MID`, `PTH` and 18
+`REGION_CONFIG` rows.  So the medium description DAPI sees for the *media* level is thin;
+whether that is what the RS manager wants is the open question.
+
+Next step: instrument `u16InterpretMediaInfoMsg` (0x8580fc) - the two name pointers at
+`manager+0x470`/`+0x474`, the return values of `bIsMediaAvailable`,
+`bIsNavMediaAccessable` (needs 6) and `u32GetFullAvailMediaId`, and whether
+`u16LoadLinkMedCfgProtected` succeeds - then supply whatever the link medium config /
+backup config needs (an emulated link-device config file or the media state), because once
+`rs_tclDataContext` holds the medium, `enProcessGetRegionOutlines` stops answering 0x305, the
+RS outlines load, and `u16SendUniqueIdList` can run `u16CheckBBox` +
+`u16GenerateUniqueIds` and send real block ids to the engine.
