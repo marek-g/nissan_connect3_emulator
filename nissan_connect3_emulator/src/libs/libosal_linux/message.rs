@@ -2130,6 +2130,22 @@ fn bridge_mbx_queue(
             stamp_registration_id(name, &mut body);
             trace_dapi_map_service_data(name, &body);
             stamp_unique_id_for_receiver(name, &mut body);
+            // First answered GetBlockIDs on (engine, svc 0x26) proves the
+            // registration pair is fully stamped; that is the moment the
+            // missing CCA directory would announce the service to the
+            // engine. Emit the AVAILABLE/operational publishes now.
+            if name == "mbx_1024"
+                && body.len() >= 0x1c
+                && body[0xb] == 0x45
+                && u16::from_le_bytes([body[2], body[3]]) == 0x0400
+                && u16::from_le_bytes([body[0x14], body[0x15]]) == 0x0026
+                && body[0x1a] == 0x07
+            {
+                post_engine_fastmap_service_status(
+                    unicorn,
+                    u16::from_le_bytes([body[0x16], body[0x17]]),
+                );
+            }
             if body.len() >= 0x18
                 && u16::from_le_bytes([body[0], body[1]]) == 0x0400
                 && matches!(body[0xb], 0x41 | 0x42 | 0x44 | 0x45)
@@ -2493,6 +2509,83 @@ pub(crate) fn post_dapi_status_available(unicorn: &mut Unicorn<'_, Context>) -> 
         "[LIBOSAL-MBX] synthesized ServiceStatus(svc 0x26, regid 1, state 0) into mbx_7: {}",
         accepted
     );
+    accepted
+}
+
+/// The CCA directory on a live unit tells every *client* that a service is
+/// available: when a registration is accepted it publishes ServiceStatus
+/// (class 0x44) with state 1 to the client's mailbox. procmapengine's
+/// `ail_bExamineInfluenceToAdministration` case 2 copies that state into the
+/// service reference and - only for state 1/2 - marks the service as
+/// influencing availability, which is what later runs
+/// `vServiceAvailabilityChanged` -> `PortControl_CCAClientHandlerBase::
+/// vOnServiceState` -> the FastMap property subscription that opens the
+/// FastMap channel (CCA fn 0x101) and unblocks `LockFreeFastMapChannel` for
+/// `DAPI_LoadBlocks`. DAPI itself only ever emits state 0 ("no state"), which
+/// the client dispatch ignores outright, so with no directory in the
+/// emulator the whole chain sleeps forever.
+///
+/// Emit the pair of publishes a healthy directory would make once the engine
+/// has received its first answered GetBlockIDs (i.e. the (engine, svc 0x26)
+/// registration is fully stamped): state 1 to flip the client reference and
+/// propagate availability, then state 3 ("registered and operational"), the
+/// state in which `ail_enCheckClientMailValidity` accepts request opcodes
+/// again (state 1 admits only notify opcodes 4/0xd).
+pub(crate) fn post_engine_fastmap_service_status(
+    unicorn: &mut Unicorn<'_, Context>,
+    register_id: u16,
+) -> bool {
+    use std::sync::atomic::AtomicBool;
+    static ENGINE_STATUS_SENT: AtomicBool = AtomicBool::new(false);
+    if ENGINE_STATUS_SENT.swap(true, Ordering::Relaxed) {
+        return false;
+    }
+    let accepted = [1u8, 3]
+        .into_iter()
+        .all(|state| post_engine_status_to(unicorn, 0x0026, register_id, state));
+    log::info!(
+        "[LIBOSAL-MBX] synthesized directory ServiceStatus(svc 0x26 regid {:#x}, state 1 then 3) into mbx_1024: {}",
+        register_id,
+        accepted
+    );
+    accepted
+}
+
+/// One ServiceStatus (class 0x44) publish from DAPI (app 7) into the engine's
+/// mailbox (`mbx_1024`, app id 0x400). Field placement follows
+/// `amt_tclServiceStatus::amt_tclServiceStatus`'s serializer: length 0x1a at
+/// +0x04, opcode 2 at +0x08, class at +0x0b, service id +0x14, register id
+/// +0x16 and the state byte at +0x18 (mirrors what DAPI's real publishes
+/// carry, except theirs always hold state 0).
+fn post_engine_status_to(
+    unicorn: &mut Unicorn<'_, Context>,
+    service_id: u16,
+    register_id: u16,
+    state: u8,
+) -> bool {
+    let mut status = vec![0u8; 0x20];
+    let status_len = status.len() as u32;
+    status[0..2].copy_from_slice(&7u16.to_le_bytes());
+    status[2..4].copy_from_slice(&0x0400u16.to_le_bytes());
+    status[4..8].copy_from_slice(&status_len.to_le_bytes());
+    status[8..10].copy_from_slice(&2u16.to_le_bytes());
+    status[0xb] = 0x44;
+    status[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
+    status[0x14..0x16].copy_from_slice(&service_id.to_le_bytes());
+    status[0x16..0x18].copy_from_slice(&register_id.to_le_bytes());
+    status[0x18] = state;
+
+    let mut blob = Vec::with_capacity(8 + status.len());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&status_len.to_le_bytes());
+    blob.extend_from_slice(&status);
+    let mut state_guard = unicorn.get_data().namespace.lock().unwrap();
+    let queue_id = OsalQueueService::ensure_queue(&mut state_guard.mq, "mbx_1024");
+    state_guard.mq.grow_msgsize(queue_id, blob.len() as i64);
+    let accepted = OsalQueueService::guest_post(&mut state_guard.mq, "mbx_1024", blob, 0);
+    if accepted {
+        state_guard.notify_waiters();
+    }
     accepted
 }
 
