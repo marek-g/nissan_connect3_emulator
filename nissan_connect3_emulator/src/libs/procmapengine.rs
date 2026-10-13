@@ -2642,6 +2642,44 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
             .unwrap();
     }
 
+    // `ail_tclServiceReference::bIsDataSet(svc, server_app, reg_id)` is called
+    // once per client reference from the tail of
+    // `ail_bExamineInfluenceToAdministration` to find the ref a ServiceStatus
+    // applies to; the ServiceState only flips on a full 3-field match. Log
+    // every candidate (stored fields + lookup tuple) so a near-miss - e.g. an
+    // AIL-self-assigned register-id vs our conf id - shows up.
+    let site = base_address + (0x0066_e394u32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) >= 400 {
+                return;
+            }
+            let reference = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let want = [RegisterARM::R1, RegisterARM::R2, RegisterARM::R3]
+                .map(|r| (uc.reg_read(r).unwrap_or(0) as u32) & 0xffff);
+            log::info!(
+                "PROCMAPENGINE fastmap trace bIsDataSet t={}ms thread=[{}] ref={:#x} fields=[{}] want=[{:#x},{:#x},{:#x}] lr={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                reference,
+                (0..4u32)
+                    .map(|i| format!(
+                        "{:#x}",
+                        read_u32_or_invalid(uc, reference.wrapping_add(i * 4))
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                want[0],
+                want[1],
+                want[2],
+                ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                    .wrapping_sub(base_address)
+                    .wrapping_add(ORIGINAL_BASE),
+            );
+        })
+        .unwrap();
+
     // Write watchpoints on the three gate globals: whoever stores the dataset
     // id, the validated dataset id, or the fastmap availability byte tells us
     // which medium/CCA event the engine considers the trigger.
