@@ -1793,3 +1793,55 @@ questions, in order:
 every black label drawn over the map window ("FM1", "Starting navigation.",
 "50 m") and looks terrible; limiting the key to flat black leaves a diagonal
 hatch of dashes. Both variants were tried and reverted in r464/r465.
+
+## The map is a display-engine layer, not a prochmi texture (r467, 2026-10-13)
+
+`prochmi_out.out` is now in the Ghidra project and analysed; prochmi is ARM (not
+Thumb) mode, and its Ghidra VAs equal runtime VAs.
+
+The layer compositing model, verified by decompiling prochmi:
+
+- prochmi's GL output is itself one svg layer (`OpenGL+0xc` is its own layer
+  handle, driven by `OpenGL::setGuiLayerVisible` 0x01344598 and
+  `OpenGL::ResizeAll` 0x013452f0 via `svgScaleLayer`/`svgEnableLayerSettings`).
+  procmap's surface `0x5f4d4150`/layer `0x5f4c0001` ("MAP_View1") is a sibling
+  layer *below* it, composited by the display engine - which here is the
+  emulator.
+- `GUI_GL_OpenGL::mixLayers` 0x01346bb0 clears the HMI layer to
+  `GUI_Color32 0x00000000` (premultiplied alpha) so the map shows through the
+  hole, and only draws the external layer itself in the hide-snapshot case
+  (`if (param_2 != 0) GUI_GL_LayerCopy::draw(param_2)`, call site 0x01346d98,
+  `GUI_GL_LayerCopy::draw` 0x01342a28). `getBackground` 0x0133f528 returns that
+  param_2.
+- The SHOW path that makes the map visible is
+  `EAManager::requestEAShow` 0x0133eef4 → `updateEAShow` 0x0133ea84
+  (state 0: `LayerSync::requestViewStatus(EA,2)` 0x01343b50; needs a VISIBLE ack
+  from the peer, which comes back through
+  `clGUIWidgetEngine::onGuiLSyncViewStatusChanged` 0x0133b7b8 →
+  `LayerSync::onViewStatusChanged` 0x01343d14 → `EAManager::onViewStatusChanged`
+  0x0133e9b8; state 2: `LayerSync::setLayersVisible(EA,1,rect)` 0x013436e4) →
+  `svgSetLayerWindowData` 0x00fb64dc, `svgSetLayerOrder` 0x00fb6e30,
+  `svgEnableLayer` 0x00fb6e84. `copyLayer`/`performCopy` are only the
+  hide-snapshot path (callers: `updateEAHide` case 5, `requestDisplayModeChange`).
+
+r467 measurement: **the SHOW path does run in the emulator** -
+`requestViewStatus(ea=0, 2)` → our emulated VISIBLE ack → `onViewStatusChanged` →
+`setLayersVisible(ea=0, visible=1, rect=0x38ef6f8)` →
+`svgGetLayerByName("MAP_View1") = 0x5f4c0001`. `LayerCopy::draw` and
+`LayerCopy::free` never fire (0 hits), i.e. `getBackground` returns 0 and no
+snapshot is composited - which is correct, steady-state prochmi should not bind
+that texture at all.
+
+So the missing piece is entirely on our side of the svg ABI: `install_svg_map_
+surface_hooks` (prochmi.rs) emulates only the *status* calls (by_name,
+layer/surface status, errors, apply/wait) and bypasses them; `svgEnableLayer`,
+`svgDisableLayer`, `svgSetLayerWindowData` and `svgSetLayerOrder` are not
+intercepted, so the display engine is never told - and never emulates - that the
+map layer is on and where. Next step: intercept those four (addresses above),
+record per-layer `{enabled, x, y, w, h, order}` in the emulator's svg layer
+model, and composite `MAP_SURFACE_BYTES` as the layer *below* the HMI layer for
+that rect. Related: the HMI layer is cleared opaque (`glClearColor(0,0,0,1)`)
+because `OpenGL+0x140` is non-zero, i.e. prochmi believes it owns an opaque
+background; once our svg emulation answers its layer configuration calls without
+error, the transparent-hole clear (`0x00000000`) is the branch that should run,
+and then the map shows through the hole exactly like on the unit.

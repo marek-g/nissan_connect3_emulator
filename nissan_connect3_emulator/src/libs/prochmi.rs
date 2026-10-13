@@ -2029,6 +2029,20 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
         ),
         (GUI_GL_TEXTURE_CONSTRUCTOR, "GUI_GL_Texture::GUI_GL_Texture"),
         (GUI_GL_OPENGL_MIX_LAYERS, "GUI_GL_OpenGL::mixLayers"),
+        // Gate chain for the map (external application) layer.  prochni is the
+        // only component that can make the display engine show procmap's layer:
+        // `EAManager::getBackground` hands the LayerCopy to `mixLayers`, which
+        // then calls `LayerCopy::draw`, and `setLayersVisible` is the one place
+        // that enables the foreign svg layer at all.
+        (0x0133_f528 - ORIGINAL_BASE, "GUI_DM_EAManager::getBackground"),
+        (0x0133_ede4 - ORIGINAL_BASE, "GUI_DM_EAManager::isBlocked"),
+        (0x0134_36e4 - ORIGINAL_BASE, "GUI_GL_LayerSync::setLayersVisible"),
+        (0x0134_2b24 - ORIGINAL_BASE, "GUI_GL_LayerCopy::free"),
+        (0x0134_2a28 - ORIGINAL_BASE, "GUI_GL_LayerCopy::draw"),
+        (
+            0x0133_b7b8 - ORIGINAL_BASE,
+            "clGUIWidgetEngine::onGuiLSyncViewStatusChanged",
+        ),
         (
             GUI_DM_DISPLAY_MANAGER_UPDATE,
             "GUI_DM_DisplayManager::update",
