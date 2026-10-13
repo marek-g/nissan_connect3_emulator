@@ -38,6 +38,97 @@ pub static MQB_1024_INFO: AtomicU32 = AtomicU32::new(0);
 // the queue.
 static POSFI_LAST_DELIVERED_SEQ: AtomicU32 = AtomicU32::new(0xffff_ffff);
 static POSFI_SEQ_DELIVERIES: AtomicU32 = AtomicU32::new(0);
+
+/// Bounded repeat detector for the map engine's mailbox (`mbx_1024`).  Messages whose FI
+/// header the engine's CCA pump cannot route (register-id `0xfffe`, see the delivery site)
+/// are re-posted by the pump instead of being consumed, which livelocks the queue.  Count
+/// deliveries per header (FNV-1a over the message's FI header) and only drop a message once
+/// the *same* header has been handed out `MAX_MBX1024_DELIVERIES` times, so distinct answers
+/// - which always carry a different service/sequence - still reach the engine.
+fn mbx1024_repeat_too_often(header: &[u8]) -> bool {
+    const MAX_MBX1024_DELIVERIES: u32 = 4;
+    static DELIVERIES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, u32>>> =
+        std::sync::OnceLock::new();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in header {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    let table = DELIVERIES.get_or_init(Default::default);
+    let mut table = match table.lock() {
+        Ok(table) => table,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if table.len() > 512 {
+        table.clear();
+    }
+    let count = table.entry(hash).or_insert(0);
+    *count += 1;
+    *count > MAX_MBX1024_DELIVERIES
+}
+
+/// Assign and stamp the CCA registration id of a `(client queue, service)` pair; see the
+/// call site in the post path.  Handles the message classes that carry the register-id
+/// field at wire offset `+0x16`: register `0x41`, register-conf `0x43`, unregister-conf
+/// `0x44` and service data `0x45`.  A conf that already carries an id (a fabricated
+/// registration) is *learned* instead of overwritten, so hand-assigned ids keep working.
+fn stamp_registration_id(queue: &str, body: &mut [u8]) {
+    const REGISTER_ID_OFFSET: usize = 0x16;
+    const UNASSIGNED: u16 = 0xffff;
+    // Stay clear of the ids handed out by hand elsewhere (the fabricated posfi
+    // registration uses 0x17).
+    const FIRST_ASSIGNED_ID: u16 = 0x00e0;
+    static REGISTRATIONS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(String, u16), u16>>,
+    > = std::sync::OnceLock::new();
+    static NEXT_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(FIRST_ASSIGNED_ID);
+    static STAMPS_LOGGED: AtomicU32 = AtomicU32::new(0);
+
+    if !queue.starts_with("mbx_") || body.len() <= REGISTER_ID_OFFSET + 1 {
+        return;
+    }
+    let class = body[0x0b];
+    if !matches!(class, 0x41 | 0x43 | 0x44 | 0x45) {
+        return;
+    }
+    let service = u16::from_le_bytes([body[0x14], body[0x15]]);
+    if service == 0 || service == UNASSIGNED {
+        return;
+    }
+    let current = u16::from_le_bytes([body[REGISTER_ID_OFFSET], body[REGISTER_ID_OFFSET + 1]]);
+    let table = REGISTRATIONS.get_or_init(Default::default);
+    let mut table = match table.lock() {
+        Ok(table) => table,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let key = (queue.to_string(), service);
+    if class == 0x43 {
+        if current != UNASSIGNED {
+            table.insert(key, current);
+            return;
+        }
+        let id = *table
+            .entry(key)
+            .or_insert_with(|| NEXT_ID.fetch_add(1, Ordering::Relaxed));
+        body[REGISTER_ID_OFFSET..REGISTER_ID_OFFSET + 2].copy_from_slice(&id.to_le_bytes());
+        log::info!(
+            "[LIBOSAL-MBX] assigned registration id {id:#06x} to service {service:#06x} on {queue}"
+        );
+        return;
+    }
+    let Some(&id) = table.get(&key) else {
+        return;
+    };
+    if current == id {
+        return;
+    }
+    body[REGISTER_ID_OFFSET..REGISTER_ID_OFFSET + 2].copy_from_slice(&id.to_le_bytes());
+    if STAMPS_LOGGED.fetch_add(1, Ordering::Relaxed) < 12 {
+        log::info!(
+            "[LIBOSAL-MBX] stamped registration id {id:#06x} into class {class:#04x} of service {service:#06x} on {queue} (was {current:#06x})"
+        );
+    }
+}
 static SYNTH_PWR_CVM_SIGNAL_CHANGED_CONTENT: AtomicU32 = AtomicU32::new(0);
 static SYNTH_MAP_PWR_START_CONF_SENT: AtomicBool = AtomicBool::new(false);
 static SYNTH_MAP_PWR_START_CONF_CONTENT: AtomicU32 = AtomicU32::new(0);
@@ -1945,6 +2036,16 @@ fn bridge_mbx_queue(
             if name == "mbx_7" && body.len() >= 0x10 && (body[0xb] == 0x41 || body[0xb] == 0x45) {
                 body[0xc..0x10].copy_from_slice(&0x0000_fffeu32.to_le_bytes());
             }
+            // Complete the service-registration handshake the way the unit's TE-side CCA
+            // directory would: it owns the registration ids and stamps them into the
+            // messages of a registered pair as they pass. That directory lives in the
+            // encrypted region registries, so here every natural `RegisterConf` arrives
+            // with register-id 0xffff ("nothing assigned"), the client's service handler
+            // stays unregistered, and every later answer from the provider - which stamps
+            // its own id - fails the receiver's registration match and is re-posted. Give
+            // each (client queue, service) pair an id when its conf arrives and stamp that
+            // id into every provider message delivered to the same pair afterwards.
+            stamp_registration_id(name, &mut body);
             if body.len() >= 0x18
                 && u16::from_le_bytes([body[0], body[1]]) == 0x0400
                 && matches!(body[0xb], 0x41 | 0x42 | 0x44 | 0x45)
@@ -2050,10 +2151,21 @@ fn bridge_mbx_queue(
                             // content starts at blob[8]: sub-id @ +0x00,
                             // class @ +0x0b, register-id @ +0x0e, service
                             // @ +0x14, seq @ +0x1c (all relative to content).
+                            // `reg-id == 0xfffe` alone must not drop the message: it is what
+                            // every DAPI answer carries here (the engine's `vRegisterService`
+                            // handshake never gets a routable id from the emulated SCD, so the
+                            // result header is stamped `0xfffe` and `bDispatchCCAMessages`
+                            // cannot match it to a client handler), and on the unit such a
+                            // result is delivered and consumed anyway.  Stamping on it threw
+                            // away real answers, including the GetBlockIDs results.  Bound the
+                            // livelock by the *content* instead: an identical header reaching
+                            // this queue repeatedly is the re-post loop the pump cannot
+                            // resolve, distinct answers are all delivered.
                             let bounces = blob.len() >= 0x28
                                 && u16::from_le_bytes([blob[8], blob[9]]) == 0x0007
                                 && blob[0x13] == 0x45
-                                && u16::from_le_bytes([blob[0x16], blob[0x17]]) == 0xfffe;
+                                && u16::from_le_bytes([blob[0x16], blob[0x17]]) == 0xfffe
+                                && mbx1024_repeat_too_often(&blob[8..blob.len().min(0x30)]);
                             let posfi = blob.len() >= 0x28
                                 && blob[0x13] == 0x45
                                 && u16::from_le_bytes([blob[0x1c], blob[0x1d]]) == 0x001e;
