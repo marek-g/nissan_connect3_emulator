@@ -2680,6 +2680,57 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
         })
         .unwrap();
 
+    // Page-range watch (narrow hooks cannot be trusted mid-TB, see AGENTS.md)
+    // on the ServiceState-apply loop tail of `ail_bExamineInfluenceToAdministration`:
+    // at 0x66a1d4 the candidate node (`[sp,#0xdc]`) is loaded before the null
+    // check, and the bIsDataSet lookup tuple is `([sp,#0x20], r11, [sp,#0x28])`.
+    // A null node means the dispatch's client-reference list (AIL conf handler
+    // appends at `**(this+0x50)`+4) never got an entry, which is exactly the
+    // case where a ServiceStatus publish is silently dropped.
+    {
+        let page_base = base_address + (0x0066_a000u32 - ORIGINAL_BASE);
+        let target = (base_address + (0x0066_a1d4u32 - ORIGINAL_BASE)) as u64;
+        unicorn
+            .add_code_hook(page_base as u64, page_base as u64 + 0xfff, move |uc, address, _| {
+                if address != target {
+                    return;
+                }
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 40 {
+                    return;
+                }
+                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                let node = read_u32_or_invalid(uc, sp.wrapping_add(0xdc));
+                let a1 = read_u16_or_invalid(uc, sp.wrapping_add(0x20));
+                let a2 = (uc.reg_read(RegisterARM::R11).unwrap_or(0) as u32) & 0xffff;
+                let a3 = read_u16_or_invalid(uc, sp.wrapping_add(0x28));
+                let fields = if node != 0 && node < 0xf000_0000 {
+                    (0..4u32)
+                        .map(|i| {
+                            format!(
+                                "{:#x}",
+                                read_u32_or_invalid(uc, node.wrapping_add(i * 4))
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                } else {
+                    "-".to_string()
+                };
+                log::info!(
+                    "PROCMAPENGINE fastmap trace status-loop t={}ms thread=[{}] node={:#x} fields=[{}] want=[{:#x},{:#x},{:#x}]",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    node,
+                    fields,
+                    a1,
+                    a2,
+                    a3,
+                );
+            })
+            .unwrap();
+    }
+
     // Write watchpoints on the three gate globals: whoever stores the dataset
     // id, the validated dataset id, or the fastmap availability byte tells us
     // which medium/CCA event the engine considers the trigger.
