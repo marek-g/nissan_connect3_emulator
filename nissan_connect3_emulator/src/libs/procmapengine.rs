@@ -2536,6 +2536,112 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
         })
         .unwrap();
 
+    // ---- property registration / service state fan-out (fastmap availability) ----
+    // `PortControl_CCAClientHandlerBase::vOnServiceState(svc, reg, ...)`: logs
+    // every arrival, whether a client handler matched or it traced "Unhandled
+    // service state change".
+    let site = base_address + (0x0059_2604u32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) >= 40 {
+                return;
+            }
+            let words = (0..5u32)
+                .map(|i| {
+                    let r = [RegisterARM::R0, RegisterARM::R1, RegisterARM::R2, RegisterARM::R3, RegisterARM::R4][i as usize];
+                    format!("{:#x}", (uc.reg_read(r).unwrap_or(0) as u32))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            log::info!(
+                "PROCMAPENGINE fastmap trace vOnServiceState t={}ms thread=[{}] r0..r4=[{}] lr={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                words,
+                ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                    .wrapping_sub(base_address)
+                    .wrapping_add(ORIGINAL_BASE),
+            );
+        })
+        .unwrap();
+
+    // AIL-side availability fan-out `vServiceAvailabilityChanged` (0x66434c):
+    // reads the registry state; the only path that tells PortControl.
+    let site = base_address + (0x0066_434cu32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) >= 40 {
+                return;
+            }
+            let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            log::info!(
+                "PROCMAPENGINE fastmap trace vServiceAvailabilityChanged t={}ms thread=[{}] this={:#x} r1={:#x} lr={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                this,
+                uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                    .wrapping_sub(base_address)
+                    .wrapping_add(ORIGINAL_BASE),
+            );
+        })
+        .unwrap();
+
+    // Property subscription state machine: `vUpRegOrGet` (0x593580) sends the
+    // UpReg/Get pair, `CheckSubscriptionState` (0x593218) and
+    // `vCheckPropertyRegistration` (0x59327c) interpret the answers, and
+    // `bSendServiceDataMsg` (0x593668) is the send itself. Log handler + args +
+    // message header so the stalled step shows up.
+    for (va, label) in [
+        (0x0059_3580u32, "vUpRegOrGet(q,state)"),
+        (0x0059_3218u32, "CheckSubscriptionState"),
+        (0x0059_327cu32, "vCheckPropertyRegistration"),
+        (0x0059_3668u32, "bSendServiceDataMsg"),
+        (0x0059_31e0u32, "vServiceStateChanged(base)"),
+    ] {
+        let site = base_address + (va - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+                static COUNT: AtomicU32 = AtomicU32::new(0);
+                if COUNT.fetch_add(1, Ordering::Relaxed) >= 100 {
+                    return;
+                }
+                let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let arg1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                // The message-taking sites pass an `amt_tclServiceData` whose
+                // header pointer sits at +0x04; the others pass values.
+                let (svc, reg, fn_id, opcode) = if va == 0x0059_3218 || va == 0x0059_327c {
+                    let header = read_u32_or_invalid(uc, arg1.wrapping_add(4));
+                    (
+                        read_u16_or_invalid(uc, header.wrapping_add(0x14)),
+                        read_u16_or_invalid(uc, header.wrapping_add(0x16)),
+                        read_u16_or_invalid(uc, header.wrapping_add(0x18)),
+                        read_u8_or_invalid(uc, header.wrapping_add(0x1a)),
+                    )
+                } else {
+                    (0xffff, 0xffff, 0xffff, 0xff)
+                };
+                log::info!(
+                    "PROCMAPENGINE fastmap trace {label} t={}ms thread=[{}] this={:#x} words=[{}] r1={:#x} svc={:#x} reg={:#x} fn={:#x} opcode={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    this,
+                    (0..6u32)
+                        .map(|i| format!("{:#x}", read_u32_or_invalid(uc, this.wrapping_add(i * 4))))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    arg1,
+                    svc,
+                    reg,
+                    fn_id,
+                    opcode,
+                );
+            })
+            .unwrap();
+    }
+
     // Write watchpoints on the three gate globals: whoever stores the dataset
     // id, the validated dataset id, or the fastmap availability byte tells us
     // which medium/CCA event the engine considers the trigger.
