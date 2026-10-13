@@ -2357,3 +2357,47 @@ The wire shows two confs for svc 0x26 to the engine: DAPI's original
 (regid ffff, unique 0, **status 4**) and a stamped one (regid 1, unique fffe,
 status 1). r571's page-watch on 0x66a1d4 dumps the list node + lookup tuple to
 pin down whether the append (waiter match) ever succeeded.
+
+## Warning: the AIL region 0x668000-0x66b000 is Thumb, Ghidra lists parts of it as ARM (r572-r573)
+
+Every probe placed at addresses taken from Ghidra's ARM-flavoured listing of
+`ail_bExamineInfluenceToAdministration`/`ail_bHandleMsgServiceRegisterConf`
+(0x669ba0, 0x669c38, 0x66a1d4, ...) got 0 hits while the function-entry probe at
+0x66963c fired. Re-decoding the bytes with capstone as Thumb
+(`/home/marek/Temp/opencode/tdecode.py`) gives the real control flow, confirmed
+by the armed instruction tracer (`PROCMAPENGINE ail-step`, armed per
+admin-type-2 arrival; the trace walks exactly the Thumb addresses):
+
+* Switch: `sub r1, r1, #1; cmp r1, #4; ldrls pc,[pc,r1<<2]` at 0x669654, table
+  at 0x66965c = [0x6698e8, 0x669990, 0x669a50, 0x669aec, 0x669ba0] for
+  admin types 1..5. **ServiceStatus (type 2) -> 0x669990.**
+* Case 2 parses the raw wire body: status byte `ldrb [content, #0x18]`,
+  serverApp +0x00, unique +0x0e, svc +0x14, regid +0x16 (confirms the fabricated
+  messages' layout). Spill: status -> [sp,#0x30], unique -> [sp,#0x28],
+  serverApp -> [sp,#0x20], svc -> sb, regid -> fp, "walk refs" flag = 1 ->
+  [sp,#0x3c].
+* Tail 0x6696d0: `bl 0x66d1ec` (TakeListAccess); r4==0 for case 2 -> 0x669c8c;
+  `[sp,#0x3c]==1` -> walk `**(this+0x50)` list from +4: per node
+  `bl 0x66e3d0` = `bIsDataSet(svc, serverApp, regid, unique[stack])` with
+  per-field 0xffff wildcards against node fields +0x00(svc!) +0x02 +0x04 +0x06 -
+  NOTE node layout differs from Ghidra's 0x66e394 sibling (svc at +0x00 here).
+  Match -> 0x66a36c -> `vSetServiceState(ref, status)` at 0x66e43c.
+* r573 trace of one fabricated status=1 publish: `0x669cc4: cmp node,0; beq
+  0x669cfc` - **the `*this+0x50` client-reference list head is NULL**, so the
+  walk is skipped, and the handler falls into the no-reference path: resolves a
+  receiver queue for svc-as-appid (0x26 = 38, opens it!) via `bl 0x66df4c`
+  (`ail_hGetReceiverQueue`), builds and posts a message via `bl 0x660ea0`,
+  stores dispatch+0x30 = 4, done. No state applied anywhere.
+
+`*this+0x50` is populated *only* by `ail_bHandleMsgServiceRegisterConf`
+(0x6682bc, real Thumb flow): requires the sync-answer list `*this+0x5c`
+non-empty (vtable+0x10 check), then conf status byte (+0x18)==1 -> 0x668488
+append branch, else the loop over waiters with `bIsWaitForRegister` (0x66e598).
+Sync waiters are created only by `bInitServiceSyncAnswerForReg` (0x66e504),
+called only from the **synchronous** client API `u16RegisterService` (0x662d24,
+AIL API vtable). Async registrations instead complete via
+`vHandleAsyncRegisterConf` (0x665720, status 1 -> PortControl
+`vOnAsyncRegisterConf` 0x592688 through vtable+0x58) - which does **not** touch
+`*this+0x50`. r574 traces one conf processing (entry dump of the +0x5c/+0x50
+lists + fetch sequence) to identify which path the engine's svc-0x26
+registration actually took and why no reference exists.
