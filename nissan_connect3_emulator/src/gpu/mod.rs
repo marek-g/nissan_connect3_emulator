@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::ffi::CString;
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Mutex, Once, OnceLock};
 use std::time::Duration;
@@ -75,6 +75,53 @@ const MAP_SURFACE_HANDLE: u32 = 0x5f4d4150;
 
 static MAP_SURFACE_DIRTY: AtomicBool = AtomicBool::new(false);
 static MAP_SURFACE_BYTES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+// Display-engine state of the map layer, as requested by the HMI through the
+// svg layer API (see `libs::prochmi`'s layer control hooks): `*_ENABLED` is
+// `svgEnableLayer`/`svgDisableLayer` for the map layer handle and the window is
+// what `LayerSync::setLayersVisible` hands over.  The compositor substitutes map
+// pixels only inside that window, the way the hardware layer compositor shows a
+// layer that the GUI asked to be visible.
+static MAP_LAYER_ENABLED: AtomicBool = AtomicBool::new(false);
+static MAP_LAYER_X: AtomicU32 = AtomicU32::new(0);
+static MAP_LAYER_Y: AtomicU32 = AtomicU32::new(0);
+static MAP_LAYER_W: AtomicU32 = AtomicU32::new(0);
+static MAP_LAYER_H: AtomicU32 = AtomicU32::new(0);
+static MAP_LAYER_SIGNATURE: AtomicU64 = AtomicU64::new(u64::MAX);
+static MAP_LAYER_PUBLISHES: AtomicU32 = AtomicU32::new(0);
+static MAP_LAYER_HOLE_LOGS: AtomicU32 = AtomicU32::new(0);
+
+/// Publish the map layer's visibility and screen window (top-left origin, in
+/// screen pixels) so the frame compositor knows where the layer below the HMI
+/// layer is actually on.
+pub fn set_map_layer_window(enabled: bool, x: u32, y: u32, w: u32, h: u32) {
+    let pack = |enabled: bool, x: u32, y: u32, w: u32, h: u32| -> u64 {
+        ((enabled as u64) << 63)
+            | ((x as u64 & 0xffff) << 40)
+            | ((y as u64 & 0xffff) << 24)
+            | ((w as u64 & 0xffffff) << 12)
+            | (h as u64 & 0xfff)
+    };
+    let signature = pack(enabled, x, y, w, h);
+    MAP_LAYER_ENABLED.store(enabled, Ordering::Relaxed);
+    MAP_LAYER_X.store(x, Ordering::Relaxed);
+    MAP_LAYER_Y.store(y, Ordering::Relaxed);
+    MAP_LAYER_W.store(w, Ordering::Relaxed);
+    MAP_LAYER_H.store(h, Ordering::Relaxed);
+    if MAP_LAYER_SIGNATURE.swap(signature, Ordering::Relaxed) != signature {
+        let hits = MAP_LAYER_PUBLISHES.fetch_add(1, Ordering::Relaxed);
+        if hits < 40 {
+            log::info!(
+                "GPU: map layer window published enabled={} rect=({},{},{},{})",
+                enabled,
+                x,
+                y,
+                w,
+                h
+            );
+        }
+    }
+}
 
 // Client-array emulation for glVertexAttribPointer: guest vertices live in
 // guest RAM and are re-specified every frame with the SAME pointers. One
@@ -1161,15 +1208,42 @@ fn composite_hmi_over_map(backend: &mut Backend) {
     if backend.map_pixels.len() != backend.hmi_pixels.len() {
         return;
     }
+    // The display engine only shows the map layer where the HMI told it to:
+    // `svgEnableLayer` for the map layer handle plus the window from
+    // `LayerSync::setLayersVisible` (see `libs::prochmi`).  A window that was
+    // never published means nothing was requested, so the HMI frame stands on its
+    // own - exactly like a disabled layer on the unit.
+    let enabled = MAP_LAYER_ENABLED.load(Ordering::Relaxed);
+    let lx = (MAP_LAYER_X.load(Ordering::Relaxed) as usize).min(MAP_SURFACE_WIDTH);
+    let ly = (MAP_LAYER_Y.load(Ordering::Relaxed) as usize).min(MAP_SURFACE_HEIGHT);
+    let lw = match MAP_LAYER_W.load(Ordering::Relaxed) as usize {
+        0 => MAP_SURFACE_WIDTH,
+        w => w.min(MAP_SURFACE_WIDTH - lx),
+    };
+    let lh = match MAP_LAYER_H.load(Ordering::Relaxed) as usize {
+        0 => MAP_SURFACE_HEIGHT,
+        h => h.min(MAP_SURFACE_HEIGHT - ly),
+    };
+    // The readback runs bottom-up while a layer window is top-left origin.
+    let row_first = MAP_SURFACE_HEIGHT.saturating_sub(ly + lh);
+    let row_last = MAP_SURFACE_HEIGHT.saturating_sub(ly);
+    let col_last = (lx + lw).min(MAP_SURFACE_WIDTH);
     let mut opaque_count = 0u32;
     let mut transparent_count = 0u32;
     let mut mixed_count = 0u32;
-    for px in backend
+    let mut outside_count = 0u32;
+    for (index, (hmi, map)) in backend
         .hmi_pixels
         .chunks_exact_mut(4)
         .zip(backend.map_pixels.chunks_exact(4))
+        .enumerate()
     {
-        let (hmi, map) = (px.0, px.1);
+        let row = index / MAP_SURFACE_WIDTH;
+        let col = index % MAP_SURFACE_WIDTH;
+        if !enabled || row < row_first || row >= row_last || col < lx || col >= col_last {
+            outside_count += 1;
+            continue;
+        }
         let a = hmi[3] as u16;
         if a == 255 {
             opaque_count += 1;
@@ -1190,14 +1264,29 @@ fn composite_hmi_over_map(backend: &mut Backend) {
         }
         hmi[3] = 255;
     }
+    if !enabled && transparent_count > 0 {
+        // The HMI layer does have a hole (a transparent clear) but no layer is
+        // enabled underneath it, so nothing can show through.  This is the state
+        // to compare against the unit's map page.
+        let hits = MAP_LAYER_HOLE_LOGS.fetch_add(1, Ordering::Relaxed);
+        if hits < 5 {
+            log::info!(
+                "GPU: HMI layer has {} transparent pixels but no map layer is enabled (window {:#x})",
+                transparent_count,
+                MAP_LAYER_SIGNATURE.load(Ordering::Relaxed)
+            );
+        }
+    }
     let count = HMI_COMPOSITE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if count < 20 {
         log::info!(
-            "GPU: HMI composite frame={} opaque={} transparent={} mixed={} map_first_px={}",
+            "GPU: HMI composite frame={} enabled={} opaque={} transparent={} mixed={} outside={} map_first_px={}",
             count,
+            enabled,
             opaque_count,
             transparent_count,
             mixed_count,
+            outside_count,
             if backend.map_pixels.len() >= 4 {
                 format!(
                     "({},{},{},{})",
