@@ -2038,3 +2038,21 @@ is only partly analysed - both are inside longer functions), and `Gui_Nav_Receiv
 `NavReady` and `setVehiclePos` are not strings anywhere in prochmi_out.out: the popup logic
 lives in the UCL/Lua resource pools, so hiding it needs a data-level route (resource pool /
 registry / the state the state machine reads), not a hook at those addresses.
+
+## Why the map-data manager ignores the Krakow box (r491, field-by-field)
+
+`GetHighestPriorityRequest` is not confused about the rectangle - the two static request
+records already hold what they should, and only their arming differs:
+
+| record | kind | data type | handled-state (+0x74) | +0x1f4 / +0x1f8 | rectangle |
+|---|---|---|---|---|---|
+| camera `ms_asMapDataReqAcCam[0].rect` 0x78fcd4 | 5 | 1 | **1** | 0xefffffff / 0xefffffff | Michigan (power-on) |
+| cursor `ms_sMapDataReqCarsor` 0x7904e4 | 4 | 0 | **0** | 0xffffffff / 0xffffffff | **Krakow, from our posfi feed** |
+
+So the posfi-driven `UpdateMapDataRequest(prio 4, ...)` does land in the cursor record
+(`0x0e225926..0x0e319b66`, `0x2395cae7..0x239d6c07`) but never *arms* it: the handled-state
+stays 0 and the left-to-fetch fields keep their 0xffffffff "nothing pending" sentinel, while
+the camera record shows state 1 with 0xefffffff. That is why `PerformMapDataRequest`'s prio-4
+branch ends by writing 0 to the car-cursor reference counter 0x7906e4 at 0x50cd2c instead of
+turning the box into a `GetBlockIDs` request, and it is the concrete thing to fix next: the
+condition in the prio-4 branch (0x50cb48..0x50cd2c) that decides whether to arm the record.
