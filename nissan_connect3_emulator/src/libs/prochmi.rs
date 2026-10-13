@@ -32,6 +32,12 @@ const GUI_UTIL_QUEUE_READER_BEGIN: u32 = 0x0134_c534 - ORIGINAL_BASE;
 const GUI_MSGBOX_READER_C1_LR: u32 = 0x0236_8bac - ORIGINAL_BASE;
 const GUI_MSGBOX_BEGIN_CALL_LR: u32 = 0x0133_bd64 - ORIGINAL_BASE;
 const GUI_MSG_ON_MESSAGE: u32 = 0x0136_52d4 - ORIGINAL_BASE;
+/// `GUI_FISystemMsg_Receiver::vOnServiceAvailable` - sets the receiver's ready byte
+/// at `+0x1c` and runs the Lua callback that hides the "Starting navigation." popup.
+const GUI_NAV_V_ON_SERVICE_AVAILABLE: u32 = 0x023a_9d28 - ORIGINAL_BASE;
+/// `GUI_State::vSetProperties` - creates the MapService receiver for PROCNAV's
+/// navigation service (0x0027).
+const GUI_NAV_V_SET_PROPERTIES: u32 = 0x023a_9890 - ORIGINAL_BASE;
 const GUI_MSG_EVENT_NAME_RETURN: u32 = 0x0136_5408 - ORIGINAL_BASE;
 const GUI_MSG_FIRE_INTERNAL_EVENT: u32 = 0x0136_5868 - ORIGINAL_BASE;
 const HSI_CM_BASE_SEND_SYSTEM_EVENT: u32 = 0x0180_a8bc - ORIGINAL_BASE;
@@ -712,6 +718,45 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
             }
         })
         .unwrap();
+
+    // Which services the HMI is told about: the map page can only hide its
+    // "Starting navigation." popup once the MapService receiver for PROCNAV's
+    // navigation service (0x0027) reports ready, and that readiness comes from
+    // `vOnServiceAvailable`.  Logging both it and the receiver creation shows
+    // whether the notification never arrives or arrives and is refused.
+    for (offset, label) in [
+        (GUI_NAV_V_ON_SERVICE_AVAILABLE, "vOnServiceAvailable"),
+        (GUI_NAV_V_SET_PROPERTIES, "GUI_State::vSetProperties"),
+    ] {
+        let address = base_address + offset;
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+                static HITS: [std::sync::atomic::AtomicU32; 2] = [
+                    std::sync::atomic::AtomicU32::new(0),
+                    std::sync::atomic::AtomicU32::new(0),
+                ];
+                let index = if offset == GUI_NAV_V_SET_PROPERTIES { 1 } else { 0 };
+                let hits = HITS[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if hits >= 24 {
+                    return;
+                }
+                let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let content = read_u32(uc, message + 0x04);
+                log::info!(
+                    "PROCHMI nav-service trace {label} t={}ms thread=[{}] this={:#x} r1={:#x} ready={} svc={:#x} opcode={:#x} caller={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    this,
+                    message,
+                    if this != 0 { read_u8(uc, this + 0x1c) } else { 0xff },
+                    if content != 0 { read_u16(uc, content + 0x14) } else { 0xffff },
+                    if content != 0 { read_u8(uc, content + 0x1a) } else { 0xff },
+                    uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                );
+            })
+            .unwrap();
+    }
 
     let hmi_perform_new_app_state = base_address + CL_HMI_MNGR_PERFORM_NEW_APP_STATE;
     unicorn

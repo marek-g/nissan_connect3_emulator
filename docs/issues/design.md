@@ -2004,3 +2004,37 @@ deserialises `posfi_tclMsgNavPositionStatus` version 10 and, when the coordinate
 handler's stored box (`this+0x70..0x7c`), re-arms
 `UpdateMapDataRequest(4, 0, 5.0f, 0, lon +-100000, lat +-50000)` - the only rectangle the
 posfi feed can move.
+
+## The Krakow request already exists - it just never wins the MDM arbitration (r489-r490)
+
+`vHandleNavPosition` works with our fabricated `posfi_tclMsgNavPositionStatus`: at t=12.4 s
+it re-armed `UpdateMapDataRequest(prio=4, type=0, scale=5.0, rect=[0x0e2873a6, 0x0e2b80e6,
+0x2398d827, 0x239a5ec7])` - longitude 19.76..19.96, latitude 49.94..50.01, i.e. the Krakow
+car box - `CreateMDMJobMapDataRequest` returned a real job (0x90ba1d18, the r434 "allocation
+failed" theory is dead), the MDM ran it, and `PerformMapDataRequest` entered its prio-4
+branch (0x50cb48) and wrote 0 to the car-cursor reference counter 0x7906e4 at 0x50cd2c.
+No DAPI request was ever built from that rectangle: every `DapiGetBlockIDs` entry still
+carries the camera record's rect, because `GetHighestPriorityRequest` (bl at 0x5116e0, see
+the `IntHandleMapDataRequest picked` probe) keeps returning the camera request record
+`0x78fcd4` (kind 5) and never `ms_sMapDataReqCarsor` 0x7904e4. That arbitration - not the
+posfi feed, not DAPI - is what stands between the emulator and a block request over Europe.
+
+## RenFI: the request never reaches the engine's dispatcher (r490)
+
+`map_tclPortControl_Platform::vHandleRenFIMessages` 0x3a359c has a function-entry hook and
+has never fired in any run. The uncapped `vOnNewMessage` probe (count + dump-if-any-word ==
+0x300, all three message-object indirections) shows the platform handler processing
+messages whose headers never contain `0x300`: the fabricated rendererfi requests are dropped
+by the AIL claim walk before dispatch, consistent with the handler table at 0x713ee0 having
+no 0x300 entry. Also note 0x3a3798, earlier recorded as "vStart registers the RenFI
+service", is inside `vHandleRenFIMessages` - there is no such vStart gate, so the question
+is purely how a client request for a server service gets claimed.
+
+## The popup is not reachable through the C++ VAs in the old notes (r489)
+
+Hooks at 0x023a_9d28 and 0x023a_9890 (recorded as `vOnServiceAvailable` and
+`GUI_State::vSetProperties`) never fire, Ghidra has no function at either address (prochmi
+is only partly analysed - both are inside longer functions), and `Gui_Nav_ReceiverReady`,
+`NavReady` and `setVehiclePos` are not strings anywhere in prochmi_out.out: the popup logic
+lives in the UCL/Lua resource pools, so hiding it needs a data-level route (resource pool /
+registry / the state the state machine reads), not a hook at those addresses.
