@@ -1460,6 +1460,7 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     {
         spawn_gps_provider(unicorn);
         spawn_posfi_provider(unicorn);
+        spawn_renfi_camera_driver(unicorn);
     }
 }
 
@@ -1854,4 +1855,122 @@ pub(crate) fn extrapolated_positions_message(seq: u16) -> Vec<u8> {
     blob.extend_from_slice(&(LEN as u32).to_le_bytes());
     blob.extend_from_slice(&content);
     blob
+}
+/// One `ren_rendererfi_tclMsgSetCameraParameters` request blob - the message with
+/// which the HMI tells the map engine where to point the view.  The engine's
+/// RenFI server (`map_tclPortControl_Platform::vHandleRenFIMessages` `0x3a359c`,
+/// reached from `vOnNewMessage` for `bIsClientMessage` messages whose header
+/// `+0x14` service id is `0x300`) is the only way the *view* rectangle near
+/// `0x78fcd4` changes: the posfi feed moves the car position (`CCP`) and nothing
+/// else, which is why r458-r468 kept requesting the engine's power-on rectangle
+/// around `(-83.45, 42.5)` - no block can exist there for the `sd2-GENJ_EU_I.A v2`
+/// (Europe) dataset on the card.
+///
+/// Payload layout (little endian, packed; derived from the
+/// `ren_rendererfi_tclMsgSetCameraParametersMethodStart` serializer, 31 bytes,
+/// no version-gated fields; angles in the engine's map unit - 2^32 per turn):
+///
+/// ```text
+///   0  u8   viewId            (0 = the only view the HMI owns)
+///   1  u8   mode              (camera mode; 0 = as-is)
+///   2  u32  meter             (requested scale class)
+///   6  u16  pitch             (degrees * 10, 0 = north/up flat)
+///   8  u16  heading           (degrees * 10)
+///  10  u16  screen x          (where the position is anchored on screen)
+///  12  u16  screen y
+///  14  u32  animation ms      (0 = jump immediately)
+///  18  u8   movement          (0 = absolute position)
+///  19  s32  longitude        -| the two coordinates the view is centred on,
+///  23  s32  latitude        -| in map units
+///  27  u32  parameter list count (kept empty)
+/// ```
+pub(crate) fn renfi_set_camera_parameters_message(
+    seq: u16,
+    longitude_deg: f64,
+    latitude_deg: f64,
+    meter: u32,
+) -> Vec<u8> {
+    let mut body: Vec<u8> = Vec::with_capacity(0x20);
+    body.push(0); // viewId
+    body.push(0); // mode
+    body.extend_from_slice(&meter.to_le_bytes()); // meter
+    body.extend_from_slice(&0u16.to_le_bytes()); // pitch
+    body.extend_from_slice(&0u16.to_le_bytes()); // heading
+    body.extend_from_slice(&400u16.to_le_bytes()); // screen x (centre of 800x480)
+    body.extend_from_slice(&240u16.to_le_bytes()); // screen y
+    body.extend_from_slice(&0u32.to_le_bytes()); // no animation
+    body.push(0); // absolute movement
+    debug_assert_eq!(body.len(), 0x13);
+    body.extend_from_slice(&map_units(longitude_deg).to_le_bytes()); // longitude
+    body.extend_from_slice(&map_units(latitude_deg).to_le_bytes()); // latitude
+    body.extend_from_slice(&0u32.to_le_bytes()); // empty parameter list
+    debug_assert_eq!(body.len(), 0x1f);
+
+    let len = 0x20 + body.len();
+    let content_len = len.next_multiple_of(16);
+    let mut content = vec![0u8; content_len];
+    content[0x00..0x04].copy_from_slice(&0x0400_0016u32.to_le_bytes());
+    content[0x04..0x08].copy_from_slice(&(content_len as u32).to_le_bytes());
+    content[0x08] = 0x01; // source app: 1
+    content[0x0b] = 0x45; // class: ServiceData
+    content[0x0c..0x10].copy_from_slice(&0xffff_ffffu32.to_le_bytes()); // sub-id wildcards
+    content[0x10..0x14].copy_from_slice(&0x0001_5f90u32.to_le_bytes());
+    content[0x14..0x16].copy_from_slice(&0x0300u16.to_le_bytes()); // serviceId: rendererfi
+    content[0x16..0x18].copy_from_slice(&0xffffu16.to_le_bytes()); // register-id: wildcard
+    content[0x18..0x1a].copy_from_slice(&0x005au16.to_le_bytes()); // functionId: SetCameraParameters
+    content[0x1a] = 0x02; // opCode: Request (what bIsClientMessage accepts)
+    content[0x1c..0x1e].copy_from_slice(&seq.to_le_bytes());
+    content[0x20..0x20 + body.len()].copy_from_slice(&body);
+    let mut blob = Vec::with_capacity(8 + content_len);
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(content_len as u32).to_le_bytes());
+    blob.extend_from_slice(&content);
+    blob
+}
+
+/// Feed the engine the view command the HMI never sends.  The camera has to be
+/// over the area the SD card actually covers, otherwise DAPI can only answer the
+/// block-id query with `ServiceDataError 0x305` and no road is ever drawn.
+fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
+    let namespace = unicorn.get_data().namespace.clone();
+    let result = std::thread::Builder::new()
+        .name("renfi-camera".into())
+        .spawn(move || {
+            // Let the posfi provider move the CCP first; this one only points the
+            // view at the same spot.
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            let mut seq: u16 = 0;
+            let queue = "mbx_1024".to_string();
+            loop {
+                seq = seq.wrapping_add(1);
+                let blob = renfi_set_camera_parameters_message(seq, 19.91809, 50.06254, 100);
+                let posted = {
+                    let mut guard = namespace.lock().unwrap();
+                    crate::common::osal_queues::OsalQueueService::ensure_queue(
+                        &mut guard.mq,
+                        &queue,
+                    );
+                    let posted = crate::common::osal_queues::OsalQueueService::guest_post(
+                        &mut guard.mq,
+                        &queue,
+                        blob,
+                        0,
+                    );
+                    if posted {
+                        guard.notify_waiters();
+                    }
+                    posted
+                };
+                if seq <= 3 || !posted {
+                    log::info!(
+                        "PROCNAV: renfi camera SetCameraParameters #{seq} posted={posted} into {queue}"
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5000));
+            }
+        });
+    match result {
+        Ok(_) => log::info!("PROCNAV: renfi camera driver started"),
+        Err(error) => log::warn!("PROCNAV: cannot start renfi camera driver: {error}"),
+    }
 }
