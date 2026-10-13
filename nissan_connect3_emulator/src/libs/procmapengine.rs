@@ -5549,6 +5549,47 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             .unwrap();
     }
 
+    // r583: PreRender sees alstActive.count=0 every frame.  Its list-builder
+    // `map_tclSceneManager::UpdateDrawLayerListsForDTM` (0x42a8ec) returns 0
+    // immediately when the per-view scene root `scene_mgr + 0x44 + view*4` is
+    // null; otherwise it walks the quadtree and fills the DTM node arrays.
+    // Dump the gate value, the query rect (param_2 -> 4 ints) and the first
+    // root words to tell "no scene root" from "empty tree".
+    {
+        let upd = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let addr = base_address + 0x0042_a8ecu32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = upd.fetch_add(1, Ordering::Relaxed);
+                if count >= 40 {
+                    return;
+                }
+                let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let mcp = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let rect = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let view = read_u32_or_invalid(uc, mcp.wrapping_add(5)) & 0xff;
+                let root = read_u32_or_invalid(uc, this + 0x44 + view * 4);
+                let rw = read_u32_or_invalid(uc, root);
+                let r0 = read_u32_or_invalid(uc, rect);
+                let r1 = read_u32_or_invalid(uc, rect + 4);
+                let r2 = read_u32_or_invalid(uc, rect + 8);
+                let r3 = read_u32_or_invalid(uc, rect + 0xc);
+                log::info!(
+                    "PROCMAPENGINE render trace UpdateDrawLayerListsForDTM entry at {:#x}: scene_mgr={:#x} view={:#x} root={:#x} root[0]={:#x} rect=[{:#x},{:#x},{:#x},{:#x}]",
+                    addr,
+                    this,
+                    view,
+                    root,
+                    rw,
+                    r0,
+                    r1,
+                    r2,
+                    r3
+                );
+            })
+            .unwrap();
+    }
+
     // Message-map router `PortControl_CCAClientHandlerBase::vDispatchMessage`
     // (0x592454): keys are (u16 svc @inner+0x14, u16 fn @inner+0+0x18) pairs
     // (the map's static seed table at 0x713ea8 holds {0x70006, 0x140006,
