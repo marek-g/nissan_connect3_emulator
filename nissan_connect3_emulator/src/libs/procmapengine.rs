@@ -292,6 +292,12 @@ static AIL_MAIL_VALIDITY_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static AIL_MAIL_VALIDITY_RESULT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static AIL_POST_MESSAGE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_DATA_CLIENT_SERVICE_REF_NODE: AtomicU32 = AtomicU32::new(0);
+// The `FIApplication` instance the engine stored in its map view object
+// (`view + 0x10`), captured from `u32SetCameraParameters`.  A fabricated
+// rendererfi request has to carry it in payload+0x04: `getRenfIMapViewId`
+// 0x3947cc drops the request when it does not equal that field.
+pub(crate) static RENFI_APPLICATION_INSTANCE: AtomicU32 = AtomicU32::new(0);
+static RENFI_HEADER_DUMPS: AtomicU32 = AtomicU32::new(0);
 /// Register-id DAPIAPP assigned to the map-data (CCA svc 0x26) client
 /// registration, taken from its ServiceRegister conf. DAPI's map worker
 /// rejects requests carrying the wildcard 0xffff with error 6 "unknown
@@ -2694,6 +2700,179 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
         })
         .unwrap();
 
+    // The engine's debug channel commands (`vChannelMgr` 0x3a4888, a switch over a
+    // command record) are the other way to reach `TriggerPixmapViewRender`
+    // (case 0xb), and its case 9 toggles the Navi stress-test ladder; both would
+    // explain the camera being re-aimed from inside the map-data-manager loop.
+    {
+        let addr = base_address + 0x003a_4888u32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                let hits = HITS.fetch_add(1, Ordering::Relaxed);
+                if hits >= 12 {
+                    return;
+                }
+                let record = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let words: Vec<u32> =
+                    (0..6u32).map(|i| read_u32_or_invalid(uc, record + i * 4)).collect();
+                log::info!(
+                    "PROCMAPENGINE map-data trace vChannelMgr t={}ms thread=[{}] record={:#x} words=[{}] lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    record,
+                    words
+                        .iter()
+                        .enumerate()
+                        .map(|(i, word)| format!("{:#x}:{:#010x}", i * 4, word))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                );
+            })
+            .unwrap();
+    }
+
+    // Only four places call `MapEngine_TriggerPixmapViewRender`: the debug channel
+    // (hooked above, never fires) and the three `MapEngine_Test*` helpers plus the
+    // Navi handler's extrapolated-positions path, so watching all of them shows
+    // which one re-aims the camera at the engine's built-in default position.
+    for offset in [0x0053_b7c0u32, 0x0053_b984, 0x0053_bd68, 0x0054_98f8] {
+        let addr = base_address + offset - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                // One counter per address: a shared static would let the
+                // once-per-second posfi handler exhaust the budget and hide the
+                // others.
+                static HITS: [AtomicU32; 4] = [
+                    AtomicU32::new(0),
+                    AtomicU32::new(0),
+                    AtomicU32::new(0),
+                    AtomicU32::new(0),
+                ];
+                let index = match offset {
+                    0x0053_b984 => 1,
+                    0x0053_bd68 => 2,
+                    0x0054_98f8 => 3,
+                    _ => 0,
+                };
+                let hits = HITS[index].fetch_add(1, Ordering::Relaxed);
+                if hits >= 10 {
+                    return;
+                }
+                log::info!(
+                    "PROCMAPENGINE map-data trace camera-reset candidate {:#x} t={}ms thread=[{}] arg={} lr={:#x}",
+                    offset,
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 & 0xff,
+                    uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                );
+            })
+            .unwrap();
+    }
+
+    // Who triggers the pixmap-view render: it is the only remaining caller that
+    // re-points the camera at the engine's hard-coded power-on position (the
+    // coordinate pair lives in its literal pool at 0x53b7a8), and it is reached
+    // either from the debug channel (`vChannelMgr` case 0xb) or from the Navi
+    // handler's PC stress-test ladder, so the link register separates them.
+    {
+        let addr = base_address + 0x0053_b36cu32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                let hits = HITS.fetch_add(1, Ordering::Relaxed);
+                if hits >= 400 {
+                    return;
+                }
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                if hits >= 4 {
+                    // Beyond the first few, only the cadence matters.
+                    log::info!(
+                        "PROCMAPENGINE map-data trace TriggerPixmapViewRender t={}ms thread=[{}] hits={} view_id={} lr={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        hits,
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 & 0xff,
+                        lr,
+                    );
+                    return;
+                }
+                // The link register points outside the module here, so walk the
+                // stack for return addresses that do live in the engine's text and
+                // print them as the caller chain.
+                let chain: Vec<u32> = (0..64u32)
+                    .map(|i| read_u32_or_invalid(uc, sp + i * 4))
+                    .filter(|word| word.wrapping_sub(base_address) < 0x00a0_0000)
+                    .collect();
+                // The link register points into the heap, so show what is actually
+                // at that address: real generated code, or one of our own buffers
+                // that the guest was tricked into executing.
+                let around: Vec<u32> = (0..8u32)
+                    .map(|i| read_u32_or_invalid(uc, lr.wrapping_sub(0x10) + i * 4))
+                    .collect();
+                log::info!(
+                    "PROCMAPENGINE map-data trace TriggerPixmapViewRender t={}ms thread=[{}] view_id={} lr={:#x} sp={:#x} around=[{}] chain=[{}]",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 & 0xff,
+                    lr,
+                    sp,
+                    around
+                        .iter()
+                        .enumerate()
+                        .map(|(i, word)| format!("{:#x}:{:#010x}", i as i32 * 4 - 0x10, word))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    chain
+                        .iter()
+                        .map(|word| format!("{:#x}", word))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            })
+            .unwrap();
+    }
+
+    // Whoever creates a camera job decides the view's position: the only callers
+    // of `CreateRCJobSetCameraParameters` 0x4c5ac0 are `MDBC_CreateDefaultView`,
+    // `MDBC_EarthJumpTo`, `vTriggerAutozoom` and the debug/stress-test helpers, so
+    // logging the link register plus the parameters identifies both the creator and
+    // the coordinate source behind the power-on camera that never moves.
+    {
+        let addr = base_address + 0x004c_5ac0u32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                static LRS: AtomicU32 = AtomicU32::new(0);
+                let hits = HITS.fetch_add(1, Ordering::Relaxed);
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                if hits >= 24 || LRS.swap(lr, Ordering::Relaxed) == lr {
+                    return;
+                }
+                let params = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let words: Vec<u32> =
+                    (0..8u32).map(|i| read_u32_or_invalid(uc, params + i * 4)).collect();
+                log::info!(
+                    "PROCMAPENGINE map-data trace CreateRCJobSetCameraParameters t={}ms thread=[{}] params={:#x} words=[{}] lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    params,
+                    words
+                        .iter()
+                        .enumerate()
+                        .map(|(i, word)| format!("{:#x}:{:#010x}", i * 4, word))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    lr,
+
+                );
+            })
+            .unwrap();
+    }
+
     // Steps between "AIL accepted the message" and "the RenFI method ran", so a
     // rejected camera request can be pinned to one of them: `vOnNewMessage` of the
     // port-control handler (claim vtable slot +0x20, 0x3a4048), the client/server
@@ -2723,6 +2902,47 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 if hits >= 60 {
                     return;
                 }
+                if index == 0 {
+                    // `vOnNewMessage` reads the RenFI class word, the opcode and
+                    // the service id through its own message-object indirection,
+                    // which is not the same view of the buffer our envelope
+                    // builder uses.  Dump the header candidates whenever a
+                    // rendererfi message passes through, so the offsets the guest
+                    // really tests can be read off the bytes instead of derived
+                    // twice in different ways.
+                    let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let bases = [
+                        ("via+0x00", read_u32_or_invalid(uc, message)),
+                        ("via+0x04", read_u32_or_invalid(uc, message + 4)),
+                        ("via+0x20", read_u32_or_invalid(uc, message + 0x20)),
+                    ];
+                    for (label, base) in bases {
+                        let words: Vec<u32> =
+                            (0..20u32).map(|i| read_u32_or_invalid(uc, base + i * 4)).collect();
+                        if !words.iter().any(|word| *word & 0xffff == 0x300) {
+                            continue;
+                        }
+                        let dumps = RENFI_HEADER_DUMPS.fetch_add(1, Ordering::Relaxed);
+                        if dumps >= 8 {
+                            continue;
+                        }
+                        log::info!(
+                            "PROCMAPENGINE map-data trace RenFI buffer t={}ms thread=[{}] hits={} wrapper={:#x} {label}={:#x} words=[{}]",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            uc.get_data().inner.thread_id(),
+                            dumps,
+                            message,
+                            base,
+                            words
+                                .iter()
+                                .enumerate()
+                                .map(|(i, word)| format!("{:#x}:{:#010x}", i * 4, word))
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        );
+                    }
+                    return;
+                }
                 if index == 2 {
                     // u32SetCameraParameters(camera_object, parameters): dump what
                     // the engine actually feeds the camera and what the two
@@ -2730,6 +2950,19 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     // command never arrived" is distinguishable from "the camera
                     // was set but the view rectangle refused to move".
                     let params = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    // r0 is `&view->u32SetCameraParameters`, i.e. the map view
+                    // object + 8; the view's +0x10 holds the FIApplication
+                    // instance the RenFI server compares payload+0x04 against
+                    // (`getRenfIMapViewId` 0x3947cc), so this is where a
+                    // fabricated camera request has to take its instance from.
+                    let view = uc
+                        .reg_read(RegisterARM::R0)
+                        .unwrap_or(0)
+                        .wrapping_sub(8) as u32;
+                    let instance = read_u32_or_invalid(uc, view + 0x10);
+                    if instance != 0 && instance != 0xffff_ffff {
+                        RENFI_APPLICATION_INSTANCE.store(instance, Ordering::Relaxed);
+                    }
                     let words: Vec<u32> =
                         (0..12u32).map(|i| read_u32_or_invalid(uc, params + i * 4)).collect();
                     let view_rect = [
