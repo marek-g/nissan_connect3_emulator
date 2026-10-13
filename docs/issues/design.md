@@ -2433,3 +2433,34 @@ wire message appeared; the next question is whether the job (or the 0x401
 property subscription it drives) then emits CCA fn 0x101 to DAPI and gets the
 channel handle back (`dap_map_tclWorker::u16ProcessOpenChannel` side is ready,
 `/dev/shm` + fd-mmap are emulated).
+
+## Correction: AMT client state semantics - 0 = AVAILABLE, and the property subscribes on 0 (r576)
+
+The r575 note's "state 1 = available" was wrong. Ground truth from the engine's
+own code (all confirmed against the r576 fetch trace):
+
+* `map_tclIClientServiceHandler::bIsServiceAvailable` (0x5902f0):
+  `return this[0xe] == 0` (decompiled `1 - state`, clamped at state > 1).
+* `PortControl_CCAClientHandler_DAPI::vOnServiceState` (0x53d8a4): after the
+  base fan-out, for `param_2 == 0x26` it creates
+  `CreateMDMJobOnUpdateServiceStateDAPIFastmap(++counter, bIsServiceAvailable())`
+  on the handler at `platform+0x24` - so the MDM job's `state` argument is the
+  boolean availability, *not* the raw AMT state.
+* `map_tclClientPropertyRegHandler::vServiceStateChanged` (0x5931e0): only
+  `state == 0` triggers the virtual `vUpRegOrGet()` (vtable+0x10, template impl
+  0x591020) which sends the property UpReg; states 1/2/3 return silently.
+
+So the directory's real publish drives the reference to **state 0**, which
+simultaneously (a) makes the handler available, (b) fires the property 0x401
+UpReg, and (c) lets the mail-check admit request opcodes (it always did - state
+0 is what every successful GetBlockIDs ran under). The synthesized pair is now
+1-then-0: the first creates the 0->1 transition (the pull-notify on thread 67
+only fires on a *change*, and the synthetic reference starts at 0), the second
+transitions 1->0 and is the one that flips `handler+0xe` back to available and
+subscribes the property. r575's 1-then-3 and r576's lone 1 both left
+`handler+0xe != 0`, which is why `OnUpdateServiceStateDAPIFastmap` kept closing
+`ms_bFastmapServiceAvailable`.
+
+Side finding: the PortControl notification is **pull-based** - the state change
+is noticed ~25-40 ms later on thread 67 (map-data mainloop) at r576
+(t=29018 apply -> t=29044 notify), not inline in the AIL worker.
