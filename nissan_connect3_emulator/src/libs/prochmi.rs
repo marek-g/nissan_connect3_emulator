@@ -1852,6 +1852,15 @@ fn install_svg_layer_control_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                     match kind {
                         "enable_layer" => SVG_LAYER_ENABLED.store(true, Ordering::Relaxed),
                         "disable_layer" => SVG_LAYER_ENABLED.store(false, Ordering::Relaxed),
+                        // svgSetLayerWindowData(handle, x, y, w, h): four
+                        // one-per-register u32 arguments, the height in [sp]
+                        // (measured: r1=0 r2=0 r3=800 stack0=480).
+                        "set_window_data" => {
+                            SVG_LAYER_X.store(r1, Ordering::Relaxed);
+                            SVG_LAYER_Y.store(r2, Ordering::Relaxed);
+                            SVG_LAYER_W.store(r3, Ordering::Relaxed);
+                            SVG_LAYER_H.store(stack0, Ordering::Relaxed);
+                        }
                         _ => {}
                     }
                     publish_svg_map_layer_window();
