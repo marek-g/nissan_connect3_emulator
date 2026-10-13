@@ -2525,12 +2525,11 @@ pub(crate) fn post_dapi_status_available(unicorn: &mut Unicorn<'_, Context>) -> 
 /// the client dispatch ignores outright, so with no directory in the
 /// emulator the whole chain sleeps forever.
 ///
-/// Emit the pair of publishes a healthy directory would make once the engine
-/// has received its first answered GetBlockIDs (i.e. the (engine, svc 0x26)
-/// registration is fully stamped): state 1 to flip the client reference and
-/// propagate availability, then state 3 ("registered and operational"), the
-/// state in which `ail_enCheckClientMailValidity` accepts request opcodes
-/// again (state 1 admits only notify opcodes 4/0xd).
+/// Emit that publish once the engine has received its first answered
+/// GetBlockIDs (i.e. the (engine, svc 0x26) registration is fully stamped),
+/// with state 1 - the value that flips the client reference, propagates
+/// availability through `PortControl_CCAClientHandlerBase::vOnServiceState`,
+/// and keeps `OnUpdateServiceStateDAPIFastmap` opening the channels.
 pub(crate) fn post_engine_fastmap_service_status(
     unicorn: &mut Unicorn<'_, Context>,
     register_id: u16,
@@ -2540,11 +2539,15 @@ pub(crate) fn post_engine_fastmap_service_status(
     if ENGINE_STATUS_SENT.swap(true, Ordering::Relaxed) {
         return false;
     }
-    let accepted = [1u8, 3]
-        .into_iter()
-        .all(|state| post_engine_status_to(unicorn, 0x0026, register_id, state));
+    // r575: publishing state 1 then state 3 made the engine's client handler
+    // flip 0 -> 1 -> 3, and `OnUpdateServiceStateDAPIFastmap` (running seconds
+    // later on the MDM queue) treats anything but state 1 as unavailable - it
+    // zeroed `ms_bFastmapServiceAvailable` instead of opening the channels.
+    // State 1 is the AMT "available" value (the engine itself sends status 2
+    // for "registration denied"), so publish it once and leave it there.
+    let accepted = post_engine_status_to(unicorn, 0x0026, register_id, 1);
     log::info!(
-        "[LIBOSAL-MBX] synthesized directory ServiceStatus(svc 0x26 regid {:#x}, state 1 then 3) into mbx_1024: {}",
+        "[LIBOSAL-MBX] synthesized directory ServiceStatus(svc 0x26 regid {:#x}, state 1) into mbx_1024: {}",
         register_id,
         accepted
     );
