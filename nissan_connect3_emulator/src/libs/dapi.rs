@@ -259,6 +259,7 @@ pub fn dapiapp_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     hook_service_register_handler(unicorn, base_address);
     hook_service_data_errors(unicorn, base_address);
     hook_service_data_scan(unicorn, base_address);
+    hook_fastmap_worker_steps(unicorn, base_address);
     hook_service_state_setter(unicorn, base_address);
     hook_registry_guard(unicorn, base_address);
     hook_error_job_origin(unicorn, base_address);
@@ -1101,6 +1102,70 @@ fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
             );
         })
         .unwrap();
+}
+
+/// Step-by-step page watch inside `dap_map_tclWorker::u16ProcessOpenChannel`
+/// (0x84b310) and `u16ProcessLoadBlocks` (0x849894), the two fastmapfi server
+/// entry points procmapengine hits once the FastMap service is "available".
+/// Narrow hooks are untrustworthy mid-TB (AGENTS.md), so each function's page
+/// is hooked and dispatched on the original VA; sites picked from the
+/// disassembly (bl + 4 after each decisive callee).
+fn hook_fastmap_worker_steps(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    for page in [0x0084_9000u32, 0x0084_b000u32] {
+        let page_lo = base_address + (page - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                use std::sync::atomic::Ordering as Ord;
+                static HITS: std::sync::OnceLock<
+                    std::sync::Mutex<std::collections::HashMap<u32, u32>>,
+                > = std::sync::OnceLock::new();
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                let label = match original {
+                    // u16ProcessOpenChannel
+                    0x0084_b350 => "OpenChannel: after bGetDapFiMsgFromAction (1=deserialized)",
+                    0x0084_b40c => "OpenChannel: after u16OpenChannelToPoiServer (0xffff=fall through)",
+                    0x0084_b46c => "OpenChannel: after u16CreateSharedMemChannel (0xffff=ok, else error)",
+                    0x0084_b4bc => "OpenChannel: after u16SendResponse (r0=0 sent)",
+                    // u16ProcessLoadBlocks
+                    0x0084_98f8 => "LoadBlocks: after bGetDapFiMsgFromAction (1=deserialized)",
+                    0x0084_9a2c => "LoadBlocks: after rfoGetChannelController/bHandleIsValid (0=invalid handle)",
+                    0x0084_9a9c => "LoadBlocks: after rfoGetChannel-ish (0=fail branch)",
+                    0x0084_9af0 => "LoadBlocks: after enSetAccessMode (2=write buffer ok)",
+                    _ => return,
+                };
+                let seen = {
+                    let mut counts = HITS.get_or_init(Default::default).lock().unwrap();
+                    if counts.len() > 40 {
+                        return;
+                    }
+                    *counts.entry(original).or_insert(0) += 1;
+                    *counts.get(&original).unwrap()
+                };
+                if seen > 6 {
+                    return;
+                }
+                let regs = [
+                    RegisterARM::R0,
+                    RegisterARM::R4,
+                    RegisterARM::R7,
+                ]
+                .map(|r| (uc.reg_read(r).unwrap_or(0) as u32))
+                    .iter()
+                    .map(|v| format!("{:#x}", v))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                log::warn!(
+                    "DAPI fastmap-step {:#x}: {} r0,r4,r7=[{}] t={}ms",
+                    original,
+                    label,
+                    regs,
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                );
+            })
+            .unwrap();
+    }
 }
 
 /// Trace the registry scan inside `ail_bHandleMsgServiceData` that decides
