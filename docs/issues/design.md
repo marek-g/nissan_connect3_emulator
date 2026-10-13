@@ -1910,7 +1910,7 @@ RenFI envelope (verified against `vRegisterService` 0x66b894 /
 `fi_tclMessage::oRead` 0x389240): sub-ids at content+0x10/0x12 (0xffff for
 notifications), **serviceId u16 at content+0x18**, register id at content+0x1a,
 functionId slot content+0x1c = 0x4f (= `MethodStart`, the only registered RenFI
-function), **opcode u8 at content+0x1d? no: content+0x1b** (2 = client request),
+function), opcode u8 at content+0x1b (2 = client request),
 class byte content+0x0b (0x45 request, 0x42 service-available/5), payload base at
 content+0x20, and the total length field must be a multiple of 16 or the sender
 gets error 0x22d.
