@@ -5507,6 +5507,48 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             .unwrap();
     }
 
+    // r582 (EMU_GPU_TRACE_ALL): procmapengine's complete GL vocabulary is
+    // shader/state/texture-creation + `glClear(ccced9)` - no FBO binding and no
+    // draw call ever, so the render-to-texture path is dead before GL.
+    // `map_tclRenderer::PreRender` (0x52f184) is the gate: it returns 0 when
+    // `DAT_00790820` (0x790820) - the per-view count from
+    // `MasterHeightDataManager::ms_alstActiveNodes` (0x71aec8, 5 x 16-byte
+    // {count, ?, ?, nodes-array} entries) - is zero, and only the non-zero
+    // path calls s32SetStatesForRenderToTexture (0x52cb88) and draws.  Log the
+    // view id (byte at mcp+5, r2) and both counts each PreRender run.
+    {
+        let pre = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let page_lo = base_address + (0x0052_f000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != 0x0052_f184 {
+                    return;
+                }
+                let count = pre.fetch_add(1, Ordering::Relaxed);
+                if count >= 60 {
+                    return;
+                }
+                let mcp = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let view = read_u32_or_invalid(uc, mcp.wrapping_add(5)) & 0xff;
+                let dat = read_u32_or_invalid(uc, base_address + (0x0079_0820u32 - ORIGINAL_BASE));
+                let entry = base_address + (0x0071_aec8u32 - ORIGINAL_BASE) + view * 0x10;
+                let active = read_u32_or_invalid(uc, entry);
+                let nodes = read_u32_or_invalid(uc, entry + 0xc);
+                log::info!(
+                    "PROCMAPENGINE render trace PreRender entry at {:#x}: view={:#x} nodes_to_process={:#x} alstActive.count={:#x} nodes_arr={:#x}",
+                    original,
+                    view,
+                    dat,
+                    active,
+                    nodes
+                );
+            })
+            .unwrap();
+    }
+
     // Message-map router `PortControl_CCAClientHandlerBase::vDispatchMessage`
     // (0x592454): keys are (u16 svc @inner+0x14, u16 fn @inner+0+0x18) pairs
     // (the map's static seed table at 0x713ea8 holds {0x70006, 0x140006,
