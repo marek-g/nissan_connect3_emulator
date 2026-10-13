@@ -2257,3 +2257,51 @@ DAPI request rectangle follows to `[0xe280000,0xe2b0000,0x23990000,0x239b0000]`)
 Finally: run the emulator pinned (`taskset -c 3`).  Unpinned it repeatedly lost an order of
 magnitude (t=4.9 s of guest time in 100 s wall) while a background process held ~50 % of one
 core; pinned, 60 s of wall gives t=58 s.
+
+## 2026-10-13: the block *content* path is the FastMap channel, and nothing has ever run it
+
+r566 (probes `HandleGetBlockIDs::Execute` block array + non-`fn=0x2` request bodies)
+settles two open questions at once.
+
+* **DAPI answers the Krakow rectangle with real blocks.**  The `GetBlockIDs` answer
+  deserializes 34 `fmp_tclUniqueID` entries (12 B each, begin/end pointers at
+  `job + 0x30`/`job + 0x34`, `job + 0x24` is the array's vptr - the old probe read that
+  vptr and printed `block_count=7203024`) into the MDM job, answer code 0, request
+  `0x78fcd4` (AcCam/view, kind 5) resolved.  Both region indexes are read by DAPI
+  (`/dev/cryptnav/data/connect/map/N6E2AA.idx`, and `.tci` under
+  `/dev/cryptnav/data/data/map/`; per the user `data/data/map` is the real card layout,
+  `data/connect/map` is our mapping).  Krakow east = `N6E2*`, west Poland = `N6E1*`;
+  `N5W6*` is a different part of the world.
+* **`fn=0x103` IS `GetBlockIDs`.**  The request bodies the engine sends every ~0.6 s
+  after a camera move carry the *shifted* rect (`28 0e 00 00 99 23 00 00 ...` =
+  lon/lat lo/hi) - they are the map-data requests, serialized by
+  `fastmapfi_tclMsgGetBlockIDsMethodStart`, whose `u16GetFunctionID` returns 0x103
+  (literal pool at `0x6004c4`).  The whole `fastmapfi_*` message family lives under the
+  *same* DAPI service 0x26: OpenFastMapChannel = 0x101, CloseFastMapChannel = 0x102,
+  GetBlockIDs = 0x103.  So the method histogram proves the engine never sent 0x101.
+
+Why that matters: `map_tclJobMDMHandleGetBlockIDs::Execute` walks the answered uids,
+puts the uncached ones into the request record's "left to fetch" array
+(`request + 0x1f4` counter, `piVar3[0x7d]`), and ends via `LAB_004b4a38` with
+`map_tclMapDataManager::HandleMapDataRequest(1)` (0x512108) - which silently returns 0
+unless `ms_u32DatasetID == ms_u32DatasetID_Validated != 0` (globals 0x78f7f0/0x78f874)
+*and* `ms_bFastmapServiceAvailable == 1` (0x78f7f8).  Only then runs
+`IntHandleMapDataRequest` (0x5116d4), which loads block content through
+`DAPI_LoadBlocks` (0x38f7bc) over an *open FastMap channel*.  The channel is opened by
+`OnUpdateServiceStateDAPIFastmap` (0x512400, reached from the CCA client service-state
+machine: `PortControl_CCAClientHandlerBase::vOnServiceState` 0x592604 ->
+`map_tclClientServiceHandler::vOnServiceStateChange` 0x590390 -> property handlers ->
+`CreateMDMJobOnUpdateServiceStateDAPIFastmap` 0x4a58bc), which loops
+`ms_u32NumberOfFastMapChannels` (registry
+`PROCESS/MAP/MAPENGINE/APP_CONFIG/FASTMAP`: `NUMBER`, default 3, plus `NAME`+`SIZE`
+required by `Registry_Read_FastMapChannelConfig` 0x38f0b0, called from MDM `Init`) over
+`ms_asFastMapChannelInfo` (0x78f81c) calling `MapData_OpenFastMapChannel` (0x53a298) ->
+`DAPI_OpenFastMapChannel` (0x38fb00, needs `info + 4` shared-memory ptr != NULL) ->
+CCA fn 0x101 request through the DAPI client handler (`bIsServiceAvailable` gate).
+None of this has ever been observed at runtime - probes
+`add_fastmap_channel_trace_hooks` (r567) mark every step plus write-watchpoints on the
+three gate globals.
+
+Note the DAPIAPP-side registry we fabricated has `APP_CONFIG/MAP/FASTMAP_ENABLED=1`
+already; the engine-side `PROCESS/MAP/MAPENGINE` section does not exist in
+`registry_compat.reg` at all.
