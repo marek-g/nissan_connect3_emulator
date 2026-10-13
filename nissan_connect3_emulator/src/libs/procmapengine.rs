@@ -1951,7 +1951,7 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                 }
             }
             let count = HANDLE_SERVICE_DATA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if count >= 12 {
+            if count >= 400 {
                 return;
             }
             let thread = uc.get_data().inner.thread_id();
@@ -1972,7 +1972,13 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                     read_u32_or_invalid(uc, vtable + 0x20)
                 );
             }
-            if matches!(count, 0 | 6) && dispatch < 0xf000_0000 {
+            // Also dump on the rendererfi request (service 0x300): an opcode-2
+            // request walks the *registry* list at app_iface+0x58 (`bIsServerMessage`
+            // says "not from a server"), so its content decides whether the claim
+            // tail-calls the port-control platform's `vOnNewMessage` or answers the
+            // client with error 6 (unknown register-id).
+            let request_service = read_u32_or_invalid(uc, handle + 0x14) & 0xffff;
+            if (matches!(count, 0 | 6) || request_service == 0x0300) && dispatch < 0xf000_0000 {
                 // app interface is dispatch+0x00; the AIL lists are
                 // app_iface+0x4c (async service requests), +0x50 (server
                 // service references) and +0x58 (client service registry).
@@ -2700,6 +2706,482 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
         })
         .unwrap();
 
+    // `map_tclMapEngineControl`'s lifecycle state (`ms_eMapEngineState`, 0x7907ac) is what
+    // decides whether a RenFI camera job survives: `RndFI_AddJobToQueue` (0x53ad90) hands
+    // the job to the render control only while the state is 1/2/3 and otherwise returns
+    // 0xffab60, which makes the caller destroy the job again.  The state is written by
+    // exactly four functions - `Init` (0x51e000, -> 1 when it succeeds from 0), `Start`
+    // (0x51da24, -> 2), `Stop` (0x51e97c, -> 3) and `Exit` (0x51ef54, -> 4/5) - and the
+    // chain into them starts at the port-control platform's own `bOnInit` (0x390370 ->
+    // `map_tclPortControl::Init` 0x3a46ac -> 0x53ae30).  Trace entries plus the state as
+    // the gate sees it.
+    {
+        static HITS: AtomicU32 = AtomicU32::new(0);
+        let state_at = base_address + (0x0079_07acu32 - ORIGINAL_BASE);
+        for (offset, label) in [
+            (0x0039_0370u32, "portControl_Platform::bOnInit"),
+            (0x003a_46acu32, "map_tclPortControl::Init"),
+            (0x0051_e000u32, "MapEngineControl::Init"),
+            (0x0051_da24u32, "MapEngineControl::Start"),
+            (0x0051_e97cu32, "MapEngineControl::Stop"),
+            (0x0051_ef54u32, "MapEngineControl::Exit"),
+            (0x0053_ad90u32, "RndFI_AddJobToQueue"),
+        ] {
+            let addr = base_address + (offset - ORIGINAL_BASE);
+            let state = state_at;
+            let label: &'static str = label;
+            unicorn
+                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                    let hits = HITS.fetch_add(1, Ordering::Relaxed);
+                    if hits >= 40 {
+                        return;
+                    }
+                    let state_value = read_u32_or_invalid(uc, state);
+                    log::info!(
+                        "PROCMAPENGINE map-data trace engine lifecycle {label} t={}ms thread=[{}] state={state_value:#x} r0={:#x} lr={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                        ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                            .wrapping_sub(base_address)
+                            .wrapping_add(ORIGINAL_BASE),
+                    );
+                })
+                .unwrap();
+        }
+    }
+
+    // With the lifecycle state at 2 the RenFI camera job *is* accepted into the render
+    // control job queue, so the open question is why nothing ever executes it.  The pump
+    // (`RenderControlMainLoop`, 0x3a8b6c) peeks the queue head with `PeekElement`
+    // (0x4a52e0), asks the job's vtable slot +0x20 (`map_tclJobRC::IsExecutable`,
+    // 0x4c5c50, answering `1 - render_control[0x1ad]` for camera jobs whose `job+0x10`
+    // is not 0x8000), then removes it with `GetPeekedElement` (0x4a3d7c) and calls slot
+    // +0x24 (`map_tclJobRCSetCameraParameters::Execute`, 0x4d74c4, which calls
+    // `u32SetCameraParameters`).  Log the whole add/peek/gate/take/execute chain of the
+    // queue (`ms_pkRenderControlJobQueue`, 0x715564) to find the step our job falls out
+    // of - a non-executable head-of-line element parks every job behind it.
+    {
+        let rc_instance_global = base_address + (0x0071_5538u32 - ORIGINAL_BASE);
+        let rc_queue_global = base_address + (0x0071_5564u32 - ORIGINAL_BASE);
+        let instance_global = rc_instance_global;
+
+        static ADD_LOGS: AtomicU32 = AtomicU32::new(0);
+        let add = base_address + (0x003a_79b8u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(add as u64, add as u64, move |uc, _, _| {
+                let logs = ADD_LOGS.fetch_add(1, Ordering::Relaxed);
+                if logs >= 800 {
+                    return;
+                }
+                let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let queue = read_u32_or_invalid(uc, rc_queue_global);
+                // `map_tclJobQueue::AddElement` (0x4a4284) does not link the element: it
+                // posts the element *pointer* into the queue's incoming-job OSAL message
+                // queue (`queue + 0x30` -> OSALPointerQueue, whose +0x00 is the OSAL
+                // handle and +0x04 the name), and `EnqueueElements` (0x4a4d7c) picks it
+                // up again on the next peek.  Report that queue so the post can be
+                // followed in the OSAL message-queue trace.
+                let pointer_queue = read_u32_or_invalid(uc, queue.wrapping_add(0x30));
+                let handle = read_u32_or_invalid(uc, pointer_queue);
+                let name_at = read_u32_or_invalid(uc, pointer_queue.wrapping_add(4));
+                let name: Vec<u8> = (0..12u32)
+                    .map(|i| read_u8_or_invalid(uc, name_at.wrapping_add(i)) as u8)
+                    .collect();
+                let name = String::from_utf8_lossy(&name)
+                    .chars()
+                    .take_while(|c| *c != '\0')
+                    .collect::<String>();
+                let words: Vec<u32> = (0x20u32..0x40)
+                    .step_by(4)
+                    .map(|i| read_u32_or_invalid(uc, job.wrapping_add(i)))
+                    .collect();
+                log::info!(
+                    "PROCMAPENGINE map-data trace render queue add t={}ms thread=[{}] job={:#x} vptr={:#x} queue={:#x} state={:#x} class={:#x} words=[{}] ijw={:#x} lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    job,
+                    read_u32_or_invalid(uc, job),
+                    queue,
+                    read_u32_or_invalid(uc, queue),
+                    read_u32_or_invalid(uc, job.wrapping_add(0x10)),
+                    words
+                        .iter()
+                        .map(|w| format!("{w:#x}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    handle,
+                    ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                        .wrapping_sub(base_address)
+                        .wrapping_add(ORIGINAL_BASE),
+                );
+            })
+            .unwrap();
+
+        static POLL_LOGS: AtomicU32 = AtomicU32::new(0);
+        static POLL_LAST: AtomicU32 = AtomicU32::new(0xffff_ffff);
+        let poll = base_address + (0x004a_52e0u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(poll as u64, poll as u64, move |uc, _, _| {
+                let logs = POLL_LOGS.fetch_add(1, Ordering::Relaxed);
+                let queue = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let state = read_u32_or_invalid(uc, queue);
+                let count = read_u32_or_invalid(uc, queue.wrapping_add(0x1c));
+                // Only report a change of (queue, state, depth): the pump polls this in a
+                // tight rotation, so a flat log cap hides everything that matters later.
+                let signature = queue.rotate_left(4) ^ (state << 12) ^ count;
+                if POLL_LAST.swap(signature, Ordering::Relaxed) == signature && logs >= 40 {
+                    return;
+                }
+                log::info!(
+                    "PROCMAPENGINE map-data trace render queue poll PeekElement t={}ms thread=[{}] queue={:#x} state={:#x} count={:#x} logs={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    queue,
+                    state,
+                    count,
+                    logs + 1,
+                );
+            })
+            .unwrap();
+
+        static GATE_LOGS: AtomicU32 = AtomicU32::new(0);
+        let gate = base_address + (0x004c_5c50u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(gate as u64, gate as u64, move |uc, _, _| {
+                let logs = GATE_LOGS.fetch_add(1, Ordering::Relaxed);
+                if logs >= 3000 {
+                    return;
+                }
+                let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let instance = read_u32_or_invalid(uc, instance_global);
+                log::info!(
+                    "PROCMAPENGINE map-data trace render job gate IsExecutable t={}ms thread=[{}] job={:#x} vptr={:#x} mode={:#x} render_control={:#x} flag={:#x} lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    job,
+                    read_u32_or_invalid(uc, job),
+                    read_u32_or_invalid(uc, job.wrapping_add(0x10)),
+                    instance,
+                    if instance == 0 || instance == 0xffff_ffff {
+                        0xffff_ffff
+                    } else {
+                        read_u8_or_invalid(uc, instance.wrapping_add(0x1ad))
+                    },
+                    ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                        .wrapping_sub(base_address)
+                        .wrapping_add(ORIGINAL_BASE),
+                );
+            })
+            .unwrap();
+
+        static TAKE_LOGS: AtomicU32 = AtomicU32::new(0);
+        let take = base_address + (0x004a_3d7cu32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(take as u64, take as u64, move |uc, _, _| {
+                let logs = TAKE_LOGS.fetch_add(1, Ordering::Relaxed);
+                if logs >= 3000 {
+                    return;
+                }
+                let element = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                // `GetPeekedElement` (0x4a3d7c) hands the element back only while the
+                // queue's active list (`queue + 0x08`) is non-empty, otherwise the caller
+                // is given a null element and the job is dropped without executing.
+                let queue = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE map-data trace render queue take GetPeekedElement t={}ms thread=[{}] queue={:#x} element={:#x} vptr={:#x} state={:#x} count={:#x} active={:#x} class_list={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    queue,
+                    element,
+                    read_u32_or_invalid(uc, element),
+                    read_u32_or_invalid(uc, queue),
+                    read_u32_or_invalid(uc, queue.wrapping_add(4)),
+                    read_u32_or_invalid(uc, queue.wrapping_add(8)),
+                    read_u32_or_invalid(uc, queue.wrapping_add(0x10)),
+                );
+            })
+            .unwrap();
+
+        static REMOVED_LOGS: AtomicU32 = AtomicU32::new(0);
+        let removed = base_address + (0x004a_3be4u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(removed as u64, removed as u64, move |uc, _, _| {
+                let element = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let vptr = read_u32_or_invalid(uc, element);
+                let logs = REMOVED_LOGS.fetch_add(1, Ordering::Relaxed);
+                // `map_tclJobRCSetCameraParameters`' vtable; other job classes are only
+                // reported a handful of times so the trace stays readable.
+                if vptr != 0x006a_cb18 && logs >= 20 {
+                    return;
+                }
+                // `RemoveElementFromIJQ` is the last statement of the success branch of
+                // `GetPeekedElement`, so reaching it proves the element was handed back to
+                // the main loop (which then dispatches the job's vtable slot +0x24).
+                log::info!(
+                    "PROCMAPENGINE map-data trace render queue taken RemoveElementFromIJQ t={}ms thread=[{}] queue={:#x} element={:#x} vptr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    element,
+                    vptr,
+                );
+            })
+            .unwrap();
+
+        // 0x3a8df8 is the instruction right after `GetPeekedElement` returns in
+        // `RenderControlMainLoop` and 0x3a8e00 the one that loads the vtable before
+        // dispatching slot +0x24; both sit mid-TB, so they are watched with a page-range
+        // hook dispatching on the fetched address (see docs/issues/design.md).
+        {
+            let page = base_address + (0x003a_8000u32 - ORIGINAL_BASE);
+            unicorn
+                .add_code_hook(page as u64, (page + 0xfff) as u64, move |uc, _, _| {
+                    static DISPATCH_LOGS: AtomicU32 = AtomicU32::new(0);
+                    let offset = (uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32)
+                        .wrapping_sub(base_address)
+                        .wrapping_add(ORIGINAL_BASE);
+                    if offset != 0x003a_8df8 && offset != 0x003a_8e00 {
+                        return;
+                    }
+                    let element = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let (vptr, execute) = if element == 0 {
+                        (0, 0)
+                    } else {
+                        let vptr = read_u32_or_invalid(uc, element);
+                        (vptr, read_u32_or_invalid(uc, vptr + 0x24))
+                    };
+                    let logs = DISPATCH_LOGS.fetch_add(1, Ordering::Relaxed);
+                    if vptr != 0x006a_cb18 && logs >= 20 {
+                        return;
+                    }
+                    log::info!(
+                        "PROCMAPENGINE map-data trace render loop dispatch {offset:#x} t={}ms thread=[{}] element={:#x} vptr={:#x} execute={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        element,
+                        vptr,
+                        execute,
+                    );
+                })
+                .unwrap();
+        }
+
+        // `map_tclRenderControl::SetCameraParameters` has exactly two exits: 0x3a75f4
+        // branches to `map_tclMapView::u32SetCameraParameters`, 0x3a7604 answers 0xffab48.
+        // Both are branch targets, so they start their own translation block and a narrow
+        // hook on them is dispatched (unlike a mid-block probe, see docs/issues/design.md).
+        for (offset, label) in [
+            (0x003a_75d4u32 - ORIGINAL_BASE, "view-check"),
+            (0x003a_7604u32 - ORIGINAL_BASE, "rejected"),
+        ] {
+            static EXIT_LOGS: AtomicU32 = AtomicU32::new(0);
+            let site = base_address + offset;
+            unicorn
+                .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+                    let logs = EXIT_LOGS.fetch_add(1, Ordering::Relaxed);
+                    if logs >= 400 {
+                        return;
+                    }
+                    let view_id = (uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32) & 0xff;
+                    log::info!(
+                        "PROCMAPENGINE map-data trace render control SetCameraParameters {label} t={}ms thread=[{}] view_id={:#x} view={:#x} lon={:#x} lat={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        view_id,
+                        read_u32_or_invalid(
+                            uc,
+                            base_address + (0x0071_5550u32 - ORIGINAL_BASE) + view_id * 4
+                        ),
+                        read_u32_or_invalid(
+                            uc,
+                            (uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32).wrapping_add(0x18),
+                        ),
+                        read_u32_or_invalid(
+                            uc,
+                            (uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32).wrapping_add(0x1c),
+                        ),
+                    );
+                })
+                .unwrap();
+        }
+
+        static EXEC_LOGS: AtomicU32 = AtomicU32::new(0);
+        let exec = base_address + (0x004d_74c4u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(exec as u64, exec as u64, move |uc, _, _| {
+                let logs = EXEC_LOGS.fetch_add(1, Ordering::Relaxed);
+                if logs >= 200 {
+                    return;
+                }
+                let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                // `map_tclJobRCSetCameraParameters` keeps the camera parameter block it
+                // hands to `u32SetCameraParameters` at `job + 0x20`, longitude at +0x18
+                // and latitude at +0x1c of it.
+                log::info!(
+                    "PROCMAPENGINE map-data trace render job executed RCSetCameraParameters::Execute t={}ms thread=[{}] job={:#x} mode={:#x} state={:#x} lon={:#x} lat={:#x} scale={:#x} logs={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    job,
+                    read_u32_or_invalid(uc, job.wrapping_add(0x10)),
+                    read_u32_or_invalid(uc, base_address + (0x0079_07acu32 - ORIGINAL_BASE)),
+                    read_u32_or_invalid(uc, job.wrapping_add(0x38)),
+                    read_u32_or_invalid(uc, job.wrapping_add(0x3c)),
+                    read_u32_or_invalid(uc, job.wrapping_add(0x24)),
+                    logs + 1,
+                );
+            })
+            .unwrap();
+
+        static SET_LOGS: AtomicU32 = AtomicU32::new(0);
+        let set = base_address + (0x003a_7594u32 - ORIGINAL_BASE);
+        let views_global = base_address + (0x0071_5550u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(set as u64, set as u64, move |uc, _, _| {
+                let logs = SET_LOGS.fetch_add(1, Ordering::Relaxed);
+                if logs >= 600 {
+                    return;
+                }
+                let view_id = (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32) & 0xff;
+                let params = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                // `map_tclRenderControl::SetCameraParameters` only forwards to
+                // `map_tclMapView::u32SetCameraParameters` for view ids 1..4 whose slot
+                // in `ms_apkOpenViews` is non-null; anything else answers 0xffab48, which
+                // is why a RenFI request carrying view id 0 silently does nothing.
+                let words: Vec<u32> =
+                    (0..8u32).map(|i| read_u32_or_invalid(uc, params + i * 4)).collect();
+                let views: Vec<u32> =
+                    (0..6u32).map(|i| read_u32_or_invalid(uc, views_global + i * 4)).collect();
+                let autozoom = read_u32_or_invalid(
+                    uc,
+                    base_address + (0x0071_5548u32 - ORIGINAL_BASE),
+                );
+                let (az_flags, az_words) = if autozoom == 0 || autozoom == 0xffff_ffff {
+                    (0xffff_ffff, Vec::new())
+                } else {
+                    let flags = read_u32_or_invalid(uc, autozoom + 8);
+                    let words = (0xcu32..0x2c)
+                        .step_by(4)
+                        .map(|i| read_u32_or_invalid(uc, autozoom + i))
+                        .collect();
+                    (flags, words)
+                };
+                log::info!(
+                    "PROCMAPENGINE map-data trace render control SetCameraParameters t={}ms thread=[{}] view_id={:#x} params={:#x} words=[{}] autozoom={:#x} az_flags={:#x} az_words=[{:#x?}] open_views=[{:#x?}] lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    view_id,
+                    params,
+                    words
+                        .iter()
+                        .map(|w| format!("{w:#x}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    autozoom,
+                    az_flags,
+                    az_words,
+                    views,
+                    ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                        .wrapping_sub(base_address)
+                        .wrapping_add(ORIGINAL_BASE),
+                );
+            })
+            .unwrap();
+    }
+
+    // recognised SetCameraParameters method (0x5a) is dropped: 0x3a3244 is right after
+    // `fi_tclVisitorMessage::s32GetData` (r0 == 0 means the payload deserialised, which
+    // is the branch that calls `CreateRCJobSetCameraParametersSimple` at 0x4c5a84) and
+    // 0x3a3338 is that accepted-payload branch.  0x3a3244 sits mid-TB, so this is hooked
+    // as a page range dispatching on the fetched address (see docs/issues/design.md).
+    {
+        let page = base_address + (0x003a_3000u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(page as u64, (page + 0xfff) as u64, move |uc, _, _| {
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                let offset = (uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32)
+                    .wrapping_sub(base_address)
+                    .wrapping_add(ORIGINAL_BASE);
+                // 0x3a344c is right after the `bl map_tclPortControl::RndFI_AddJobToQueue`
+                // (0x53ad90): the queue call returns 0 when the element really went into
+                // `ms_pkRenderControlJobQueue` and an error code otherwise, which sends the
+                // handler to `DestroyRCJob` at 0x3a34d4 - so log both outcomes.
+                if offset == 0x003a_344c || offset == 0x003a_34d4 {
+                    static RESULT_LOGS: AtomicU32 = AtomicU32::new(0);
+                    let logs = RESULT_LOGS.fetch_add(1, Ordering::Relaxed);
+                    if logs >= 40 {
+                        return;
+                    }
+                    log::info!(
+                        "PROCMAPENGINE map-data trace RenFI camera add-result {offset:#x} t={}ms thread=[{}] job={:#x} add_result={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32,
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    );
+                    return;
+                }
+                if offset != 0x003a_3244 && offset != 0x003a_3338 {
+                    return;
+                }
+                let hits = HITS.fetch_add(1, Ordering::Relaxed);
+                if hits >= 24 {
+                    return;
+                }
+                let stack = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                // `fi_tclVisitorMessage` lives at sp + 0xa4: +0x04 is the message
+                // content, +0x18 the offset the payload starts at and +0x1c its
+                // length; the deserialised field objects occupy sp + 0x30 .. 0xa0
+                // (each slot that holds a vtable pointer identifies its field type).
+                let visitor = stack + 0xa4;
+                let content = read_u32_or_invalid(uc, visitor + 4);
+                let payload = read_u32_or_invalid(uc, visitor + 0x18);
+                let length = read_u32_or_invalid(uc, visitor + 0x1c);
+                let fields: Vec<u32> = (0x30u32..0xa0)
+                    .step_by(4)
+                    .map(|i| read_u32_or_invalid(uc, stack + i))
+                    .collect();
+                let bytes: Vec<u32> = (0..14u32)
+                    .map(|i| read_u32_or_invalid(uc, content.wrapping_add(payload).wrapping_add(i * 4)))
+                    .collect();
+                log::info!(
+                    "PROCMAPENGINE map-data trace RenFI camera step {offset:#x} t={}ms thread=[{}] r0={:#x} r1={:#x} r2={:#x} r3={:#x} r9={:#x} content={:#x} payload={:#x} len={:#x}\n  frame: {fields:#x?}\n  wire : {bytes:#x?}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32,
+                    content,
+                    payload,
+                    length,
+                );
+            })
+            .unwrap();
+        let simple = base_address + (0x004c_5a84u32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(simple as u64, simple as u64, move |uc, _, _| {
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                let hits = HITS.fetch_add(1, Ordering::Relaxed);
+                if hits >= 8 {
+                    return;
+                }
+                let stack = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE map-data trace RenFI camera job created t={}ms thread=[{}] r0={:#x} r1={:#x} r2={:#x} r3={:#x} stack[0..0x28]={:x?}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
+                    (0..10u32).map(|i| read_u32_or_invalid(uc, stack + i * 4)).collect::<Vec<_>>(),
+                );
+            })
+            .unwrap();
+    }
+
     // The engine's debug channel commands (`vChannelMgr` 0x3a4888, a switch over a
     // command record) are the other way to reach `TriggerPixmapViewRender`
     // (case 0xb), and its case 9 toggles the Navi stress-test ladder; both would
@@ -2902,7 +3384,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 // `vOnNewMessage` runs for every incoming service-data message, so a
                 // small cap let the routine posfi/dapi traffic hide the one message
                 // that matters here: count all of them and dump only the unusual ones.
-                if hits >= if index == 0 { 6000 } else { 60 } {
+                if hits >= if index == 0 { 6000 } else { 4000 } {
                     return;
                 }
                 if index == 0 {
@@ -2986,10 +3468,12 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                         .iter()
                         .fold(0u32, |acc, word| acc ^ word.rotate_left(7))
                         ^ view_rect[0];
-                    static LAST: AtomicU32 = AtomicU32::new(0xffff_ffff);
-                    if LAST.swap(signature, Ordering::Relaxed) == signature {
+                    static CALLS: AtomicU32 = AtomicU32::new(0);
+                    let calls = CALLS.fetch_add(1, Ordering::Relaxed);
+                    if calls >= 500 {
                         return;
                     }
+                    let _ = signature;
                     log::info!(
                         "PROCMAPENGINE map-data trace u32SetCameraParameters t={}ms thread=[{}] obj={:#x} params={:#x} words=[{}] view_rect=[{:#x},{:#x},{:#x},{:#x}] lr={:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),

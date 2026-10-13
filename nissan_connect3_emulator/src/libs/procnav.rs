@@ -1904,8 +1904,16 @@ pub(crate) fn renfi_set_camera_parameters_message(
     meter: u32,
 ) -> Vec<u8> {
     let mut body: Vec<u8> = Vec::with_capacity(0x20);
-    body.push(0); // viewId
-    body.push(0); // mode
+    // `map_tclRenderControl::SetCameraParameters` (0x3a7594) only forwards a camera job
+    // when the view id is 1..4 and `map_tclRenderControl::ms_apkOpenViews` (0x715550)
+    // holds an open view there, which for the engine's single map view is index 1.
+    body.push(1); // viewId
+    // Camera mode 3 is the one `map_tclJobRCSetCameraParameters::Create` (0x4d7a64) marks
+    // as the `0x8000` "execute immediately" job class (`map_tclJobRC::IsExecutable` then
+    // always says yes and `map_tclJobQueue::EnqueueElements` runs the element instead of
+    // filing it into the queue's class-3 list, which neither main loop drains).  With
+    // mode 0 the request is deserialised, queued and then silently dropped.
+    body.push(3); // mode
     body.extend_from_slice(&meter.to_le_bytes()); // meter
     body.extend_from_slice(&0u16.to_le_bytes()); // pitch
     body.extend_from_slice(&0u16.to_le_bytes()); // heading
@@ -1922,7 +1930,16 @@ pub(crate) fn renfi_set_camera_parameters_message(
     let len = 0x20 + body.len();
     let content_len = len.next_multiple_of(16);
     let mut content = vec![0u8; content_len];
-    content[0x00..0x04].copy_from_slice(&0x0400_0016u32.to_le_bytes());
+    // u16 @ +0x00 = the app that *owns* the service being addressed (here the map
+    // engine itself, 0x400).  `ail_tclServiceRegistry::bIsDataSet` (0x66e8d4) compares
+    // exactly this field against the registry entry the engine created when it published
+    // its own service ({+0x02 service = 0x0300, +0x04 owner = 0x0400, +0x06 = 0xffff,
+    // state = AVAILABLE}); with any other value the claim path does not recognize the
+    // request as one for its own service and answers the client with error 6 "unknown
+    // register-id" instead of tail-calling the port-control platform's `vOnNewMessage`
+    // (app-interface vtable +0x20), so `vHandleRenFIMessages` and the
+    // SetCameraParameters method (0x5a) never run.
+    content[0x00..0x04].copy_from_slice(&0x0016_0400u32.to_le_bytes());
     content[0x04..0x08].copy_from_slice(&(content_len as u32).to_le_bytes());
     content[0x08] = 0x01; // source app: 1
     content[0x0b] = 0x45; // class: ServiceData
