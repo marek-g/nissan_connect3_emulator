@@ -5388,6 +5388,72 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             .unwrap();
     }
 
+    // r579: `map_tclJobRCMapObjectsUpdate` (vtable 0x6abe80) reached the render
+    // queue and passed the IsExecutable gate 24x, so the MDM->RC handoff works.
+    // Its Execute (0x4d37e0, vtable+0x2c) forwards each map object to
+    // `DTM_FBO_Handler::bCheckForTextureUpdateBasedOnNewMO` (0x556170, texture
+    // cache invalidation) and to `map_tclSceneManager::MapObjectsUpdate`
+    // (0x4357c8, scene graph).  Watch all three: if the FBO handler is null or
+    // the object loop never runs, the MAP surface stays the flat background.
+    {
+        let mo_exec = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let addr = base_address + 0x004d_37e0u32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = mo_exec.fetch_add(1, Ordering::Relaxed);
+                if count >= 100 {
+                    return;
+                }
+                let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let vec = read_u32_or_invalid(uc, this + 0x54);
+                let n = read_u32_or_invalid(uc, vec);
+                let view = read_u32_or_invalid(uc, this + 0x1c) & 0xff;
+                log::info!(
+                    "PROCMAPENGINE render trace RCMapObjectsUpdate::Execute t entry at {:#x}: this={:#x} mo_vec={:#x} count={:#x} view={:#x}",
+                    addr,
+                    this,
+                    vec,
+                    n,
+                    view
+                );
+            })
+            .unwrap();
+        let tex = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let addr = base_address + 0x0055_6170u32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = tex.fetch_add(1, Ordering::Relaxed);
+                if count >= 60 {
+                    return;
+                }
+                let mo = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let fbo = read_u32_or_invalid(uc, base_address + (0x0071_ae94u32 - ORIGINAL_BASE));
+                log::info!(
+                    "PROCMAPENGINE render trace bCheckForTextureUpdateBasedOnNewMO entry at {:#x}: map_object={:#x} fbo_handler={:#x}",
+                    addr,
+                    mo,
+                    fbo
+                );
+            })
+            .unwrap();
+        let scene = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let addr = base_address + 0x0043_57c8u32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = scene.fetch_add(1, Ordering::Relaxed);
+                if count >= 100 {
+                    return;
+                }
+                log::info!(
+                    "PROCMAPENGINE render trace SceneManager::MapObjectsUpdate entry at {:#x}: job={:#x} scene_mgr={:#x}",
+                    addr,
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                    read_u32_or_invalid(uc, base_address + (0x0079_0788u32 - ORIGINAL_BASE))
+                );
+            })
+            .unwrap();
+    }
+
     // Message-map router `PortControl_CCAClientHandlerBase::vDispatchMessage`
     // (0x592454): keys are (u16 svc @inner+0x14, u16 fn @inner+0+0x18) pairs
     // (the map's static seed table at 0x713ea8 holds {0x70006, 0x140006,
