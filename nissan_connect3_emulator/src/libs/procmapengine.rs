@@ -658,6 +658,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     add_map_view_hooks(unicorn, base_address);
     add_map_data_main_loop_trace_hooks(unicorn, base_address);
     add_get_block_ids_answer_trace_hooks(unicorn, base_address);
+    add_fastmap_channel_trace_hooks(unicorn, base_address);
 
     let force_early_active = std::env::var("EMU_PROCMAPENGINE_FORCE_ACTIVE_STATE")
         .is_ok_and(|value| !value.is_empty() && value != "0");
@@ -2362,6 +2363,176 @@ fn add_job_queue_wait_skip_hook(unicorn: &mut Unicorn<'_, Context>, base_address
                     triggered
                 );
             }
+        })
+        .unwrap();
+}
+
+/// Trace the FastMap channel path, the gate that stands between the 34 block
+/// ids DAPI answers and any block *content* ever arriving.
+///
+/// `map_tclJobMDMHandleGetBlockIDs::Execute` ends by calling
+/// `map_tclMapDataManager::HandleMapDataRequest` (0x512108), which silently
+/// returns unless `ms_u32DatasetID == ms_u32DatasetID_Validated != 0` *and*
+/// `ms_bFastmapServiceAvailable == 1`; only then does it run
+/// `IntHandleMapDataRequest`, which loads the wanted blocks through
+/// `DAPI_LoadBlocks` over an open FastMap channel. The channel opens in
+/// `OnUpdateServiceStateDAPIFastmap` (0x512400, reached via the CCA service
+/// state machine `vOnServiceState` -> `map_tclClientServiceHandler::
+/// vOnServiceStateChange`), which loops `ms_u32NumberOfFastMapChannels` times
+/// over `ms_asFastMapChannelInfo` (registry
+/// `PROCESS/MAP/MAPENGINE/APP_CONFIG/FASTMAP`: NUMBER default 3, NAME + SIZE
+/// required) calling `MapData_OpenFastMapChannel` -> `DAPI_OpenFastMapChannel`
+/// (needs `info + 4` shared memory != NULL) -> CCA fn 0x101 request. None of
+/// these have ever been observed at runtime; these probes say exactly where the
+/// chain stops.
+fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    // The MDM globals, at their Ghidra VAs relative to the image base.
+    let global = |va: u32| base_address + (va - ORIGINAL_BASE);
+    let stop_loading = global(0x0078_f7a0);
+    let dataset_id = global(0x0078_f7f0);
+    let fastmap_available = global(0x0078_f7f8);
+    let channel_info = global(0x0078_f81c);
+    let dataset_validated = global(0x0078_f874);
+    let channel_number = global(0x0078_f878);
+
+    // `map_tclClientServiceHandler::vOnServiceStateChange(uchar)`: the CCA
+    // service state fan-in; `this + 4` is the u16 service id, `this + 0xe` the
+    // stored state.
+    let site = base_address + (0x0059_0390u32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
+                return;
+            }
+            let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            log::info!(
+                "PROCMAPENGINE fastmap trace vOnServiceStateChange t={}ms thread=[{}] handler={:#x} svc={:#x} old_state={:#x} new_state={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                this,
+                read_u16_or_invalid(uc, this + 4),
+                read_u8_or_invalid(uc, this + 0xe),
+                (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32) & 0xff,
+            );
+        })
+        .unwrap();
+
+    // `map_tclMapDataManager::OnUpdateServiceStateDAPIFastmap(uchar)`: opens a
+    // channel per configured FastMap slot when it runs with state 1.
+    let site = base_address + (0x0051_2400u32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            let n = COUNT.fetch_add(1, Ordering::Relaxed);
+            if n >= 20 {
+                return;
+            }
+            log::info!(
+                "PROCMAPENGINE fastmap trace OnUpdateServiceStateDAPIFastmap t={}ms thread=[{}] state={:#x} dataset={:#x} validated={:#x} fastmap_avail={:#x} channels={:#x} stop_loading={:#x} info[0,10,20]={:#x},{:#x},{:#x} lr={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32) & 0xff,
+                read_u32_or_invalid(uc, dataset_id),
+                read_u32_or_invalid(uc, dataset_validated),
+                read_u8_or_invalid(uc, fastmap_available),
+                read_u32_or_invalid(uc, channel_number),
+                read_u32_or_invalid(uc, stop_loading),
+                read_u32_or_invalid(uc, channel_info),
+                read_u32_or_invalid(uc, channel_info + 0x10),
+                read_u32_or_invalid(uc, channel_info + 0x20),
+                ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                    .wrapping_sub(base_address)
+                    .wrapping_add(ORIGINAL_BASE),
+            );
+        })
+        .unwrap();
+
+    // `map_tclMapDataManager::HandleMapDataRequest(uchar)`: the gate itself.
+    let site = base_address + (0x0051_2108u32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            let n = COUNT.fetch_add(1, Ordering::Relaxed);
+            if n >= 20 {
+                return;
+            }
+            log::info!(
+                "PROCMAPENGINE fastmap trace HandleMapDataRequest t={}ms thread=[{}] arg={:#x} dataset={:#x} validated={:#x} fastmap_avail={:#x} channels={:#x} stop_loading={:#x} lr={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                (uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32) & 0xff,
+                read_u32_or_invalid(uc, dataset_id),
+                read_u32_or_invalid(uc, dataset_validated),
+                read_u8_or_invalid(uc, fastmap_available),
+                read_u32_or_invalid(uc, channel_number),
+                read_u32_or_invalid(uc, stop_loading),
+                ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                    .wrapping_sub(base_address)
+                    .wrapping_add(ORIGINAL_BASE),
+            );
+        })
+        .unwrap();
+
+    // `map_tclPortControl::MapData_OpenFastMapChannel(u16, map_rFastMapChannelInfo&)`.
+    let site = base_address + (0x0053_a298u32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) >= 20 {
+                return;
+            }
+            let channel = (uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32) & 0xffff;
+            let info = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            log::info!(
+                "PROCMAPENGINE fastmap trace MapData_OpenFastMapChannel t={}ms thread=[{}] channel={:#x} info={:#x} words=[{}]",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                channel,
+                info,
+                (0..4u32)
+                    .map(|i| format!("{:#x}", read_u32_or_invalid(uc, info.wrapping_add(i * 4))))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        })
+        .unwrap();
+
+    // `PortControl_CCAClientHandler_DAPI::OpenFastMapChannel(u16, info&)`:
+    // refuses with 0xffab2a while the client service handler
+    // (`this + 0x24`) says `bIsServiceAvailable == 0`, so log its state.
+    let site = base_address + (0x0053_d500u32 - ORIGINAL_BASE);
+    unicorn
+        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            if COUNT.fetch_add(1, Ordering::Relaxed) >= 20 {
+                return;
+            }
+            let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let handler = read_u32_or_invalid(uc, this + 0x24);
+            let (svc, state) = if handler != 0 && handler != u32::MAX {
+                (
+                    read_u16_or_invalid(uc, handler + 4),
+                    read_u8_or_invalid(uc, handler + 0xe),
+                )
+            } else {
+                (0xffff, 0xff)
+            };
+            let channel = (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32) & 0xffff;
+            let info = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let shm = read_u32_or_invalid(uc, info.wrapping_add(4));
+            log::info!(
+                "PROCMAPENGINE fastmap trace CCA OpenFastMapChannel t={}ms thread=[{}] handler={:#x} svc={:#x} state={:#x} channel={:#x} shm={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                handler,
+                svc,
+                state,
+                channel,
+                shm,
+            );
         })
         .unwrap();
 }
