@@ -1383,10 +1383,14 @@ fn post_lsync_map_announcement(unicorn: &mut Unicorn<'_, Context>, original_pc: 
                 LSYNC_MAP_STAGE.store(99, Ordering::Relaxed);
                 log::info!("PROCHMI: EA hide monitor timed out ticks={}", ticks);
             } else if read_u32(unicorn, entry + 0x24) == 4 && ticks > 20 {
-                let _ = write_u32(unicorn, entry + 0x24, 5);
-                let _ = write_u8(unicorn, manager + 0x12c, 1);
+                // Do NOT force the hide expiry (entry+0x24 4 -> 5): that runs
+                // LayerSync::copyLayer, which switches the map layer into its
+                // snapshot-on-hide mode, and prochmi then stops compositing the
+                // live layer - which is exactly what made the map flash once and
+                // go black.  Left alone, the EA entry stays in state 4.
+                LSYNC_MAP_STAGE.store(99, Ordering::Relaxed);
                 log::info!(
-                    "PROCHMI: emulated EA hide timer expiry; copyLayer snapshot armed entry={:#x}",
+                    "PROCHMI: EA entry {:#x} stays in state 4 (no forced hide); map layer kept live",
                     entry
                 );
             }
