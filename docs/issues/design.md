@@ -2464,3 +2464,43 @@ subscribes the property. r575's 1-then-3 and r576's lone 1 both left
 Side finding: the PortControl notification is **pull-based** - the state change
 is noticed ~25-40 ms later on thread 67 (map-data mainloop) at r576
 (t=29018 apply -> t=29044 notify), not inline in the AIL worker.
+
+## r577/r578: FastMap channels really open now; the loss moved to the LoadBlocks answer path
+
+With the 1-then-0 ServiceStatus pair the whole subscribe chain runs end to end
+(r577/r578 logs):
+
+* `vOnServiceStateChange(0)` fires the property 0x401 UpReg, DAPI answers,
+  `bIsServiceAvailable()==1`, and `ms_bFastmapServiceAvailable` stays 1 from
+  t~25s/r578 t~51s on (`WRITE ... value=0x1 pc=0x512444`; the later
+  `pc=0x50447c/0x504488` writes at value 0 hit the byte at 0x78f7f9, one past
+  the flag - LockFree claim bookkeeping, not the gate: the literal pool at
+  0x50461c holds `ms_asFastMapChannelInfo=0x78f81c`, sentinel `0xffff`,
+  `0x78f880` (claim timestamp dword), `0x78f7f9`).
+* The engine opens all three channels (`MapData_OpenFastMapChannel` channels
+  0x49/0x4a/0x4b, shm names FM_T_1..3), `DAPI_OpenFastMapChannel` puts fn=0x101
+  on the wire, and DAPI's `u16ProcessOpenChannel` (r578 fastmap-step probes)
+  deserializes OK, falls through the POI open (0xffff), creates the shared-mem
+  channel (r0=0 = OK) and sends the answer.  `vHandleOpenFastMapChannel` runs
+  for all 3 answers.
+* Property traffic on the wire is fn=0x0401 (op 03 Get -> op 06 answer);
+  GetBlockIDs is fn=0x0103 and **LoadBlocks is fn=0x0104** - the wire bytes are
+  little-endian, earlier notes listing "0x102 = LoadBlocks" misread the dump.
+  DAPI's `u16ProcessLoadBlocks` reaches `enSetAccessMode==2` ("write buffer
+  ok"), i.e. it gets a writable buffer in the shared channel.
+* DAPI reads the real card content around then: `N6E2AA.idx`,
+  `DATA/DATA/MAP/N6E2102.map/.tci` (Krakow blocks), `DATA/DATA/RNW/CCP/POL/*.DAT`.
+
+Remaining loss (r578): of 25 fn=0x104 answers delivered into
+`ail_bHandleMsgServiceData`, only 2 reach `vHandleLoadBlocks` - and even those
+never execute: `map_tclJobMDMHandleLoadBlocks` (Create thunk 0x4a59f8 ->
+Create 0x4b60b4, job vtable 0x6a3b48, Execute vtable+0x24=0x4b5420) shows up in
+no queue trace, so the channel slots stay claimed and every later
+`IntHandleMapDataRequest` re-claims/re-sends (`DapiLoadBlocks` r0=0 x6, always
+channel idx 0).  r579 adds probes at `MapData_AddJobToQueue` (0x53a094),
+`MDMHandleLoadBlocks::Execute` entry, and at
+`PortControl_CCAClientHandlerBase::vDispatchMessage` (0x592454, message-map
+router; seed table 0x713ea8 maps key `(fn<<16)|svc`: 0x1010026->Open,
+0x1030026->GetBlockIDs, 0x1040026->LoadBlocks, 0x4010026->
+vHandleDatablocksChanged) plus its `vOnUnhandledMessage` (0x5923e8) swallow
+arm, to find where the 23 answers die and why the 2 jobs never run.
