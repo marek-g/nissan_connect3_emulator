@@ -109,6 +109,11 @@ const PORTCONTROL_VON_NEW_MESSAGE: u32 = 0x003a_4048 - ORIGINAL_BASE;
 // posfi reference.  ail_tclServiceRegistry::u8GetServiceState covers the
 // other walk.
 const AIL_REF_IS_DATASET_FN: u32 = 0x0066_e3d0 - ORIGINAL_BASE;
+/// `ail_tclServiceReference::ail_tclServiceReference(app, svc, regid, unique)`
+/// - the record the register-confirmation handler appends to the engine's
+/// service-reference list (+0 svc, +2 server app, +4 register id, +8 unique
+/// id, +0xa/+0xc/+0xe = 0xffff wildcards).
+const AIL_REF_CTOR_FN: u32 = 0x0066_e2ec - ORIGINAL_BASE;
 const AIL_REF_GET_STATE_FN: u32 = 0x0066_e940 - ORIGINAL_BASE;
 const AIL_REGISTRY_GET_STATE_FN: u32 = 0x0066_e444 - ORIGINAL_BASE;
 // map_tclNavPropertyHandler::vProcessNavPositionStatus(handler, msg) - called
@@ -253,6 +258,7 @@ static NAV_PROCESS_POS_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static HANDLE_SERVICE_DATA_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static VON_NEW_MESSAGE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static REF_WALK_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static REF_CTOR_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_DATA_UPDATE_REQUEST_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static PORTCONTROL_PLATFORM: AtomicU32 = AtomicU32::new(0);
 static NAVI_REGISTER_KICK_PENDING: AtomicU32 = AtomicU32::new(0);
@@ -422,6 +428,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     HANDLE_SERVICE_DATA_TRACE_COUNT.store(0, Ordering::Relaxed);
     VON_NEW_MESSAGE_TRACE_COUNT.store(0, Ordering::Relaxed);
     REF_WALK_TRACE_COUNT.store(0, Ordering::Relaxed);
+    REF_CTOR_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_DATA_UPDATE_REQUEST_TRACE_COUNT.store(0, Ordering::Relaxed);
     PORTCONTROL_PLATFORM.store(0, Ordering::Relaxed);
     NAVI_REGISTER_KICK_PENDING.store(0, Ordering::Relaxed);
@@ -1932,6 +1939,7 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                     let app_iface = read_u32_or_invalid(uc, dispatch);
                     if app_iface < 0xf000_0000 {
                         ensure_posfi_ref_linked(uc, app_iface);
+                        ensure_service_reference_unique_ids(uc, app_iface);
                     }
                 }
             }
@@ -2103,13 +2111,41 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
             let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
             let p4 = read_u32_or_invalid(uc, sp) & 0xffff;
             let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            // 0x66e3d0 compares p1..p3 against +0/+2/+4 (0xffff = wildcard) and
+            // p4 against +8, so dump the four compared slots.
             log::info!(
-                "PROCMAPENGINE: ref bIsDataSet entry={entry:#x} tuple=({p1:#x},{p2:#x},{p3:#x},{p4:#x}) entry_words=[{:#x},{:#x},{:#x},{:#x}] state={:#x} lr={lr:#x} thread=[{thread}] trace={}",
+                "PROCMAPENGINE: ref bIsDataSet entry={entry:#x} tuple=({p1:#x},{p2:#x},{p3:#x},{p4:#x}) compared=[{:#x},{:#x},{:#x},{:#x}] plus6={:#x} state={:#x} lr={lr:#x} thread=[{thread}] trace={}",
                 read_u32_or_invalid(uc, entry) & 0xffff,
                 (read_u32_or_invalid(uc, entry) >> 16) & 0xffff,
                 read_u32_or_invalid(uc, entry + 4) & 0xffff,
+                read_u32_or_invalid(uc, entry + 8) & 0xffff,
                 (read_u32_or_invalid(uc, entry + 4) >> 16) & 0xffff,
                 (read_u32_or_invalid(uc, entry + 4) >> 16) & 0xff,
+                count + 1
+            );
+        })
+        .unwrap();
+
+    // ail_tclServiceReference ctor: shows what a register-confirmation actually
+    // handed the engine for each service reference (the +8 unique id is the
+    // slot later matched against every ServiceData message's unique id).
+    let ref_ctor = base_address + AIL_REF_CTOR_FN;
+    unicorn
+        .add_code_hook(ref_ctor as u64, ref_ctor as u64, move |uc, _, _| {
+            let count = REF_CTOR_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count >= 40 {
+                return;
+            }
+            let thread = uc.get_data().inner.thread_id();
+            let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let app = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
+            let service = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32 & 0xffff;
+            let regid = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32 & 0xffff;
+            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+            let unique = read_u32_or_invalid(uc, sp) & 0xffff;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            log::info!(
+                "PROCMAPENGINE: service-reference ctor this={this:#x} app={app:#x} service={service:#x} regid={regid:#x} unique={unique:#x} lr={lr:#x} thread=[{thread}] trace={}",
                 count + 1
             );
         })
@@ -4249,6 +4285,59 @@ fn ensure_posfi_ref_linked(unicorn: &mut Unicorn<'_, Context>, app_iface: u32) {
         write_u32(unicorn, list + 0xc, count + 1);
     }
     log::info!("PROCMAPENGINE: re-linked posfi service reference into list {list:#x}");
+}
+
+/// Keep the engine's service-reference records claimable by DAPI.
+///
+/// The claim walk (`ail_tclServiceReference::bIsDataSet`, 0x66e3d0) matches an
+/// incoming ServiceData against a reference on (service id, server app,
+/// register id, unique id).  Its 0xffff wildcard is implemented only for the
+/// message arguments (`param == 0xffff || this[slot] == param`), so the stored
+/// slot has to compare equal to what the peer really sends.  The async register
+/// path never assigns that slot: `bRegisterAsyncExecute` (0x660f74) builds the
+/// outgoing ServiceRegister with zeros in its trailing words (the log shows
+/// `sub12=0xfffe sub14=0x0000`) and `vHandleAsyncRegisterConf` (0x665720) only
+/// flags the request entry and calls back into the client handler, so the
+/// reference DAPI's answer is matched against holds unique id 0 while every
+/// ServiceData DAPI sends carries `AIL_NO_UNIQUE_ID` (0xfffe).  Each map-data
+/// answer was therefore dropped as unclaimable and the engine answered with a
+/// ServiceDataError instead of handing the block ids to the request (r443:
+/// `tuple=(0x26,0x7,0x1,0xfffe)` vs `compared=[0x26,0x7,0x1,0x0]`, GetBlockIDs
+/// stuck at state 1, which in turn starves the car-cursor request).
+///
+/// Only unassigned references of the DAPI application are touched and only with
+/// the sentinel that peer actually uses; no claim that could already match
+/// changes (no message in a run carries unique id 0), so no existing route can
+/// regress.  This maintains registration bookkeeping the emulator already owns
+/// (the same list the fabricated posfi reference lives in), never the apps.
+fn ensure_service_reference_unique_ids(unicorn: &mut Unicorn<'_, Context>, app_iface: u32) {
+    /// DAPI's application id: the peer whose ServiceData answers carry 0xfffe.
+    const DAPI_APP_ID: u32 = 0x7;
+
+    let list = read_u32_or_invalid(unicorn, app_iface + 0x50);
+    if list >= 0xf000_0000 {
+        return;
+    }
+    let mut node = read_u32_or_invalid(unicorn, list + 4);
+    let mut steps = 0u32;
+    while (0x1000..0xf000_0000).contains(&node) && node != list && steps < 16 {
+        let item = node + 8;
+        let service = read_u32_or_invalid(unicorn, item) & 0xffff;
+        let server_app = read_u32_or_invalid(unicorn, item + 2) & 0xffff;
+        let unique = read_u32_or_invalid(unicorn, item + 8) & 0xffff;
+        if service != 0
+            && service != 0xffff
+            && server_app == DAPI_APP_ID
+            && unique == 0
+            && write_u16(unicorn, item + 8, 0xfffe)
+        {
+            log::info!(
+                "PROCMAPENGINE: service reference {item:#x} (service {service:#x}, DAPI) had no unique id, set 0xfffe to match DAPI's messages"
+            );
+        }
+        node = read_u32_or_invalid(unicorn, node + 4);
+        steps += 1;
+    }
 }
 
 fn insert_posfi_service_reference(unicorn: &mut Unicorn<'_, Context>, _original_pc: u32) {    if POSFI_REF_INSERTED.load(Ordering::Relaxed) != 0 {
