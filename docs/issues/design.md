@@ -2164,3 +2164,47 @@ backup config needs (an emulated link-device config file or the media state), be
 `rs_tclDataContext` holds the medium, `enProcessGetRegionOutlines` stops answering 0x305, the
 RS outlines load, and `u16SendUniqueIdList` can run `u16CheckBBox` +
 `u16GenerateUniqueIds` and send real block ids to the engine.
+
+## Resolved: the fabricated RenFI `SetCameraParameters` request now moves the map view (2026-10-13)
+
+The camera request that `spawn_renfi_camera_driver()` fabricates into `mbx_1024` is now
+deserialised, queued, executed *and* applied: `map_tclMapView::u32SetCameraParameters`
+receives Krakow (lon `0x0e29fa46`, lat `0x23999b77`, 100 m) and the DAPI block-id request
+rectangle that follows moves with it - `DapiGetBlockIDs entry ...
+rect=[0xe280000,0xe2b0000,0x23990000,0x239b0000]` (19.90-19.94 E, 50.05-50.07 N) instead of
+the power-on Michigan rectangle (`run_r551.log`, seven requests after the seven camera posts).
+Two payload fields were missing, both pure data in the fabricated message (no guest patching):
+
+* **view id** (payload byte 0) has to be 1..4: `map_tclRenderControl::SetCameraParameters`
+  (0x3a7594) rejects everything else with `0xffab48` after
+  `sub r3, r5, #1 ; uxtb ; cmp #3 ; bhi` and a null `ms_apkOpenViews[view]`
+  (global `0x715550`, indexed by view id; the engine's single map view `0xda0bc4` sits in
+  slot 1).  Byte 0 used to be 0, so the job ran and answered an error code nobody looked at.
+* **camera mode** (payload byte 1) has to be **3**.  `map_tclJobRCSetCameraParameters::Create`
+  (0x4d7a64) stores `job + 0x10 = (camera_mode == 3) ? 0x8000 : 3`, and that word is the job
+  *class* `map_tclJobQueue::EnqueueElements` (0x4a4d7c) routes on: class 3 goes into the
+  queue's `+0x10/+0x14` list, which neither `RenderControlMainLoop` (`PeekElement` walks the
+  `+0x08` list) nor `MapViewMainLoop` ever reads, so a mode-0 camera request was silently
+  parked forever.  Class `0x8000` is the "execute immediately" class: `EnqueueElements`
+  returns the element to `PeekElement`, `map_tclJobRC::IsExecutable` (0x4c5c50) always says
+  yes for it, `map_tclJobQueue::GetPeekedElement` (0x4a3d7c) hands it back (it returns null
+  only while the queue's active list `queue + 0x08` is empty, which for an immediately
+  executed element is exactly what happens unless the element itself got linked in) and the
+  main loop dispatches vtable slot `+0x24` = `Execute` (0x4d74c4).
+
+Job-queue internals worth keeping (measured on `ms_pkRenderControlJobQueue` = `0xa6cff0`):
+`+0x00` state, `+0x04` count, `+0x08/+0x0c` active list head/tail, `+0x10/+0x14` class-3
+list, `+0x30` the incoming-job `OSALPointerQueue` whose `+0x00` is the OSAL message-queue
+handle - the render control queue's IJQ is OSAL queue **NOIOSCR** (`0x40093b10`), so
+`AddElement` (0x4a4284) does not link the element at all, it *posts the element pointer*
+(4-byte message) and `EnqueueElements` dequeues it on the next peek.  Element fields:
+`+0x00` vtable, `+0x04` apply timestamp (0 = now, compared against
+`OSAL_ClockGetElapsedTime()`), `+0x10` class, `+0x14/+0x18` list links, vtable `+0x20`
+`IsExecutable`, `+0x24` `Execute`, `+0x28` release.
+
+Measurement lesson (cost hours, three separate false conclusions): fixed log caps on hot
+probes.  `render queue add` (400/800), `render job executed` (30/139/200) and
+`u32SetCameraParameters` (60, in the `{6000, 60, 60}` array of the
+`vOnNewMessage/bIsClientMessage/u32SetCameraParameters` loop) each looked like "the pipeline
+stopped here" while the probe had simply stopped logging.  Log per-*value-change* or with a
+cap that the run cannot reach, and re-check the cap before believing a silent tail.
