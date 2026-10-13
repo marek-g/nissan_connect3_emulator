@@ -2899,23 +2899,34 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     0
                 };
                 let hits = HITS[index].fetch_add(1, Ordering::Relaxed);
-                if hits >= 60 {
+                // `vOnNewMessage` runs for every incoming service-data message, so a
+                // small cap let the routine posfi/dapi traffic hide the one message
+                // that matters here: count all of them and dump only the unusual ones.
+                if hits >= if index == 0 { 6000 } else { 60 } {
                     return;
                 }
                 if index == 0 {
-                    // `vOnNewMessage` reads the RenFI class word, the opcode and
-                    // the service id through its own message-object indirection,
-                    // which is not the same view of the buffer our envelope
-                    // builder uses.  Dump the header candidates whenever a
-                    // rendererfi message passes through, so the offsets the guest
-                    // really tests can be read off the bytes instead of derived
-                    // twice in different ways.
                     let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                     let bases = [
                         ("via+0x00", read_u32_or_invalid(uc, message)),
                         ("via+0x04", read_u32_or_invalid(uc, message + 4)),
                         ("via+0x20", read_u32_or_invalid(uc, message + 0x20)),
                     ];
+                    let interesting = bases.iter().any(|(_, base)| {
+                        (0..20u32)
+                            .any(|i| read_u32_or_invalid(uc, base + i * 4) & 0xffff == 0x300)
+                    });
+                    if !interesting {
+                        if hits % 400 == 0 {
+                            log::info!(
+                                "PROCMAPENGINE map-data trace portControl::vOnNewMessage t={}ms thread=[{}] count={} (no 0x300 seen so far)",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                uc.get_data().inner.thread_id(),
+                                hits,
+                            );
+                        }
+                        return;
+                    }
                     for (label, base) in bases {
                         let words: Vec<u32> =
                             (0..20u32).map(|i| read_u32_or_invalid(uc, base + i * 4)).collect();
@@ -2930,7 +2941,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                             "PROCMAPENGINE map-data trace RenFI buffer t={}ms thread=[{}] hits={} wrapper={:#x} {label}={:#x} words=[{}]",
                             crate::libs::dapi::emu_t0_elapsed_ms(),
                             uc.get_data().inner.thread_id(),
-                            dumps,
+                            hits,
                             message,
                             base,
                             words
