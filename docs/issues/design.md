@@ -1714,3 +1714,27 @@ Consequences for the open threads here:
   Probe traps hit on the way (all "budget proved nothing"): the
   `PerformMapDataRequest` bl-site filter had an inner `count < 200` that hid the
   request=4 line, and the `GetElement` probe's 100-entry cap went blind at t~6s.
+- **r444 (DAPI's GetBlockIDs answer finally claims and is parsed):** the map-data
+  answer failed the AIL claim walk on its *unique id* slot.  `bIsDataSet`
+  (0x66e3d0) is `param == 0xffff || this[slot] == param`, so the 0xffff wildcard
+  exists only on the message side and reference +8 has to hold the peer's real
+  unique id.  The async registration path never fills it:
+  `bRegisterAsyncExecute` (0x660f74) sends ServiceRegister with zeros in its
+  trailing words (log: `sub12=0xfffe sub14=0x0000`) and
+  `vHandleAsyncRegisterConf` (0x665720) only flags the request entry plus calls
+  back, so the reference kept unique id 0 while DAPI answers with
+  `AIL_NO_UNIQUE_ID` (0xfffe) -> `tuple=(0x26,0x7,0x1,0xfffe)` vs
+  `compared=[0x26,0x7,0x1,0x0]`.  `ensure_service_reference_unique_ids()`
+  (run from the ServiceData claim hook, next to the posfi-ref watchdog, DAPI refs
+  only) now yields `compared=[0x26,0x7,0x1,0xfffe]`, the answer routes through
+  the handler map (key 0x7 -> 0xa07a78) into `vHandleGetBlockIDs` (0x53e7ac,
+  opcode 8, mdm_ref 0x17) which queues a type-0x6b job the MDM mainloop runs
+  (Execute 0x4b4028).  `ServiceDataError` dropped 2 -> 1 and `vOnNewMessage`
+  fired for svc 0x26 for the first time.
+- **Two findings this opens up:** (a) the answer is only 0x22 bytes, i.e. DAPI
+  reports (almost) no blocks for the requested rect; (b) the request rect
+  encoding is *not* 1e-5 degrees: the engine's own view request holds
+  `[-990231045, -2039..., 506995542, ...]` = lon -83.0 / lat 42.5 in units of
+  360/2^32 degrees (1 deg = 11930464.57), while the fabricated position put
+  `0x1cdde1` (19.91809e5) into the same slot.  The posfi wire coordinates and
+  thus the Krakow rect have to be re-encoded before DAPI can answer them.
