@@ -265,6 +265,7 @@ pub fn dapiapp_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     hook_service_status_handler(unicorn, base_address);
     hook_srvctrl_worker_lookup(unicorn, base_address);
     hook_rs_region_outlines_gate(unicorn, base_address);
+    hook_rs_broadcasts(unicorn, base_address);
     hook_device_manager_init(unicorn, base_address);
     hook_device_manager_flow(unicorn, base_address);
     if std::env::var("EMU_PATCH_DAPI_ADMIN_LOCK")
@@ -1745,6 +1746,40 @@ fn hook_rs_region_outlines_gate(unicorn: &mut Unicorn<'_, Context>, base_address
                 read_u32_at(uc, context + 0x354),
                 text(uc, name_b),
                 stack,
+            );
+        })
+        .unwrap();
+}
+
+/// `rs_tclManager::u16InterpretBroadcast` (0x858880) is how the regionselection component
+/// hears about media and devices: it only acts on messages whose `+0x15` byte is 6 and
+/// then routes function id 0x83 to `u16InterpretMediaInfoMsg` and 0x84 to
+/// `u16InterpretDeviceInfoMsg` - the messages that fill the media id/name slots of the
+/// `rs_tclDataContext` (see `hook_rs_region_outlines_gate`).  Log every broadcast that
+/// reaches the manager to see whether the media-info one is missing or arrives and is
+/// refused.
+fn hook_rs_broadcasts(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const INTERPRET_BROADCAST: u32 = 0x0085_8880 - ORIGINAL_BASE;
+    let address = base_address + INTERPRET_BROADCAST;
+    unicorn
+        .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            let hits = HITS.fetch_add(1, Ordering::Relaxed);
+            if hits >= 16 {
+                return;
+            }
+            let job = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            log::warn!(
+                "DAPI rs-broadcast t={}ms thread=[{}] manager={:#x} job={:#x} type={:#x} fct={:#x} byte15={:#x} lr={:#x}",
+                emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                job,
+                read_u32_at(uc, job + 0x20),
+                read_u32_at(uc, job + 0x0a) & 0xffff,
+                read_u32_at(uc, job + 0x15) & 0xff,
+                uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
             );
         })
         .unwrap();
