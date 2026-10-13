@@ -2056,3 +2056,31 @@ the camera record shows state 1 with 0xefffffff. That is why `PerformMapDataRequ
 branch ends by writing 0 to the car-cursor reference counter 0x7906e4 at 0x50cd2c instead of
 turning the box into a `GetBlockIDs` request, and it is the concrete thing to fix next: the
 condition in the prio-4 branch (0x50cb48..0x50cd2c) that decides whether to arm the record.
+
+## `PerformMapDataRequest` arms a request through a *handled-attempt counter*, not a flag
+
+Decompiled skeleton of `map_tclMapDataManager::PerformMapDataRequest` (0x50c93c) around the
+record handling (`puVar14` = the request record, so `+0x74` is the field our dump shows as
+`state`):
+
+```c
+if ((int)(param_7 - param_6) < 1000) { ... }        /* rectangle too narrow  -> reject */
+if ((int)(param_9 - param_8) < 1000) { ... }        /* rectangle too short   -> reject */
+...
+bVar2 = false;                                   /* "already queued" test */
+...
+if (!bVar2 && (bVar4 == false && iVar10 == 0)) {
+    *(uint *)(puVar14 + 0x74) = 0;               /* the branch that CLEARS the record */
+}
+bVar4 = (int)*(uint *)(puVar14 + 0x74) < 3;      /* +0x74 counts handled attempts, max 3 */
+TriggerHandleMapDataRequest(*(int *)(local_34[0] + 0x74) < 3);
+```
+
+So `+0x74` is a counter of handling attempts (capped at 3) and the `visible` argument of
+`TriggerHandleMapDataRequest` is literally `counter < 3`; a record is only a candidate for
+`GetHighestPriorityRequest` while it sits in `ms_lMapDataHighPrioRequests` and has a
+non-sentinel left-to-fetch pair. The cursor record ends with `+0x74 == 0` and both fetch
+fields at `0xffffffff`, which is the *cleared* shape: the prio-4 request reaches the
+clearing branch (`!bVar2 && bVar4 == false && iVar10 == 0`) instead of the queuing one.
+Which of the three tests sends it there is the open question - instrument the branch around
+0x50ccf0..0x50cd2c (Thumb code, so use a page-range hook, not a narrow one).
