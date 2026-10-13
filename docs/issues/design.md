@@ -2084,3 +2084,48 @@ fields at `0xffffffff`, which is the *cleared* shape: the prio-4 request reaches
 clearing branch (`!bVar2 && bVar4 == false && iVar10 == 0`) instead of the queuing one.
 Which of the three tests sends it there is the open question - instrument the branch around
 0x50ccf0..0x50cd2c (Thumb code, so use a page-range hook, not a narrow one).
+
+## The real blocker for roads: DAPI's regionselection context has no medium (r497-r503)
+
+`GetBlockIDs` is answered with `ServiceDataError 0x305` for *every* rectangle, Michigan or
+Krakow, so the engine never receives block ids and the map surface stays empty. The chain is
+now measured end to end inside DAPIAPP:
+
+1. `dap_map_tclWorker::u16SendUniqueIdList` (0x84a2f8) refuses the request unless both
+   region-profile outline containers of its data context are non-empty:
+   `bIsRnwRegProfOutlinesValid_Locked` (0x8c5e5c, container `context+0x8e4`) and
+   `bIsRsRegProfOutlinesValid_Locked` (0x8c5e08, container `context+0x8f4`) - validity is
+   literally `1 - dap_tclRegProfOutline::bEmpty()`.
+2. The RNW load worked: the first attempt at t=4.3 s saw `r0=0`, the attempt at t=4.8 s saw
+   **`r0=1`**, i.e. the RNW outlines are loaded (that request opened
+   `.../cryptnav/rnw/NAV_ROOT.DAT`, served from the real card tree).
+3. The RS load cannot work. `u16ProcessLoadRsRegProfOutlines` (0x8495d4) builds a
+   `dap_regionselectionfi_tclMsgGetRegionOutlinesMethodStart` job (message type 0x17,
+   command/fct 8) and sends it over the reference at `worker+0x180` - which is non-null
+   (0xf81eb0), so the request is really issued.
+4. The request is routed correctly. `dap_tclSrvCrtl::poGetWorker` (0xb62680) scans
+   `{worker, message type}` pairs (count u16 at `+0x40`) in control block 0xf8d6f8, whose
+   table is `[0x2 0x18 0xc 0x6 0x16 0x4 0x17 0xe]`, and hands the job to the
+   `rs_tclManager` sub-object at `datamanager+0x2828`; that manager assigns a fresh
+   `rs_tclWorker` (vtable 0xe1e9d8) whose `enProcessJob` (vtable+0x08 = 0x86be98) dispatches
+   command 8 to `enProcessGetRegionOutlines` (0x869ab4, traces "command GETREGIONOUTLINES
+   received").
+5. That handler is where 0x305 is born: it compares the requested media id against the two
+   media slots of its `rs_tclDataContext` - id at `context+0x354` with the medium name at
+   `context+0x78`, and id at `context+0x1a0` with the name at `context+0x70` - and if
+   neither matches, stores `*param_1 = 0x305` (code at 0x869f90, trace "medium not found
+   media id %d").  Measured at that instruction: `ctx=0xf8d2a4 media_at_1a0=0x0
+   name[+0x70]=<null> media_at_354=0x0 name[+0x78]=<null>` - the regionselection data
+   context holds **no medium at all**.
+
+So the missing piece is not the engine, not posfi, not the RenFI service and not the card
+data: it is that DAPI's regionselection component is never told about the medium. The
+`rs_tclManager` learns media through broadcast messages (`u16InterpretBroadcast` at 0x858880
+routes function id 0x83 to `u16InterpretMediaInfoMsg` and 0x84 to
+`u16InterpretDeviceInfoMsg`), so the fix belongs to the media-info broadcast that the device
+manager emits when the medium becomes active (our own trace says it does: "DAPI map-data
+medium ACTIVE at t=2109ms"): that broadcast has to reach the regionselection manager, which
+then fills `+0x1a0`/`+0x70` or `+0x354`/`+0x78` and the outline request can be answered.
+Once RS outlines load, `u16SendUniqueIdList` proceeds to `u16Lock` -> `bIsInitIdxCache` ->
+`u16CheckBBox` -> `u16GenerateUniqueIds` -> `u16SendResponse`, and the engine gets block ids
+for the rectangle it asks about.

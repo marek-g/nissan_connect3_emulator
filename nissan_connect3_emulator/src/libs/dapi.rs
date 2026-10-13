@@ -263,6 +263,8 @@ pub fn dapiapp_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     hook_registry_guard(unicorn, base_address);
     hook_error_job_origin(unicorn, base_address);
     hook_service_status_handler(unicorn, base_address);
+    hook_srvctrl_worker_lookup(unicorn, base_address);
+    hook_rs_region_outlines_gate(unicorn, base_address);
     hook_device_manager_init(unicorn, base_address);
     hook_device_manager_flow(unicorn, base_address);
     if std::env::var("EMU_PATCH_DAPI_ADMIN_LOCK")
@@ -1046,7 +1048,7 @@ fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                 *counts.entry(original).or_insert(0) += 1;
                 *counts.get(&original).unwrap()
             };
-            if seen > 3 {
+            if seen > 8 {
                 return;
             }
             let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -1071,11 +1073,26 @@ fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                 );
                 return;
             }
+            let worker = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+            let mut rnw = [0u8; 4];
+            let mut rs = [0u8; 4];
+            let rnwfi_ref = uc
+                .mem_read((worker + 0x180) as u64, &mut rnw)
+                .map(|_| u32::from_le_bytes(rnw))
+                .unwrap_or(0xffff_ffff);
+            let rsfi_ref = uc
+                .mem_read((worker + 0x184) as u64, &mut rs)
+                .map(|_| u32::from_le_bytes(rs))
+                .unwrap_or(0xffff_ffff);
             log::warn!(
-                "DAPI blockids-step {:#x}: {} r0={:#x}",
+                "DAPI blockids-step {:#x}: {} r0={:#x} t={}ms worker={:#x} rnwfi_ref={:#x} ref+4={:#x}",
                 original,
                 label,
                 result,
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                worker,
+                rnwfi_ref,
+                rsfi_ref,
             );
         })
         .unwrap();
@@ -1551,4 +1568,184 @@ fn hook_service_data_errors(unicorn: &mut Unicorn<'_, Context>, base_address: u3
             })
             .unwrap();
     }
+}
+fn read_u32_at(unicorn: &mut Unicorn<'_, Context>, address: u32) -> u32 {
+    let mut buf = [0u8; 4];
+    unicorn
+        .mem_read(address as u64, &mut buf)
+        .map(|_| u32::from_le_bytes(buf))
+        .unwrap_or(0xffff_ffff)
+}
+
+/// `dap_tclSrvCrtl::poGetWorker` (0xb62680) chooses the worker that will serve a job
+/// by scanning the `{worker, message type}` pairs of its control block (8 bytes per
+/// entry, entry count as u16 at `+0x40`) for the job's message type at `job + 0x20`.
+/// The regionselectionfi request (type 0x17, the RS region-profile outlines DAPI needs
+/// before it can answer `GetBlockIDs`) comes back without a worker - DAPI then reports
+/// "Unexpected message" and answers 0x305 - even though `u16AddService` really did
+/// register a worker for 0x17.  Dump the table that is searched, the types it holds and
+/// what the job asks for, so the mismatch (wrong control block, wrong type, or a worker
+/// that refuses the message through its vtable+0x08 filter) becomes visible.
+fn hook_srvctrl_worker_lookup(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const PO_GET_WORKER: u32 = 0x00b6_2680 - ORIGINAL_BASE;
+    let address = base_address + PO_GET_WORKER;
+    unicorn
+        .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            let hits = HITS.fetch_add(1, Ordering::Relaxed);
+            if hits >= 48 {
+                return;
+            }
+            let srvctrl = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let job_slot = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let job = read_u32_at(uc, job_slot);
+            let message_type = read_u32_at(uc, job + 0x20);
+            let count = u16::try_from(
+                read_u32_at(uc, srvctrl + 0x40) & 0xffff,
+            )
+            .unwrap_or(0xffff);
+            let types = (0..u32::from(count).min(16))
+                .map(|index| format!("{:#x}", read_u32_at(uc, srvctrl + index * 8 + 4)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            // The worker for the requested type (if any) is a sub-object of the data
+            // manager; its first word is the vtable, and vtable+0x08 is the method
+            // `vProcessJob` calls.  Print those so the handler that produced the error
+            // can be opened in Ghidra.
+            let mut matched = String::new();
+            for index in 0..u32::from(count).min(16) {
+                let slot = read_u32_at(uc, srvctrl + index * 8 + 4);
+                if slot != message_type {
+                    continue;
+                }
+                let worker = read_u32_at(uc, srvctrl + index * 8);
+                let vtable = read_u32_at(uc, worker);
+                let slots = (0..5u32)
+                    .map(|n| format!("{:#x}", read_u32_at(uc, vtable + n * 4)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                matched = format!("worker={:#x} vtable={:#x} vt=[{}]", worker, vtable, slots);
+            }
+            let _ = &types;
+            log::warn!(
+                "DAPI srvctrl worker lookup t={}ms thread=[{}] srvctrl={:#x} count={} types=[{}] job={:#x} type={:#x} fct={:#x} {matched} lr={:#x}",
+                emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                srvctrl,
+                count,
+                types,
+                job,
+                message_type,
+                read_u32_at(uc, job + 0x0a) & 0xffff,
+                uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+            );
+        })
+        .unwrap();
+
+    // `vProcessJob` calls the *assigned* worker's vtable+0x08 right after
+    // `poGetWorker` returns (the bl is at 0x82af9c, so the result is in r0 one
+    // instruction later).  For the regionselectionfi request that assigned worker
+    // is a freshly created `rs_tclWorker`, and the method it runs is the code that
+    // answers with error 0x305 - so capture the vtable it dispatches through.
+    // Hooked as a page range on purpose (mid-TB narrow hooks can never fire).
+    let page_lo = base_address + 0x0082_a000u32 - ORIGINAL_BASE;
+    let page_hi = page_lo + 0xfff;
+    unicorn
+        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+            static ASSIGNED: AtomicU32 = AtomicU32::new(0);
+            const AFTER_PO_GET_WORKER: u32 = 0x0082_afa0;
+            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+            if pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE) != AFTER_PO_GET_WORKER {
+                return;
+            }
+            let hits = ASSIGNED.fetch_add(1, Ordering::Relaxed);
+            if hits >= 12 {
+                return;
+            }
+            let worker = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let vtable = read_u32_at(uc, worker);
+            let slots = (0..4u32)
+                .map(|n| format!("{:#x}", read_u32_at(uc, vtable + n * 4)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            log::warn!(
+                "DAPI assigned worker t={}ms thread=[{}] worker={:#x} vtable={:#x} vt=[{}]",
+                emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                worker,
+                vtable,
+                slots,
+            );
+        })
+        .unwrap();
+}
+
+/// `rs_tclWorker::enProcessGetRegionOutlines` (0x869ab4) answers the regionselectionfi
+/// `GETREGIONOUTLINES` command the map worker sends to obtain the region-profile
+/// outlines DAPI requires before it can turn a `GetBlockIDs` request into block ids.
+/// It looks the requested media id up in its `rs_tclDataContext`: the stored media id at
+/// `context + 0x354` (with the medium's name at `context + 0x78`) or the one at
+/// `context + 0x1a0` (name at `context + 0x70`).  When neither matches it stores error
+/// 0x305 ("medium not found media id %d") - which is exactly the answer the engine gets
+/// today, so the RS data context has no medium registered.  Dump the ids and names the
+/// context really holds next to the stack window that carries the requested id.
+fn hook_rs_region_outlines_gate(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static WORKER: AtomicU32 = AtomicU32::new(0);
+    static HITS: AtomicU32 = AtomicU32::new(0);
+    // Both addresses live in one 4 KiB page: hook the page and dispatch on the fetch
+    // address, because a narrow mid-TB hook can register `Ok` and never be called.
+    let page_lo = base_address + 0x0086_9000u32 - ORIGINAL_BASE;
+    let page_hi = page_lo + 0xfff;
+    unicorn
+        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+            let offset = (uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32)
+                .wrapping_sub(base_address)
+                .wrapping_add(ORIGINAL_BASE);
+            if offset == 0x0086_9ab4 {
+                WORKER.store(uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32, Ordering::Relaxed);
+                return;
+            }
+            if offset != 0x0086_9f90 {
+                return;
+            }
+            let hits = HITS.fetch_add(1, Ordering::Relaxed);
+            if hits >= 6 {
+                return;
+            }
+            let worker = WORKER.load(Ordering::Relaxed);
+            let context = read_u32_at(uc, worker + 0x14);
+            let name_a = read_u32_at(uc, context + 0x70);
+            let name_b = read_u32_at(uc, context + 0x78);
+            let text = |uc: &mut Unicorn<'_, Context>, at: u32| -> String {
+                if at == 0 || at == 0xffff_ffff {
+                    return "<null>".to_string();
+                }
+                (0..24u32)
+                    .map(|i| read_u32_at(uc, at + i))
+                    .flat_map(|word| word.to_le_bytes())
+                    .take_while(|byte| *byte != 0)
+                    .map(|byte| char::from(byte))
+                    .collect()
+            };
+            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+            let stack = (0..24u32)
+                .map(|i| format!("{:#x}", read_u32_at(uc, sp + i * 4)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            log::warn!(
+                "DAPI rs-getregionoutlines t={}ms thread=[{}] worker={:#x} ctx={:#x} media_at_1a0={:#x} name[+0x70]={} media_at_354={:#x} name[+0x78]={} stack=[{}]",
+                emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                worker,
+                context,
+                read_u32_at(uc, context + 0x1a0),
+                text(uc, name_a),
+                read_u32_at(uc, context + 0x354),
+                text(uc, name_b),
+                stack,
+            );
+        })
+        .unwrap();
 }
