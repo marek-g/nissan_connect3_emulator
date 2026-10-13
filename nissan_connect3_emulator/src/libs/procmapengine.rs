@@ -2535,6 +2535,36 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
             );
         })
         .unwrap();
+
+    // Write watchpoints on the three gate globals: whoever stores the dataset
+    // id, the validated dataset id, or the fastmap availability byte tells us
+    // which medium/CCA event the engine considers the trigger.
+    for (va, name) in [
+        (0x0078_f7f0u32, "ms_u32DatasetID"),
+        (0x0078_f7f8u32, "ms_bFastmapServiceAvailable"),
+        (0x0078_f874u32, "ms_u32DatasetID_Validated"),
+    ] {
+        use unicorn_engine::unicorn_const::HookType;
+        let field = base_address + (va - ORIGINAL_BASE);
+        unicorn
+            .add_mem_hook(HookType::MEM_WRITE, field as u64, field as u64 + 3, move |uc, _t, address, size, value| {
+                static COUNT: AtomicU32 = AtomicU32::new(0);
+                if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
+                    return true;
+                }
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCMAPENGINE fastmap trace WRITE {name} t={}ms thread=[{}] size={} value={:#x} pc={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    size,
+                    value,
+                    pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                );
+                true
+            })
+            .unwrap();
+    }
 }
 
 /// Follow DAPI's GetBlockIDs answer through the MDM job that applies it.
