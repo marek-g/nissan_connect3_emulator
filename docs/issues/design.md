@@ -1885,3 +1885,71 @@ sub-id `0x16` (`handle=0x92eec000`, the same object that serves posfi), and
 runs. `bIsClientMessage` `0x386c08` never runs either, so the request is dropped
 before the RenFI dispatcher: the server-side registration/dispatch for service
 `0x300` has to be found before this message can do anything.
+
+## Exact RenFI wire format, and why the fabricated request was dropped (Ghidra, 2026-10-13)
+
+`vHandleRenFIMessages` 0x3a359c selects its method by the **method id at
+payload+0x12** (`msg+0x32`), not by the functionId slot:
+
+```c
+uVar2 = *(ushort *)(*(int *)param_2 + 0x32);
+if (uVar2 == 0x64) RndFI_HandleScaling(...);
+else { if (uVar2 != 0x5a) { trace(0xaff5d6a2, 0x60); return; }
+       RndFI_HandleSetCameraParameters(...); }
+```
+
+The gate before it, and the reason an accepted message can still vanish:
+
+| stage | VA | gate |
+|---|---|---|
+| `vOnNewMessage` | 0x3a4048 (claim vtable `0x685450` slot `+0x20`) | opcode at content+0x1b == 2, content+0x18 == 0x300, **and** the class word at content+0x20 in {`0x6df6a8`, `0x6df6f8`} |
+| `getRenfIMapViewId` | 0x3947cc | `content+0x24` (payload+0x04) must equal `view+0x10` (the `FIApplication` instance from `pGetRenfiApplicationInstance` 0x391580) or the trace 0xaff5d6a2/0x4d fires and the request is ignored |
+| `tclMsgSetCameraParameters::oRead` | 0x38b0e0 | content+0x24 == 0xffffffff => -1; reserved byte content+0x25 must be 0; parameter count content+0x41 must be <= 2 or the object is not built |
+
+RenFI envelope (verified against `vRegisterService` 0x66b894 /
+`fi_tclMessage::oRead` 0x389240): sub-ids at content+0x10/0x12 (0xffff for
+notifications), **serviceId u16 at content+0x18**, register id at content+0x1a,
+functionId slot content+0x1c = 0x4f (= `MethodStart`, the only registered RenFI
+function), **opcode u8 at content+0x1d? no: content+0x1b** (2 = client request),
+class byte content+0x0b (0x45 request, 0x42 service-available/5), payload base at
+content+0x20, and the total length field must be a multiple of 16 or the sender
+gets error 0x22d.
+
+`ren_rendererfi_tclMsgSetCameraParameters` payload (content+0x20 base, `oRead`
+0x38b0e0, version 10): +0x00 type base (accepts only 0x6df6a8/0x6df6f8, the
+reader rewrites 0x6df6f8 -> 0x6df6a8), +0x04 FIApplication instance, +0x08..0x0c
+two u16, +0x0e u32, +0x12 u16 method id (0x5a), +0x14 u32 zoom in metres,
++0x18 s32 longitude, +0x1c s32 latitude (both masked to 0xffffc000 -
+1/64 arc-seconds - and range-checked), +0x20 u8 flag, +0x21 u8 parameter count,
+then up to two 2-byte {paramId, enabled} records.
+
+Camera effects once it is accepted: `RndFI_HandleSetCameraParameters` 0x3a2748
+stores the angle pair into `view+0xa8/+0xac`, optionally writes the
+`0x78fcd4` request rectangle (+0x00 prio 5, +0x04 type 1, +0x08 f32 scale,
++0x0c..0x18 rectangle) when the flag byte is nonzero, and otherwise starts an
+animated move through `u32CreateAnimation` 0x3938b0. A **zero** zoom means "keep
+current zoom"; a nonzero zoom also arms the zoom request at `0x790548` (a zoom of
+1 metre means "largest block set"). The "follow the car" switch is method 0x76
+(`ContinuousScrolling`, payload byte +0x16) which writes engine state byte
+`0x7907ac`, and scrolling is refused while that state is 0, 4 or 5.
+
+## "Starting navigation." never disappears for a different reason (Ghidra, 2026-10-13)
+
+The popup is `GUI_POPUP_MSGBOX_BASE` from `msgBox.lua` (string pool
+`0x0314_8f68`, pool-relative 0x15b4). The map page shows it in
+`LuaCallback_MapPage_StateMachine_Show` 0x023a_9b84 and can only hide it at
+
+```c
+if (*(int *)(luastate + 0x1088) != 0) { GUI_Lua_Interface::prepareCall(..., "MapService", "setVehiclePos"); Hide(); }
+```
+
+so dismissal requires the MapService **`setVehiclePos`** method to exist, i.e. the
+`GUI_FISystemMsg_Receiver` for PROCNAV's service 0x0027 (registered by
+`GUI_State::vSetProperties` 0x023a_9890) to have reached `vOnServiceAvailable`
+0x023a_9d28, which sets its ready flag at +0x1c and runs the Lua callback
+`Gui_Nav_ReceiverReady` - and the DAPI-register diag shows service 0x0027 is never
+offered to the HMI in our runs. Hiding is always Lua-driven (`Hide` 0x0237_7974):
+there is no timer and no `closePopup`/`closeAllPopups` call behind this popup, and
+`GUI_MessageBox::HideDialog` 0x0237_3634 would need the popup id in
+`receiver+0x210`. So the popup is a symptom of the missing PROCNAV service offer,
+not of the camera.
