@@ -3436,15 +3436,21 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     return;
                 }
                 log::info!(
-                    "PROCMAPENGINE map-data trace prio4-branch at {:#x} t={}ms thread=[{}] hits={} r0={:#x} r4={:#x} r6={:#x} r9={:#x} carsor_state={} f1f4={:#x} stack=[{}] size={}",
+                    "PROCMAPENGINE map-data trace prio4-branch at {:#x} t={}ms thread=[{}] hits={} r0={:#x} r1={:#x} r4={:#x} r6={:#x} r9={:#x} counters[cam={} block={} carsor={}] f1f4={:#x} stack=[{}] size={}",
                     offset,
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     uc.get_data().inner.thread_id(),
                     hits,
                     uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
                     uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32,
                     uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32,
                     uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32,
+                    read_u32_or_invalid(
+                        uc,
+                        base_address + 0x0078_fcd4u32 - ORIGINAL_BASE + 0x74,
+                    ),
+                    read_u32_or_invalid(uc, base_address + 0x0079_0348u32 - ORIGINAL_BASE + 0x74),
                     read_u32_or_invalid(uc, carsor + 0x74),
                     read_u32_or_invalid(uc, carsor + 0x1f4),
                     (0..12u32)
