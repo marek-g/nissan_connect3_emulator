@@ -164,6 +164,17 @@ const MAP_DATA_DAPI_LOAD_BLOCKS_CALL: u32 = 0x0053_a230 - ORIGINAL_BASE;
 const MAP_DATA_DAPI_LOAD_BLOCKS_RESULT: u32 = 0x0053_a234 - ORIGINAL_BASE;
 const MAP_DATA_DATASET_ID_GLOBAL: u32 = 0x0078_f7f0 - ORIGINAL_BASE;
 const MAP_DATA_DATASET_ID_VALIDATED_GLOBAL: u32 = 0x0078_f874 - ORIGINAL_BASE;
+
+/// One-shot instruction tracer over the AIL administration module
+/// (0x660000-0x66f000), armed by the `ExamineInfluenceToAdministration` probe
+/// when it sees admin type 2 (ServiceStatus). Ghidra misdecodes parts of this
+/// region as ARM although the unit runs Thumb, so every static address derived
+/// from that listing is suspect; the fetch trace is the ground truth for which
+/// code a ServiceStatus processing actually walks.
+/// Steps remaining (0 = off), arming thread, and arm count.
+static EXAMINE_TRACE_STEPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static EXAMINE_TRACE_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xffff_ffff);
+static EXAMINE_TRACE_ARMS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const MAP_DATA_FASTMAP_AVAILABLE_GLOBAL: u32 = 0x0078_f7f8 - ORIGINAL_BASE;
 const MAP_DATA_STOP_LOADING_GLOBAL: u32 = 0x0078_f7a0 - ORIGINAL_BASE;
 /// Dataset id of the inserted card, taken from the CRYPTNAV volume's
@@ -2680,74 +2691,32 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
         })
         .unwrap();
 
-    // Physical case-2 path of `ail_bExamineInfluenceToAdministration` (the
-    // decompiler blends it with the ARM appclose tail, so instrument the real
-    // fetch addresses via a page-range watch):
-    //   0x669ba0  switch entry: dumps the raw 0x44 fields
-    //             (serverApp=+0x00, svc=+0x14, regid=+0x16, subid=+0x0e)
-    //   0x669c38  `sub_66df4c(appIface+0x54-list, appIface+0x2c-lock, msg.svc)`
-    //             - a service-state registry lookup whose failure routes to
-    //             "service not registered" error handling instead of the
-    //             state apply, so its input + result are the decisive data.
+    // Instruction tracer over the AIL administration module, armed per
+    // admin-type-2 arrival by the `ExamineInfluenceToAdministration` probe
+    // (see EXAMINE_TRACE_STEPS). Logs the real fetch sequence so the actual
+    // ServiceStatus code path is observable despite the Ghidra misdecode.
     {
-        let page_base = base_address + (0x0066_9000u32 - ORIGINAL_BASE);
-        let t_entry = (base_address + (0x0066_9ba0u32 - ORIGINAL_BASE)) as u64;
-        let t_lookup = (base_address + (0x0066_9c38u32 - ORIGINAL_BASE)) as u64;
-        let t_found = (base_address + (0x0066_a21cu32 - ORIGINAL_BASE)) as u64;
-        let t_notfound = (base_address + (0x0066_9c60u32 - ORIGINAL_BASE)) as u64;
+        let lo = (base_address + (0x0066_0000u32 - ORIGINAL_BASE)) as u64;
+        let hi = (base_address + (0x0067_0000u32 - ORIGINAL_BASE)) as u64;
         unicorn
-            .add_code_hook(page_base as u64, page_base as u64 + 0xfff, move |uc, address, _| {
-                let kind = if address == t_entry {
-                    0u8
-                } else if address == t_lookup {
-                    1u8
-                } else if address == t_found {
-                    2u8
-                } else if address == t_notfound {
-                    3u8
-                } else {
-                    return;
-                };
-                static HITS: AtomicU32 = AtomicU32::new(0);
-                if HITS.fetch_add(1, Ordering::Relaxed) >= 60 {
+            .add_code_hook(lo, hi, move |uc, address, _| {
+                if EXAMINE_TRACE_STEPS.load(Ordering::Relaxed) == 0 {
                     return;
                 }
-                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
-                match kind {
-                    0 => {
-                        let header = read_u32_or_invalid(uc, sp.wrapping_add(0x18));
-                        log::info!(
-                            "PROCMAPENGINE fastmap trace status-case2 t={}ms thread=[{}] header={:#x} fields=[app={:#x},svc={:#x},reg={:#x},sub={:#x},status={:#x}]",
-                            crate::libs::dapi::emu_t0_elapsed_ms(),
-                            uc.get_data().inner.thread_id(),
-                            header,
-                            read_u16_or_invalid(uc, header),
-                            read_u16_or_invalid(uc, header.wrapping_add(0x14)),
-                            read_u16_or_invalid(uc, header.wrapping_add(0x16)),
-                            read_u16_or_invalid(uc, header.wrapping_add(0x0e)),
-                            read_u8_or_invalid(uc, header.wrapping_add(0x18)),
-                        );
-                    }
-                    1 => {
-                        let app_iface = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
-                        log::info!(
-                            "PROCMAPENGINE fastmap trace status-lookup t={}ms thread=[{}] app_iface={:#x} list+0x54={:#x} lock+0x2c={:#x} want_svc={:#x}",
-                            crate::libs::dapi::emu_t0_elapsed_ms(),
-                            uc.get_data().inner.thread_id(),
-                            app_iface,
-                            read_u32_or_invalid(uc, app_iface.wrapping_add(0x54)),
-                            read_u32_or_invalid(uc, app_iface.wrapping_add(0x2c)),
-                            (uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32) & 0xffff,
-                        );
-                    }
-                    2 | 3 => log::info!(
-                        "PROCMAPENGINE fastmap trace status-lookup-{} t={}ms thread=[{}]",
-                        if kind == 2 { "found" } else { "notfound" },
-                        crate::libs::dapi::emu_t0_elapsed_ms(),
-                        uc.get_data().inner.thread_id(),
-                    ),
-                    _ => {}
+                if uc.get_data().inner.thread_id()
+                    != EXAMINE_TRACE_TID.load(Ordering::Relaxed)
+                {
+                    return;
                 }
+                let left = EXAMINE_TRACE_STEPS.fetch_sub(1, Ordering::Relaxed);
+                if left <= 1 {
+                    EXAMINE_TRACE_STEPS.store(0, Ordering::Relaxed);
+                }
+                log::info!(
+                    "PROCMAPENGINE ail-step {:#x} (left {})",
+                    ((address as u32) - base_address).wrapping_add(ORIGINAL_BASE),
+                    left - 1,
+                );
             })
             .unwrap();
     }
@@ -3627,6 +3596,13 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     } else {
                         (0, admin)
                     };
+                    if offset == 0x0066_963c - ORIGINAL_BASE
+                        && admin == 2
+                        && EXAMINE_TRACE_ARMS.fetch_add(1, Ordering::Relaxed) < 2
+                    {
+                        EXAMINE_TRACE_TID.store(uc.get_data().inner.thread_id(), Ordering::Relaxed);
+                        EXAMINE_TRACE_STEPS.store(500, Ordering::Relaxed);
+                    }
                     let header = read_u32_or_invalid(uc, message.wrapping_add(4));
                     log::info!(
                         "PROCMAPENGINE map-data trace {} t={}ms thread=[{}] ref={:#x} ref_words={:#x?} state={:#x} admin={:#x} header={:#x} src={:#x} dst={:#x} class={:#x} svc={:#x} reg={:#x} opcode={:#x} lr={:#x}",
