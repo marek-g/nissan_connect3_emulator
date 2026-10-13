@@ -266,6 +266,10 @@ pub fn dapiapp_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     hook_srvctrl_worker_lookup(unicorn, base_address);
     hook_rs_region_outlines_gate(unicorn, base_address);
     hook_rs_broadcasts(unicorn, base_address);
+    hook_rs_media_info(unicorn, base_address);
+    hook_media_info_vector(unicorn, base_address);
+    hook_dapi_device_config(unicorn, base_address);
+    hook_dapi_file_lookup(unicorn, base_address);
     hook_device_manager_init(unicorn, base_address);
     hook_device_manager_flow(unicorn, base_address);
     if std::env::var("EMU_PATCH_DAPI_ADMIN_LOCK")
@@ -1781,6 +1785,443 @@ fn hook_rs_broadcasts(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                 read_u32_at(uc, job + 0x15) & 0xff,
                 uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
             );
+        })
+        .unwrap();
+}
+
+/// `rs_tclManager::u16InterpretMediaInfoMsg` (0x8580fc) only registers a medium when the
+/// media-info control reports the medium *names* the manager holds at `+0x470` (link
+/// medium) and `+0x474` (nav medium) as available - the nav one additionally has to
+/// report state 6 before `u32GetFullAvailMediaId` is stored into the data context.  Dump
+/// those names on entry and the data context's media slots again right after
+/// `u16InterpretBroadcast` returns (called at 0x858b08 from `poAssignWorker`), so a
+/// missing name and a refused availability become distinguishable.
+fn hook_rs_media_info(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static ENTRY_HITS: AtomicU32 = AtomicU32::new(0);
+    static AFTER_HITS: AtomicU32 = AtomicU32::new(0);
+    let page_lo = base_address + 0x0085_8000u32 - ORIGINAL_BASE;
+    let page_hi = page_lo + 0xfff;
+    unicorn
+        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+            let offset = (uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32)
+                .wrapping_sub(base_address)
+                .wrapping_add(ORIGINAL_BASE);
+            let text = |uc: &mut Unicorn<'_, Context>, name: u32| -> String {
+                if name == 0 || name == 0xffff_ffff {
+                    return "<null>".to_string();
+                }
+                (0..32u32)
+                    .map(|i| read_u32_at(uc, name + i))
+                    .flat_map(|word| word.to_le_bytes())
+                    .take_while(|byte| *byte != 0)
+                    .map(|byte| char::from(byte))
+                    .collect()
+            };
+            if offset == 0x0085_80fc {
+                let hits = ENTRY_HITS.fetch_add(1, Ordering::Relaxed);
+                if hits >= 8 {
+                    return;
+                }
+                let manager = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let context = manager + 0x54;
+                if hits < 3 {
+                    // What does the media-info message actually carry?  The manager
+                    // compares the message's media names against its own `+0x470` and
+                    // `+0x474` strings, so dump the job and every pointer it reaches,
+                    // with the ASCII of each, to see whether a name ever arrives.
+                    let job = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let ascii_at = |uc: &mut Unicorn<'_, Context>, at: u32| -> String {
+                        (0..40u32)
+                            .map(|i| read_u32_at(uc, at + i))
+                            .flat_map(|word| word.to_le_bytes())
+                            .map(|byte| if byte.is_ascii_graphic() || byte == b'/' || byte == b' ' {
+                                char::from(byte)
+                            } else {
+                                '.'
+                            })
+                            .collect::<String>()
+                    };
+                    let mut pointers = Vec::new();
+                    for index in (0..0x60u32).step_by(4) {
+                        let word = read_u32_at(uc, job + index);
+                        if (0x00f0_0000..0x0140_0000).contains(&word) {
+                            pointers.push(format!("+{index:#x}->{word:#x}:{}", ascii_at(uc, word)));
+                        }
+                    }
+                    let config = read_u32_at(uc, manager + 0x08);
+                    let mut config_refs = Vec::new();
+                    for index in (0..0x60u32).step_by(4) {
+                        let word = read_u32_at(uc, config + index);
+                        if (0x00f0_0000..0x0140_0000).contains(&word) {
+                            config_refs.push(format!("+{index:#x}->{word:#x}:{}", ascii_at(uc, word)));
+                        }
+                    }
+                    log::warn!(
+                        "DAPI rs-media-info config dump t={}ms manager={:#x} config={:#x} words={:x?}\n  cfg refs: {}",
+                        emu_t0_elapsed_ms(),
+                        manager,
+                        config,
+                        (0..0x18u32)
+                            .map(|i| read_u32_at(uc, config + i * 4))
+                            .collect::<Vec<_>>(),
+                        config_refs.join("\n  "),
+                    );
+                    log::warn!(
+                        "DAPI rs-media-info job dump t={}ms job={:#x} words={:x?}\n  refs: {}",
+                        emu_t0_elapsed_ms(),
+                        job,
+                        (0..0x30u32)
+                            .map(|i| read_u32_at(uc, job + i * 4))
+                            .collect::<Vec<_>>(),
+                        pointers.join("\n  "),
+                    );
+                }
+                let link_name = read_u32_at(uc, manager + 0x470);
+                let nav_name = read_u32_at(uc, manager + 0x474);
+                let link_avail = read_u32_at(uc, context + 0x4a0) & 0xff;
+                let media_a = read_u32_at(uc, context + 0x1a0);
+                let name_a = read_u32_at(uc, context + 0x70);
+                let media_b = read_u32_at(uc, context + 0x354);
+                let name_b = read_u32_at(uc, context + 0x78);
+                log::warn!(
+                    "DAPI rs-media-info entry t={}ms thread=[{}] manager={:#x} link_name[+0x470]={} nav_name[+0x474]={} link_avail={} ctx_media[1a0]={:#x} name[+0x70]={} ctx_media[354]={:#x} name[+0x78]={}",
+                    emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    manager,
+                    text(uc, link_name),
+                    text(uc, nav_name),
+                    link_avail,
+                    media_a,
+                    text(uc, name_a),
+                    media_b,
+                    text(uc, name_b),
+                );
+                return;
+            }
+            if offset != 0x0085_8b0c {
+                return;
+            }
+            let hits = AFTER_HITS.fetch_add(1, Ordering::Relaxed);
+            if hits >= 8 {
+                return;
+            }
+            // r0 carries the error the interpreter left behind in `*param_2`'s place;
+            // the manager is the object that `poAssignWorker` worked on (r7 there).
+            let manager = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+            let context = manager + 0x54;
+            let media_a = read_u32_at(uc, context + 0x1a0);
+            let name_a = read_u32_at(uc, context + 0x70);
+            let media_b = read_u32_at(uc, context + 0x354);
+            let name_b = read_u32_at(uc, context + 0x78);
+            let status = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            log::warn!(
+                "DAPI rs-media-info after t={}ms thread=[{}] manager={:#x} r0={:#x} ctx_media[1a0]={:#x} name[+0x70]={} ctx_media[354]={:#x} name[+0x78]={}",
+                emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                manager,
+                status,
+                media_a,
+                text(uc, name_a),
+                media_b,
+                text(uc, name_b),
+            );
+        })
+        .unwrap();
+}
+
+/// `dap_tclMediaInfoCtrl` is nothing but a deserialized `dap_devmanfi_tclMsgMediaInfoStatus`
+/// (device-manager FI media-info status) message: the media it lists live in a
+/// `bpstl::vector<fi_tcl_DevMediaInfo>` at `ctrl + 0x08`, and the regionselection manager
+/// only registers a medium whose *name* appears in that vector (with entry type 6).  Dump
+/// the requested name together with the raw buffer of the vector, so it is visible which
+/// media the device manager actually announces - that is the name the (currently empty)
+/// `APP_CONFIG/DEVICES` registry values `DEVICE_NAV_1..4` / `DEFAULT_DEV` have to provide.
+fn hook_media_info_vector(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    const NAV_ACCESSABLE: u32 = 0x008c_4bb8 - ORIGINAL_BASE;
+    let address = base_address + NAV_ACCESSABLE;
+    unicorn
+        .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            let hits = HITS.fetch_add(1, Ordering::Relaxed);
+            if hits >= 4 {
+                return;
+            }
+            let ctrl = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let asked = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let name = |uc: &mut Unicorn<'_, Context>, at: u32| -> String {
+                if at == 0 || at == 0xffff_ffff {
+                    return "<null>".to_string();
+                }
+                (0..40u32)
+                    .map(|i| read_u32_at(uc, at + i))
+                    .flat_map(|word| word.to_le_bytes())
+                    .take_while(|byte| *byte != 0)
+                    .map(|byte| char::from(byte))
+                    .collect()
+            };
+            // `bpstl::vector` is {allocator/vtable, begin, end, capacity} and it sits at
+            // `ctrl + 0x08`, so the data pointers are `ctrl + 0x0c` / `ctrl + 0x10`.
+            let begin = read_u32_at(uc, ctrl + 0x0c);
+            let finish = read_u32_at(uc, ctrl + 0x10);
+            let capacity = read_u32_at(uc, ctrl + 0x14);
+            let span = finish.wrapping_sub(begin) as usize;
+            let words = (0..span.min(0x60) / 4)
+                .map(|i| format!("{:#x}", read_u32_at(uc, begin + (i * 4) as u32)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ascii = (0..span.min(0x80))
+                .map(|i| {
+                    let byte = (read_u32_at(uc, begin + i as u32) & 0xff) as u8;
+                    if byte == 0 {
+                        '.'
+                    } else if byte.is_ascii_graphic() || byte == b'/' || byte == b' ' {
+                        char::from(byte)
+                    } else {
+                        '?'
+                    }
+                })
+                .collect::<String>();
+            let mut derefs = Vec::new();
+            for index in (0..60u32).step_by(4) {
+                let word = read_u32_at(uc, begin + index);
+                if (0x00e0_0000..0x0140_0000).contains(&word) {
+                    derefs.push(format!("+{index:#04x}->{word:#x}:{:?}", name(uc, word)));
+                }
+            }
+            log::warn!(
+                "DAPI media-info deref t={}ms entries={} {}\n  raw ascii: {}",
+                emu_t0_elapsed_ms(),
+                span / 60,
+                derefs.join("\n  "),
+                ascii,
+            );
+            log::warn!(
+                "DAPI media-info vector t={}ms thread=[{}] ctrl={:#x} asked={:?} entries={} vector=[{:#x},{:#x},{:#x}] span={:#x} words=[{}]\n  ascii: {}",
+                emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                ctrl,
+                name(uc, asked),
+                span / 60,
+                begin,
+                finish,
+                capacity,
+                span,
+                words,
+                ascii,
+            );
+        })
+        .unwrap();
+}
+
+/// `dap_tclDapiApp::vEvalDeviceConfig` (0x822630) is what transfers the
+/// `APP_CONFIG/DEVICES` registry values into the shared `dap_tclConfiguration` (at
+/// `dapiapp + 0x7c`): `DEFAULT_DEV` into `pcGetDefaultDevice()`, `DEVICE_ONLINE_LINKING`
+/// straight into the configuration's inline name buffer at `+0x54e` (which
+/// `rs_tclManager`'s constructor hands out as its link medium at `+0x470`), and each
+/// `DEVICE_NAV_n` triple into `bAddNavDevice` (0x82255c).  Log every evaluation and every
+/// registration so it becomes visible which of the values the accessor actually serves.
+fn hook_dapi_device_config(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static EVAL_HITS: AtomicU32 = AtomicU32::new(0);
+    static POST_AFTER: AtomicU32 = AtomicU32::new(0);
+    static ADD_HITS: AtomicU32 = AtomicU32::new(0);
+    const EVAL: u32 = 0x0082_2630 - ORIGINAL_BASE;
+    const ADD_DEVICE: u32 = 0x0082_255c - ORIGINAL_BASE;
+    for (offset, _) in [(EVAL, "eval"), (ADD_DEVICE, "add")] {
+        let address = base_address + offset;
+        let which = if offset == EVAL { 0u8 } else { 1u8 };
+        unicorn
+            .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+                let text = |uc: &mut Unicorn<'_, Context>, at: u32| -> String {
+                    if at == 0 || at == 0xffff_ffff {
+                        return "<null>".to_string();
+                    }
+                    (0..32u32)
+                        .map(|i| read_u32_at(uc, at + i))
+                        .flat_map(|word| word.to_le_bytes())
+                        .take_while(|byte| *byte != 0)
+                        .map(|byte| char::from(byte))
+                        .collect()
+                };
+                if which == 0 {
+                    let hits = EVAL_HITS.fetch_add(1, Ordering::Relaxed);
+                    if hits >= 12 {
+                        return;
+                    }
+                    let app = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let config = app + 0x7c;
+                    log::warn!(
+                        "DAPI device-config eval t={}ms thread=[{}] app={:#x} config={:#x} accessor={:#x} config[+0x54e]={:?} config[+0x56c]={:?}",
+                        emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        app,
+                        config,
+                        uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                        text(uc, config + 0x54e),
+                        text(uc, config + 0x56c),
+                    );
+                    // One-shot probe at the return site: if a `DEVICE_ONLINE_LINKING` or
+                    // `DEVICE_OL_SOURCE_DEVICE` read succeeded it landed in these inline
+                    // configuration buffers, which is what `rs_tclManager` reads as its
+                    // medium names, so their content after the call is decisive.
+                    let after = (uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32).wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                    if (0x0082_0000..0x0083_0000).contains(&after) {
+                        let posted = POST_AFTER.fetch_add(1, Ordering::Relaxed);
+                        if posted < 4 {
+                            let lo = (base_address + after - ORIGINAL_BASE) as u64;
+                            let _ = uc.add_code_hook(lo, lo, move |inner, _, _| {
+                                let app = {
+                                    let sp = inner.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                                    read_u32_at(inner, sp + 0x20)
+                                };
+                                let name = |uc: &mut Unicorn<'_, Context>, at: u32| -> String {
+                                    (0..32u32)
+                                        .map(|i| read_u32_at(uc, at + i))
+                                        .flat_map(|word| word.to_le_bytes())
+                                        .take_while(|byte| *byte != 0)
+                                        .map(|byte| char::from(byte))
+                                        .collect()
+                                };
+                                let mut dump = Vec::new();
+                                if (0x00f0_0000..0x0140_0000).contains(&app) {
+                                    for off in (0x540u32..0x5f0).step_by(4) {
+                                        let word = name(inner, app + off);
+                                        if word.chars().any(|c| c != '.') {
+                                            dump.push(format!("+{off:#x}={word:?}"));
+                                        }
+                                    }
+                                }
+                                log::warn!(
+                                    "DAPI device-config post t={}ms r0={:#x} candidate_app={:#x} raw[sp+0x10..0x38]={:x?}",
+                                    emu_t0_elapsed_ms(),
+                                    inner.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                                    app,
+                                    (0x10u32..0x38).step_by(4).map(|o| read_u32_at(inner, inner.reg_read(RegisterARM::SP).unwrap_or(0) as u32 + o)).collect::<Vec<_>>(),
+                                );
+                                if !dump.is_empty() {
+                                    log::warn!("DAPI device-config post strings: {}", dump.join(" "));
+                                }
+                            });
+                        }
+                    }
+                    return;
+                }
+                let hits = ADD_HITS.fetch_add(1, Ordering::Relaxed);
+                if hits >= 12 {
+                    return;
+                }
+                let name = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let prm = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let max_fd = (uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32) & 0xff;
+                let stack = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                let app = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                // The `DEVICE_ONLINE_LINKING` branch passes the configuration's own inline
+                // name buffer (`dapiapp + 0x7c + 0x54e`) - the field `rs_tclManager` uses as
+                // its medium name - while the `DEVICE_NAV_n` branches pass a stack buffer.
+                // The call site in `lr` separates them unambiguously.
+                let from_config_field = name == app.wrapping_add(0x7c + 0x54e);
+                let online_field = text(uc, app.wrapping_add(0x7c + 0x54e));
+                log::warn!(
+                    "DAPI device-config add-nav-device t={}ms thread=[{}] name={:?} prm={:?} max_fd={} optical={} lr={:#x} name_is_config_54e={} config_field={:?}",
+                    emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    text(uc, name),
+                    text(uc, prm),
+                    max_fd,
+                    read_u32_at(uc, stack) & 0xff,
+                    lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                    from_config_field,
+                    online_field,
+                );
+            })
+            .unwrap();
+    }
+}
+
+/// `dap_dev_tclFileManagement::s32OpenCreate` (0x8ac488) is DAPI's own file layer: before
+/// any syscall happens it looks the path up in its registered-file table
+/// (`s32SearchForCompleteFileName`, 0x8aba88: `count` at `this + 4`, descriptor array at
+/// `*this`, 0x7c bytes each, case-insensitive compare against `pcGetCompleteFileName`) and
+/// returns 0xffff without touching the OS when the file is unknown.  Measured at
+/// 0x8ac4a4 - right after that lookup, where r0 holds the index (0xffffffff = unknown),
+/// r10 the path and r6 the file-management object - so the table content itself is dumped
+/// whenever a lookup misses.
+fn hook_dapi_file_lookup(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static HITS: AtomicU32 = AtomicU32::new(0);
+    static MISSES: AtomicU32 = AtomicU32::new(0);
+    let page_lo = base_address + 0x008a_c000u32 - ORIGINAL_BASE;
+    let page_hi = page_lo + 0xfff;
+    unicorn
+        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+            let offset = (uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32)
+                .wrapping_sub(base_address)
+                .wrapping_add(ORIGINAL_BASE);
+            if offset != 0x008a_c4a4 {
+                return;
+            }
+            let hits = HITS.fetch_add(1, Ordering::Relaxed);
+            if hits >= 400 {
+                return;
+            }
+            let path_ptr = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
+            let files = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+            let index = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let path = {
+                (0..64u32)
+                    .map(|i| read_u32_at(uc, path_ptr + i))
+                    .flat_map(|word| word.to_le_bytes())
+                    .take_while(|byte| *byte != 0)
+                    .map(|byte| char::from(byte))
+                    .collect::<String>()
+            };
+            let count = read_u32_at(uc, files + 0x04);
+            let base = read_u32_at(uc, files + 0x00);
+            log::warn!(
+                "DAPI filemgmt open t={}ms thread=[{}] path={:?} index={:#x} table={} files={}",
+                emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                path,
+                index,
+                base,
+                count,
+            );
+            if index != 0xffff_ffff {
+                return;
+            }
+            let misses = MISSES.fetch_add(1, Ordering::Relaxed);
+            if misses >= 8 || base == 0 || base == 0xffff_ffff {
+                return;
+            }
+            // Descriptor layout is only partly known; the registered path is the longest
+            // printable run inside the 0x7c-byte record, so extract it that way.
+            let names = (0..count.min(30))
+                .map(|entry| {
+                    let record = base + entry * 0x7c;
+                    let mut best = String::new();
+                    let mut current = String::new();
+                    for i in 0..0x7cu32 {
+                        let byte = (read_u32_at(uc, record + i) & 0xff) as u8;
+                        if byte.is_ascii_graphic() || byte == b'/' || byte == b' ' {
+                            current.push(char::from(byte));
+                        } else {
+                            if current.len() > best.len() {
+                                best = std::mem::take(&mut current);
+                            }
+                            current.clear();
+                        }
+                    }
+                    if current.len() > best.len() {
+                        best = current;
+                    }
+                    best
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            log::warn!("DAPI filemgmt table ({} entries): {}", count, names);
         })
         .unwrap();
 }
