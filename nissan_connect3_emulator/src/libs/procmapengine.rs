@@ -5590,6 +5590,77 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             .unwrap();
     }
 
+    // Zero r584 hits on UpdateDrawLayerListsForDTM: PreRender's DAT-gate skips
+    // it, so `ms_alstActiveNodes` (0x71aec8) is only ever filled elsewhere -
+    // candidate readers are `bUpdateLOD` (0x3bd940) and
+    // `map_tclMapElm_DTMTextureDummy::Draw` (0x3cef80), and the DTM texture
+    // node registration happens per texture creation.  Watch every write into
+    // the 80-byte array (dispatch on the fetch address, per AGENTS.md a page
+    // hook is the reliable form) and log those two entries.
+    {
+        use unicorn_engine::unicorn_const::HookType;
+        let lo = (base_address + (0x0071_aec8u32 - ORIGINAL_BASE)) as u64;
+        let hi = lo + 79;
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        unicorn
+            .add_mem_hook(HookType::MEM_WRITE, lo, hi, move |uc, _t, address, _size, _value| {
+                let count = writes.fetch_add(1, Ordering::Relaxed);
+                if count >= 60 {
+                    return true;
+                }
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                let index = (address - lo) / 0x10;
+                let off = (address - lo) % 0x10;
+                log::info!(
+                    "PROCMAPENGINE render trace alstActive WRITE addr={:#x} (view {:#x} +{:#x}) pc={:#x} lr={:#x}",
+                    address,
+                    index,
+                    off,
+                    original,
+                    uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
+                );
+                true
+            })
+            .unwrap();
+        let upd = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let addr = base_address + 0x003b_d940u32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = upd.fetch_add(1, Ordering::Relaxed);
+                if count >= 30 {
+                    return;
+                }
+                let mcp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let view = read_u32_or_invalid(uc, mcp.wrapping_add(5)) & 0xff;
+                log::info!(
+                    "PROCMAPENGINE render trace bUpdateLOD entry at {:#x}: mcp={:#x} view={:#x} lr={:#x}",
+                    addr,
+                    mcp,
+                    view,
+                    uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
+                );
+            })
+            .unwrap();
+        let drw = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let addr = base_address + 0x003c_ef80u32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = drw.fetch_add(1, Ordering::Relaxed);
+                if count >= 30 {
+                    return;
+                }
+                log::info!(
+                    "PROCMAPENGINE render trace DTMTextureDummy::Draw entry at {:#x}: this={:#x} r1={:#x} lr={:#x}",
+                    addr,
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
+                );
+            })
+            .unwrap();
+    }
+
     // Message-map router `PortControl_CCAClientHandlerBase::vDispatchMessage`
     // (0x592454): keys are (u16 svc @inner+0x14, u16 fn @inner+0+0x18) pairs
     // (the map's static seed table at 0x713ea8 holds {0x70006, 0x140006,
