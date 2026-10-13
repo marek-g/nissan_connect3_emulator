@@ -1695,19 +1695,36 @@ fn spawn_posfi_provider(unicorn: &mut Unicorn<'_, Context>) {
 /// header word the generic `fi` driver consumes first, then the class' 130-byte
 /// (`movs r1, #0x82` in oRead `0x600f8c`) packed const block as a
 /// recognisable pattern.
+/// Convert a WGS84 angle in degrees to the engine's internal map position unit:
+/// one full turn is 2^32 units, so 1 degree is 2^32 / 360 = 11_930_464.57 units
+/// (the map engine documents the inverse, 8.381903e-08 degrees per unit, and its
+/// own request rectangles use this unit).
+fn map_units(degrees: f64) -> i32 {
+    (degrees * (4_294_967_296f64 / 360.0)).round() as i32
+}
+
 pub(crate) fn nav_position_status_message(seq: u16) -> Vec<u8> {
     // fi_tcl visitor payload (r424/r425 object dumps): the NavPositionStatus
     // wire is a flat sequential encoding - DataSetId u32, PositionWGS84
-    // {Longitude s32, Latitude s32} (both degrees * 1e5), then the one-cell /
-    // section fields read 1-2 bytes each (e8/e16 descriptors).  r425 proved
-    // the map-window gate in vHandleNavPosition only opens when
-    // PositionCalculationState != 0, and a sparse dword pattern left a 0x00
-    // byte exactly there, so all bytes behind the coordinates are a uniform
-    // non-zero filler (0x01 keeps every scalar small, no length-loop risk).
+    // {Longitude s32, Latitude s32}, then the one-cell / section fields read
+    // 1-2 bytes each (e8/e16 descriptors).  r425 proved the map-window gate in
+    // vHandleNavPosition only opens when PositionCalculationState != 0, and a
+    // sparse dword pattern left a 0x00 byte exactly there, so all bytes behind
+    // the coordinates are a uniform non-zero filler (0x01 keeps every scalar
+    // small, no length-loop risk).
+    //
+    // The coordinate unit is the engine's internal map position unit, not
+    // degrees * 1e5 (r444): vHandleNavPosition copies fi_tcl_s32_Longitude /
+    // fi_tcl_s32_Latitude into the window bbox (+0x70..+0x7c) with validity
+    // clamps near +-2^31 and no scaling, that bbox becomes the rect of the
+    // UpdateMapDataRequest, and the engine's own view request carries
+    // -990_231_045 / 506_995_542 in the same slots = lon -83.0 / lat 42.5 with
+    // one turn in 2^32 units.  Feeding 1e-5 degrees made DAPI see a rect near
+    // (0.17, 0.42) degrees in the ocean and answer without blocks.
     let mut body = Vec::with_capacity(0x2c0);
     body.extend_from_slice(&0u32.to_le_bytes()); // DataSetId
-    body.extend_from_slice(&1_991_809i32.to_le_bytes()); // Longitude (19.91809 E)
-    body.extend_from_slice(&5_006_254i32.to_le_bytes()); // Latitude (50.06254 N)
+    body.extend_from_slice(&map_units(19.91809).to_le_bytes()); // Longitude (Krakow)
+    body.extend_from_slice(&map_units(50.06254).to_le_bytes()); // Latitude (Krakow)
     body.resize(0x2c0, 0x01);
     let len = 0x20 + body.len();
     let LEN = len.next_multiple_of(16);
