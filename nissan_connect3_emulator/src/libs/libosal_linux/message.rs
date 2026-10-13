@@ -2570,7 +2570,12 @@ fn post_engine_status_to(
     status[4..8].copy_from_slice(&status_len.to_le_bytes());
     status[8..10].copy_from_slice(&2u16.to_le_bytes());
     status[0xb] = 0x44;
-    status[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
+    // +0x0e is the sub-id the client walk (`bIsDataSet` at 0x66e3d0) matches
+    // against the reference's unique id with 0xffff as the wildcard. The
+    // engine's svc-0x26 reference stores unique 0, so use the wildcard: 0xfffe
+    // ("none") matches nothing and the whole apply-then-propagate flow is
+    // skipped with a "no reference" echo instead.
+    status[0x0e..0x10].copy_from_slice(&0xffffu16.to_le_bytes());
     status[0x14..0x16].copy_from_slice(&service_id.to_le_bytes());
     status[0x16..0x18].copy_from_slice(&register_id.to_le_bytes());
     status[0x18] = state;
