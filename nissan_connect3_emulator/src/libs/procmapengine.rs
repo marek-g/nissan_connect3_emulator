@@ -5752,21 +5752,33 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         let addr = base_address + 0x0052_ccc8u32 - ORIGINAL_BASE;
         unicorn
             .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                // r630b: the flat 120-cap was exhausted within the first
+                // few frames (43 layers per pass), hiding the tail where the
+                // harvest fills lists.  Log only NON-EMPTY lists (plus a
+                // sparse heartbeat of empty ones).
                 let count = dl.fetch_add(1, Ordering::Relaxed);
-                if count >= 120 {
-                    return;
-                }
                 let list = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let layer = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let w0 = read_u32_or_invalid(uc, list);
+                let w1 = read_u32_or_invalid(uc, list + 4);
+                let w2 = read_u32_or_invalid(uc, list + 8);
+                let non_empty = w1 != 0 || w2 != 0;
+                if !non_empty && (count % 4300 != 0 || count >= 47_300) {
+                    return;
+                }
+                if non_empty && count >= 100_000 {
+                    return;
+                }
                 log::info!(
-                    "PROCMAPENGINE render trace DrawList entry at {:#x}: layer={:#x} elem_list={:#x} w0={:#x} w1={:#x} w2={:#x} count={:#x}",
+                    "PROCMAPENGINE render trace DrawList entry at {:#x}: layer={:#x} elem_list={:#x} w0={:#x} w1={:#x} w2={:#x} count={:#x} t={}ms",
                     addr,
                     layer,
                     list,
-                    read_u32_or_invalid(uc, list),
-                    read_u32_or_invalid(uc, list + 4),
-                    read_u32_or_invalid(uc, list + 8),
-                    count
+                    w0,
+                    w1,
+                    w2,
+                    count,
+                    crate::libs::dapi::emu_t0_elapsed_ms()
                 );
             })
             .unwrap();
