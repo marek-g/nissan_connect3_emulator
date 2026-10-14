@@ -1928,6 +1928,7 @@ pub(crate) fn renfi_set_camera_parameters_message(
     longitude_deg: f64,
     latitude_deg: f64,
     meter: u32,
+    mode: u8,
 ) -> Vec<u8> {
     let mut body: Vec<u8> = Vec::with_capacity(0x20);
     // `map_tclRenderControl::SetCameraParameters` (0x3a7594) only forwards a camera job
@@ -1939,7 +1940,15 @@ pub(crate) fn renfi_set_camera_parameters_message(
     // always says yes and `map_tclJobQueue::EnqueueElements` runs the element instead of
     // filing it into the queue's class-3 list, which neither main loop drains).  With
     // mode 0 the request is deserialised, queued and then silently dropped.
-    body.push(3); // mode
+    // r633: mode 1 (simple) takes `map_tclMapView::u32SetCameraParameters`'
+    // early branch (0x523eec `param_2[0]-1 < 2`): the camera is stored at
+    // view+0x6c..0x88 and the dirty flag raised, but NO
+    // `UpdateMapDataRequest` is issued - the r632 evidence showed each
+    // request re-arming a synchronous camera echo (0x504a6c) whose rect is
+    // the request rect, so the mode-3 messages both drive the data round
+    // and re-open the Milwaukee echo window.  A light mode-1 refresh holds
+    // view+0x84 at Krakow without touching the request machine.
+    body.push(mode); // mode
     body.extend_from_slice(&meter.to_le_bytes()); // meter
     body.extend_from_slice(&0u16.to_le_bytes()); // pitch
     body.extend_from_slice(&0u16.to_le_bytes()); // heading
@@ -1998,6 +2007,44 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
             let mut seq: u16 = 0;
             let mut drift: f64 = 0.0;
             let queue = "mbx_1024".to_string();
+            // r633: companion refresher - a light mode-1 camera message every
+            // 2 s.  Mode 1 takes u32SetCameraParameters' simple branch: the
+            // camera lands at view+0x6c..0x88 and the dirty flag is raised,
+            // but no UpdateMapDataRequest (hence no Milwaukee echo) is
+            // issued.  It holds the committed Krakow centre against the
+            // echo-driven pull-back between the mode-3 round drivers.
+            {
+                let ns2 = namespace.clone();
+                let q2 = queue.clone();
+                let _ = std::thread::Builder::new()
+                    .name("renfi-commit".into())
+                    .spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(16));
+                        let mut sq: u16 = 0x4000;
+                        loop {
+                            sq = sq.wrapping_add(1);
+                            let blob =
+                                renfi_set_camera_parameters_message(sq, 19.91809, 50.06254, 40, 1);
+                            let mut guard = ns2.lock().unwrap();
+                            crate::common::osal_queues::OsalQueueService::ensure_queue(
+                                &mut guard.mq, &q2,
+                            );
+                            if crate::common::osal_queues::OsalQueueService::guest_post(
+                                &mut guard.mq,
+                                &q2,
+                                blob,
+                                0,
+                            ) {
+                                guard.notify_waiters();
+                            }
+                            drop(guard);
+                            if sq < 0x4005 {
+                                log::info!("PROCNAV: renfi commit #{sq:#x} posted");
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(2_000));
+                        }
+                    });
+            }
             loop {
                 seq = seq.wrapping_add(1);
                 let blob = renfi_set_camera_parameters_message(
@@ -2005,6 +2052,7 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
                     19.91809 + drift,
                     50.06254,
                     40,
+                    3,
                 );
                 let posted = {
                     let mut guard = namespace.lock().unwrap();
