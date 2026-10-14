@@ -6110,7 +6110,13 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     mcp_c as u64 + 7,
                     move |uc, _t, address, size, value| {
                         static COUNT: AtomicU32 = AtomicU32::new(0);
-                        if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
+                        // r624: the r623 cap of 60 was exhausted by the init
+                        // chatter (screen-size writes below 0x10000) before
+                        // the interesting window; skip the small values.
+                        if value > 0x1_0000 && COUNT.fetch_add(1, Ordering::Relaxed) >= 300 {
+                            return true;
+                        }
+                        if value <= 0x1_0000 {
                             return true;
                         }
                         let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
@@ -6280,6 +6286,20 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         }
                         let mcp = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
                         let view = read_u8_or_invalid(uc, mcp + 5);
+                        if original == 0x0043_1718u32 {
+                            // r624: GlobalViewRect_2D centres on mcp+0x1c/
+                            // +0x20; read them live here so we see what the
+                            // per-frame rect is built from.
+                            let cx = read_u32_or_invalid(uc, mcp + 0x1c);
+                            let cy = read_u32_or_invalid(uc, mcp + 0x20);
+                            log::info!(
+                                "PROCMAPENGINE render trace DOM-mcp-centre t={}ms mcp={:#x} centre=({:#x},{:#x})",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                mcp,
+                                cx,
+                                cy
+                            );
+                        }
                         if original == 0x0043_17bcu32 {
                             // Right after `bl PerformLocalUpdateOfMapObjects`:
                             // r0 = harvested element count.
