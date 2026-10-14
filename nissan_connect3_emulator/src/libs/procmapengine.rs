@@ -1119,6 +1119,15 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     log::warn!("PROCMAPENGINE: pure render kick factory returned no job");
                     return;
                 }
+                // `map_tclJobRCRenderPixmapView::Execute` looks the view up
+                // through the byte at job+0x1c; the factory does not fill it
+                // (same gap `queue_view_creation_job` patches for the create
+                // job), so stamp the render view id here or Execute fails
+                // `GetView(0)` and the job never runs (r655).
+                if uc.mem_write((job + 0x1c) as u64, &[MAP_RENDER_VIEW_ID as u8]).is_err() {
+                    log::warn!("PROCMAPENGINE: failed to stamp view id on pure render job {:#x}", job);
+                    return;
+                }
                 MAP_RENDER_KICK_JOB.store(job, Ordering::Relaxed);
                 MAP_RENDER_KICK_ENQUEUE_PENDING.store(true, Ordering::Relaxed);
                 let count = MAP_RENDER_KICK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -3964,12 +3973,14 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let instance = read_u32_or_invalid(uc, instance_global);
                 log::info!(
-                    "PROCMAPENGINE map-data trace render job gate IsExecutable t={}ms thread=[{}] job={:#x} vptr={:#x} mode={:#x} render_control={:#x} flag={:#x} lr={:#x}",
+                    "PROCMAPENGINE map-data trace render job gate IsExecutable t={}ms thread=[{}] job={:#x} vptr={:#x} mode={:#x} viewid={:#x} f1d={:#x} render_control={:#x} flag={:#x} lr={:#x}",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     uc.get_data().inner.thread_id(),
                     job,
                     read_u32_or_invalid(uc, job),
                     read_u32_or_invalid(uc, job.wrapping_add(0x10)),
+                    read_u8_or_invalid(uc, job.wrapping_add(0x1c)),
+                    read_u8_or_invalid(uc, job.wrapping_add(0x1d)),
                     instance,
                     if instance == 0 || instance == 0xffff_ffff {
                         0xffff_ffff
