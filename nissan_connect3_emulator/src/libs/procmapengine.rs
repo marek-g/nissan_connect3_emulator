@@ -845,6 +845,82 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             .unwrap();
     }
 
+    // r647: the raw-data cache only gets entries through
+    // `Convert{FastMap,FastMap3DBinary,FastMapImage,Pyramid}BlockFromShared
+    // Memory` -> `CreateNewRawDataBlock`/`AddNewRawDataBlock` (DAPI hands the
+    // block over in shared memory).  r646: 50 ContainsBlockID lookups with
+    // real Krakow uids but rawcount stayed 0 - find whether the convert
+    // functions run at all and whether Create/Add are reached.
+    {
+        let probes = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let glo = base_address + (0x0050_d1a0u32 - ORIGINAL_BASE);
+        let page_lo = base_address + (0x0050_d000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != glo {
+                    return;
+                }
+                let count = probes.fetch_add(1, Ordering::Relaxed);
+                if count >= 40 {
+                    return;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                let w0 = read_u32_or_invalid(uc, r0);
+                let w1 = read_u32_or_invalid(uc, r1);
+                log::info!(
+                    "PROCMAPENGINE render trace cvtFMB-enter t={}ms thread=[{}] r0={:#x} r1={:#x} w0={:#x} w1={:#x} lr={:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    r0,
+                    r1,
+                    w0,
+                    w1,
+                    lr,
+                    count
+                );
+            })
+            .unwrap();
+        let probes2 = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let t_create = base_address + (0x0051_66dcu32 - ORIGINAL_BASE);
+        let t_add = base_address + (0x0051_64e0u32 - ORIGINAL_BASE);
+        let page_lo = base_address + (0x0051_6000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                let which = if original == t_create {
+                    "Create"
+                } else if original == t_add {
+                    "Add"
+                } else {
+                    return;
+                };
+                let count = probes2.fetch_add(1, Ordering::Relaxed);
+                if count >= 40 {
+                    return;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE render trace rawcache-{which} t={}ms thread=[{}] r0={:#x} w0={:#x},{:#x} lr={:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    r0,
+                    read_u32_or_invalid(uc, r0),
+                    read_u32_or_invalid(uc, r0.wrapping_add(4)),
+                    lr,
+                    count
+                );
+            })
+            .unwrap();
+    }
+
     if std::env::var_os("EMU_PROCMAPENGINE_TRACE_INIT")
         .is_some_and(|value| !value.is_empty() && value != "0")
     {
