@@ -5682,12 +5682,21 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 }
                 let renderer = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let renderer_obj = read_u32_or_invalid(uc, renderer.wrapping_add(0x18));
+                // ViewRenderThread passes layers = renderer + 0x14a (u8 layer
+                // ids) and count = byte at renderer + 0x279; the per-layer
+                // `map_tclMapElementList` table is at Execute's this + 8.
+                let n_layers = read_u32_or_invalid(uc, renderer_obj.wrapping_add(0x279)) & 0xff;
+                let layers = read_u32_or_invalid(uc, renderer_obj.wrapping_add(0x14a));
+                let table = read_u32_or_invalid(uc, renderer.wrapping_add(8));
                 log::info!(
-                    "PROCMAPENGINE render trace Renderer::Execute entry at {:#x}: viewctl={:#x} renderer={:#x} surface={:#x} count={:#x}",
+                    "PROCMAPENGINE render trace Renderer::Execute entry at {:#x}: viewctl={:#x} renderer={:#x} surface={:#x} n_layers={:#x} layers={:#010x} elem_table={:#x} count={:#x}",
                     addr,
                     renderer,
                     renderer_obj,
                     read_u32_or_invalid(uc, renderer_obj.wrapping_add(0x40)),
+                    n_layers,
+                    layers,
+                    table,
                     count
                 );
             })
@@ -5704,6 +5713,28 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     "PROCMAPENGINE render trace Surface::Flip entry at {:#x}: surface={:#x} count={:#x}",
                     addr,
                     uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    count
+                );
+            })
+            .unwrap();
+        let dl = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let addr = base_address + 0x0052_ccc8u32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = dl.fetch_add(1, Ordering::Relaxed);
+                if count >= 120 {
+                    return;
+                }
+                let list = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let layer = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE render trace DrawList entry at {:#x}: layer={:#x} elem_list={:#x} w0={:#x} w1={:#x} w2={:#x} count={:#x}",
+                    addr,
+                    layer,
+                    list,
+                    read_u32_or_invalid(uc, list),
+                    read_u32_or_invalid(uc, list + 4),
+                    read_u32_or_invalid(uc, list + 8),
                     count
                 );
             })
