@@ -2006,6 +2006,10 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
             crate::emulator::vtime::sleep_virtual(std::time::Duration::from_secs(15));
             let mut seq: u16 = 0;
             let mut drift: f64 = 0.0;
+            // r639 echo-back bookkeeping (host-ms clock, matches the stamp).
+            let mut last_post_ms: u64 = 0;
+            let mut seen_stamp: u64 = 0;
+            let mut echo_backs: u32 = 0;
             let queue = "mbx_1024".to_string();
             // r635: BOTH refresher variants removed.  Mode 1 (r633) never
             // executed (Create files non-mode-3 jobs into the class-3 queue
@@ -2076,7 +2080,40 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
                 // re-arm cadence only re-triggers rounds (r628 regression);
                 // stay at 10 s.
                 drift += 0.000085;
-                crate::emulator::vtime::sleep_virtual(std::time::Duration::from_millis(10_000));
+                last_post_ms = crate::libs::dapi::emu_t0_elapsed_ms();
+                // r639: keep the 10 s virtual base cadence, but wake in 250 ms
+                // chunks and break out early when the HMI's demo-render handler
+                // restores the Milwaukee camera into `view+0x84` (stamped by
+                // the write watch as CAM_MILWAUKEE_STAMP).  Re-arming Kraków
+                // right behind each Milwaukee write makes the (job, DOM)
+                // centre pair Kraków-aligned in nearly every render cycle, so
+                // the FillActiveMO gate stops being a lottery.  The 700 ms
+                // debounce keeps a burst of Milwaukee writes from stampeding
+                // the request pipeline (r628's round-restart regression).
+                let deadline = std::time::Instant::now()
+                    + crate::emulator::vtime::host_interval(std::time::Duration::from_millis(
+                        10_000,
+                    ));
+                loop {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(250)));
+                    let stamp = crate::libs::procmapengine::CAM_MILWAUKEE_STAMP
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if stamp != seen_stamp {
+                        seen_stamp = stamp;
+                        if echo_backs < 400
+                            && crate::libs::dapi::emu_t0_elapsed_ms()
+                                .saturating_sub(last_post_ms)
+                                >= 700
+                        {
+                            echo_backs += 1;
+                            break;
+                        }
+                    }
+                }
             }
         });
     match result {
