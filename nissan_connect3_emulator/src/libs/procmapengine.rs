@@ -6118,7 +6118,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         if value <= 0x1_0000 {
                             return true;
                         }
-                        let changed = LAST.swap(value, Ordering::Relaxed) != value;
+                        let changed = LAST.swap(value as u32, Ordering::Relaxed) != value as u32;
                         if !changed {
                             return true;
                         }
@@ -6151,7 +6151,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     move |uc, _t, _address, _size, value| {
                         static COUNT: AtomicU32 = AtomicU32::new(0);
                         static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                        if LAST.swap(value, Ordering::Relaxed) == value {
+                        if LAST.swap(value as u32, Ordering::Relaxed) == value as u32 {
                             return true;
                         }
                         if COUNT.fetch_add(1, Ordering::Relaxed) >= 200 {
