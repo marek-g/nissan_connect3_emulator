@@ -2034,8 +2034,16 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
                 // meter 40 (r612): a 34-block view drains its LoadBlocks tail
                 // over ~70 s (one wire round per missing block); a tighter
                 // view fits the whole drain in one nudge interval.
+                // r627: with the camera applied the Render commit
+                // (0x528e3c, guarded by view+0x2e0 != 0) copies the Kraków
+                // centre into the mcp and the FillActiveMO gate PASSES
+                // (elements=12 harvested at t=158810) - but a later Render
+                // pass with view+0x2e0 cleared restores the stale Milwaukee
+                // copy, so the harvest alternates.  A 2.5 s re-arm cadence
+                // keeps the committed centre correct through the render
+                // passes that matter.
                 drift += 0.000085;
-                std::thread::sleep(std::time::Duration::from_millis(10_000));
+                std::thread::sleep(std::time::Duration::from_millis(2_500));
             }
         });
     match result {
