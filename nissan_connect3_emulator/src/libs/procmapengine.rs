@@ -6030,6 +6030,12 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             let page_hi = page_lo + 0xfff;
             let lab_c = lab.clone();
             let cp2_c = cp2.clone();
+            let g590 = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let g591 = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let g592 = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let g590 = g590.clone();
+            let g591 = g591.clone();
+            let g592 = g592.clone();
             unicorn
                 .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
                     let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
@@ -6071,6 +6077,42 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                 res,
                                 count
                             );
+                        }
+                        0x0043_5940u32 => {}
+                        // The three checks between `LAB_00435940` and the
+                        // flag gate at 0x435978, any of which returns before
+                        // the copy branch: GetView result, view->scale (the
+                        // +0x304 slot) and `GetDetailLevel(scale) ==
+                        // stored+0x2c`.  r5 = stored job on this leg.
+                        0x0043_5950u32 => {
+                            let n = g590.fetch_add(1, Ordering::Relaxed);
+                            if n < 12 {
+                                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                                log::info!("PROCMAPENGINE render trace MOUpd gate-view t={}ms view={:#x} n={}", crate::libs::dapi::emu_t0_elapsed_ms(), r0, n);
+                            }
+                        }
+                        0x0043_595cu32 => {
+                            let n = g591.fetch_add(1, Ordering::Relaxed);
+                            if n < 12 {
+                                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                                log::info!("PROCMAPENGINE render trace MOUpd gate-scale t={}ms scale_slot={:#x} n={}", crate::libs::dapi::emu_t0_elapsed_ms(), r0, n);
+                            }
+                        }
+                        0x0043_5974u32 => {
+                            let n = g592.fetch_add(1, Ordering::Relaxed);
+                            if n < 40 {
+                                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                                let job = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                                log::info!(
+                                    "PROCMAPENGINE render trace MOUpd gate-lod t={}ms detail={} joblod={} stored50={:#x} stored28={:#x} n={}",
+                                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                                    r0,
+                                    read_u32_or_invalid(uc, job + 0x2c),
+                                    read_u8_or_invalid(uc, job + 0x50),
+                                    read_u32_or_invalid(uc, job + 0x28),
+                                    n
+                                );
+                            }
                         }
                         0x0043_6014u32 => {
                             let count = cp2_c.fetch_add(1, Ordering::Relaxed);
