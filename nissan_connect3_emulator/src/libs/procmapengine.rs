@@ -6078,6 +6078,48 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         log::warn!("PROCMAPENGINE: req-fetch write watch failed");
                     }
                 }
+                // r610: `LockFreeFastMapChannel` (0x504418) hands out a slot of
+                // `ms_asFastMapChannelInfo` (0x78f81c, 3 entries, stride 0x10,
+                // busy word at +0xc, channel u16 at +0x8, tag u16 at +0xa) and
+                // returns 0xff once all three are busy.  r609b proved the three
+                // slots leak - by the time the block-id round completed
+                // (t=90.6 s) every slot was stuck and the LoadBlocks leg died
+                // with "GetBlockIDs pending Job not finished" forever.  Watch
+                // every write to the table to find the occupation sites and the
+                // missing release.
+                {
+                    use unicorn_engine::unicorn_const::HookType;
+                    let lo = 0x0078_f81cu32 as u64;
+                    let hi = lo + 0x2f;
+                    let st = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let res = unicorn.add_mem_hook(
+                        HookType::MEM_WRITE,
+                        lo,
+                        hi,
+                        move |uc, _t, address, _size, value| {
+                            let count = st.fetch_add(1, Ordering::Relaxed);
+                            if count >= 300 {
+                                return true;
+                            }
+                            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                            let original =
+                                pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                            log::info!(
+                                "PROCMAPENGINE render trace fmchan WRITE t={}ms addr={:#x} value={:#x} pc={:#x} lr={:#x} count={}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                address,
+                                value,
+                                original,
+                                uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                                count
+                            );
+                            true
+                        },
+                    );
+                    if res.is_err() {
+                        log::warn!("PROCMAPENGINE: fmchan write watch failed");
+                    }
+                }
                 // r598: after the promotion marker (0xefffffff) neither
                 // +0x1f4 nor +0x1f8 ever receives a block count - the block-id
                 // round inside `map_tclMapDataManager::GetBlockIDs` (0x507de0,
