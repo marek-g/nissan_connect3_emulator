@@ -1980,7 +1980,7 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
             // view at the same spot.
             std::thread::sleep(std::time::Duration::from_secs(15));
             let mut seq: u16 = 0;
-            let mut drift: f32 = 0.0;
+            let mut drift: f64 = 0.0;
             let queue = "mbx_1024".to_string();
             loop {
                 seq = seq.wrapping_add(1);
