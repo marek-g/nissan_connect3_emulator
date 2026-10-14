@@ -6092,6 +6092,41 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     })
                     .unwrap();
             }
+            // r623: the DOM view rect comes out of
+            // `GlobalViewRect_2D(rect, mcp, matrix)` which reads the mcp
+            // centre at mcp+0x14/+0x18 - observed frozen at the boot default
+            // (0xc4f45dfb, 0x1e3b77c6) while the view's own camera copy
+            // (view+0x84/+0x88) holds the renfi values.  Watch the centre
+            // pair (mcp = view 0xda0bc4 + 0x280 = 0xda0e44) to find who is
+            // supposed to move it.
+            {
+                use unicorn_engine::unicorn_const::HookType;
+                let mcp_c = 0xda0e58u32; // 0xda0bc4 + 0x280 + 0x14
+                let _ = unicorn.add_mem_hook(
+                    HookType::MEM_WRITE,
+                    mcp_c as u64,
+                    mcp_c as u64 + 7,
+                    move |uc, _t, address, size, value| {
+                        static COUNT: AtomicU32 = AtomicU32::new(0);
+                        if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
+                            return true;
+                        }
+                        let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                        let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                        log::warn!(
+                            "PROCMAPENGINE render trace MCP-centre WRITE t={}ms thread=[{}] off=+{:#x} size={} value={:#x} pc={:#x} lr={:#x}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            uc.get_data().inner.thread_id(),
+                            address.wrapping_sub(mcp_c as u64),
+                            size,
+                            value,
+                            pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                            lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE) & !1,
+                        );
+                        true
+                    },
+                );
+            }
             let lab = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let cp2 = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let page_lo = base_address + (0x0043_5000u32 - ORIGINAL_BASE);
