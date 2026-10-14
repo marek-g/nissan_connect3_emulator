@@ -6075,6 +6075,65 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     );
                 })
                 .unwrap();
+            // `FillActiveMOArrayFromRCMapObjectsRequest` (which alone fills the
+            // per-view active-MO array DetermineMapObjects walks) runs only
+            // when the stored job's +0x28 reqstate >= 2; every observed job
+            // stores state 1 ("CentreRect loading INcomplete").  The state
+            // comes from the MDM request at call time:
+            // CreateRCJobMapObjectsUpdate(view_ptr, prio_ptr, state_ptr) -
+            // dump the dereferenced values, plus GetLeftBlocks (0x5054f4, the
+            // only other creator, called from IntHandleMapDataRequest) to see
+            // whether the surround-block round ever runs.
+            {
+                let cj = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let addr = base_address + 0x004c_5bacu32 - ORIGINAL_BASE;
+                unicorn
+                    .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                        let count = cj.fetch_add(1, Ordering::Relaxed);
+                        if count >= 60 {
+                            return;
+                        }
+                        let vp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                        let pp = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                        let sp = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                        log::info!(
+                            "PROCMAPENGINE render trace CreateRCJobMOUpd entry at {:#x}: req={:#x} view={:#x} prio={:#x} state={:#x} lr={:#x} count={:#x}",
+                            addr,
+                            vp.wrapping_sub(4),
+                            read_u32_or_invalid(uc, vp) & 0xff,
+                            read_u32_or_invalid(uc, pp) & 0xff,
+                            read_u32_or_invalid(uc, sp) & 0xffff_ffff,
+                            uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                            count
+                        );
+                    })
+                    .unwrap();
+                let glb = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let addr = base_address + 0x0050_54f4u32 - ORIGINAL_BASE;
+                unicorn
+                    .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                        let count = glb.fetch_add(1, Ordering::Relaxed);
+                        if count >= 30 {
+                            return;
+                        }
+                        let req = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                        let a1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                        let a2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                        log::info!(
+                            "PROCMAPENGINE render trace GetLeftBlocks entry at {:#x}: req={:#x} type={:#x} state74={:#x} out1={:#x} c1={:#x} out2={:#x} c2={:#x} count={:#x}",
+                            addr,
+                            req,
+                            read_u32_or_invalid(uc, req) & 0xff,
+                            read_u32_or_invalid(uc, req + 0x74),
+                            a1,
+                            read_u32_or_invalid(uc, a1),
+                            a2,
+                            read_u32_or_invalid(uc, a2),
+                            count
+                        );
+                    })
+                    .unwrap();
+            }
         }
     }
 
