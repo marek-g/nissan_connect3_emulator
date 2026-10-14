@@ -6178,6 +6178,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         );
                     })
                     .unwrap();
+            }
             // `FillActiveMOArrayFromRCMapObjectsRequest` (which alone fills the
             // per-view active-MO array DetermineMapObjects walks) runs only
             // when the stored job's +0x28 reqstate >= 2; every observed job
