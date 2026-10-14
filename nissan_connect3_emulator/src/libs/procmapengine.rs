@@ -1623,7 +1623,22 @@ fn add_render_thread_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addres
                     };
                     let mut triggered = false;
                     if MAP_VIEW_READY.load(Ordering::Relaxed) {
-                        triggered = trigger_pending_map_render(uc, return_pc, true);
+                        // r648: force_periodic=false.  The periodic re-fire
+                        // of the canned `MapEngine_TriggerPixmapViewRender`
+                        // (113 hits in the first minute of r646) re-armed the
+                        // Flint demo camera (its baked literals), and each
+                        // off-centre rect made `PerformMapDataRequest` reset
+                        // the whole request state machine (0x78fd48 -> 0,
+                        // refetch counters, FreeFastMapChannel), so
+                        // `GetNextDataHandledState` never reached 2,
+                        // `GetLeftBlocks` never captured state 2 into the
+                        // RCMOUPD job (+0x28), and the copy-to-active branch
+                        // (roads -> layer lists) never ran.  The engine pumps
+                        // its own draw jobs through the RndFI lifecycle and
+                        // the renfi camera messages; keep only the initial
+                        // trigger and let the request state machine sit in
+                        // one rect long enough to advance.
+                        triggered = trigger_pending_map_render(uc, return_pc, false);
                     }
                     if !triggered {
                         uc.reg_write(RegisterARM::R0, 0).unwrap_or_default();
@@ -2685,7 +2700,10 @@ fn add_job_queue_wait_skip_hook(unicorn: &mut Unicorn<'_, Context>, base_address
 
             let mut triggered = false;
             if MAP_VIEW_READY.load(Ordering::Relaxed) {
-                triggered = trigger_pending_map_render(uc, lr, true);
+                // r648: periodic Flint trigger disabled, see the
+                // `add_render_job_queue_wait_skip_hook` comment above
+                // (request-state-machine reset storm).
+                triggered = trigger_pending_map_render(uc, lr, false);
             }
             if !triggered {
                 uc.reg_write(RegisterARM::R0, 0).unwrap_or_default();
