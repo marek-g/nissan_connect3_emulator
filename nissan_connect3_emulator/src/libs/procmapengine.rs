@@ -795,6 +795,56 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             .unwrap();
     }
 
+    // r646: `GetLeftBlocks` only fills the RCMOUPD job's MO list when the
+    // raw-data block for a requested block id is already in
+    // `map_tclRawMapDataCache` (global 0x790704: [obj]=count, [obj+0xc]=id
+    // array, entries -> block, block+4/+8 = uid).  Empty cache => empty job
+    // list => `last mo of lod` (job+0x50) stays 0 => the copy-to-active
+    // branch never runs.  Log every ContainsBlockID lookup with the cache
+    // size to see whether the raw blocks ever arrive (LoadBlocks tail).
+    {
+        let probes = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let glo = base_address + (0x0051_5eecu32 - ORIGINAL_BASE);
+        let page_lo = base_address + (0x0051_5000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != glo {
+                    return;
+                }
+                let count = probes.fetch_add(1, Ordering::Relaxed);
+                if count >= 80 {
+                    return;
+                }
+                let uid = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let cache = read_u32_or_invalid(
+                    uc,
+                    base_address + (0x0079_0704u32 - ORIGINAL_BASE),
+                );
+                let uid0 = read_u32_or_invalid(uc, uid);
+                let uid1 = read_u32_or_invalid(uc, uid.wrapping_add(4));
+                let ccount = read_u32_or_invalid(uc, cache);
+                let arr = read_u32_or_invalid(uc, cache.wrapping_add(0xc));
+                let first = read_u32_or_invalid(uc, arr);
+                let first_uid = read_u32_or_invalid(uc, first.wrapping_add(4));
+                log::info!(
+                    "PROCMAPENGINE render trace rawcache-lookup t={}ms thread=[{}] uid={:#x},{:#x} cache={:#x} count={:#x} first={:#x},{:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    uid0,
+                    uid1,
+                    cache,
+                    ccount,
+                    first,
+                    first_uid,
+                    count
+                );
+            })
+            .unwrap();
+    }
+
     if std::env::var_os("EMU_PROCMAPENGINE_TRACE_INIT")
         .is_some_and(|value| !value.is_empty() && value != "0")
     {
@@ -6978,18 +7028,33 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                     uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
                                     count
                                 );
+                                let req = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                                let lodslot = read_u32_or_invalid(uc, req + 0x74);
+                                let n = if lodslot < 8 { lodslot } else { 0 };
+                                let cnt114 = read_u32_or_invalid(uc, req + n * 0x10 + 0x114);
+                                let arr = read_u32_or_invalid(uc, req + n * 0x10 + 0x120);
+                                let id0 = read_u32_or_invalid(uc, arr);
+                                let id0b = read_u32_or_invalid(uc, arr.wrapping_add(4));
+                                let id1 = read_u32_or_invalid(uc, arr.wrapping_add(8));
+                                let id1b = read_u32_or_invalid(uc, arr.wrapping_add(0xc));
+                                let f1f8 = read_u32_or_invalid(uc, req + 0x1f8);
+                                let cache = read_u32_or_invalid(
+                                    uc,
+                                    base_address + (0x0079_0704u32 - ORIGINAL_BASE),
+                                );
+                                let ccount = read_u32_or_invalid(uc, cache);
                                 log::info!(
-                                    "PROCMAPENGINE render trace MDM::GetBlockIDs rows fxa4={:#x} fxa8={:#x} fxb4={:#x} fxb8={:#x} fxac={:#x} fxb0={:#x} fxbc={:#x} fxc0={:#x} fx114={:#x} fx118={:#x}",
-                                    read_u32_or_invalid(uc, req + 0xa4),
-                                    read_u32_or_invalid(uc, req + 0xa8),
-                                    read_u32_or_invalid(uc, req + 0xb4),
-                                    read_u32_or_invalid(uc, req + 0xb8),
-                                    read_u32_or_invalid(uc, req + 0xac),
-                                    read_u32_or_invalid(uc, req + 0xb0),
-                                    read_u32_or_invalid(uc, req + 0xbc),
-                                    read_u32_or_invalid(uc, req + 0xc0),
-                                    read_u32_or_invalid(uc, req + 0x114),
-                                    read_u32_or_invalid(uc, req + 0x118)
+                                    "PROCMAPENGINE render trace MDM::GetBlockIDs rows lod={} cnt114={:#x} arr120={:#x} id0={:#x},{:#x} id1={:#x},{:#x} rawcache={:#x} rawcount={:#x} f1f8={:#x}",
+                                    n,
+                                    cnt114,
+                                    arr,
+                                    id0,
+                                    id0b,
+                                    id1,
+                                    id1b,
+                                    cache,
+                                    ccount,
+                                    f1f8,
                                 );
                             })
                             .unwrap();
