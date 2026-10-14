@@ -921,6 +921,94 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             .unwrap();
     }
 
+    // r649: `GetLeftBlocks` sets the RCMOUPD job's `last mo of lod` byte via
+    // the single store `0x506370 strbne r3,[r7,#0x50]` (r3=1 only when r7,
+    // the job pointer at leg entry 0x506340, is non-null).  r648 reached
+    // state2 (`stored28/new28=0x2`) and a non-empty raw-data cache but
+    // `new50=0` at every Combine - instrument the leg entry (r7, +0x1f4
+    // refetch counter, +0x74 state, block count, the [r8]>1 gate), the two
+    // other Create legs (0x506248/0x506264), the store itself, and
+    // `GetLinkedMapObjectsForRCUse` (0x513a6c) which fills the job's MO list
+    // from a cache-hit block.
+    {
+        let leg = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let t_leg = base_address + (0x0050_6340u32 - ORIGINAL_BASE);
+        let t_store = base_address + (0x0050_6370u32 - ORIGINAL_BASE);
+        let t_c2 = base_address + (0x0050_6248u32 - ORIGINAL_BASE);
+        let t_c3 = base_address + (0x0050_6264u32 - ORIGINAL_BASE);
+        let page_lo = base_address + (0x0050_6000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                let name = match original {
+                    a if a == t_leg => "gbi-leg",
+                    a if a == t_store => "gbi-store50",
+                    a if a == t_c2 => "gbi-create-a",
+                    a if a == t_c3 => "gbi-create-b",
+                    _ => return,
+                };
+                let count = leg.fetch_add(1, Ordering::Relaxed);
+                if count >= 60 {
+                    return;
+                }
+                let req = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                let job = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                let r8v = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+                let state = read_u32_or_invalid(uc, req.wrapping_add(0x74));
+                let n = if state < 8 { state } else { 0 };
+                let cnt114 = read_u32_or_invalid(uc, req.wrapping_add(n * 0x10 + 0x114));
+                let f1f4 = read_u32_or_invalid(uc, req.wrapping_add(0x1f4));
+                let f1f8 = read_u32_or_invalid(uc, req.wrapping_add(0x1f8));
+                let g8 = read_u32_or_invalid(uc, r8v);
+                log::info!(
+                    "PROCMAPENGINE render trace gbl-{name} t={}ms thread=[{}] req={:#x} job={:#x} state74={:#x} cnt114={:#x} f1f4={:#x} f1f8={:#x} r8={:#x}->{:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    req,
+                    job,
+                    state,
+                    cnt114,
+                    f1f4,
+                    f1f8,
+                    r8v,
+                    g8,
+                    count
+                );
+            })
+            .unwrap();
+        let linked = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let t_linked = base_address + (0x0051_3a6cu32 - ORIGINAL_BASE);
+        let page_lo = base_address + (0x0051_3000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != t_linked {
+                    return;
+                }
+                let count = linked.fetch_add(1, Ordering::Relaxed);
+                if count >= 40 {
+                    return;
+                }
+                let block = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let out = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE render trace linked-MO t={}ms thread=[{}] block={:#x} uid={:#x},{:#x} out={:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    block,
+                    read_u32_or_invalid(uc, block.wrapping_add(4)),
+                    read_u32_or_invalid(uc, block.wrapping_add(8)),
+                    out,
+                    count
+                );
+            })
+            .unwrap();
+    }
+
     if std::env::var_os("EMU_PROCMAPENGINE_TRACE_INIT")
         .is_some_and(|value| !value.is_empty() && value != "0")
     {
