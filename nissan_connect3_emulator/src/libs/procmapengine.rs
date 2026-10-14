@@ -5661,6 +5661,55 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             .unwrap();
     }
 
+    // r584/r585: PreRender returns 0 every frame (DTM node lists never
+    // written since the _INIT_8 zeroing), `bUpdateLOD` and
+    // `map_tclMapElm_DTMTextureDummy::Draw` never run, and
+    // UpdateDrawLayerListsForDTM is only called from PreRender's
+    // non-zero branch.  ViewRenderThread (0x530238) then computes
+    // bSkipFrame = (PreProcess | PickFrame | PreRender) == 0 and only calls
+    // map_tclRenderer::Execute (0x52d618, bl at 0x5304c0) plus
+    // rl_tclSurface::Flip (0x5520d8) when a frame is NOT skipped.  Watch all
+    // three to see whether the draw body runs at all and on which surface
+    // (surface = renderer +0x40, r0 of Flip).
+    {
+        let exec = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let addr = base_address + 0x0052_d618u32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = exec.fetch_add(1, Ordering::Relaxed);
+                if count >= 40 {
+                    return;
+                }
+                let renderer = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let renderer_obj = read_u32_or_invalid(uc, renderer.wrapping_add(0x18));
+                log::info!(
+                    "PROCMAPENGINE render trace Renderer::Execute entry at {:#x}: viewctl={:#x} renderer={:#x} surface={:#x} count={:#x}",
+                    addr,
+                    renderer,
+                    renderer_obj,
+                    read_u32_or_invalid(uc, renderer_obj.wrapping_add(0x40)),
+                    count
+                );
+            })
+            .unwrap();
+        let flip = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let addr = base_address + 0x0055_20d8u32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = flip.fetch_add(1, Ordering::Relaxed);
+                if count >= 40 {
+                    return;
+                }
+                log::info!(
+                    "PROCMAPENGINE render trace Surface::Flip entry at {:#x}: surface={:#x} count={:#x}",
+                    addr,
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    count
+                );
+            })
+            .unwrap();
+    }
+
     // Message-map router `PortControl_CCAClientHandlerBase::vDispatchMessage`
     // (0x592454): keys are (u16 svc @inner+0x14, u16 fn @inner+0+0x18) pairs
     // (the map's static seed table at 0x713ea8 holds {0x70006, 0x140006,
