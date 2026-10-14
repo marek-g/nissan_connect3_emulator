@@ -5605,31 +5605,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
     // the 80-byte array (dispatch on the fetch address, per AGENTS.md a page
     // hook is the reliable form) and log those two entries.
     {
-        use unicorn_engine::unicorn_const::HookType;
-        let lo = (base_address + (0x0071_aec8u32 - ORIGINAL_BASE)) as u64;
-        let hi = lo + 79;
-        let writes = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        unicorn
-            .add_mem_hook(HookType::MEM_WRITE, lo, hi, move |uc, _t, address, _size, _value| {
-                let count = writes.fetch_add(1, Ordering::Relaxed);
-                if count >= 60 {
-                    return true;
-                }
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
-                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
-                let index = (address - lo) / 0x10;
-                let off = (address - lo) % 0x10;
-                log::info!(
-                    "PROCMAPENGINE render trace alstActive WRITE addr={:#x} (view {:#x} +{:#x}) pc={:#x} lr={:#x}",
-                    address,
-                    index,
-                    off,
-                    original,
-                    uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
-                );
-                true
-            })
-            .unwrap();
+        // r603: the alstActiveNodes write-watch was removed to keep the host
+        // address-space section budget down (phys_section_add assert at
+        // r603); its question is answered (only _INIT_8 zeroes it).
         let upd = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let addr = base_address + 0x003b_d940u32 - ORIGINAL_BASE;
         unicorn
@@ -5814,39 +5792,8 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 );
             })
             .unwrap();
-        // Per-view scene roots live at ms_pkSceneManager (0xaa53a8, stable
-        // across runs) + 0x44..0x54; both DetermineMapObjects and
-        // UpdateDrawLayerListsForDTM bail while they are null.  Watch the
-        // field range to find who (if anybody) creates them.
-        {
-            use unicorn_engine::unicorn_const::HookType;
-            let lo = 0x00aa_53ecu32 as u64;
-            let hi = lo + 0x14;
-            let roots = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let res = unicorn.add_mem_hook(
-                HookType::MEM_WRITE,
-                lo,
-                hi,
-                move |uc, _t, address, _size, _value| {
-                    let count = roots.fetch_add(1, Ordering::Relaxed);
-                    if count >= 20 {
-                        return true;
-                    }
-                    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
-                    let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
-                    log::info!(
-                        "PROCMAPENGINE render trace scene-root WRITE addr={:#x} pc={:#x} lr={:#x}",
-                        address,
-                        original,
-                        uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
-                    );
-                    true
-                },
-            );
-            if res.is_err() {
-                log::warn!("PROCMAPENGINE: scene-root write watch failed");
-            }
-        }
+        // r603: the scene-root write-watch answered its question (roots exist
+        // at 0x9083e068..) and was removed to keep the host section budget down.
         // `DetermineMapObjects` only inserts MOs into the DTM grid when the
         // per-view cell array (scene+0x30+view*4, `*count` there) is non-zero;
         // those arrays are fed by the raw data blocks created from the
@@ -5946,84 +5893,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     );
                 })
                 .unwrap();
-            // The two per-[lod][idx] RC-job arrays at scene+0x84..0xd3 and
-            // scene+0xd4..0x123 (scene stable at 0xaa53a8).
-            use unicorn_engine::unicorn_const::HookType;
-            let jobs = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            for (lo, hi, tag) in [
-                (0x00aa_542cu32, 0x00aa_547cu32, "jobArrayA(+0x84)"),
-                (0x00aa_547cu32, 0x00aa_54ccu32, "jobArrayB(+0xd4)"),
-            ] {
-                let cnt = jobs.fetch_add(0, Ordering::Relaxed);
-                let tag = tag;
-                let arc = {
-                    // separate counter per range via fetch on the same Arc is
-                    // fine: just cap globally at 40.
-                    let a = std::sync::Arc::clone(&jobs);
-                    a
-                };
-                let _ = cnt;
-                let res = unicorn.add_mem_hook(
-                    HookType::MEM_WRITE,
-                    lo as u64,
-                    hi as u64,
-                    move |uc, _t, address, _size, value| {
-                        let count = arc.fetch_add(1, Ordering::Relaxed);
-                        if count >= 40 {
-                            return true;
-                        }
-                        let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
-                        let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
-                        log::info!(
-                            "PROCMAPENGINE render trace scene-job-array WRITE[{}] addr={:#x} value={:#x} pc={:#x} lr={:#x}",
-                            tag,
-                            address,
-                            value,
-                            original,
-                            uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
-                        );
-                        true
-                    },
-                );
-                if res.is_err() {
-                    log::warn!("PROCMAPENGINE: scene-job-array write watch failed");
-                }
-            }
-            // Third camera-viewpoint array (+0x124) and the setter:
-            // MapObjectsUpdate case 5 calls SetCameraViewPointMOs(scene,
-            // array, job, view, lod) at 0x435924 for reqstate 1..2 only when
-            // view<=4 && lod<=3; otherwise it branches to 0x435d78.  The
-            // setter stores the job into array[(lod + view*4)*4] on the empty
-            // slot path (LAB_00432c14).  Watch entry args and the else leg.
-            {
-                let lo = 0x00aa_54ccu32 as u64;
-                let hi = lo + 0x14;
-                let cnt = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-                let res = unicorn.add_mem_hook(
-                    HookType::MEM_WRITE,
-                    lo,
-                    hi,
-                    move |uc, _t, address, _size, value| {
-                        let count = cnt.fetch_add(1, Ordering::Relaxed);
-                        if count >= 20 {
-                            return true;
-                        }
-                        let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
-                        let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
-                        log::info!(
-                            "PROCMAPENGINE render trace scene-job-array WRITE[jobArrayC(+0x124)] addr={:#x} value={:#x} pc={:#x} lr={:#x}",
-                            address,
-                            value,
-                            original,
-                            uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
-                        );
-                        true
-                    },
-                );
-                if res.is_err() {
-                    log::warn!("PROCMAPENGINE: jobArrayC write watch failed");
-                }
-            }
+            // r603: the jobArray A/B/C write-watches were removed (the
+            // SetCameraViewPointMOs entry probe shows the slot contents
+            // directly) to keep the host section budget down.
             let setp = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let addr = base_address + 0x0043_2b44u32 - ORIGINAL_BASE;
             unicorn
