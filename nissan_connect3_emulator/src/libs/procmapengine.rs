@@ -6109,13 +6109,20 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     mcp_c as u64 + 7,
                     move |uc, _t, address, size, value| {
                         static COUNT: AtomicU32 = AtomicU32::new(0);
-                        // r624: the r623 cap of 60 was exhausted by the init
+                        static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        // r623: the r623 cap of 60 was exhausted by the init
                         // chatter (screen-size writes below 0x10000) before
                         // the interesting window; skip the small values.
-                        if value > 0x1_0000 && COUNT.fetch_add(1, Ordering::Relaxed) >= 300 {
+                        // r626b: r626's 300-cap was eaten by the identical
+                        // every-frame stale writes - log only value CHANGES.
+                        if value <= 0x1_0000 {
                             return true;
                         }
-                        if value <= 0x1_0000 {
+                        let changed = LAST.swap(value, Ordering::Relaxed) != value;
+                        if !changed {
+                            return true;
+                        }
+                        if COUNT.fetch_add(1, Ordering::Relaxed) >= 300 {
                             return true;
                         }
                         let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
@@ -6126,6 +6133,36 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                             uc.get_data().inner.thread_id(),
                             address.wrapping_sub(mcp_c as u64),
                             size,
+                            value,
+                            pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                            lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE) & !1,
+                        );
+                        true
+                    },
+                );
+                // r626b: the Render commit `view+0x84/0x88 -> mcp+0x38/0x3c`
+                // (the camera copy, 0x528e3c) runs only when the float at
+                // view+0x2e0 is non-zero (guard `vcmp s15,#0 / beq 0x529914`
+                // at 0x528e14).  Watch it to learn what makes it live.
+                let _ = unicorn.add_mem_hook(
+                    HookType::MEM_WRITE,
+                    0xda0ea4u64, // 0xda0bc4 + 0x2e0
+                    0xda0ea4u64 + 3,
+                    move |uc, _t, _address, _size, value| {
+                        static COUNT: AtomicU32 = AtomicU32::new(0);
+                        static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if LAST.swap(value, Ordering::Relaxed) == value {
+                            return true;
+                        }
+                        if COUNT.fetch_add(1, Ordering::Relaxed) >= 200 {
+                            return true;
+                        }
+                        let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                        let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                        log::warn!(
+                            "PROCMAPENGINE render trace VIEW-2e0 WRITE t={}ms thread=[{}] value={:#x} pc={:#x} lr={:#x}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            uc.get_data().inner.thread_id(),
                             value,
                             pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
                             lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE) & !1,
