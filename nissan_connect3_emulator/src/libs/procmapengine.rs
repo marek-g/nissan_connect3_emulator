@@ -1151,6 +1151,50 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             .unwrap();
     }
 
+    // r658: which leg does `map_tclJobRCRenderPixmapView::Execute` take?  r657
+    // shows the kick jobs taken (GetPeekedElement x14) with zero GL, so
+    // Execute must bail before RenderView.  Probe the four decision legs:
+    // mapstate error (0x4d6218), GetView==0 (0x4d6234, r0 = view), the
+    // view+0xf50 test (0x4d6248, r0 = view), the draw leg (0x4d6500) and the
+    // phase-B re-queue leg (0x4d62cc).
+    {
+        let ex_legs = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let page_lo = base_address + (0x004d_6000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                let name = match original {
+                    0x004d_6234u32 => "getview1",
+                    0x004d_6248u32 => "f50-test",
+                    0x004d_6500u32 => "draw-leg",
+                    0x004d_62ccu32 => "phaseB",
+                    0x004d_6218u32 => "bad-mapstate",
+                    _ => return,
+                };
+                let count = ex_legs.fetch_add(1, Ordering::Relaxed);
+                if count >= 60 {
+                    return;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let f50 = if r0 == 0 || r0 == u32::MAX {
+                    u32::MAX
+                } else {
+                    read_u32_or_invalid(uc, r0.wrapping_add(0xf50))
+                };
+                log::info!(
+                    "PROCMAPENGINE render trace rpex-{name} t={}ms thread=[{}] r0={:#x} f50={:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    r0,
+                    f50,
+                    count,
+                );
+            })
+            .unwrap();
+    }
+
     if std::env::var_os("EMU_PROCMAPENGINE_TRACE_INIT")
         .is_some_and(|value| !value.is_empty() && value != "0")
     {
