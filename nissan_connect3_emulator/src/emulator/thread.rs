@@ -69,6 +69,11 @@ pub enum BlockReason {
     FutexWaitShared {
         id: usize,
         deadline: Option<Instant>,
+        /// the deadline was synthesized by the emulator watchdog (the guest
+        /// asked for an open-ended wait): on expiry the word is zeroed as if
+        /// the owner died (see `SystemNamespace::futex_steal_shared`), not
+        /// reported as -ETIMEDOUT.
+        watchdog: bool,
     },
     SleepUntil(Instant),
     /// waiting in mq_timedsend for a free slot on the queue
@@ -161,7 +166,7 @@ impl BlockReason {
     pub fn name(&self) -> String {
         match self {
             BlockReason::FutexWait { addr, deadline } => format!("futex@{addr:#x}{}", if deadline.is_some() { "/to" } else { "" }),
-            BlockReason::FutexWaitShared { id, deadline } => format!("futex-shared[{id}]{}", if deadline.is_some() { "/to" } else { "" }),
+            BlockReason::FutexWaitShared { id, deadline, .. } => format!("futex-shared[{id}]{}", if deadline.is_some() { "/to" } else { "" }),
             BlockReason::SleepUntil(_) => "sleep".to_string(),
             BlockReason::MqSend { queue_id, .. } => format!("mqsend[{queue_id}]"),
             BlockReason::MqReceive { queue_id, .. } => format!("mqreceive[{queue_id}]"),

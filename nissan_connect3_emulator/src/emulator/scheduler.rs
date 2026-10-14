@@ -469,18 +469,30 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
                     set_runnable(unicorn, tid, Some(-110i32 as u32)); // -ETIMEDOUT
                 }
             }
-            BlockReason::FutexWaitShared { id, deadline } => {
+            BlockReason::FutexWaitShared { id, deadline, watchdog } => {
                 // a shared-memory futex (e.g. a POSIX named semaphore): woken by
                 // any process' FUTEX_WAKE (signalled in the global registry), or
                 // timed out. The registry entry is reaped here, in this owner.
                 let outcome = {
                     let mut ns = namespace.lock().unwrap();
                     match ns.futex_poll_shared(id) {
-                        crate::os::syscalls::namespace::SharedFutexPoll::Woken => Some(0u32),
+                        crate::os::syscalls::namespace::SharedFutexPoll::Woken => Some(Ok(0u32)),
                         crate::os::syscalls::namespace::SharedFutexPoll::Waiting => {
                             if deadline.map(|d| d <= now).unwrap_or(false) {
-                                ns.futex_remove_shared(id);
-                                Some(-110i32 as u32) // -ETIMEDOUT
+                                if watchdog {
+                                    // Dead-owner repair: the guest asked for an
+                                    // open-ended wait, so the deadline is the
+                                    // emulator watchdog. Zero the mutex word in
+                                    // the shared host buffer (this owner's
+                                    // mapping is host-ptr backed, so the write
+                                    // is coherent for every process) and wake
+                                    // with success; the guest's lock retry then
+                                    // takes the uncontended word.
+                                    ns.futex_steal_shared(id).map(Err).or(Some(Ok(0u32)))
+                                } else {
+                                    ns.futex_remove_shared(id);
+                                    Some(Ok(-110i32 as u32)) // -ETIMEDOUT
+                                }
                             } else {
                                 None
                             }
@@ -488,8 +500,23 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
                         crate::os::syscalls::namespace::SharedFutexPoll::Gone => None,
                     }
                 };
-                if let Some(result) = outcome {
-                    set_runnable(unicorn, tid, Some(result));
+                match outcome {
+                    Some(Ok(result)) => set_runnable(unicorn, tid, Some(result)),
+                    Some(Err(uaddr)) => {
+                        // `uaddr` is this owner's VA into the host-backed shm
+                        // region; zeroing it clears the lost unlock globally.
+                        if unicorn.mem_write(uaddr as u64, &[0u8; 4]).is_err() {
+                            log::warn!(
+                                "[{tid}] shared-futex watchdog: failed to zero word {uaddr:#x}"
+                            );
+                        } else {
+                            log::warn!(
+                                "[{tid}] shared-futex watchdog: zeroed stuck word {uaddr:#x} after 20 s grace (dead-owner repair)"
+                            );
+                        }
+                        set_runnable(unicorn, tid, Some(0u32));
+                    }
+                    None => {}
                 }
             }
             BlockReason::MqSend { .. } | BlockReason::MqReceive { .. } => {

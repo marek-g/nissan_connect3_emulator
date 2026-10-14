@@ -19,6 +19,9 @@ use std::sync::Arc;
 /// entry (and makes its guest thread runnable) the next time it runs.
 struct SharedFutexWaiter {
     key: (String, u32),
+    /// Guest virtual address of the futex word (used by the deadlock-break
+    /// watchdog to zero a mutex whose owner died - robust-futex semantics).
+    uaddr: u32,
     signaled: bool,
 }
 
@@ -73,18 +76,36 @@ impl SystemNamespace {
 
     /// Enqueue a wait on a shared-memory futex word; returns the waiter id that
     /// the caller records in the thread's `BlockReason::FutexWaitShared`.
-    pub fn futex_wait_shared(&mut self, key: (String, u32)) -> usize {
+    pub fn futex_wait_shared(&mut self, key: (String, u32), uaddr: u32) -> usize {
         let id = self.next_futex_waiter;
         self.next_futex_waiter += 1;
         self.futex_slab.insert(
             id,
             SharedFutexWaiter {
                 key: key.clone(),
+                uaddr,
                 signaled: false,
             },
         );
         self.futex_by_key.entry(key).or_default().push_back(id);
         id
+    }
+
+    /// Deadline watchdog reaping: drop the waiter and hand back the futex word
+    /// address so the caller (the owner process' host thread, which sees the
+    /// word through its own address space) can zero it and let the waiter
+    /// re-acquire a mutex whose holder never returns (dead-owner repair -
+    /// Linux does this via robust lists, which this guest never populated).
+    pub fn futex_steal_shared(&mut self, id: usize) -> Option<u32> {
+        let waiter = self.futex_slab.remove(&id);
+        let waiter = waiter?;
+        if let Some(queue) = self.futex_by_key.get_mut(&waiter.key) {
+            queue.retain(|&x| x != id);
+            if queue.is_empty() {
+                self.futex_by_key.remove(&waiter.key);
+            }
+        }
+        Some(waiter.uaddr)
     }
 
     /// Signal up to `val` pending waiters of a shared futex word. Returns how
