@@ -98,6 +98,8 @@ thread_local! {
     /// Synthesized source waiting for `glCompileShader` after a
     /// `glShaderBinary` substitution.
     static GL_SYNTH_SHADER_SOURCE: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
+    /// Caps the map-target matrix-upload trace.
+    static MATRIX_LOG_SEEN: Cell<u32> = const { Cell::new(0) };
     static API_LOG_COUNT: Cell<u32> = const { Cell::new(0) };
     static REAL_GL_OUTPUT_LOG_COUNT: Cell<u32> = const { Cell::new(0) };
     static EGL_CURRENT_API: Cell<u32> = const { Cell::new(EGL_OPENGL_ES_API) };
@@ -2639,6 +2641,36 @@ fn route_uniform_matrix(unicorn: &mut Unicorn<'_, Context>, components: usize) -
     let count = ureg(unicorn, RegisterARM::R1).min(65536) as i32;
     let transpose = ureg(unicorn, RegisterARM::R2) as u8;
     let values_ptr = ureg(unicorn, RegisterARM::R3);
+    if current_gpu_target() == GpuTarget::Map {
+        let seen = MATRIX_LOG_SEEN.with(|c| {
+            let old = c.get();
+            c.set(old.wrapping_add(1));
+            old
+        });
+        if seen < 60 {
+            let probe =
+                read_f32_array(unicorn, values_ptr, components.min(16));
+            let tail = read_f32_array(unicorn, values_ptr, components.max(4))
+                .drain((components.saturating_sub(4)).min(components)..)
+                .take(4)
+                .collect::<Vec<f32>>();
+            log::info!(
+                "PROCMAPENGINE GPU trace matrix upload t={}ms loc={} n={} comps={} m0=[{:.1},{:.1},{:.1},{:.1}] translate=[{:.1},{:.1},{:.1},{:.1}]",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                loc,
+                count,
+                components,
+                probe.first().copied().unwrap_or(0.0),
+                probe.get(1).copied().unwrap_or(0.0),
+                probe.get(2).copied().unwrap_or(0.0),
+                probe.get(3).copied().unwrap_or(0.0),
+                tail.first().copied().unwrap_or(0.0),
+                tail.get(1).copied().unwrap_or(0.0),
+                tail.get(2).copied().unwrap_or(0.0),
+                tail.get(3).copied().unwrap_or(1.0),
+            );
+        }
+    }
     let values = read_f32_array(unicorn, values_ptr, (count.max(0) as usize).saturating_mul(components));
     gpu_void_clear(move || unsafe {
         let ptr = if values.is_empty() {

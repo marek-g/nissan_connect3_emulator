@@ -1226,13 +1226,21 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                 } else {
                     read_cstring(uc, name_ptr)
                 };
+                // Resolve the uniform locations the engine will upload the
+                // clip matrices to (u_matViewProj at +0x4, u_matModelView at
+                // +0x8 - see `vFindUniformLocations` name table) so the
+                // `glUniformMatrix4fv` trace can be correlated with them.
+                let loc_vp = read_u32_or_invalid(uc, slot.wrapping_add(0x4));
+                let loc_mv = read_u32_or_invalid(uc, slot.wrapping_add(0x8));
                 log::info!(
-                    "PROCMAPENGINE render trace dtm-shader t={}ms thread=[{}] slot={:#x} handle={:#x} name={} mcp={:#x} lod={:#x} n={}",
+                    "PROCMAPENGINE render trace dtm-shader t={}ms thread=[{}] slot={:#x} handle={:#x} name={} loc_vp={:#x} loc_mv={:#x} mcp={:#x} lod={:#x} n={}",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     uc.get_data().inner.thread_id(),
                     slot,
                     r3,
                     name,
+                    loc_vp,
+                    loc_mv,
                     r6,
                     read_u8_or_invalid(uc, r6.wrapping_add(5)),
                     count,
