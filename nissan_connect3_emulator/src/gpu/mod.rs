@@ -2,7 +2,7 @@ use crate::emulator::context::Context;
 use sdl2::event::Event;
 use sdl2::video::Window;
 use sdl2::{sys, EventPump};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::collections::HashMap;
 use std::io::Write;
@@ -60,8 +60,44 @@ struct GpuCommand {
     reply: mpsc::Sender<GpuOutput>,
 }
 
+/// GLSL ES sources substituted for the map engine's precompiled (Vivante
+/// `glShaderBinary`) shader blobs, which no other GPU can load.  The map
+/// engine's `rl_tclOpenGLShader` resolves *all* of its interface by name
+/// (`vFindUniformLocations`/`vFindAttribLocations` via
+/// `glGetActiveUniform`/`glGetUniformLocation`), so a synthesized program
+/// only has to declare the engine's own attribute/uniform vocabulary:
+/// `a_position`/`a_color` (see the table at 0x68b960) and `u_matModelView`/
+/// `u_matViewProj` (uploaded by `rl_tclOpenGLShader::vUpdateShaderUniforms`
+/// into program-slot offsets +0xec/+0xf0).  r659: street elements draw with
+/// an empty slot 0x19 (`shd_42100000.glsl` is a `[BinaryShader]` manifest
+/// only), binding 526 VBOs but reaching no `glDraw*`.
+const SYNTH_VERT_SHADER: &str = "attribute vec4 a_position;
+attribute vec4 a_color;
+uniform mat4 u_matModelView;
+uniform mat4 u_matViewProj;
+varying vec4 v_color;
+void main() {
+    gl_Position = u_matViewProj * (u_matModelView * a_position);
+    v_color = a_color;
+}
+";
+const SYNTH_FRAG_SHADER: &str = "precision mediump float;
+varying vec4 v_color;
+void main() {
+    gl_FragColor = v_color;
+}
+";
+
+const GL_VERTEX_SHADER_TYPE: u32 = 0x8b31;
+
 thread_local! {
     static PENDING_GL_ERROR: Cell<bool> = const { Cell::new(false) };
+    /// `glCreateShader` type per shader object, so `glShaderBinary` can tell
+    /// vertex from fragment.
+    static GL_SHADER_STAGES: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
+    /// Synthesized source waiting for `glCompileShader` after a
+    /// `glShaderBinary` substitution.
+    static GL_SYNTH_SHADER_SOURCE: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
     static API_LOG_COUNT: Cell<u32> = const { Cell::new(0) };
     static REAL_GL_OUTPUT_LOG_COUNT: Cell<u32> = const { Cell::new(0) };
     static EGL_CURRENT_API: Cell<u32> = const { Cell::new(EGL_OPENGL_ES_API) };
@@ -2857,7 +2893,23 @@ fn route_tex_sub_image2d(unicorn: &mut Unicorn<'_, Context>) -> u32 {
 fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32> {
     match name {
         "glShaderBinary" => {
-            PENDING_GL_ERROR.with(|flag| flag.set(true));
+            // The engine hands us GPU-specific precompiled binaries (Vivante)
+            // that the host driver must reject; substitute a GLSL ES source
+            // for the shader object instead (see `SYNTH_VERT_SHADER`).
+            let count = ureg(unicorn, RegisterARM::R0).min(64);
+            let shaders = ureg(unicorn, RegisterARM::R1);
+            for i in 0..count {
+                let id = read_u32(unicorn, shaders.wrapping_add(i * 4));
+                if id == 0 || id == u32::MAX {
+                    continue;
+                }
+                let stage = GL_SHADER_STAGES.with(|m| m.borrow().get(&id).copied());
+                let source = match stage {
+                    Some(GL_VERTEX_SHADER_TYPE) => SYNTH_VERT_SHADER,
+                    _ => SYNTH_FRAG_SHADER,
+                };
+                GL_SYNTH_SHADER_SOURCE.with(|m| m.borrow_mut().insert(id, source.to_string()));
+            }
             return Some(0);
         }
         "glDrawArrays" => {
@@ -3131,14 +3183,37 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
         }
         "glCreateShader" => {
             GL_LIVE_SHADERS.fetch_add(1, Ordering::Relaxed);
-            return gpu_ret_u1(gl::CreateShader, ureg(unicorn, RegisterARM::R0));
+            let kind = ureg(unicorn, RegisterARM::R0);
+            let created = gpu_ret_u1(gl::CreateShader, kind);
+            if let Some(id) = created {
+                if id != 0 {
+                    GL_SHADER_STAGES.with(|m| m.borrow_mut().insert(id, kind));
+                }
+            }
+            return created;
         }
         "glCreateProgram" => {
             GL_LIVE_PROGRAMS.fetch_add(1, Ordering::Relaxed);
             return gpu_ret_u0(gl::CreateProgram);
         }
         "glCompileShader" => {
-            gpu_void_v1(gl::CompileShader, ureg(unicorn, RegisterARM::R0));
+            let id = ureg(unicorn, RegisterARM::R0);
+            let synth = GL_SYNTH_SHADER_SOURCE.with(|m| m.borrow_mut().remove(&id));
+            if let Some(source) = synth {
+                match CString::new(source) {
+                    Ok(cstring) => {
+                        gpu_void_clear(move || unsafe {
+                            let pointer = cstring.as_ptr();
+                            let length = cstring.as_bytes().len() as i32;
+                            gl::ShaderSource(id, 1, &pointer, &length);
+                            gl::CompileShader(id);
+                        });
+                    }
+                    Err(_) => {}
+                }
+                return Some(0);
+            }
+            gpu_void_v1(gl::CompileShader, id);
             return Some(0);
         }
         "glDeleteProgram" => {
@@ -3146,7 +3221,10 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
             return Some(0);
         }
         "glDeleteShader" => {
-            gpu_void_v1(gl::DeleteShader, ureg(unicorn, RegisterARM::R0));
+            let id = ureg(unicorn, RegisterARM::R0);
+            GL_SHADER_STAGES.with(|m| m.borrow_mut().remove(&id));
+            GL_SYNTH_SHADER_SOURCE.with(|m| m.borrow_mut().remove(&id));
+            gpu_void_v1(gl::DeleteShader, id);
             return Some(0);
         }
         "glCheckFramebufferStatus" => {
