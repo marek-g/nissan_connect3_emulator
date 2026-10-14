@@ -2110,6 +2110,11 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
                                 >= 700
                         {
                             echo_backs += 1;
+                            if echo_backs <= 40 {
+                                log::info!(
+                                    "PROCNAV: renfi echo-back #{echo_backs} (milwaukee stamp seen, re-arming Krakow next post)"
+                                );
+                            }
                             break;
                         }
                     }
