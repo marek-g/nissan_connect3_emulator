@@ -2016,7 +2016,7 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
                 // armed a redundant request whose late Execute (job queue
                 // congestion, +28 s in r608) alternated the request content
                 // and reset the accepted 34-block round mid-flight.  Instead,
-                // re-arm the camera every 15 s with a micro drift (0.000085
+                // re-arm the camera every 10 s with a micro drift (0.000085
                 // deg ~ 0x400 map units per step, always inside one 0x10000
                 // rounding cell): the nudge changes the request content (so
                 // `PerformMapDataRequest` re-runs and `MDM::GetBlockIDs` is
@@ -2031,7 +2031,7 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
                 // over ~70 s (one wire round per missing block); a tighter
                 // view fits the whole drain in one nudge interval.
                 drift += 0.000085;
-                std::thread::sleep(std::time::Duration::from_millis(15_000));
+                std::thread::sleep(std::time::Duration::from_millis(10_000));
             }
         });
     match result {
