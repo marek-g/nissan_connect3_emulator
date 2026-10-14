@@ -6170,6 +6170,39 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         log::warn!("PROCMAPENGINE: req-state write watch failed");
                     }
                 }
+                // The request static (0x78fcd4) tracks outstanding work at
+                // +0x1f4/+0x1f8 ("LeftToFetch: %d/%d") and per-state block
+                // rows at +state*0x10+0x114.  Dump them on every
+                // IntHandleMapDataRequest to see whether LeftToFetch ever
+                // drains to 0 (which should promote +0x74 past 1).
+                {
+                    let ihm = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let addr = base_address + 0x0051_16d4u32 - ORIGINAL_BASE;
+                    unicorn
+                        .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                            let count = ihm.fetch_add(1, Ordering::Relaxed);
+                            if count >= 60 {
+                                return;
+                            }
+                            let req = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                            // The camera-viewpoint request is the static at
+                            // 0x78fcd4; dump it directly (r0 is a byte arg).
+                            let req_static = 0x0078_fcd4u32;
+                            log::info!(
+                                "PROCMAPENGINE render trace IntHandleMapDataRequest entry at {:#x}: r0={:#x} state74={:#x} f114={:#x} f118={:#x} f1f4={:#x} f1f8={:#x} f200={:#x} count={:#x}",
+                                addr,
+                                req,
+                                read_u32_or_invalid(uc, req_static + 0x74),
+                                read_u32_or_invalid(uc, req_static + 0x114),
+                                read_u32_or_invalid(uc, req_static + 0x118),
+                                read_u32_or_invalid(uc, req_static + 0x1f4),
+                                read_u32_or_invalid(uc, req_static + 0x1f8),
+                                read_u32_or_invalid(uc, req_static + 0x200),
+                                count
+                            );
+                        })
+                        .unwrap();
+                }
             }
         }
     }
