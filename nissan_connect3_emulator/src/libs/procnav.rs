@@ -2007,7 +2007,7 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
             let mut seq: u16 = 0;
             let mut drift: f64 = 0.0;
             // r639 echo-back bookkeeping (host-ms clock, matches the stamp).
-            let mut last_post_ms: u64 = 0;
+            let mut last_post_ms: u128 = 0;
             let mut seen_stamp: u64 = 0;
             let mut echo_backs: u32 = 0;
             let queue = "mbx_1024".to_string();

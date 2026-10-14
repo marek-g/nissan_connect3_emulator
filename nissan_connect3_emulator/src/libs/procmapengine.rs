@@ -6259,7 +6259,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         // renfi echo-back (see CAM_MILWAUKEE_STAMP).
                         if value as u32 == 0xc4f4_5dfb {
                             CAM_MILWAUKEE_STAMP
-                                .store(crate::libs::dapi::emu_t0_elapsed_ms(), Ordering::Relaxed);
+                                .store(crate::libs::dapi::emu_t0_elapsed_ms() as u64, Ordering::Relaxed);
                         }
                         static COUNT: AtomicU32 = AtomicU32::new(0);
                         static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
