@@ -2130,16 +2130,22 @@ fn bridge_mbx_queue(
             stamp_registration_id(name, &mut body);
             trace_dapi_map_service_data(name, &body);
             stamp_unique_id_for_receiver(name, &mut body);
-            // First answered GetBlockIDs on (engine, svc 0x26) proves the
-            // registration pair is fully stamped; that is the moment the
-            // missing CCA directory would announce the service to the
-            // engine. Emit the AVAILABLE/operational publishes now.
+            // The stamped RegisterConf (class 0x43) on the engine's mailbox
+            // proves the (engine, svc 0x26) registration pair carries its
+            // final id; that is the moment the missing CCA directory would
+            // announce the service to the engine. Emit the publishes there,
+            // not on the first answered GetBlockIDs: r608 showed the
+            // answer-triggered pair consumed ~30 s after posting, its
+            // `OnUpdateServiceStateDAPIFastmap` reset jobs landing exactly on
+            // top of the accepted 34-block round. Triggering on the conf lets
+            // those two resets land while the request is still young.
+            // The class-0x45 leg stays as a fallback (once-guarded).
             if name == "mbx_1024"
                 && body.len() >= 0x1c
-                && body[0xb] == 0x45
+                && matches!(body[0xb], 0x43 | 0x45)
                 && u16::from_le_bytes([body[2], body[3]]) == 0x0400
                 && u16::from_le_bytes([body[0x14], body[0x15]]) == 0x0026
-                && body[0x1a] == 0x07
+                && (body[0xb] == 0x43 || body[0x1a] == 0x07)
             {
                 post_engine_fastmap_service_status(
                     unicorn,
