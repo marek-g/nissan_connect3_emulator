@@ -6027,7 +6027,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             let lab = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let cp2 = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let page_lo = base_address + (0x0043_5000u32 - ORIGINAL_BASE);
-            let page_hi = page_lo + 0xfff;
+            // r614: the copy branch target 0x436014 sits on the NEXT page -
+            // cover 0x435000..0x436fff so its dispatch fires too.
+            let page_hi = page_lo + 0x1fff;
             let lab_c = lab.clone();
             let cp2_c = cp2.clone();
             let g590 = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -6132,6 +6134,50 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     }
                 })
                 .unwrap();
+            // r616: `DetermineMapObjects` (0x430f34) calls
+            // `PerformLocalUpdateOfMapObjects` at 0x4317b8 - the harvest step
+            // that feeds the per-frame element lists - but five branches skip
+            // it: `mcp[0xaa] == 0` (update-request leg, lands at 0x4328b4),
+            // the two active-inside arrays being NULL (0x432a44 / 0x432a50)
+            // and the visible/POI arrays being NULL (0x43186c, shared exit).
+            // 0x431718 marks the leg that proceeds towards the PLU call.
+            // One hook spans both pages (0x431000..0x432fff).
+            {
+                let domskip = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let page_lo = base_address + (0x0043_1000u32 - ORIGINAL_BASE);
+                let page_hi = page_lo + 0x1fff;
+                let sk = domskip.clone();
+                unicorn
+                    .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                        let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                        let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                        if !matches!(
+                            original,
+                            0x0043_1718u32
+                                | 0x0043_186cu32
+                                | 0x0043_28b4u32
+                                | 0x0043_2a44u32
+                                | 0x0043_2a50u32
+                        ) {
+                            return;
+                        }
+                        let n = sk.fetch_add(1, Ordering::Relaxed);
+                        if n >= 200 {
+                            return;
+                        }
+                        let mcp = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
+                        let view = read_u8_or_invalid(uc, mcp + 5);
+                        log::info!(
+                            "PROCMAPENGINE render trace DOM-leg t={}ms leg={:#x} mcp={:#x} mcpaa={:#x} view={} n={}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            original,
+                            mcp,
+                            read_u8_or_invalid(uc, mcp + 0xaa),
+                            view,
+                            n
+                        );
+                    })
+                    .unwrap();
             // `FillActiveMOArrayFromRCMapObjectsRequest` (which alone fills the
             // per-view active-MO array DetermineMapObjects walks) runs only
             // when the stored job's +0x28 reqstate >= 2; every observed job
