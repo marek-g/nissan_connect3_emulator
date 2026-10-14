@@ -5765,17 +5765,29 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 }
                 let scene = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 log::info!(
-                    "PROCMAPENGINE render trace PreProcess->DetermineMapObjects call site {:#x}: scene={:#x} mcp={:#x} rect={:#x} lists={:#x} roots=[{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                    "PROCMAPENGINE render trace PreProcess->DetermineMapObjects call site {:#x}: scene={:#x} mcp={:#x} rect={:#x} lists={:#x} f8={:#x} f10={:#x} f14={:#x} f1c={:#x} f20={:#x} f30={:#x} f34={:#x} f38={:#x} roots=[{:#x},{:#x},{:#x},{:#x},{:#x}] rectv=[{:#x},{:#x},{:#x},{:#x}]",
                     original,
                     scene,
                     uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
                     uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
                     uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
+                    read_u32_or_invalid(uc, scene + 8),
+                    read_u32_or_invalid(uc, scene + 0x10),
+                    read_u32_or_invalid(uc, scene + 0x14),
+                    read_u32_or_invalid(uc, scene + 0x1c),
+                    read_u32_or_invalid(uc, scene + 0x20),
+                    read_u32_or_invalid(uc, scene + 0x30),
+                    read_u32_or_invalid(uc, scene + 0x34),
+                    read_u32_or_invalid(uc, scene + 0x38),
                     read_u32_or_invalid(uc, scene + 0x44),
                     read_u32_or_invalid(uc, scene + 0x48),
                     read_u32_or_invalid(uc, scene + 0x4c),
                     read_u32_or_invalid(uc, scene + 0x50),
-                    read_u32_or_invalid(uc, scene + 0x54)
+                    read_u32_or_invalid(uc, scene + 0x54),
+                    read_u32_or_invalid(uc, uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32),
+                    read_u32_or_invalid(uc, uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32 + 4),
+                    read_u32_or_invalid(uc, uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32 + 8),
+                    read_u32_or_invalid(uc, uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32 + 0xc)
                 );
             })
             .unwrap();
@@ -5827,6 +5839,57 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             if res.is_err() {
                 log::warn!("PROCMAPENGINE: scene-root write watch failed");
             }
+        }
+        // `DetermineMapObjects` only inserts MOs into the DTM grid when the
+        // per-view cell array (scene+0x30+view*4, `*count` there) is non-zero;
+        // those arrays are fed by the raw data blocks created from the
+        // LoadBlocks shared-memory payload:
+        // `map_tclRawMapDataCache::CreateNewRawDataBlock(uniqueID, type)`
+        // (0x5166dc) + `AddNewRawDataBlock` (0x5164e0).  If these never run,
+        // the 2 `result_blocks` per LoadBlocks answer die in shm and no map
+        // element ever exists.
+        {
+            let create = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let addr = base_address + 0x0051_66dcu32 - ORIGINAL_BASE;
+            unicorn
+                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                    let count = create.fetch_add(1, Ordering::Relaxed);
+                    if count >= 40 {
+                        return;
+                    }
+                    let uid = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let kind = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let w0 = read_u32_or_invalid(uc, uid);
+                    let w1 = read_u32_or_invalid(uc, uid + 4);
+                    let w2 = read_u32_or_invalid(uc, uid + 8);
+                    log::info!(
+                        "PROCMAPENGINE render trace CreateNewRawDataBlock entry at {:#x}: uid={:#x} [{:#x},{:#x},{:#x}] type={:#x} count={:#x}",
+                        addr,
+                        uid,
+                        w0,
+                        w1,
+                        w2,
+                        kind,
+                        count
+                    );
+                })
+                .unwrap();
+            let add = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let addr = base_address + 0x0051_64e0u32 - ORIGINAL_BASE;
+            unicorn
+                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                    let count = add.fetch_add(1, Ordering::Relaxed);
+                    if count >= 40 {
+                        return;
+                    }
+                    log::info!(
+                        "PROCMAPENGINE render trace AddNewRawDataBlock entry at {:#x}: block={:#x} count={:#x}",
+                        addr,
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                        count
+                    );
+                })
+                .unwrap();
         }
     }
 
