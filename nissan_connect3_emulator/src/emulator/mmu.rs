@@ -79,6 +79,7 @@ impl Mmu {
         description: &str,
         filepath: &str,
     ) {
+        self.defragment(unicorn);
         self.remove_internal(unicorn, address, size);
 
         // fresh anonymous memory is zero-filled by the emulator (like a real kernel)
@@ -124,6 +125,7 @@ impl Mmu {
         shared_key: Option<&str>,
         host_ptr: *mut c_void,
     ) {
+        self.defragment(unicorn);
         self.remove_internal(unicorn, address, size);
 
         unsafe {
@@ -382,8 +384,89 @@ impl Mmu {
             .retain(|item| item.memory_end < address || item.memory_start >= address + size);
     }
 
-    fn remove_internal(&mut self, unicorn: &mut Unicorn<'_, Context>, address: u32, size: u32) {
-        // split regions at the beginning and end point of the range
+    /// r620: unicorn caps the address space at 4096 sections
+    /// (`phys_section_add: assert map->sections_nb < TARGET_PAGE_SIZE`), and
+    /// every `mem_map` call adds one. The emulation-side bump allocator
+    /// (`heap_alloc`/brk growth behind `[heap]`, the monitor sem/io blocks,
+    /// `[gpu-string]`, `[mbx-snapshot]`) hands out adjacent, same-permission
+    /// RW pages one mapping at a time - ~900 of them in the first 60 s - so
+    /// runs died from the assert around t=195 s. Once the region list reaches
+    /// 500 entries, merge every adjacent run of private, non-executable,
+    /// equal-permission regions back into a single mapping (contents staged
+    /// through the host), keeping the section count far below the cap.
+    fn defragment(&mut self, unicorn: &mut Unicorn<'_, Context>) {
+        if self.regions.len() < 500 {
+            return;
+        }
+        self.regions.sort_unstable_by_key(|r| r.memory_start);
+        let mergeable = |r: &MmuRegion| {
+            (r.memory_perms & Prot::EXEC) == Prot::NONE && r.shared_key.is_none()
+        };
+        let regions = std::mem::take(&mut self.regions);
+        let mut merged: Vec<MmuRegion> = Vec::with_capacity(regions.len());
+        let mut i = 0usize;
+        while i < regions.len() {
+            let head = &regions[i];
+            if !mergeable(head) {
+                merged.push(regions[i].clone());
+                i += 1;
+                continue;
+            }
+            let mut run_end = head.memory_end;
+            let mut j = i + 1;
+            while j < regions.len() {
+                let next = &regions[j];
+                if mergeable(next)
+                    && next.memory_perms == head.memory_perms
+                    && next.memory_start == run_end + 1
+                {
+                    run_end = next.memory_end;
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if j - i == 1 {
+                merged.push(regions[i].clone());
+                i = j;
+                continue;
+            }
+            let total = run_end - head.memory_start + 1;
+            let mut buf = vec![0u8; total as usize];
+            unicorn
+                .mem_read(head.memory_start as u64, &mut buf)
+                .expect("mmu defragment: read run");
+            for r in &regions[i..j] {
+                unicorn
+                    .mem_unmap(r.memory_start as u64, (r.memory_end - r.memory_start + 1) as u64)
+                    .expect("mmu defragment: unmap member");
+            }
+            unicorn
+                .mem_map(head.memory_start as u64, total as u64, head.memory_perms)
+                .expect("mmu defragment: map run");
+            unicorn
+                .mem_write(head.memory_start as u64, &buf)
+                .expect("mmu defragment: restore contents");
+            log::debug!(
+                "mmu defragment: merged {} regions at {:#x} size {:#x}",
+                j - i,
+                head.memory_start,
+                total
+            );
+            merged.push(MmuRegion {
+                memory_start: head.memory_start,
+                memory_end: run_end,
+                memory_perms: head.memory_perms,
+                description: head.description.clone(),
+                filepath: head.filepath.clone(),
+                shared_key: None,
+            });
+            i = j;
+        }
+        self.regions = merged;
+    }
+
+    fn remove_internal(&mut self, unicorn: &mut Unicorn<'_, Context>, address: u32, size: u32) {        // split regions at the beginning and end point of the range
         self.split_internal(unicorn, address);
         self.split_internal(unicorn, address + size);
 
