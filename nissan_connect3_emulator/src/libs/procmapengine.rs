@@ -5763,14 +5763,19 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 if count >= 20 {
                     return;
                 }
+                let scene = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 log::info!(
-                    "PROCMAPENGINE render trace PreProcess->DetermineMapObjects call site {:#x}: scene={:#x} mcp={:#x} rect={:#x} lists={:#x} r5={:#x}",
+                    "PROCMAPENGINE render trace PreProcess->DetermineMapObjects call site {:#x}: scene={:#x} mcp={:#x} rect={:#x} lists={:#x} roots=[{:#x},{:#x},{:#x},{:#x},{:#x}]",
                     original,
-                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    scene,
                     uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
                     uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
                     uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
-                    uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32
+                    read_u32_or_invalid(uc, scene + 0x44),
+                    read_u32_or_invalid(uc, scene + 0x48),
+                    read_u32_or_invalid(uc, scene + 0x4c),
+                    read_u32_or_invalid(uc, scene + 0x50),
+                    read_u32_or_invalid(uc, scene + 0x54)
                 );
             })
             .unwrap();
@@ -5790,6 +5795,39 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 );
             })
             .unwrap();
+        // Per-view scene roots live at ms_pkSceneManager (0xaa53a8, stable
+        // across runs) + 0x44..0x54; both DetermineMapObjects and
+        // UpdateDrawLayerListsForDTM bail while they are null.  Watch the
+        // field range to find who (if anybody) creates them.
+        {
+            use unicorn_engine::unicorn_const::HookType;
+            let lo = 0x00aa_53ecu32 as u64;
+            let hi = lo + 0x14;
+            let roots = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let res = unicorn.add_mem_hook(
+                HookType::MEM_WRITE,
+                lo,
+                hi,
+                move |uc, _t, address, _size, _value| {
+                    let count = roots.fetch_add(1, Ordering::Relaxed);
+                    if count >= 20 {
+                        return true;
+                    }
+                    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                    let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                    log::info!(
+                        "PROCMAPENGINE render trace scene-root WRITE addr={:#x} pc={:#x} lr={:#x}",
+                        address,
+                        original,
+                        uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
+                    );
+                    true
+                },
+            );
+            if res.is_err() {
+                log::warn!("PROCMAPENGINE: scene-root write watch failed");
+            }
+        }
     }
 
     // Message-map router `PortControl_CCAClientHandlerBase::vDispatchMessage`
