@@ -1195,6 +1195,44 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             .unwrap();
     }
 
+    // r659: DTMStreet::Draw gates the whole GL leg on the shader program
+    // slot (`ldr r3,[r2,r4]; cmp r3,#0; beq skip` at 0x55b360..68, slot =
+    // rl_tclOpenGLShader::ms_arShaderPrograms + {0x19,0x20}*0x150).  r658
+    // binds 526 VBOs after the copy but never reaches a glDraw* - probe the
+    // handle to see which slot is empty.
+    {
+        let sh_checks = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let page_lo = base_address + (0x0055_b000u32 - ORIGINAL_BASE);
+        let page_hi = base_address + (0x0055_bfffu32 - ORIGINAL_BASE);
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != 0x0055_b364u32 {
+                    return;
+                }
+                let count = sh_checks.fetch_add(1, Ordering::Relaxed);
+                if count >= 40 {
+                    return;
+                }
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE render trace dtm-shader t={}ms thread=[{}] slot={:#x} handle={:#x} mcp={:#x} lod={:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    r2.wrapping_add(r4),
+                    r3,
+                    r6,
+                    read_u8_or_invalid(uc, r6.wrapping_add(5)),
+                    count,
+                );
+            })
+            .unwrap();
+    }
+
     if std::env::var_os("EMU_PROCMAPENGINE_TRACE_INIT")
         .is_some_and(|value| !value.is_empty() && value != "0")
     {
