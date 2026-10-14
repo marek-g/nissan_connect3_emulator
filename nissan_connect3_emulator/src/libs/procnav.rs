@@ -2007,12 +2007,14 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
             let mut seq: u16 = 0;
             let mut drift: f64 = 0.0;
             let queue = "mbx_1024".to_string();
-            // r633: companion refresher - a light mode-1 camera message every
-            // 2 s.  Mode 1 takes u32SetCameraParameters' simple branch: the
-            // camera lands at view+0x6c..0x88 and the dirty flag is raised,
-            // but no UpdateMapDataRequest (hence no Milwaukee echo) is
-            // issued.  It holds the committed Krakow centre against the
-            // echo-driven pull-back between the mode-3 round drivers.
+            // r633b: companion refresher - the r633 mode-1 experiment proved
+            // mode-1 jobs are filed into the class-3 queue and never execute
+            // (no view+0x84 writes at the 2 s cadence in run_r633), so the
+            // refresher must be mode 3 again.  r628's churn came from the
+            // DRIFT (each message changed the request rect and re-armed the
+            // state machine); a fixed-position mode-3 message re-commits
+            // view+0x2b8 to Krakow every 2 s with an identical rect, which
+            // the request machine treats as content-match.
             {
                 let ns2 = namespace.clone();
                 let q2 = queue.clone();
@@ -2024,7 +2026,7 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
                         loop {
                             sq = sq.wrapping_add(1);
                             let blob =
-                                renfi_set_camera_parameters_message(sq, 19.91809, 50.06254, 40, 1);
+                                renfi_set_camera_parameters_message(sq, 19.91809, 50.06254, 40, 3);
                             let mut guard = ns2.lock().unwrap();
                             crate::common::osal_queues::OsalQueueService::ensure_queue(
                                 &mut guard.mq, &q2,
