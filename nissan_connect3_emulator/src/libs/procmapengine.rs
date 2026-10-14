@@ -6093,15 +6093,17 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     .unwrap();
             }
             // r623: the DOM view rect comes out of
-            // `GlobalViewRect_2D(rect, mcp, matrix)` which reads the mcp
-            // centre at mcp+0x14/+0x18 - observed frozen at the boot default
+            // `GlobalViewRect_2D(rect, mcp, matrix)` which centres on
+            // mcp+0x1c/+0x20 (with mcp+0x14/+0x18 as the far corners - the
+            // first r623 watch proved +0x14/+0x18 carry the 800x480 screen
+            // extents) - observed frozen at the boot default
             // (0xc4f45dfb, 0x1e3b77c6) while the view's own camera copy
             // (view+0x84/+0x88) holds the renfi values.  Watch the centre
             // pair (mcp = view 0xda0bc4 + 0x280 = 0xda0e44) to find who is
             // supposed to move it.
             {
                 use unicorn_engine::unicorn_const::HookType;
-                let mcp_c = 0xda0e58u32; // 0xda0bc4 + 0x280 + 0x14
+                let mcp_c = 0xda0e60u32; // 0xda0bc4 + 0x280 + 0x1c
                 let _ = unicorn.add_mem_hook(
                     HookType::MEM_WRITE,
                     mcp_c as u64,
