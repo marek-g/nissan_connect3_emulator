@@ -215,12 +215,15 @@ fn read_i32(unicorn: &Unicorn<'_, Context>, addr: u32) -> i32 {
     read_u32(unicorn, addr) as i32
 }
 
-/// convert an IOSC timeout (milliseconds, -1 = infinite) into a deadline
+/// convert an IOSC timeout (milliseconds, -1 = infinite) into a deadline.
+/// The milliseconds are guest time -> dilated host deadline (vtime).
 fn timeout_to_deadline(ms: i32) -> Option<Instant> {
     if ms < 0 {
         None
     } else {
-        Some(Instant::now() + Duration::from_millis(ms as u64))
+        Some(crate::emulator::vtime::deadline(Duration::from_millis(
+            ms as u64,
+        )))
     }
 }
 

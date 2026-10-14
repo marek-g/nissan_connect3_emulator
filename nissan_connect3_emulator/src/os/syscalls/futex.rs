@@ -252,5 +252,9 @@ fn read_timeout_deadline(unicorn: &Unicorn<'_, Context>, timeout: u32) -> Option
     unicorn.mem_read(timeout as u64 + 4, &mut buf).unwrap();
     let nanoseconds = unpack_u32(&buf) as u64;
 
-    Some(Instant::now() + Duration::new(seconds, nanoseconds as u32))
+    // relative timeout in guest time -> dilated host deadline (vtime)
+    Some(crate::emulator::vtime::deadline(Duration::new(
+        seconds,
+        nanoseconds as u32,
+    )))
 }

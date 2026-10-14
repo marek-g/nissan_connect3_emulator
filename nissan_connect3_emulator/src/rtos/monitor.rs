@@ -770,7 +770,7 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool 
         // block word; task starts were answered in place above.
         match read_word(unicorn, block) {
             Ok(ticks) if ticks != 0 && ticks < 0x0010_0000 => {
-                Some(std::time::Instant::now() + TICK * ticks)
+                Some(crate::emulator::vtime::deadline(TICK * ticks))
             }
             _ => None,
         }
@@ -783,7 +783,7 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool 
         if timeout == 0 || timeout >= 0x8000_0000 {
             None
         } else {
-            Some(std::time::Instant::now() + TICK * timeout)
+            Some(crate::emulator::vtime::deadline(TICK * timeout))
         }
     } else if service & 0xff == OSAL_SERVICE_OBJECT
         && matches!(service >> 16, OSAL_EVENT_WAIT | OSAL_MBX_WAIT)
@@ -796,12 +796,12 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool 
         if timeout == 0 || timeout >= 0x8000_0000 {
             None
         } else {
-            Some(std::time::Instant::now() + TICK * timeout)
+            Some(crate::emulator::vtime::deadline(TICK * timeout))
         }
     } else if ticks == 0 {
         None
     } else {
-        Some(std::time::Instant::now() + TICK * ticks)
+        Some(crate::emulator::vtime::deadline(TICK * ticks))
     };
     log::info!(
         "monitor: thread [{}] yields on service {:#x} (object {}, {} ticks, block {:#x}, continuation {:#x}) with {}",

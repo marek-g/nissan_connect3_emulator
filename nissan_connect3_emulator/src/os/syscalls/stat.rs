@@ -3,7 +3,6 @@ use crate::emulator::users::{GID, UID};
 use crate::emulator::utils::{pack_i32, pack_u32, pack_u64, read_string};
 use crate::os::file_system::{FileInfo, FileSystemType, FileType};
 use crate::os::syscalls::fcntl::get_path_relative_to_dir;
-use std::time::SystemTime;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn stat64(unicorn: &mut Unicorn<'_, Context>, path: u32, stat_buf: u32) -> u32 {
@@ -349,11 +348,10 @@ fn write_stat64_buffer(
     // st_blocks
     stat_data.extend_from_slice(&pack_u64((file_info.file_details.length + 511) / 512));
 
-    // st_atime
-    let time = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    // st_atime (and the mtime/ctime below): report the guest's virtual epoch
+    // so staleness/freshness checks against `gettimeofday` stay consistent
+    // under EMU_REALTIME_FACTOR (vtime).
+    let time = crate::emulator::vtime::vepoch().as_secs();
     stat_data.extend_from_slice(&pack_u32(time as u32));
 
     // st_atime_ns

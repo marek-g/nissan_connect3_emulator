@@ -2774,11 +2774,11 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
             .name("fastmap-status".into())
             .spawn(move || {
                 for round in 0..18u32 {
-                    std::thread::sleep(std::time::Duration::from_millis(if round == 0 {
-                        18_000
-                    } else {
-                        8_000
-                    }));
+                    // guest-time pacing: the apply chain we wait for runs on
+                    // the dilated clock (vtime).
+                    crate::emulator::vtime::sleep_virtual(std::time::Duration::from_millis(
+                        if round == 0 { 18_000 } else { 8_000 },
+                    ));
                     if FASTMAP_STATUS_APPLIED.load(Ordering::Relaxed) {
                         break;
                     }
