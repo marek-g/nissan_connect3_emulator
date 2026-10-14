@@ -1988,7 +1988,7 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
                     seq,
                     19.91809 + drift,
                     50.06254,
-                    100,
+                    40,
                 );
                 let posted = {
                     let mut guard = namespace.lock().unwrap();
@@ -2012,21 +2012,26 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
                         "PROCNAV: renfi camera SetCameraParameters #{seq} posted={posted} into {queue}"
                     );
                 }
-                // r609: a second camera message 2 s after the first only
+                // r609/r612: a second camera message 2 s after the first only
                 // armed a redundant request whose late Execute (job queue
                 // congestion, +28 s in r608) alternated the request content
                 // and reset the accepted 34-block round mid-flight.  Instead,
-                // re-arm the camera every 25 s with a tiny drift: the nudge
-                // changes the request content (so `PerformMapDataRequest`
-                // re-runs and `MDM::GetBlockIDs` is re-issued), but stays far
-                // inside the 0x10000-unit rounding cell of the wire rect, so
+                // re-arm the camera every 15 s with a micro drift (0.000085
+                // deg ~ 0x400 map units per step, always inside one 0x10000
+                // rounding cell): the nudge changes the request content (so
+                // `PerformMapDataRequest` re-runs and `MDM::GetBlockIDs` is
+                // re-issued), but the rounded wire rect never changes, so
                 // once a full round has written the loaded-rect rows the
                 // "Rect matches -> idle" branch short-circuits the request to
-                // complete and the state machine promotes towards 2.  It also
+                // complete and the state machine promotes towards 2 (r611
+                // reached state 2 this way, at 165 s).  The re-arm also
                 // refreshes the MapObjectsUpdate job array with the current
                 // request state, which is what gates the element fill.
-                drift += 0.0002;
-                std::thread::sleep(std::time::Duration::from_millis(25_000));
+                // meter 40 (r612): a 34-block view drains its LoadBlocks tail
+                // over ~70 s (one wire round per missing block); a tighter
+                // view fits the whole drain in one nudge interval.
+                drift += 0.000085;
+                std::thread::sleep(std::time::Duration::from_millis(15_000));
             }
         });
     match result {

@@ -6068,7 +6068,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         hi,
                         move |uc, _t, address, _size, value| {
                             let count = st.fetch_add(1, Ordering::Relaxed);
-                            if count >= 60 {
+                            if count >= 300 {
                                 return true;
                             }
                             let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
