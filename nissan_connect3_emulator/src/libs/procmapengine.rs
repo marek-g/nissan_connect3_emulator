@@ -6170,6 +6170,40 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         log::warn!("PROCMAPENGINE: req-state write watch failed");
                     }
                 }
+                // Block bookkeeping window: +0x1f4/+0x1f8 (LeftToFetch, must
+                // drain back to -1 for the 1->2 promotion) and +0x200
+                // (MDMRefCtr, u16, gate `== 0`) of the static request.
+                {
+                    use unicorn_engine::unicorn_const::HookType;
+                    let lo = 0x0078_fec0u32 as u64;
+                    let hi = lo + 0x18;
+                    let st = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let res = unicorn.add_mem_hook(
+                        HookType::MEM_WRITE,
+                        lo,
+                        hi,
+                        move |uc, _t, address, _size, value| {
+                            let count = st.fetch_add(1, Ordering::Relaxed);
+                            if count >= 80 {
+                                return true;
+                            }
+                            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                            let original =
+                                pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                            log::info!(
+                                "PROCMAPENGINE render trace req-fetch WRITE addr={:#x} value={:#x} pc={:#x} lr={:#x}",
+                                address,
+                                value,
+                                original,
+                                uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
+                            );
+                            true
+                        },
+                    );
+                    if res.is_err() {
+                        log::warn!("PROCMAPENGINE: req-fetch write watch failed");
+                    }
+                }
                 // The request static (0x78fcd4) tracks outstanding work at
                 // +0x1f4/+0x1f8 ("LeftToFetch: %d/%d") and per-state block
                 // rows at +state*0x10+0x114.  Dump them on every
