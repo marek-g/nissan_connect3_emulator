@@ -2577,12 +2577,9 @@ pub(crate) fn post_engine_fastmap_service_status(
 /// +0x04, opcode 2 at +0x08, class at +0x0b, service id +0x14, register id
 /// +0x16 and the state byte at +0x18 (mirrors what DAPI's real publishes
 /// carry, except theirs always hold state 0).
-fn post_engine_status_to(
-    unicorn: &mut Unicorn<'_, Context>,
-    service_id: u16,
-    register_id: u16,
-    state: u8,
-) -> bool {
+/// Builds one directory ServiceStatus publish body (no header) for the
+/// engine's svc-0x26 reference; see the field map on `post_engine_status_to`.
+fn engine_status_body(state: u8) -> Vec<u8> {
     let mut status = vec![0u8; 0x20];
     let status_len = status.len() as u32;
     status[0..2].copy_from_slice(&7u16.to_le_bytes());
@@ -2596,14 +2593,55 @@ fn post_engine_status_to(
     // ("none") matches nothing and the whole apply-then-propagate flow is
     // skipped with a "no reference" echo instead.
     status[0x0e..0x10].copy_from_slice(&0xffffu16.to_le_bytes());
-    status[0x14..0x16].copy_from_slice(&service_id.to_le_bytes());
-    status[0x16..0x18].copy_from_slice(&register_id.to_le_bytes());
+    status[0x14..0x16].copy_from_slice(&0x0026u16.to_le_bytes());
+    // Registration id 0x1: the id the stamped RegisterConf on mbx_1024 carries
+    // in every observed run.
+    status[0x16..0x18].copy_from_slice(&1u16.to_le_bytes());
     status[0x18] = state;
+    status
+}
 
+fn wrap_status_blob(status: Vec<u8>) -> Vec<u8> {
     let mut blob = Vec::with_capacity(8 + status.len());
     blob.extend_from_slice(&1u32.to_le_bytes());
-    blob.extend_from_slice(&status_len.to_le_bytes());
+    blob.extend_from_slice(&(status.len() as u32).to_le_bytes());
     blob.extend_from_slice(&status);
+    blob
+}
+
+/// Host-thread repost variant: r610 showed the conf-triggered pair popped from
+/// `mbx_1024` by an engine consumer that does not run the administration walk
+/// (the state-change fan-in never fired), while r608 popped it in the right
+/// context. Whether a pop applies is consumer-thread luck, so re-post the pair
+/// from the host until the engine probe reports it was applied.
+pub(crate) fn post_engine_fastmap_status_pair(
+    namespace: &std::sync::Arc<std::sync::Mutex<crate::os::syscalls::namespace::SystemNamespace>>,
+) -> (bool, bool) {
+    let mut posted = [false; 2];
+    for (slot, state) in posted.iter_mut().zip([1u8, 0]) {
+        let blob = wrap_status_blob(engine_status_body(state));
+        let mut guard = namespace.lock().unwrap();
+        let queue_id = OsalQueueService::ensure_queue(&mut guard.mq, "mbx_1024");
+        guard.mq.grow_msgsize(queue_id, blob.len() as i64);
+        let accepted = OsalQueueService::guest_post(&mut guard.mq, "mbx_1024", blob, 0);
+        if accepted {
+            guard.notify_waiters();
+        }
+        *slot = accepted;
+    }
+    (posted[0], posted[1])
+}
+
+fn post_engine_status_to(
+    unicorn: &mut Unicorn<'_, Context>,
+    service_id: u16,
+    register_id: u16,
+    state: u8,
+) -> bool {
+    debug_assert_eq!(service_id, 0x0026);
+    let mut status = engine_status_body(state);
+    status[0x16..0x18].copy_from_slice(&register_id.to_le_bytes());
+    let blob = wrap_status_blob(status);
     let mut state_guard = unicorn.get_data().namespace.lock().unwrap();
     let queue_id = OsalQueueService::ensure_queue(&mut state_guard.mq, "mbx_1024");
     state_guard.mq.grow_msgsize(queue_id, blob.len() as i64);

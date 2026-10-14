@@ -222,6 +222,9 @@ const MAP_RENDER_TRIGGER_INTERVAL: u32 = 20;
 const OSAL_THREAD_WAIT: u32 = 0x4851_4fa8;
 
 static PROCMAP_BASE: AtomicU32 = AtomicU32::new(0);
+// Set once the engine's administration walk applies our synthesized directory
+// ServiceStatus to the svc-0x26 client reference (`vOnServiceStateChange`).
+pub(crate) static FASTMAP_STATUS_APPLIED: AtomicBool = AtomicBool::new(false);
 static PROCMAP_GUEST_CALL_STUB: AtomicU32 = AtomicU32::new(0);
 static APP_STATE_STARTED: AtomicBool = AtomicBool::new(false);
 static MAP_POWER_CCA_MODE_SET: AtomicBool = AtomicBool::new(false);
@@ -2421,12 +2424,18 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                 return;
             }
             let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let svc = read_u16_or_invalid(uc, this + 4);
+            if svc == 0x0026 {
+                // A walk popped our directory publish and applied it to the
+                // svc-0x26 client reference; the re-post driver can stop.
+                FASTMAP_STATUS_APPLIED.store(true, Ordering::Relaxed);
+            }
             log::info!(
                 "PROCMAPENGINE fastmap trace vOnServiceStateChange t={}ms thread=[{}] handler={:#x} svc={:#x} old_state={:#x} new_state={:#x}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
                 uc.get_data().inner.thread_id(),
                 this,
-                read_u16_or_invalid(uc, this + 4),
+                svc,
                 read_u8_or_invalid(uc, this + 0xe),
                 (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32) & 0xff,
             );
@@ -2751,6 +2760,43 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                 true
             })
             .unwrap();
+    }
+
+    // r611: the conf-triggered directory publish is popped by whichever engine
+    // thread services `mbx_1024` first - r610 showed a pop by a consumer that
+    // does not run the administration walk, so the pair was silently swallowed
+    // and the fastmap gate (property 0x401 UpReg -> OpenFastMapChannel ->
+    // channel handle in `ms_asFastMapChannelInfo`) never fired.  Re-post the
+    // pair until the probe above reports an application.
+    {
+        let namespace = unicorn.get_data().namespace.clone();
+        let spawned = std::thread::Builder::new()
+            .name("fastmap-status".into())
+            .spawn(move || {
+                for round in 0..18u32 {
+                    std::thread::sleep(std::time::Duration::from_millis(if round == 0 {
+                        18_000
+                    } else {
+                        8_000
+                    }));
+                    if FASTMAP_STATUS_APPLIED.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let (first, second) =
+                        crate::libs::libosal_linux::message::post_engine_fastmap_status_pair(
+                            &namespace,
+                        );
+                    log::info!(
+                        "PROCMAPENGINE: re-posted directory ServiceStatus pair (state 1 then 0) into mbx_1024: {first} {second} round={round}"
+                    );
+                    if FASTMAP_STATUS_APPLIED.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+            });
+        if spawned.is_err() {
+            log::warn!("PROCMAPENGINE: cannot start fastmap status re-post driver");
+        }
     }
 }
 
