@@ -5444,11 +5444,18 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 if count >= 100 {
                     return;
                 }
+                let job = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 log::info!(
-                    "PROCMAPENGINE render trace SceneManager::MapObjectsUpdate entry at {:#x}: job={:#x} scene_mgr={:#x}",
+                    "PROCMAPENGINE render trace SceneManager::MapObjectsUpdate entry at {:#x}: job={:#x} scene_mgr={:#x} type={:#x} reqstate={:#x} view={:#x} lod={:#x} a20={:#x} mos={:#x}",
                     addr,
-                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
-                    read_u32_or_invalid(uc, base_address + (0x0079_0788u32 - ORIGINAL_BASE))
+                    job,
+                    read_u32_or_invalid(uc, base_address + (0x0079_0788u32 - ORIGINAL_BASE)),
+                    read_u32_or_invalid(uc, job + 0x24),
+                    read_u32_or_invalid(uc, job + 0x28),
+                    read_u32_or_invalid(uc, job + 0x1c) & 0xff,
+                    read_u32_or_invalid(uc, job + 0x2c),
+                    read_u32_or_invalid(uc, job + 0x20),
+                    read_u32_or_invalid(uc, job + 0x54)
                 );
             })
             .unwrap();
@@ -5980,6 +5987,92 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     log::warn!("PROCMAPENGINE: scene-job-array write watch failed");
                 }
             }
+            // Third camera-viewpoint array (+0x124) and the setter:
+            // MapObjectsUpdate case 5 calls SetCameraViewPointMOs(scene,
+            // array, job, view, lod) at 0x435924 for reqstate 1..2 only when
+            // view<=4 && lod<=3; otherwise it branches to 0x435d78.  The
+            // setter stores the job into array[(lod + view*4)*4] on the empty
+            // slot path (LAB_00432c14).  Watch entry args and the else leg.
+            {
+                let lo = 0x00aa_54ccu32 as u64;
+                let hi = lo + 0x14;
+                let cnt = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let res = unicorn.add_mem_hook(
+                    HookType::MEM_WRITE,
+                    lo,
+                    hi,
+                    move |uc, _t, address, _size, value| {
+                        let count = cnt.fetch_add(1, Ordering::Relaxed);
+                        if count >= 20 {
+                            return true;
+                        }
+                        let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                        let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                        log::info!(
+                            "PROCMAPENGINE render trace scene-job-array WRITE[jobArrayC(+0x124)] addr={:#x} value={:#x} pc={:#x} lr={:#x}",
+                            address,
+                            value,
+                            original,
+                            uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
+                        );
+                        true
+                    },
+                );
+                if res.is_err() {
+                    log::warn!("PROCMAPENGINE: jobArrayC write watch failed");
+                }
+            }
+            let setp = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let addr = base_address + 0x0043_2b44u32 - ORIGINAL_BASE;
+            unicorn
+                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                    let count = setp.fetch_add(1, Ordering::Relaxed);
+                    if count >= 40 {
+                        return;
+                    }
+                    let array = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let job = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    let view = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32 & 0xff;
+                    // lod arrives on the stack (str r12,[sp] at 0x435920): r12.
+                    // Thumb BL pushes nothing; read the arg via the caller's sp.
+                    let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    let lod = read_u32_or_invalid(uc, sp) & 0xffff_ffff;
+                    let off = (lod + view * 4) * 4;
+                    let slot = read_u32_or_invalid(uc, array.wrapping_add(off));
+                    log::info!(
+                        "PROCMAPENGINE render trace SetCameraViewPointMOs entry at {:#x}: array={:#x} job={:#x} view={} lod={:#x} slot={:#x} count={:#x}",
+                        addr,
+                        array,
+                        job,
+                        view,
+                        lod,
+                        slot,
+                        count
+                    );
+                })
+                .unwrap();
+            // Else leg 0x435d78 (view>4 || lod>3) - page hook, dispatch on pc.
+            let els = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let page_lo = base_address + (0x0043_5000u32 - ORIGINAL_BASE);
+            let page_hi = page_lo + 0xfff;
+            unicorn
+                .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                    let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                    if original != 0x0043_5d78u32 {
+                        return;
+                    }
+                    let count = els.fetch_add(1, Ordering::Relaxed);
+                    if count >= 20 {
+                        return;
+                    }
+                    log::info!(
+                        "PROCMAPENGINE render trace MapObjectsUpdate-else-leg 0x435d78 hit at {:#x} count={:#x}",
+                        original,
+                        count
+                    );
+                })
+                .unwrap();
         }
     }
 
