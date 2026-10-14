@@ -1685,7 +1685,17 @@ fn spawn_posfi_provider(unicorn: &mut Unicorn<'_, Context>) {
                         log::info!("posfi provider: {queue} refused a message (#{seq})");
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1000));
+                // r601/r602: every position message arms a fresh MDM
+                // MapDataRequest job whose Execute copies the new request over
+                // the static one and zeroes its state (PerformMapDataRequest
+                // 0x50ccf0), so the LeftToFetch round (34 -> 0) is thrown away
+                // before the data-handled state can promote 1 -> 2 - and DAPI's
+                // guest-side answer latency is tens of seconds.  The car moves
+                // fast at first (arm the camera view and the request), then the
+                // cadence drops to one tick per long settling window so a full
+                // GetBlockIDs + LoadBlocks + promotion cycle can complete.
+                let interval_ms = if seq <= 4 { 1_000 } else { 240_000 };
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
             }
         });
     match result {
@@ -1996,7 +2006,13 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
                         "PROCNAV: renfi camera SetCameraParameters #{seq} posted={posted} into {queue}"
                     );
                 }
-                std::thread::sleep(std::time::Duration::from_millis(5000));
+                // r602: like the posfi provider - each camera message can arm a
+                // fresh request whose Execute resets the in-flight block round,
+                // and the guest DAPI answer latency is tens of seconds.  Point
+                // the camera at Krakow once, then keep it still for a long
+                // settling window.
+                let interval_ms = if seq <= 2 { 2_000 } else { 300_000 };
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
             }
         });
     match result {
