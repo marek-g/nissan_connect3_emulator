@@ -815,7 +815,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     return;
                 }
                 let count = probes.fetch_add(1, Ordering::Relaxed);
-                if count >= 80 {
+                if count >= 300 {
                     return;
                 }
                 let uid = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -864,7 +864,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     return;
                 }
                 let count = probes.fetch_add(1, Ordering::Relaxed);
-                if count >= 40 {
+                if count >= 100 {
                     return;
                 }
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -902,7 +902,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     return;
                 };
                 let count = probes2.fetch_add(1, Ordering::Relaxed);
-                if count >= 40 {
+                if count >= 100 {
                     return;
                 }
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -950,7 +950,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     _ => return,
                 };
                 let count = leg.fetch_add(1, Ordering::Relaxed);
-                if count >= 60 {
+                if count >= 300 {
                     return;
                 }
                 let req = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
@@ -990,7 +990,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     return;
                 }
                 let count = linked.fetch_add(1, Ordering::Relaxed);
-                if count >= 40 {
+                if count >= 300 {
                     return;
                 }
                 let block = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -1036,7 +1036,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     return;
                 };
                 let count = legs.fetch_add(1, Ordering::Relaxed);
-                if count >= 90 {
+                if count >= 500 {
                     return;
                 }
                 let req = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
@@ -6969,7 +6969,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         }
                         0x0043_6014u32 => {
                             let count = cp2_c.fetch_add(1, Ordering::Relaxed);
-                            if count >= 40 {
+                            if count >= 150 {
                                 return;
                             }
                             let job = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
