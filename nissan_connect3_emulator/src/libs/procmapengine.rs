@@ -6175,8 +6175,8 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 // (MDMRefCtr, u16, gate `== 0`) of the static request.
                 {
                     use unicorn_engine::unicorn_const::HookType;
-                    let lo = 0x0078_fec0u32 as u64;
-                    let hi = lo + 0x18;
+                    let lo = 0x0078_fec4u32 as u64;
+                    let hi = lo + 0xa;
                     let st = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                     let res = unicorn.add_mem_hook(
                         HookType::MEM_WRITE,
@@ -6184,7 +6184,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         hi,
                         move |uc, _t, address, _size, value| {
                             let count = st.fetch_add(1, Ordering::Relaxed);
-                            if count >= 80 {
+                            if count >= 400 {
                                 return true;
                             }
                             let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
