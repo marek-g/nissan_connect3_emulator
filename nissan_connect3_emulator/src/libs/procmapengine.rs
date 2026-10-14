@@ -6204,6 +6204,46 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         log::warn!("PROCMAPENGINE: req-fetch write watch failed");
                     }
                 }
+                // r598: after the promotion marker (0xefffffff) neither
+                // +0x1f4 nor +0x1f8 ever receives a block count - the block-id
+                // round inside `map_tclMapDataManager::GetBlockIDs` (0x507de0,
+                // IntHandleMapDataRequest line 123) is not completing.  Probe
+                // entry and the DAPI-call return value.
+                {
+                    let gbids = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let page_lo = base_address + (0x0050_7000u32 - ORIGINAL_BASE);
+                    let page_hi = page_lo + 0xfff;
+                    {
+                        let lo = page_lo;
+                        let cnt = std::sync::Arc::clone(&gbids);
+                        unicorn
+                            .add_code_hook(lo as u64, (page_hi) as u64, move |uc, _, _| {
+                                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                                let original =
+                                    pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                                if original != 0x0050_7de0u32 {
+                                    return;
+                                }
+                                let count = cnt.fetch_add(1, Ordering::Relaxed);
+                                if count >= 40 {
+                                    return;
+                                }
+                                let req = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                                log::info!(
+                                    "PROCMAPENGINE render trace MDM::GetBlockIDs entry at {:#x}: req={:#x} state74={:#x} f1f4={:#x} f1f8={:#x} f200={:#x} lr={:#x} count={:#x}",
+                                    original,
+                                    req,
+                                    read_u32_or_invalid(uc, req + 0x74),
+                                    read_u32_or_invalid(uc, req + 0x1f4),
+                                    read_u32_or_invalid(uc, req + 0x1f8),
+                                    read_u32_or_invalid(uc, req + 0x200),
+                                    uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                                    count
+                                );
+                            })
+                            .unwrap();
+                    }
+                }
                 // The request static (0x78fcd4) tracks outstanding work at
                 // +0x1f4/+0x1f8 ("LeftToFetch: %d/%d") and per-state block
                 // rows at +state*0x10+0x114.  Dump them on every
