@@ -6203,6 +6203,78 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         })
                         .unwrap();
                 }
+                // r596: the request state climbs 0->1 then is reset to 0
+                // (PerformMapDataRequest 0x50ccf0 / PerformResetMapDataRequest
+                // 0x50ec0c) over and over - never reaches 2 which
+                // FillActiveMOArrayFromRCMapObjectsRequest requires.  Both are
+                // fed by UpdateMapDataRequest (0x50494c), called per nav
+                // position (vHandleNavPosition), per camera change and from
+                // Render/DetermineMapObjects.  Page-dispatch both entry points
+                // with args to see what re-arms (and resets) the request.
+                {
+                    let upd = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let page_lo = base_address + (0x0050_4000u32 - ORIGINAL_BASE);
+                    let page_hi = page_lo + 0xfff;
+                    unicorn
+                        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                            let original =
+                                pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                            if original != 0x0050_494cu32 {
+                                return;
+                            }
+                            let count = upd.fetch_add(1, Ordering::Relaxed);
+                            if count >= 40 {
+                                return;
+                            }
+                            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                            log::info!(
+                                "PROCMAPENGINE render trace UpdateMapDataRequest entry prio={:#x} view={:#x} scale_bits={:#x} r3={:#x} rect=[{:#x},{:#x},{:#x},{:#x}] lr={:#x} count={:#x}",
+                                uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                                uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xff,
+                                uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+                                uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
+                                read_u32_or_invalid(uc, sp + 4),
+                                read_u32_or_invalid(uc, sp + 8),
+                                read_u32_or_invalid(uc, sp + 0xc),
+                                read_u32_or_invalid(uc, sp + 0xc),
+                                uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                                count
+                            );
+                        })
+                        .unwrap();
+                    let perf = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let page_lo = base_address + (0x0050_c000u32 - ORIGINAL_BASE);
+                    let page_hi = page_lo + 0xfff;
+                    unicorn
+                        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                            let original =
+                                pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                            if original != 0x0050_c93cu32 {
+                                return;
+                            }
+                            let count = perf.fetch_add(1, Ordering::Relaxed);
+                            if count >= 40 {
+                                return;
+                            }
+                            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                            log::info!(
+                                "PROCMAPENGINE render trace PerformMapDataRequest entry prio={:#x} view={:#x} scale_bits={:#x} r3={:#x} rect=[{:#x},{:#x},{:#x},{:#x}] lr={:#x} count={:#x}",
+                                uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                                uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xff,
+                                uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+                                uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
+                                read_u32_or_invalid(uc, sp + 4),
+                                read_u32_or_invalid(uc, sp + 8),
+                                read_u32_or_invalid(uc, sp + 0xc),
+                                read_u32_or_invalid(uc, sp + 0xc),
+                                uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                                count
+                            );
+                        })
+                        .unwrap();
+                }
             }
         }
     }
