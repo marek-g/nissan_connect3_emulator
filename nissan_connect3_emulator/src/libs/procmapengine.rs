@@ -1219,12 +1219,20 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                 let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
                 let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
                 let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                let slot = r2.wrapping_add(r4);
+                let name_ptr = read_u32_or_invalid(uc, slot.wrapping_add(0x14c));
+                let name = if name_ptr == 0 || name_ptr == u32::MAX || name_ptr < 0x1000 {
+                    "<none>".to_string()
+                } else {
+                    read_cstring(uc, name_ptr)
+                };
                 log::info!(
-                    "PROCMAPENGINE render trace dtm-shader t={}ms thread=[{}] slot={:#x} handle={:#x} mcp={:#x} lod={:#x} n={}",
+                    "PROCMAPENGINE render trace dtm-shader t={}ms thread=[{}] slot={:#x} handle={:#x} name={} mcp={:#x} lod={:#x} n={}",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     uc.get_data().inner.thread_id(),
-                    r2.wrapping_add(r4),
+                    slot,
                     r3,
+                    name,
                     r6,
                     read_u8_or_invalid(uc, r6.wrapping_add(5)),
                     count,
