@@ -729,14 +729,20 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                 let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 if original == 0x0066_e3d0u32 {
+                    let refx = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let a1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    // Posfi wake messages hit this loop several times a
+                    // second; only the svc-0x26 (DAPI fastmap) probes carry
+                    // information.
+                    if a1 != 0x0026 {
+                        return;
+                    }
                     let count = bisect_hits.fetch_add(1, Ordering::Relaxed);
                     if count >= 120 {
                         return;
                     }
-                    let refx = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                     let mut refbuf = [0u8; 12];
                     let ref_ok = uc.mem_read(refx as u64, &mut refbuf).is_ok();
-                    let a1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                     let a2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
                     let a3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
                     let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0);

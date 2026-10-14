@@ -2636,9 +2636,17 @@ fn engine_status_body(state: u8) -> Vec<u8> {
     // skipped with a "no reference" echo instead.
     status[0x0e..0x10].copy_from_slice(&0xffffu16.to_le_bytes());
     status[0x14..0x16].copy_from_slice(&0x0026u16.to_le_bytes());
-    // Registration id 0x1: the id the stamped RegisterConf on mbx_1024 carries
-    // in every observed run.
-    status[0x16..0x18].copy_from_slice(&1u16.to_le_bytes());
+    // Registration id: wildcard 0xffff.  `bIsDataSet` (0x66e3d0) only lets a
+    // status message through when every wire id is 0xffff or equals the
+    // reference field, and the engine's real svc-0x26 reference stores the
+    // async-register transaction id 0xe0 (see the r1=0xe0 of
+    // vHandleAsyncRegisterConf), not 1 - with reg-id 1 the pair never matched
+    // and `ail_bExamineInfluenceToAdministration` consumed it without
+    // setting `ref+6` (r643: zero `vSetServiceState` hits, stall).  The
+    // wildcard matches, administration applies the state, the 0-return
+    // forwards the pair to MQB_1024 and the body thread runs the client
+    // walk (`vServiceStateChanged`).
+    status[0x16..0x18].copy_from_slice(&0xffffu16.to_le_bytes());
     status[0x18] = state;
     status
 }
