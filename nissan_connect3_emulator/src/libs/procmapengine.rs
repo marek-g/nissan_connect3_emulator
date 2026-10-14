@@ -1123,8 +1123,15 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                 // through the byte at job+0x1c; the factory does not fill it
                 // (same gap `queue_view_creation_job` patches for the create
                 // job), so stamp the render view id here or Execute fails
-                // `GetView(0)` and the job never runs (r655).
-                if uc.mem_write((job + 0x1c) as u64, &[MAP_RENDER_VIEW_ID as u8]).is_err() {
+                // `GetView(0)` and the job never runs (r655).  The byte at
+                // +0x1d is the job's phase flag: the pooled memory comes back
+                // from the allocator with `1` left by a previous lifecycle
+                // (r656), which sends Execute into the re-queue-into-view-queue
+                // phase and the job never draws - force phase 0.
+                if uc
+                    .mem_write((job + 0x1c) as u64, &[MAP_RENDER_VIEW_ID as u8, 0u8])
+                    .is_err()
+                {
                     log::warn!("PROCMAPENGINE: failed to stamp view id on pure render job {:#x}", job);
                     return;
                 }
