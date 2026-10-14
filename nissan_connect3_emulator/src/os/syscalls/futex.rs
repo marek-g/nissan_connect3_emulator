@@ -82,10 +82,26 @@ pub fn futex(
                     // word is in shared memory: register globally so another
                     // process' FUTEX_WAKE can signal it; this process' host
                     // thread reaps it via advance_blocked.
+                    //
+                    // r654: an open-ended shared wait gets a 20 s virtual
+                    // watchdog deadline.  The engine's AIL administration path
+                    // (`ail_bExamineInfluenceToAdministration` -> list mutex)
+                    // deadlocked forever in ~1/3 of runs (r652b/r653/f: thread
+                    // [66] parked on `futex-shared` with the holder gone); the
+                    // scheduler's deadline path now zeroes the word and wakes
+                    // the waiter (dead-owner repair), so the engine survives a
+                    // lost unlock instead of stalling every mbx_1024 consumer.
+                    let watchdog = deadline.is_none();
+                    let deadline = deadline
+                        .or_else(|| Some(crate::emulator::vtime::deadline(Duration::from_secs(20))));
                     let namespace = data.namespace.clone();
-                    let id = namespace.lock().unwrap().futex_wait_shared(key);
+                    let id = namespace.lock().unwrap().futex_wait_shared(key, uaddr);
                     unicorn.get_data().set_action(ThreadAction::Block(
-                        BlockReason::FutexWaitShared { id, deadline },
+                        BlockReason::FutexWaitShared {
+                            id,
+                            deadline,
+                            watchdog,
+                        },
                     ));
                     return 0;
                 }
