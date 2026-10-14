@@ -6032,6 +6032,66 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     })
                     .unwrap();
             }
+            // r622: three-way visibility into the same function's rect gate:
+            // 0x4291b0 = centre rect (param_4) covered, 0x429014 = surround
+            // rect (param_3/param_5) covered - both reach the MO loop - and
+            // 0x428fd8 = the bail exit reached when no rect covers.  At the
+            // bail r7 still carries the job and r10 param_3; param_4/param_5
+            // live at [sp,#0x40]/[sp,#0x44].
+            {
+                let gate = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let page_lo = base_address + (0x0042_8000u32 - ORIGINAL_BASE);
+                let page_hi = page_lo + 0x1fff;
+                let gt = gate.clone();
+                unicorn
+                    .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                        let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                        let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                        let tag = match original {
+                            0x0042_91b0u32 => "fill-gate1",
+                            0x0042_9014u32 => "fill-gate23",
+                            0x0042_8fd8u32 => "fill-bail",
+                            _ => return,
+                        };
+                        let n = gt.fetch_add(1, Ordering::Relaxed);
+                        if n >= 60 {
+                            return;
+                        }
+                        let job = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                        let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                        let rect3 = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
+                        let rect4 = read_u32_or_invalid(uc, sp.wrapping_add(0x40));
+                        let rect5 = read_u32_or_invalid(uc, sp.wrapping_add(0x44));
+                        log::info!(
+                            "PROCMAPENGINE render trace {} t={}ms job={:#x} jobc=[{:#x},{:#x},{:#x},{:#x}] jobs=[{:#x},{:#x},{:#x},{:#x}] p3=[{:#x},{:#x},{:#x},{:#x}] p4=[{:#x},{:#x},{:#x},{:#x}] p5=[{:#x},{:#x},{:#x},{:#x}] n={}",
+                            tag,
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            job,
+                            read_u32_or_invalid(uc, job + 0x40),
+                            read_u32_or_invalid(uc, job + 0x44),
+                            read_u32_or_invalid(uc, job + 0x48),
+                            read_u32_or_invalid(uc, job + 0x4c),
+                            read_u32_or_invalid(uc, job + 0x30),
+                            read_u32_or_invalid(uc, job + 0x34),
+                            read_u32_or_invalid(uc, job + 0x38),
+                            read_u32_or_invalid(uc, job + 0x3c),
+                            read_u32_or_invalid(uc, rect3),
+                            read_u32_or_invalid(uc, rect3 + 4),
+                            read_u32_or_invalid(uc, rect3 + 8),
+                            read_u32_or_invalid(uc, rect3 + 0xc),
+                            read_u32_or_invalid(uc, rect4),
+                            read_u32_or_invalid(uc, rect4 + 4),
+                            read_u32_or_invalid(uc, rect4 + 8),
+                            read_u32_or_invalid(uc, rect4 + 0xc),
+                            read_u32_or_invalid(uc, rect5),
+                            read_u32_or_invalid(uc, rect5 + 4),
+                            read_u32_or_invalid(uc, rect5 + 8),
+                            read_u32_or_invalid(uc, rect5 + 0xc),
+                            n
+                        );
+                    })
+                    .unwrap();
+            }
             let lab = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let cp2 = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let page_lo = base_address + (0x0043_5000u32 - ORIGINAL_BASE);
