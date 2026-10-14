@@ -6048,7 +6048,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 {
                     use unicorn_engine::unicorn_const::HookType;
                     let lo = 0x0078_fec4u32 as u64;
-                    let hi = lo + 0xa;
+                    let hi = lo + 0x14;
                     let st = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                     let res = unicorn.add_mem_hook(
                         HookType::MEM_WRITE,
@@ -6218,21 +6218,26 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 // drains to 0 (which should promote +0x74 past 1).
                 {
                     let ihm = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-                    let addr = base_address + 0x0051_16d4u32 - ORIGINAL_BASE;
+                    let page_lo = base_address + (0x0051_1000u32 - ORIGINAL_BASE);
+                    let page_hi = page_lo + 0xfff;
                     unicorn
-                        .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
-                            let count = ihm.fetch_add(1, Ordering::Relaxed);
-                            if count >= 60 {
+                        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                            let original =
+                                pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                            if original != 0x0051_16d4u32 {
                                 return;
                             }
-                            let req = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                            let count = ihm.fetch_add(1, Ordering::Relaxed);
+                            if count >= 80 {
+                                return;
+                            }
                             // The camera-viewpoint request is the static at
                             // 0x78fcd4; dump it directly (r0 is a byte arg).
                             let req_static = 0x0078_fcd4u32;
                             log::info!(
-                                "PROCMAPENGINE render trace IntHandleMapDataRequest entry at {:#x}: r0={:#x} state74={:#x} f114={:#x} f118={:#x} f1f4={:#x} f1f8={:#x} f200={:#x} count={:#x}",
-                                addr,
-                                req,
+                                "PROCMAPENGINE render trace IntHandleMapDataRequest entry r0={:#x} state74={:#x} f114={:#x} f118={:#x} f1f4={:#x} f1f8={:#x} f200={:#x} count={:#x}",
+                                uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
                                 read_u32_or_invalid(uc, req_static + 0x74),
                                 read_u32_or_invalid(uc, req_static + 0x114),
                                 read_u32_or_invalid(uc, req_static + 0x118),

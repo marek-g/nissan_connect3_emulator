@@ -1694,7 +1694,7 @@ fn spawn_posfi_provider(unicorn: &mut Unicorn<'_, Context>) {
                 // fast at first (arm the camera view and the request), then the
                 // cadence drops to one tick per long settling window so a full
                 // GetBlockIDs + LoadBlocks + promotion cycle can complete.
-                let interval_ms = if seq <= 4 { 1_000 } else { 240_000 };
+                let interval_ms = if seq <= 4 { 1_000 } else { 150_000 };
                 std::thread::sleep(std::time::Duration::from_millis(interval_ms));
             }
         });
