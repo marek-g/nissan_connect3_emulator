@@ -5762,7 +5762,12 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 let w0 = read_u32_or_invalid(uc, list);
                 let w1 = read_u32_or_invalid(uc, list + 4);
                 let w2 = read_u32_or_invalid(uc, list + 8);
-                let non_empty = w1 != 0 || w2 != 0;
+                // DrawList iterates *(list+4) [count = u16 at list+0xa] and
+                // calls vtable+0x38 per element - the element count is the
+                // real emptiness test.
+                let cnt = read_u32_or_invalid(uc, list + 0xa) & 0xffff;
+                let vtbl = if w1 == 0 { 0 } else { read_u32_or_invalid(uc, w1) };
+                let non_empty = cnt != 0;
                 if !non_empty && (count % 4300 != 0 || count >= 47_300) {
                     return;
                 }
@@ -5770,7 +5775,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     return;
                 }
                 log::info!(
-                    "PROCMAPENGINE render trace DrawList entry at {:#x}: layer={:#x} elem_list={:#x} w0={:#x} w1={:#x} w2={:#x} count={:#x} t={}ms",
+                    "PROCMAPENGINE render trace DrawList entry at {:#x}: layer={:#x} elem_list={:#x} w0={:#x} w1={:#x} w2={:#x} count={:#x} t={}ms elems={} vtbl={:#x}",
                     addr,
                     layer,
                     list,
@@ -5778,7 +5783,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     w1,
                     w2,
                     count,
-                    crate::libs::dapi::emu_t0_elapsed_ms()
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    cnt,
+                    vtbl
                 );
             })
             .unwrap();
