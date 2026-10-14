@@ -710,6 +710,85 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             .unwrap();
     }
 
+    // r643: `ail_bExamineInfluenceToAdministration` case-2 consumed every
+    // fabricated svc-0x26 status pair in the stalled runs (r642: consumed=1
+    // 40x, no MQB post).  Its tail iterates the client reference list and
+    // applies the state via `ail_tclServiceReference::vSetServiceState`
+    // (plain byte store at ref+6) ONLY when `bIsDataSet(ref, svc, type,
+    // regid, sub)` matches (0xffff args are wildcards; ref+0 svc, +2,
+    // +4 regid, +6 state, +8 sub).  Log both to learn whether the pair ever
+    // matches a reference (i.e. ever gets applied) or falls into the
+    // no-match AutoFunctionUnregister leg.
+    {
+        let bisect_hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let vset_hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let page_lo = base_address + (0x0066_e000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original == 0x0066_e3d0u32 {
+                    let count = bisect_hits.fetch_add(1, Ordering::Relaxed);
+                    if count >= 120 {
+                        return;
+                    }
+                    let refx = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let mut refbuf = [0u8; 12];
+                    let ref_ok = uc.mem_read(refx as u64, &mut refbuf).is_ok();
+                    let a1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let a2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    let a3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0);
+                    let mut sbuf = [0u8; 4];
+                    let stack = if uc.mem_read(sp, &mut sbuf).is_ok() {
+                        u32::from_le_bytes(sbuf)
+                    } else {
+                        0xffff_ffff
+                    };
+                    let g16 = |o: usize| -> u32 {
+                        if ref_ok {
+                            u16::from_le_bytes([refbuf[o], refbuf[o + 1]]) as u32
+                        } else {
+                            0xffff_ffff
+                        }
+                    };
+                    log::info!(
+                        "PROCMAPENGINE: CCA ref-match t={}ms thread=[{}] ref={:#x} svc={:#x} w2={:#x} regid={:#x} state={:#x} sub={:#x} args={:#x},{:#x},{:#x},{:#x} n={}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        refx,
+                        g16(0),
+                        g16(2),
+                        g16(4),
+                        if ref_ok { refbuf[6] as u32 } else { 0xffff_ffff },
+                        g16(8),
+                        a1,
+                        a2,
+                        a3,
+                        stack,
+                        count
+                    );
+                } else if original == 0x0066_e43cu32 {
+                    let count = vset_hits.fetch_add(1, Ordering::Relaxed);
+                    if count >= 24 {
+                        return;
+                    }
+                    let refx = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let state = (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32) & 0xff;
+                    log::info!(
+                        "PROCMAPENGINE: CCA ref-state-set t={}ms thread=[{}] ref={:#x} new_state={} n={}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        refx,
+                        state,
+                        count
+                    );
+                }
+            })
+            .unwrap();
+    }
+
     if std::env::var_os("EMU_PROCMAPENGINE_TRACE_INIT")
         .is_some_and(|value| !value.is_empty() && value != "0")
     {
