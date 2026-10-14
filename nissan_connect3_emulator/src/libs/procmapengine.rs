@@ -6005,10 +6005,18 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
                         let rect4 = read_u32_or_invalid(uc, sp);
                         log::info!(
-                            "PROCMAPENGINE render trace FillActiveMO entry t={}ms job={:#x} mask={:#x} jobrect=[{:#x},{:#x},{:#x},{:#x}] surround=[{:#x},{:#x}] centre=[{:#x},{:#x},{:#x},{:#x}] count={:#x}",
+                            "PROCMAPENGINE render trace FillActiveMO entry t={}ms job={:#x} mask={:#x} mos={} jobrect=[{:#x},{:#x},{:#x},{:#x}] surround=[{:#x},{:#x}] centre=[{:#x},{:#x},{:#x},{:#x}] count={:#x}",
                             crate::libs::dapi::emu_t0_elapsed_ms(),
                             job,
                             (uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32) & 0xffff,
+                            {
+                                let arr = read_u32_or_invalid(uc, job + 0x54);
+                                if arr == 0 {
+                                    0
+                                } else {
+                                    read_u32_or_invalid(uc, arr)
+                                }
+                            },
                             if job == 0 { 0 } else { read_u32_or_invalid(uc, job + 0x40) },
                             if job == 0 { 0 } else { read_u32_or_invalid(uc, job + 0x44) },
                             if job == 0 { 0 } else { read_u32_or_invalid(uc, job + 0x48) },
@@ -6122,11 +6130,18 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                 return;
                             }
                             let job = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                            let arr = read_u32_or_invalid(uc, job + 0x54);
+                            let mos = if arr == 0 {
+                                0
+                            } else {
+                                read_u32_or_invalid(uc, arr)
+                            };
                             log::info!(
-                                "PROCMAPENGINE render trace MOUpd copy-active t={}ms stored={:#x} stored28={:#x} count={:#x}",
+                                "PROCMAPENGINE render trace MOUpd copy-active t={}ms stored={:#x} stored28={:#x} mos={} count={:#x}",
                                 crate::libs::dapi::emu_t0_elapsed_ms(),
                                 job,
                                 read_u32_or_invalid(uc, job + 0x28),
+                                mos,
                                 count
                             );
                         }
