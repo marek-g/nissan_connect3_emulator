@@ -6092,18 +6092,17 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     })
                     .unwrap();
             }
-            // r623: the DOM view rect comes out of
-            // `GlobalViewRect_2D(rect, mcp, matrix)` which centres on
-            // mcp+0x1c/+0x20 (with mcp+0x14/+0x18 as the far corners - the
-            // first r623 watch proved +0x14/+0x18 carry the 800x480 screen
-            // extents) - observed frozen at the boot default
-            // (0xc4f45dfb, 0x1e3b77c6) while the view's own camera copy
-            // (view+0x84/+0x88) holds the renfi values.  Watch the centre
-            // pair (mcp = view 0xda0bc4 + 0x280 = 0xda0e44) to find who is
-            // supposed to move it.
+            // r623/r626: `GlobalViewRect_2D` builds the per-frame DOM rect
+            // as corner offsets (mcp+0x14..+0x20 fixed-point corners times a
+            // scale matrix) plus the absolute centre pair at mcp+0x38 (x) /
+            // mcp+0x3c (y) - the r625 scan confirms which fields hold the
+            // 0xc4f4xxxx stale values.  Those stayed frozen at the boot
+            // default while the view's own camera copy (view+0x84/+0x88)
+            // holds the renfi values; watch the centre pair (mcp = view
+            // 0xda0bc4 + 0x280 = 0xda0e44) to find who must move it.
             {
                 use unicorn_engine::unicorn_const::HookType;
-                let mcp_c = 0xda0e60u32; // 0xda0bc4 + 0x280 + 0x1c
+                let mcp_c = 0xda0e78u32; // 0xda0bc4 + 0x280 + 0x38 (rect centre x/y)
                 let _ = unicorn.add_mem_hook(
                     HookType::MEM_WRITE,
                     mcp_c as u64,
@@ -6168,6 +6167,29 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                 lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE) & !1
                             },
                             count
+                        );
+                        // r625b: locate where the 0xc4f4xxxx centre ints
+                        // actually live inside this mcp.
+                        log::info!(
+                            "PROCMAPENGINE render trace GlobalViewRect-scan t={}ms mcp={:#x} b24=[{:#x},{:#x},{:#x},{:#x}] b34=[{:#x},{:#x},{:#x},{:#x}] b44=[{:#x},{:#x},{:#x},{:#x}] b54=[{:#x},{:#x},{:#x},{:#x}]",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            mcp,
+                            read_u32_or_invalid(uc, mcp + 0x24),
+                            read_u32_or_invalid(uc, mcp + 0x28),
+                            read_u32_or_invalid(uc, mcp + 0x2c),
+                            read_u32_or_invalid(uc, mcp + 0x30),
+                            read_u32_or_invalid(uc, mcp + 0x34),
+                            read_u32_or_invalid(uc, mcp + 0x38),
+                            read_u32_or_invalid(uc, mcp + 0x3c),
+                            read_u32_or_invalid(uc, mcp + 0x40),
+                            read_u32_or_invalid(uc, mcp + 0x44),
+                            read_u32_or_invalid(uc, mcp + 0x48),
+                            read_u32_or_invalid(uc, mcp + 0x4c),
+                            read_u32_or_invalid(uc, mcp + 0x50),
+                            read_u32_or_invalid(uc, mcp + 0x54),
+                            read_u32_or_invalid(uc, mcp + 0x58),
+                            read_u32_or_invalid(uc, mcp + 0x5c),
+                            read_u32_or_invalid(uc, mcp + 0x60)
                         );
                     })
                     .unwrap();
