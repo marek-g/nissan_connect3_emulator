@@ -6029,7 +6029,8 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                             let original =
                                 pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                             log::info!(
-                                "PROCMAPENGINE render trace req-state WRITE addr={:#x} value={:#x} pc={:#x} lr={:#x}",
+                                "PROCMAPENGINE render trace req-state WRITE t={}ms addr={:#x} value={:#x} pc={:#x} lr={:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
                                 address,
                                 value,
                                 original,
@@ -6063,7 +6064,8 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                             let original =
                                 pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                             log::info!(
-                                "PROCMAPENGINE render trace req-fetch WRITE addr={:#x} value={:#x} pc={:#x} lr={:#x}",
+                                "PROCMAPENGINE render trace req-fetch WRITE t={}ms addr={:#x} value={:#x} pc={:#x} lr={:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
                                 address,
                                 value,
                                 original,
@@ -6312,6 +6314,65 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         })
                         .unwrap();
                 }
+                // r608: the request-state zeroing at 0x50ccf0 (inside
+                // PerformMapDataRequest) destroys accepted 34-block rounds
+                // (row + +0x1f4 written, RCMOUS queued) one second after they
+                // land.  One-shot armed backtrace: the first time the reset's
+                // caller landing pad 0x50ce0c is reached, log the fetch
+                // sequence backwards through PerformMapDataRequest's callers
+                // (return-address chain via the frames' saved lr is hard, so
+                // just dump the step trace backwards is impossible - instead
+                // arm a step tracer over 0x50c000-0x50dfff and stop at the
+                // first fetch outside, whose lr is the culprit).
+                {
+                    let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let steps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    for page in [0x0050_c000u32, 0x0050_d000u32] {
+                        let lo = base_address + (page - ORIGINAL_BASE);
+                        let armed = std::sync::Arc::clone(&armed);
+                        let steps = std::sync::Arc::clone(&steps);
+                        unicorn
+                            .add_code_hook(lo as u64, (lo + 0xfff) as u64, move |uc, _, _| {
+                                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                                let original =
+                                    pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                                if original == 0x0050_ccf0u32 && steps.load(Ordering::Relaxed) == 0
+                                {
+                                    armed.store(true, Ordering::Relaxed);
+                                    log::info!(
+                                        "PROCMAPENGINE render trace req-state reset executing t={}ms lr={:#x}",
+                                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                                        uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
+                                    );
+                                    return;
+                                }
+                                if !armed.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                let n = steps.fetch_add(1, Ordering::Relaxed);
+                                if n >= 400 {
+                                    armed.store(false, Ordering::Relaxed);
+                                    return;
+                                }
+                                if original < 0x0050_c000u32 || original > 0x0050_dfffu32 {
+                                    armed.store(false, Ordering::Relaxed);
+                                    log::info!(
+                                        "PROCMAPENGINE reset-step EXIT {:#010x} lr={:#x}",
+                                        original,
+                                        uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
+                                    );
+                                    return;
+                                }
+                                log::info!(
+                                    "PROCMAPENGINE reset-step {:#010x} lr={:#x} (left {})",
+                                    original,
+                                    uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                                    400 - n
+                                );
+                            })
+                            .unwrap();
+                    }
+                }
                 // r606: the request state climbs 0->1 then is reset to 0
                 // (PerformMapDataRequest 0x50ccf0 / PerformResetMapDataRequest
                 // 0x50ec0c) over and over - never reaches 2 which
@@ -6333,12 +6394,13 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                 return;
                             }
                             let count = upd.fetch_add(1, Ordering::Relaxed);
-                            if count >= 40 {
+                            if count >= 160 {
                                 return;
                             }
                             let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
                             log::info!(
-                                "PROCMAPENGINE render trace UpdateMapDataRequest entry prio={:#x} view={:#x} scale_bits={:#x} r3={:#x} rect=[{:#x},{:#x},{:#x},{:#x}] lr={:#x} count={:#x}",
+                                "PROCMAPENGINE render trace UpdateMapDataRequest entry t={}ms prio={:#x} view={:#x} scale_bits={:#x} r3={:#x} rect=[{:#x},{:#x},{:#x},{:#x}] lr={:#x} count={:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
                                 uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
                                 uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xff,
                                 uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
@@ -6364,12 +6426,13 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                 return;
                             }
                             let count = perf.fetch_add(1, Ordering::Relaxed);
-                            if count >= 40 {
+                            if count >= 160 {
                                 return;
                             }
                             let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
                             log::info!(
-                                "PROCMAPENGINE render trace PerformMapDataRequest entry prio={:#x} view={:#x} scale_bits={:#x} r3={:#x} rect=[{:#x},{:#x},{:#x},{:#x}] lr={:#x} count={:#x}",
+                                "PROCMAPENGINE render trace PerformMapDataRequest entry t={}ms prio={:#x} view={:#x} scale_bits={:#x} r3={:#x} rect=[{:#x},{:#x},{:#x},{:#x}] lr={:#x} count={:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
                                 uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
                                 uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xff,
                                 uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
