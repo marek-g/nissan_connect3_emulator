@@ -1698,7 +1698,13 @@ fn spawn_posfi_provider(unicorn: &mut Unicorn<'_, Context>) {
                 // message churn (section-assert pressure) right when the
                 // render tail needed a quiet engine; four burst ticks are
                 // enough to arm the CCP and the car cursor.
-                let interval_ms = if seq <= 4 { 1_000 } else { 400_000 };
+                // r628: they are NOT - the engine only starts at t~10 s, so
+                // the burst ticks are dropped, the CCP keeps its hardcoded
+                // Milwaukee default (0xc4f45dfb, 0x1e3b77c6) and the
+                // follow-camera restores that into view+0x84 between our
+                // renfi commits (the flip-flop r627 exposed).  Tick every
+                // 20 s instead so the CCP lives.
+                let interval_ms = if seq <= 4 { 1_000 } else { 20_000 };
                 std::thread::sleep(std::time::Duration::from_millis(interval_ms));
             }
         });
@@ -1728,6 +1734,12 @@ fn map_units(degrees: f64) -> i32 {
 /// fixed position arms it exactly once and never again; stepping the car keeps new
 /// requests coming, exactly as a moving vehicle would.
 fn car_position(seq: u16) -> (f64, f64) {
+    // r628: ticks past the arming burst repeat one fixed point - the CCP
+    // only needs to exist and sit over Krakow; moving it every 20 s would
+    // re-trigger the request reset storm r618 quieted.
+    if seq > 4 {
+        return (19.91809, 50.06254);
+    }
     if seq % 2 == 0 {
         (19.91809, 50.06254)
     } else {
@@ -2037,13 +2049,13 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
                 // r627: with the camera applied the Render commit
                 // (0x528e3c, guarded by view+0x2e0 != 0) copies the Kraków
                 // centre into the mcp and the FillActiveMO gate PASSES
-                // (elements=12 harvested at t=158810) - but a later Render
-                // pass with view+0x2e0 cleared restores the stale Milwaukee
-                // copy, so the harvest alternates.  A 2.5 s re-arm cadence
-                // keeps the committed centre correct through the render
-                // passes that matter.
+                // (elements=12 harvested at t=158810) - but the follow
+                // camera restores the Milwaukee CCP default into view+0x84
+                // between commits (fixed by live posfi ticks), so a spammy
+                // re-arm cadence only re-triggers rounds (r628 regression);
+                // stay at 10 s.
                 drift += 0.000085;
-                std::thread::sleep(std::time::Duration::from_millis(2_500));
+                std::thread::sleep(std::time::Duration::from_millis(10_000));
             }
         });
     match result {
