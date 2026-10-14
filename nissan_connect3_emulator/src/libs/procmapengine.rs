@@ -6133,6 +6133,43 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         );
                     })
                     .unwrap();
+                // The camera-viewpoint request is a static at 0x78fcd4 (its
+                // +0x74 state stays 1 forever -> every RC job is created with
+                // reqstate 1 -> FillActiveMOArrayFromRCMapObjectsRequest never
+                // runs, gate "CentreRect loading INcomplete" wants >= 2).
+                // Watch the state dword and a window around it to find the
+                // promotion writer (or prove there is none in this state).
+                {
+                    use unicorn_engine::unicorn_const::HookType;
+                    let lo = 0x0078_fd3cu32 as u64;
+                    let hi = lo + 0x20;
+                    let st = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let res = unicorn.add_mem_hook(
+                        HookType::MEM_WRITE,
+                        lo,
+                        hi,
+                        move |uc, _t, address, _size, value| {
+                            let count = st.fetch_add(1, Ordering::Relaxed);
+                            if count >= 60 {
+                                return true;
+                            }
+                            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                            let original =
+                                pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                            log::info!(
+                                "PROCMAPENGINE render trace req-state WRITE addr={:#x} value={:#x} pc={:#x} lr={:#x}",
+                                address,
+                                value,
+                                original,
+                                uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
+                            );
+                            true
+                        },
+                    );
+                    if res.is_err() {
+                        log::warn!("PROCMAPENGINE: req-state write watch failed");
+                    }
+                }
             }
         }
     }
