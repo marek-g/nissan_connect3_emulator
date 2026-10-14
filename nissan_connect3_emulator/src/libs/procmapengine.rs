@@ -618,6 +618,8 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     {
         let gate_hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let drop_hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let examine_hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let post_hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let page_lo = base_address + (0x0066_c000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
         unicorn
@@ -654,6 +656,53 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                         uc.get_data().inner.thread_id(),
                         r3,
                         r10,
+                        count
+                    );
+                } else if original == 0x0066_cfa8u32 {
+                    // `bl ail_bExamineInfluenceToAdministration(this, 2, msg)`
+                    // return for class-0x44 with a forward queue set:
+                    // r0 != 0 means administration consumed the status
+                    // message here; r0 == 0 falls through to the body post
+                    // at 0x66cfc8 (`bl bPostIpcMessage`, logged at the OSAL
+                    // layer as `post MQB_1024`).
+                    let count = examine_hits.fetch_add(1, Ordering::Relaxed);
+                    if count >= 40 {
+                        return;
+                    }
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let msg = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                    let content = read_u32_or_invalid(uc, msg.wrapping_add(4));
+                    log::info!(
+                        "PROCMAPENGINE: CCA class-44 examine t={}ms thread=[{}] consumed={:#x} content={:#x} head={:#x} w8={:#x} w14={:#x} state_b18={:#x} n={}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        r0,
+                        content,
+                        read_u32_or_invalid(uc, content),
+                        read_u32_or_invalid(uc, content.wrapping_add(8)),
+                        read_u32_or_invalid(uc, content.wrapping_add(0x14)),
+                        read_u32_or_invalid(uc, content.wrapping_add(0x18)) & 0xff,
+                        count
+                    );
+                } else if original == 0x0066_cfccu32 {
+                    // `bl bPostIpcMessage(..., fwdq, msg, 1)` return for
+                    // class-0x44: r0 == 0 means the forward failed and the
+                    // message gets rejected through vtable+0x74 (0x66cff8).
+                    let count = post_hits.fetch_add(1, Ordering::Relaxed);
+                    if count >= 40 {
+                        return;
+                    }
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let msg = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                    let content = read_u32_or_invalid(uc, msg.wrapping_add(4));
+                    log::info!(
+                        "PROCMAPENGINE: CCA class-44 post-call t={}ms thread=[{}] ok={:#x} content={:#x} head={:#x} state_b18={:#x} n={}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        r0,
+                        content,
+                        read_u32_or_invalid(uc, content),
+                        read_u32_or_invalid(uc, content.wrapping_add(0x18)) & 0xff,
                         count
                     );
                 }
