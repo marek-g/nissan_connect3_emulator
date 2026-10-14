@@ -2090,9 +2090,20 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
                 // the FillActiveMO gate stops being a lottery.  The 700 ms
                 // debounce keeps a burst of Milwaukee writes from stampeding
                 // the request pipeline (r628's round-restart regression).
+                // r651: 10 s -> 40 s.  Every renfi nudge re-inits the static
+                // map-data request (PerformMapDataRequest writes state 0,
+                // refetch sentinels, frees the fastmap channel), and r650
+                // timing showed the state-2 block-load round needs ~100 s of
+                // `req-fetch` quiet to drain (completion `0x507ed8 ->
+                // sentinel -1` only at 81/122/220 s).  At a 10 s cadence the
+                // machine crawls 0->1->2->0 forever, `GetLeftBlocks` never
+                // sees `[0x1f8] == -1` with a live job, `job+0x50` stays 0
+                // and the copy-to-active never runs.  A 40 s window lets one
+                // round complete while the FillActiveMO job flow (4 ticks
+                // per 40 s) continues.
                 let deadline = std::time::Instant::now()
                     + crate::emulator::vtime::host_interval(std::time::Duration::from_millis(
-                        10_000,
+                        40_000,
                     ));
                 loop {
                     let now = std::time::Instant::now();
