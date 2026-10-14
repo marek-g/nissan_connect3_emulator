@@ -5791,6 +5791,58 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             .unwrap();
     }
 
+    // r637: the per-element draw call of the DrawList loop (verified ARM
+    // disasm): 0x52ccc8 takes list=r1 (-> r6); the loop is gated by a global
+    // `[0x52ce10]-referred word at +0x1c` being <= 7 (`bhi 0x52cda8` skips
+    // every element - a candidate bail for the zero-GL mystery), then per
+    // iteration loads r12 = [r0] / [r12] (r0 = *(list+4)) and tail-calls
+    // [r12 + 0x38] at 0x52cd40 with r0 = *(list+4), r1 = r7 (3rd arg),
+    // r2 = r8 (stack arg +0x28), r3 = r10 (2nd arg), r4 = index, r5 = stack
+    // arg +0x2c (per-frame cursor the callee advances).  Mid-TB fetch address
+    // -> page-range hook (unicorn bounded-hook quirk, see AGENTS.md).
+    {
+        let drawn = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let page_lo = base_address + (0x0052_c000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != 0x0052_cd40u32 {
+                    return;
+                }
+                let count = drawn.fetch_add(1, Ordering::Relaxed);
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let target = if r0 == 0 {
+                    0
+                } else {
+                    let vtbl = read_u32_or_invalid(uc, r0);
+                    if vtbl == 0 {
+                        0
+                    } else {
+                        let table = read_u32_or_invalid(uc, vtbl);
+                        read_u32_or_invalid(uc, table.wrapping_add(0x38))
+                    }
+                };
+                if count >= 60 {
+                    return;
+                }
+                log::info!(
+                    "PROCMAPENGINE render trace MOUpd elem-draw t={}ms this={:#x} a_r1={:#x} a_r2={:#x} a_r3={:#x} idx={} iter={:#x} target={:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    r0,
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32,
+                    target,
+                    count
+                );
+            })
+            .unwrap();
+    }
+
     // r587: 43 layers iterate, every per-layer element list is empty
     // ({vtable, 0, 0}).  Those lists are filled per frame by
     // `map_tclSceneManager::DetermineMapObjects` (0x430f34), called from
