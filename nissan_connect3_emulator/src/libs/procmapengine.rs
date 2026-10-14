@@ -5813,16 +5813,13 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 }
                 let count = drawn.fetch_add(1, Ordering::Relaxed);
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                // At the call site `r0 == r12 == *(*(list+4))` (the
+                // `cpy r0, r12` at 0x52cd28), so the callee address is
+                // simply [r0 + 0x38].
                 let target = if r0 == 0 {
                     0
                 } else {
-                    let vtbl = read_u32_or_invalid(uc, r0);
-                    if vtbl == 0 {
-                        0
-                    } else {
-                        let table = read_u32_or_invalid(uc, vtbl);
-                        read_u32_or_invalid(uc, table.wrapping_add(0x38))
-                    }
+                    read_u32_or_invalid(uc, r0.wrapping_add(0x38))
                 };
                 if count >= 60 {
                     return;
@@ -6345,6 +6342,15 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             let g590 = g590.clone();
             let g591 = g591.clone();
             let g592 = g592.clone();
+            // r638: r627's copy fired because the INCOMING job lived long
+            // enough for its completion flag (+0x50) to be set and forwarded
+            // by Combine.  Since r635 each renfi drift rotates in a fresh
+            // incoming job and new50 stays 0 - so watch +0x50 of every
+            // incoming job we have ever seen (armed from the Combine probe)
+            // and catch who does (or does not) raise it.
+            let armed: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u32>>> =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+            let armed_c = armed.clone();
             unicorn
                 .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
                     let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
@@ -6363,9 +6369,6 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         }
                         0x0043_5db0u32 => {
                             let count = lab_c.fetch_add(1, Ordering::Relaxed);
-                            if count >= 60 {
-                                return;
-                            }
                             // Right after `bl Combine`: r5 = stored (slot)
                             // job, r8 = incoming job; the reads below observe
                             // the forwarded state/flag (`Combine` writes
@@ -6374,6 +6377,42 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                             let job = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
                             let newjob = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
                             let res = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                            // Arm a write watch on this incoming job's
+                            // completion flag (once per object).
+                            if newjob != 0 && (newjob >> 28) == 9 {
+                                use unicorn_engine::unicorn_const::HookType;
+                                let mut guard = armed_c.lock().unwrap();
+                                if guard.len() < 48 && guard.insert(newjob) {
+                                    drop(guard);
+                                    let _ = uc.add_mem_hook(
+                                        HookType::MEM_WRITE,
+                                        newjob as u64 + 0x50,
+                                        newjob as u64 + 0x53,
+                                        move |uc2, _t, _a, size, value| {
+                                            static FC: AtomicU32 = AtomicU32::new(0);
+                                            if FC.fetch_add(1, Ordering::Relaxed) >= 80 {
+                                                return true;
+                                            }
+                                            let pc = uc2.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                                            let lr = uc2.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                                            log::warn!(
+                                                "PROCMAPENGINE render trace MOUpd flag50 WRITE t={}ms thread=[{}] job={:#x} size={} value={:#x} pc={:#x} lr={:#x}",
+                                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                                uc2.get_data().inner.thread_id(),
+                                                newjob,
+                                                size,
+                                                value,
+                                                pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                                                lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE) & !1,
+                                            );
+                                            true
+                                        },
+                                    );
+                                }
+                            }
+                            if count >= 60 {
+                                return;
+                            }
                             log::info!(
                                 "PROCMAPENGINE render trace MOUpd combined t={}ms stored={:#x} stored28={:#x} stored50={:#x} newjob={:#x} new28={:#x} new50={:#x} res={:#x} count={:#x}",
                                 crate::libs::dapi::emu_t0_elapsed_ms(),
