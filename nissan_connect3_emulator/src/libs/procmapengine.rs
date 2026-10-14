@@ -6154,6 +6154,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         if !matches!(
                             original,
                             0x0043_1718u32
+                                | 0x0043_17bcu32
                                 | 0x0043_186cu32
                                 | 0x0043_28b4u32
                                 | 0x0043_2a44u32
@@ -6167,6 +6168,18 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         }
                         let mcp = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
                         let view = read_u8_or_invalid(uc, mcp + 5);
+                        if original == 0x0043_17bcu32 {
+                            // Right after `bl PerformLocalUpdateOfMapObjects`:
+                            // r0 = harvested element count.
+                            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                            log::info!(
+                                "PROCMAPENGINE render trace DOM-plu-ret t={}ms view={} elements={}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                view,
+                                r0
+                            );
+                            return;
+                        }
                         log::info!(
                             "PROCMAPENGINE render trace DOM-leg t={}ms leg={:#x} mcp={:#x} mcpaa={:#x} view={} n={}",
                             crate::libs::dapi::emu_t0_elapsed_ms(),

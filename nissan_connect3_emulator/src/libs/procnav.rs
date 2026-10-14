@@ -1694,7 +1694,11 @@ fn spawn_posfi_provider(unicorn: &mut Unicorn<'_, Context>) {
                 // fast at first (arm the camera view and the request), then the
                 // cadence drops to one tick per long settling window so a full
                 // GetBlockIDs + LoadBlocks + promotion cycle can complete.
-                let interval_ms = if seq <= 4 { 1_000 } else { 150_000 };
+                // r618: a fifth tick ~166 s only added a reset storm plus
+                // message churn (section-assert pressure) right when the
+                // render tail needed a quiet engine; four burst ticks are
+                // enough to arm the CCP and the car cursor.
+                let interval_ms = if seq <= 4 { 1_000 } else { 400_000 };
                 std::thread::sleep(std::time::Duration::from_millis(interval_ms));
             }
         });
