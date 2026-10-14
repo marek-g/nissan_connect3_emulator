@@ -1009,6 +1009,69 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             .unwrap();
     }
 
+    // r650: the linked-MO hits of r649 come from legs *before* the +0x50
+    // leg (0x5059a4/0x505f74/0x506004/0x506594).  Probe the GetLeftBlocks
+    // decision chain: entry 0x5054f4, the refetch-counter leg 0x505828
+    // (r12=[0x1f4]+1 vs [lod+0x114] count), the `0x505858 cmp [r8],#1`
+    // gate, the `0x505860/0x505868` sentinel tests and the type-5 branch
+    // 0x50587c that jumps to the +0x50 store leg.
+    {
+        let legs = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let targets: [(u32, &str); 7] = [
+            (0x0050_54f4, "entry"),
+            (0x0050_5634, "leg-idle"),
+            (0x0050_5664, "leg-skip"),
+            (0x0050_5700, "leg-low-gate"),
+            (0x0050_5828, "gate-f1f4"),
+            (0x0050_5858, "gate-r8"),
+            (0x0050_5868, "gate-f1f8"),
+        ];
+        let page_lo = base_address + (0x0050_5000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                let Some((_, name)) = targets.iter().find(|(a, _)| *a == original) else {
+                    return;
+                };
+                let count = legs.fetch_add(1, Ordering::Relaxed);
+                if count >= 90 {
+                    return;
+                }
+                let req = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                let job = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                let r8v = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let r12 = uc.reg_read(RegisterARM::R12).unwrap_or(0) as u32;
+                let state = read_u32_or_invalid(uc, req.wrapping_add(0x74));
+                let n = if state < 8 { state } else { 0 };
+                let cnt114 = read_u32_or_invalid(uc, req.wrapping_add(n * 0x10 + 0x114));
+                let f1f4 = read_u32_or_invalid(uc, req.wrapping_add(0x1f4));
+                let f1f8 = read_u32_or_invalid(uc, req.wrapping_add(0x1f8));
+                let tp = read_u32_or_invalid(uc, req);
+                let g8 = read_u32_or_invalid(uc, r8v);
+                log::info!(
+                    "PROCMAPENGINE render trace gbl-{name} t={}ms thread=[{}] req={:#x} job={:#x} type={:#x} state74={:#x} cnt114={:#x} f1f4={:#x} f1f8={:#x} r1={:#x} r12={:#x} r8={:#x}->{:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    req,
+                    job,
+                    tp,
+                    state,
+                    cnt114,
+                    f1f4,
+                    f1f8,
+                    r1,
+                    r12,
+                    r8v,
+                    g8,
+                    count
+                );
+            })
+            .unwrap();
+    }
+
     if std::env::var_os("EMU_PROCMAPENGINE_TRACE_INIT")
         .is_some_and(|value| !value.is_empty() && value != "0")
     {
