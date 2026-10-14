@@ -6170,6 +6170,35 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         true
                     },
                 );
+                // r629: watch view+0x84 (the camera longitude copy the
+                // Render commit reads) - the Milwaukee value keeps creeping
+                // back between renfi commits; catch the writer red-handed.
+                let _ = unicorn.add_mem_hook(
+                    HookType::MEM_WRITE,
+                    0xda0c48u64, // 0xda0bc4 + 0x84
+                    0xda0c48u64 + 3,
+                    move |uc, _t, _address, _size, value| {
+                        static COUNT: AtomicU32 = AtomicU32::new(0);
+                        static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if LAST.swap(value as u32, Ordering::Relaxed) == value as u32 {
+                            return true;
+                        }
+                        if COUNT.fetch_add(1, Ordering::Relaxed) >= 200 {
+                            return true;
+                        }
+                        let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                        let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                        log::warn!(
+                            "PROCMAPENGINE render trace VIEW-84 WRITE t={}ms thread=[{}] value={:#x} pc={:#x} lr={:#x}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            uc.get_data().inner.thread_id(),
+                            value,
+                            pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                            lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE) & !1,
+                        );
+                        true
+                    },
+                );
             }
             // r625: `map_tclMapMathUtils::GlobalViewRect_2D(rect, mcp, m2x2)`
             // (0x44b14c) builds the per-frame DOM rect from the true mcp's
