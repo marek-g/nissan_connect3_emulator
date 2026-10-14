@@ -5891,6 +5891,96 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 })
                 .unwrap();
         }
+        // r590: raw data blocks ARE created/added (24x), yet the per-view
+        // active-MO array stays empty.  `PerformLocalUpdateOfMapObjects`
+        // (0x42c49c) is what refills it: it reads the per-[lod][idx] RC
+        // MapObjectsUpdate job from scene+0x84+(idx+lod*4)*4 (second array at
+        // +0xd4) and only fills when `job != null && job.cell_count(+0x28)
+        // >= 2` (else trace "CentreRect loading INcomplete"), then calls
+        // FillActiveMOArrayFromRCMapObjectsRequest.  Watch the entry with the
+        // job lookup, and watch writes to both job-array rows.
+        {
+            let plc = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let addr = base_address + 0x0042_c49cu32 - ORIGINAL_BASE;
+            unicorn
+                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                    let count = plc.fetch_add(1, Ordering::Relaxed);
+                    if count >= 30 {
+                        return;
+                    }
+                    let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let view = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xff;
+                    let lod = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32 & 0xff;
+                    let idx = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32 & 0xffff;
+                    let job_a = if lod < 5 && idx < 4 {
+                        read_u32_or_invalid(uc, this + 0x84 + (idx + lod * 4) * 4)
+                    } else {
+                        0xdead_beee
+                    };
+                    let cells_a = read_u32_or_invalid(uc, job_a.wrapping_add(0x28));
+                    let job_b = if lod < 5 && idx < 4 {
+                        read_u32_or_invalid(uc, this + 0xd4 + (idx + lod * 4) * 4)
+                    } else {
+                        0xdead_beee
+                    };
+                    log::info!(
+                        "PROCMAPENGINE render trace PerformLocalUpdate entry at {:#x}: scene={:#x} view={} lod={} idx={} jobA={:#x} cellsA={:#x} jobB={:#x} count={:#x}",
+                        addr,
+                        this,
+                        view,
+                        lod,
+                        idx,
+                        job_a,
+                        cells_a,
+                        job_b,
+                        count
+                    );
+                })
+                .unwrap();
+            // The two per-[lod][idx] RC-job arrays at scene+0x84..0xd3 and
+            // scene+0xd4..0x123 (scene stable at 0xaa53a8).
+            use unicorn_engine::unicorn_const::HookType;
+            let jobs = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            for (lo, hi, tag) in [
+                (0x00aa_542cu32, 0x00aa_547cu32, "jobArrayA(+0x84)"),
+                (0x00aa_547cu32, 0x00aa_54ccu32, "jobArrayB(+0xd4)"),
+            ] {
+                let cnt = jobs.fetch_add(0, Ordering::Relaxed);
+                let tag = tag;
+                let arc = {
+                    // separate counter per range via fetch on the same Arc is
+                    // fine: just cap globally at 40.
+                    let a = std::sync::Arc::clone(&jobs);
+                    a
+                };
+                let _ = cnt;
+                let res = unicorn.add_mem_hook(
+                    HookType::MEM_WRITE,
+                    lo as u64,
+                    hi as u64,
+                    move |uc, _t, address, _size, value| {
+                        let count = arc.fetch_add(1, Ordering::Relaxed);
+                        if count >= 40 {
+                            return true;
+                        }
+                        let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                        let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                        log::info!(
+                            "PROCMAPENGINE render trace scene-job-array WRITE[{}] addr={:#x} value={:#x} pc={:#x} lr={:#x}",
+                            tag,
+                            address,
+                            value,
+                            original,
+                            uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
+                        );
+                        true
+                    },
+                );
+                if res.is_err() {
+                    log::warn!("PROCMAPENGINE: scene-job-array write watch failed");
+                }
+            }
+        }
     }
 
     // Message-map router `PortControl_CCAClientHandlerBase::vDispatchMessage`
