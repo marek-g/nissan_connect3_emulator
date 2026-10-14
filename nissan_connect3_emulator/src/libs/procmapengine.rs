@@ -5918,25 +5918,27 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                     let view = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xff;
                     let lod = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32 & 0xff;
-                    let idx = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32 & 0xffff;
-                    let job_a = if lod < 5 && idx < 4 {
-                        read_u32_or_invalid(uc, this + 0x84 + (idx + lod * 4) * 4)
+                    let bitmask = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32 & 0xffff;
+                    // 0x42c4e0: slot = this + 0x84 + (view*4 + lod)*4 (r3 is a
+                    // bitmask, NOT part of the index).
+                    let job_a = if lod < 4 && view < 5 {
+                        read_u32_or_invalid(uc, this + 0x84 + (view * 4 + lod) * 4)
                     } else {
                         0xdead_beee
                     };
                     let cells_a = read_u32_or_invalid(uc, job_a.wrapping_add(0x28));
-                    let job_b = if lod < 5 && idx < 4 {
-                        read_u32_or_invalid(uc, this + 0xd4 + (idx + lod * 4) * 4)
+                    let job_b = if lod < 4 && view < 5 {
+                        read_u32_or_invalid(uc, this + 0xd4 + (view * 4 + lod) * 4)
                     } else {
                         0xdead_beee
                     };
                     log::info!(
-                        "PROCMAPENGINE render trace PerformLocalUpdate entry at {:#x}: scene={:#x} view={} lod={} idx={} jobA={:#x} cellsA={:#x} jobB={:#x} count={:#x}",
+                        "PROCMAPENGINE render trace PerformLocalUpdate entry at {:#x}: scene={:#x} view={} lod={} bitmask={:#x} jobA={:#x} cellsA={:#x} jobB={:#x} count={:#x}",
                         addr,
                         this,
                         view,
                         lod,
-                        idx,
+                        bitmask,
                         job_a,
                         cells_a,
                         job_b,
