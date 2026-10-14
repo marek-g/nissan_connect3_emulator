@@ -6249,7 +6249,57 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         })
                         .unwrap();
                 }
-                // r596: the request state climbs 0->1 then is reset to 0
+                // r606: promotion 1->2 requires BOTH LeftToFetch fields back to
+                // -1.  +0x1f4 (visible) completes, but +0x1f8 (synch/elevation)
+                // is only ever armed through `map_tclSynchDataManager::
+                // s32GetBlockIDs` (0x519548): node -> m_apoDataLoaders[node]
+                // -> vtable+0x10 (PyramidLoader::s32GetBlockIDs 0x58bf6c),
+                // which is disabled unless its file probe in bInit succeeded
+                // (`this[4] == 1`).  Dump node, loader, enable flag, device
+                // string, the vtable targets and the return value.
+                {
+                    let syn = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let ret = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let page_lo = base_address + (0x0051_9000u32 - ORIGINAL_BASE);
+                    let page_hi = page_lo + 0xfff;
+                    let loaders = base_address + (0x0079_0744u32 - ORIGINAL_BASE);
+                    unicorn
+                        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                            let original =
+                                pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                            if original == 0x0051_9548u32 {
+                                let count = syn.fetch_add(1, Ordering::Relaxed);
+                                if count >= 12 {
+                                    return;
+                                }
+                                let np = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                                let node = read_u32_or_invalid(uc, np) & 0xff;
+                                let loader =
+                                    read_u32_or_invalid(uc, loaders.wrapping_add(node * 4));
+                                let vptr = read_u32_or_invalid(uc, loader);
+                                let en = read_u32_or_invalid(uc, loader.wrapping_add(4)) & 0xff;
+                                let devp = read_u32_or_invalid(uc, loader.wrapping_add(8));
+                                let f10 = read_u32_or_invalid(uc, vptr.wrapping_add(0x10));
+                                let f2c = read_u32_or_invalid(uc, vptr.wrapping_add(0x2c));
+                                let f30 = read_u32_or_invalid(uc, vptr.wrapping_add(0x30));
+                                log::info!(
+                                    "PROCMAPENGINE render trace SynchGetBlockIDs entry node={node} loader={loader:#x} enabled={en} device={devp:#x} vtable={vptr:#x} vt+0x10={f10:#x} vt+0x2c={f2c:#x} vt+0x30={f30:#x} count={count}",
+                                );
+                            } else if original == 0x0051_9578u32 || original == 0x0051_957cu32 {
+                                let count = ret.fetch_add(1, Ordering::Relaxed);
+                                if count >= 12 {
+                                    return;
+                                }
+                                log::info!(
+                                    "PROCMAPENGINE render trace SynchGetBlockIDs return site={original:#x} r0={:#x} count={count}",
+                                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                                );
+                            }
+                        })
+                        .unwrap();
+                }
+                // r606: the request state climbs 0->1 then is reset to 0
                 // (PerformMapDataRequest 0x50ccf0 / PerformResetMapDataRequest
                 // 0x50ec0c) over and over - never reaches 2 which
                 // FillActiveMOArrayFromRCMapObjectsRequest requires.  Both are
