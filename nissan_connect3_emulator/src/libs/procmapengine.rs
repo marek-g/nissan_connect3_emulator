@@ -6135,6 +6135,43 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     },
                 );
             }
+            // r625: `map_tclMapMathUtils::GlobalViewRect_2D(rect, mcp, m2x2)`
+            // (0x44b14c) builds the per-frame DOM rect from the true mcp's
+            // fixed-point centre/corners at mcp+0x14..+0x20.  Dump its
+            // arguments and that field block at entry to identify the real
+            // mcp and where its centre comes from (the DOM-leg "mcp" turned
+            // out to be a scene object carrying only 180/400/240 there).
+            {
+                let gr = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let addr = base_address + 0x0044_b14cu32 - ORIGINAL_BASE;
+                unicorn
+                    .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                        let count = gr.fetch_add(1, Ordering::Relaxed);
+                        if count >= 12 {
+                            return;
+                        }
+                        let rect = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                        let mcp = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                        log::info!(
+                            "PROCMAPENGINE render trace GlobalViewRect t={}ms thread=[{}] rect={:#x} mcp={:#x} f10={:#x} f14={:#x} f18={:#x} f1c={:#x} f20={:#x} lr={:#x} n={}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            uc.get_data().inner.thread_id(),
+                            rect,
+                            mcp,
+                            read_u32_or_invalid(uc, mcp + 0x10),
+                            read_u32_or_invalid(uc, mcp + 0x14),
+                            read_u32_or_invalid(uc, mcp + 0x18),
+                            read_u32_or_invalid(uc, mcp + 0x1c),
+                            read_u32_or_invalid(uc, mcp + 0x20),
+                            {
+                                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                                lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE) & !1
+                            },
+                            count
+                        );
+                    })
+                    .unwrap();
+            }
             let lab = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let cp2 = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let page_lo = base_address + (0x0043_5000u32 - ORIGINAL_BASE);
