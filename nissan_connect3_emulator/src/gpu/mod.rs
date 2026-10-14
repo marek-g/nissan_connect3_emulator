@@ -71,20 +71,14 @@ struct GpuCommand {
 /// into program-slot offsets +0xec/+0xf0).  r659: street elements draw with
 /// an empty slot 0x19 (`shd_42100000.glsl` is a `[BinaryShader]` manifest
 /// only), binding 526 VBOs but reaching no `glDraw*`.
-const SYNTH_VERT_SHADER: &str = "attribute vec4 a_position;
-attribute vec4 a_color;
-uniform mat4 u_matModelView;
-uniform mat4 u_matViewProj;
-varying vec4 v_color;
+const SYNTH_VERT_SHADER: &str = "attribute vec2 a_position;
 void main() {
-    gl_Position = u_matViewProj * (u_matModelView * a_position);
-    v_color = a_color;
+    gl_Position = vec4(a_position, 0.0, 1.0);
 }
 ";
 const SYNTH_FRAG_SHADER: &str = "precision mediump float;
-varying vec4 v_color;
 void main() {
-    gl_FragColor = v_color;
+    gl_FragColor = vec4(1.0, 0.0, 1.0, 1.0);
 }
 ";
 
@@ -2633,8 +2627,93 @@ fn route_uniform_matrix(unicorn: &mut Unicorn<'_, Context>, components: usize) -
     0
 }
 
+fn route_active_uniform(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+    active_query(unicorn, false)
+}
+
+fn route_active_attrib(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+    active_query(unicorn, true)
+}
+
+/// `glGetActiveUniform`/`glGetActiveAttrib` (ARM AAPCS: r0=program,
+/// r1=index, r2=bufSize, r3=length*, stack: size*, type*, name*).  The map
+/// engine's `vFindUniformLocations` discovers every uniform by enumerating
+/// actives and strcmp-ing against its own name table, so without a real
+/// answer the synthesized road shader's matrices resolve to no location and
+/// `vUpdateShaderUniforms` never uploads them.
+fn active_query(unicorn: &mut Unicorn<'_, Context>, attrib: bool) -> u32 {
+    let program = ureg(unicorn, RegisterARM::R0);
+    let index = ureg(unicorn, RegisterARM::R1);
+    let buf_size = ureg(unicorn, RegisterARM::R2) as usize;
+    let length_ptr = ureg(unicorn, RegisterARM::R3);
+    let size_ptr = stack_arg(unicorn, 0);
+    let type_ptr = stack_arg(unicorn, 1);
+    let name_ptr = stack_arg(unicorn, 2);
+    let output = gpu_call(move || {
+        let mut name = [0u8; 256];
+        let mut length = 0i32;
+        let mut size = 0i32;
+        let mut kind = 0u32;
+        unsafe {
+            if attrib {
+                gl::GetActiveAttrib(
+                    program,
+                    index,
+                    256,
+                    &mut length,
+                    &mut size,
+                    &mut kind,
+                    name.as_mut_ptr() as *mut std::ffi::c_char,
+                );
+            } else {
+                gl::GetActiveUniform(
+                    program,
+                    index,
+                    256,
+                    &mut length,
+                    &mut size,
+                    &mut kind,
+                    name.as_mut_ptr() as *mut std::ffi::c_char,
+                );
+            }
+            drain_host_gl_errors();
+        }
+        let bytes: Vec<u8> = name.iter().copied().take_while(|c| *c != 0).collect();
+        GpuOutput {
+            ret: kind,
+            out_u32: vec![length.max(0) as u32, size.max(0) as u32],
+            out_bytes: bytes,
+            ..Default::default()
+        }
+    });
+    let Some(output) = output else {
+        return 0;
+    };
+    if length_ptr != 0 {
+        write_u32(unicorn, length_ptr, output.out_u32[0]);
+    }
+    if size_ptr != 0 {
+        write_u32(unicorn, size_ptr, output.out_u32[1]);
+    }
+    if type_ptr != 0 {
+        write_u32(unicorn, type_ptr, output.ret);
+    }
+    if name_ptr != 0 && buf_size > 0 {
+        let mut bytes = output.out_bytes.clone();
+        if bytes.len() + 1 > buf_size {
+            bytes.truncate(buf_size.saturating_sub(1));
+        }
+        bytes.push(0);
+        let _ = unicorn.mem_write(name_ptr as u64, &bytes);
+    }
+    0
+}
+
 fn route_shader_source(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let shader = ureg(unicorn, RegisterARM::R0);
+    // Real source supersedes any `glShaderBinary` substitution waiting for
+    // this shader (the HMI probes binary support then compiles source).
+    GL_SYNTH_SHADER_SOURCE.with(|m| m.borrow_mut().remove(&shader));
     let count = (ureg(unicorn, RegisterARM::R1) as usize).min(64);
     let strings_ptr = ureg(unicorn, RegisterARM::R2);
     let lengths_ptr = ureg(unicorn, RegisterARM::R3);
@@ -2690,7 +2769,10 @@ fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
         .max(size.max(1) as usize)
         .max(4)
         .min(256);
-    let max_verts = 4096usize;
+    // Road DTM strips draw 8700+ vertices in one `glDrawArrays` (r661d: the
+    // engine fan-out read past a 4096-vertex scratch copy and the async
+    // host rasterizer segfaulted), so size the client-array window for that.
+    let max_verts = 32768usize;
     let requested = per_vertex.saturating_mul(max_verts).min(MAX_TEXTURE_BYTES);
 
     if vap_legacy() {
@@ -2893,9 +2975,15 @@ fn route_tex_sub_image2d(unicorn: &mut Unicorn<'_, Context>) -> u32 {
 fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32> {
     match name {
         "glShaderBinary" => {
-            // The engine hands us GPU-specific precompiled binaries (Vivante)
-            // that the host driver must reject; substitute a GLSL ES source
-            // for the shader object instead (see `SYNTH_VERT_SHADER`).
+            // The map engine hands us GPU-specific precompiled binaries
+            // (Vivante) that the host driver must reject; substitute a GLSL
+            // ES source for its shader objects instead (see
+            // `SYNTH_VERT_SHADER`).  Everyone else keeps the old
+            // unsupported-binary answer so their source fallback runs.
+            if current_gpu_target() != GpuTarget::Map || std::env::var_os("EMU_SYNTH_SHADERS").is_none() {
+                PENDING_GL_ERROR.with(|flag| flag.set(true));
+                return Some(0);
+            }
             let count = ureg(unicorn, RegisterARM::R0).min(64);
             let shaders = ureg(unicorn, RegisterARM::R1);
             for i in 0..count {
@@ -2908,7 +2996,18 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
                     Some(GL_VERTEX_SHADER_TYPE) => SYNTH_VERT_SHADER,
                     _ => SYNTH_FRAG_SHADER,
                 };
-                GL_SYNTH_SHADER_SOURCE.with(|m| m.borrow_mut().insert(id, source.to_string()));
+                // The binary path never calls `glCompileShader` (that is the
+                // point of binaries), so upload and compile the substituted
+                // source right here or `glLinkProgram` links empty shaders.
+                if let Ok(cstring) = CString::new(source) {
+                    gpu_void_clear(move || unsafe {
+                        let pointer = cstring.as_ptr();
+                        let length = cstring.as_bytes().len() as i32;
+                        gl::ShaderSource(id, 1, &pointer, &length);
+                        gl::CompileShader(id);
+                    });
+                }
+                GL_SYNTH_SHADER_SOURCE.with(|m| m.borrow_mut().remove(&id));
             }
             return Some(0);
         }
@@ -2916,6 +3015,20 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
             let mode = ureg(unicorn, RegisterARM::R0);
             let first = ureg(unicorn, RegisterARM::R1) as i32;
             let count = ureg(unicorn, RegisterARM::R2) as i32;
+            if current_gpu_target() == GpuTarget::Map
+                && std::env::var_os("EMU_NO_ENGINE_DRAW").is_some()
+            {
+                return Some(0);
+            }
+            let count = if current_gpu_target() == GpuTarget::Map {
+                std::env::var("EMU_ENGINE_DRAW_MAX")
+                    .ok()
+                    .and_then(|v| v.parse::<i32>().ok())
+                    .unwrap_or(count)
+                    .min(count)
+            } else {
+                count
+            };
             if gpu_void_v3(gl::DrawArrays, mode, first, count) {
                 note_real_gl_output(unicorn, "draw");
             }
@@ -3550,6 +3663,8 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
         "glUniformMatrix2fv" => return Some(route_uniform_matrix(unicorn, 4)),
         "glUniformMatrix3fv" => return Some(route_uniform_matrix(unicorn, 9)),
         "glUniformMatrix4fv" => return Some(route_uniform_matrix(unicorn, 16)),
+        "glGetActiveUniform" => return Some(route_active_uniform(unicorn)),
+        "glGetActiveAttrib" => return Some(route_active_attrib(unicorn)),
         "glShaderSource" => return Some(route_shader_source(unicorn)),
         "glVertexAttribPointer" => return Some(route_vertex_attrib_pointer(unicorn)),
         "glTexImage2D" => return Some(route_tex_image2d(unicorn)),
