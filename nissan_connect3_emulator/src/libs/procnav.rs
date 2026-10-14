@@ -1980,10 +1980,16 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
             // view at the same spot.
             std::thread::sleep(std::time::Duration::from_secs(15));
             let mut seq: u16 = 0;
+            let mut drift: f32 = 0.0;
             let queue = "mbx_1024".to_string();
             loop {
                 seq = seq.wrapping_add(1);
-                let blob = renfi_set_camera_parameters_message(seq, 19.91809, 50.06254, 100);
+                let blob = renfi_set_camera_parameters_message(
+                    seq,
+                    19.91809 + drift,
+                    50.06254,
+                    100,
+                );
                 let posted = {
                     let mut guard = namespace.lock().unwrap();
                     crate::common::osal_queues::OsalQueueService::ensure_queue(
@@ -2006,13 +2012,21 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
                         "PROCNAV: renfi camera SetCameraParameters #{seq} posted={posted} into {queue}"
                     );
                 }
-                // r602: like the posfi provider - each camera message can arm a
-                // fresh request whose Execute resets the in-flight block round,
-                // and the guest DAPI answer latency is tens of seconds.  Point
-                // the camera at Krakow once, then keep it still for a long
-                // settling window.
-                let interval_ms = if seq <= 2 { 2_000 } else { 300_000 };
-                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                // r609: a second camera message 2 s after the first only
+                // armed a redundant request whose late Execute (job queue
+                // congestion, +28 s in r608) alternated the request content
+                // and reset the accepted 34-block round mid-flight.  Instead,
+                // re-arm the camera every 25 s with a tiny drift: the nudge
+                // changes the request content (so `PerformMapDataRequest`
+                // re-runs and `MDM::GetBlockIDs` is re-issued), but stays far
+                // inside the 0x10000-unit rounding cell of the wire rect, so
+                // once a full round has written the loaded-rect rows the
+                // "Rect matches -> idle" branch short-circuits the request to
+                // complete and the state machine promotes towards 2.  It also
+                // refreshes the MapObjectsUpdate job array with the current
+                // request state, which is what gates the element fill.
+                drift += 0.0002;
+                std::thread::sleep(std::time::Duration::from_millis(25_000));
             }
         });
     match result {
