@@ -52,6 +52,15 @@ const RENDER_JOB_QUEUE_WAIT_ENABLED_ENTRY: u32 = 0x004a_45b8 - ORIGINAL_BASE;
 const RENDER_JOB_QUEUE_WAIT_RC_RETURN: u32 = 0x003a_8b88 - ORIGINAL_BASE;
 const MAP_VIEW_JOB_QUEUE_WAIT_RETURN: u32 = 0x0052_28a0 - ORIGINAL_BASE;
 const RENDER_CONTROL_ADD_JOB: u32 = 0x003a_79b8 - ORIGINAL_BASE;
+/// `map_tclJobRC::CreateRCJobRenderPixmapView(view_id_byte*, answer_info*)`
+/// (0x4c5b0c): thin wrapper over `Create` producing the render job that runs
+/// the DrawList pass.  The canned `MapEngine_TriggerPixmapViewRender` handler
+/// bakes it next to a `CreateRCJobSetCameraParameters` (0x4c5ac0) carrying the
+/// Flint demo-position literals; calling this factory alone gives the draw
+/// kick without the camera churn (r655).
+const CREATE_RC_JOB_RENDER_PIXMAP_VIEW: u32 = 0x004c_5b0c - ORIGINAL_BASE;
+/// Return site (`ldmia sp!,{r4,pc}`, r0 = job) of the wrapper above.
+const CREATE_RC_JOB_RENDER_RESULT: u32 = 0x004c_5b20 - ORIGINAL_BASE;
 const RENDER_CONTROL_RENDER_VIEW: u32 = 0x003a_7f78 - ORIGINAL_BASE;
 const RC_JOB_START_QUEUE_EXECUTE: u32 = 0x0058_6318 - ORIGINAL_BASE;
 const RC_JOB_START_AND_RENDER_EXECUTE: u32 = 0x0058_69e8 - ORIGINAL_BASE;
@@ -239,6 +248,17 @@ static MAP_VIEW_CREATE_JOB_ADDRESS: AtomicU32 = AtomicU32::new(0);
 static MAP_VIEW_READY: AtomicBool = AtomicBool::new(false);
 static MAP_RENDER_TRIGGER_PENDING: AtomicBool = AtomicBool::new(false);
 static MAP_INITIAL_RENDER_TRIGGERED: AtomicBool = AtomicBool::new(false);
+/// r655: set once the SceneManager copy-to-active branch has run with a
+/// non-empty MO array (the first Kraków roads landed in the active list).
+/// From then on the periodic wait-skip kick injects *pure* render jobs
+/// (`CreateRCJobRenderPixmapView` + `AddJobToRenderControlQueue`) instead of
+/// the canned `MapEngine_TriggerPixmapViewRender`, whose answer chain makes
+/// the HMI re-arm the Flint demo camera.
+static MAP_MO_COPY_DONE: AtomicBool = AtomicBool::new(false);
+static MAP_RENDER_KICK_CAPTURING: AtomicBool = AtomicBool::new(false);
+static MAP_RENDER_KICK_ENQUEUE_PENDING: AtomicBool = AtomicBool::new(false);
+static MAP_RENDER_KICK_JOB: AtomicU32 = AtomicU32::new(0);
+static MAP_RENDER_KICK_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_RENDER_LOOP_TRIGGER_TICK: AtomicU32 = AtomicU32::new(0);
 static MAP_RENDER_TRIGGER_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static MAP_OSAL_WAIT_SKIP_TICK: AtomicU32 = AtomicU32::new(0);
@@ -425,6 +445,11 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     MAP_VIEW_READY.store(false, Ordering::Relaxed);
     MAP_RENDER_TRIGGER_PENDING.store(false, Ordering::Relaxed);
     MAP_INITIAL_RENDER_TRIGGERED.store(false, Ordering::Relaxed);
+    MAP_MO_COPY_DONE.store(false, Ordering::Relaxed);
+    MAP_RENDER_KICK_CAPTURING.store(false, Ordering::Relaxed);
+    MAP_RENDER_KICK_ENQUEUE_PENDING.store(false, Ordering::Relaxed);
+    MAP_RENDER_KICK_JOB.store(0, Ordering::Relaxed);
+    MAP_RENDER_KICK_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_RENDER_LOOP_TRIGGER_TICK.store(0, Ordering::Relaxed);
     MAP_RENDER_TRIGGER_TRACE_COUNT.store(0, Ordering::Relaxed);
     MAP_OSAL_WAIT_SKIP_TICK.store(0, Ordering::Relaxed);
@@ -1072,6 +1097,44 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             .unwrap();
     }
 
+    // r655: capture the job pointer produced by the pure-render kick.  The
+    // factory wrapper 0x4c5b0c returns through 0x4c5b20 (`ldmia sp!,{r4,pc}`,
+    // r0 = job); hook the whole page and dispatch on the fetch address (a
+    // narrow hook on an already-translated Thumb TB can silently never fire).
+    {
+        let page_lo = base_address + (0x004c_5000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != CREATE_RC_JOB_RENDER_RESULT + ORIGINAL_BASE {
+                    return;
+                }
+                if !MAP_RENDER_KICK_CAPTURING.swap(false, Ordering::Relaxed) {
+                    return;
+                }
+                let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                if job == 0 || job == u32::MAX {
+                    log::warn!("PROCMAPENGINE: pure render kick factory returned no job");
+                    return;
+                }
+                MAP_RENDER_KICK_JOB.store(job, Ordering::Relaxed);
+                MAP_RENDER_KICK_ENQUEUE_PENDING.store(true, Ordering::Relaxed);
+                let count = MAP_RENDER_KICK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+                if count < 20 {
+                    log::info!(
+                        "PROCMAPENGINE: pure render kick created job {:#x} t={}ms thread=[{}] n={}",
+                        job,
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        count
+                    );
+                }
+            })
+            .unwrap();
+    }
+
     if std::env::var_os("EMU_PROCMAPENGINE_TRACE_INIT")
         .is_some_and(|value| !value.is_empty() && value != "0")
     {
@@ -1612,6 +1675,81 @@ fn queue_view_creation_job(unicorn: &mut Unicorn<'_, Context>, original_pc: u32)
     true
 }
 
+/// Two-stage pure render kick (r655): stage 1 calls the
+/// `CreateRCJobRenderPixmapView` factory (the page hook at its return site
+/// captures the job), stage 2 enqueues it with `AddJobToRenderControlQueue`.
+/// Both stages are injected through the ordinary guest-call stub from the
+/// engine's own wait-skip tick, so nothing outside the engine's address space
+/// is touched.
+fn kick_pixmap_render(
+    unicorn: &mut Unicorn<'_, Context>,
+    original_pc: u32,
+    base_address: u32,
+) -> bool {
+    if MAP_RENDER_KICK_ENQUEUE_PENDING.swap(false, Ordering::Relaxed) {
+        let job = MAP_RENDER_KICK_JOB.load(Ordering::Relaxed);
+        if job == 0 {
+            return false;
+        }
+        let function = base_address + RENDER_CONTROL_ADD_JOB;
+        if !call_guest_function(unicorn, original_pc, function, [job, 0, 0, 0]) {
+            MAP_RENDER_KICK_ENQUEUE_PENDING.store(true, Ordering::Relaxed);
+            log::warn!("PROCMAPENGINE: failed to enqueue pure render job {:#x}", job);
+            return false;
+        }
+        let count = MAP_RENDER_KICK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if count < 30 {
+            log::info!(
+                "PROCMAPENGINE: enqueued pure render job {:#x} t={}ms thread=[{}] n={}",
+                job,
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                unicorn.get_data().inner.thread_id(),
+                count
+            );
+        }
+        return true;
+    }
+
+    if MAP_RENDER_KICK_CAPTURING.load(Ordering::Relaxed) {
+        // A created job whose capture did not run (should not happen): give
+        // the next tick a fresh attempt instead of wedging the state machine.
+        if MAP_RENDER_KICK_JOB.load(Ordering::Relaxed) != 0
+            && MAP_RENDER_KICK_TRACE_COUNT.load(Ordering::Relaxed) % 64 == 63
+        {
+            MAP_RENDER_KICK_CAPTURING.store(false, Ordering::Relaxed);
+        }
+        return false;
+    }
+
+    let map_state = read_u32_or_invalid(unicorn, base_address + MAP_ENGINE_STATE_VAR);
+    if map_state == 0 || map_state == u32::MAX || map_state == 4 || map_state == 5 {
+        return false;
+    }
+
+    let Some(scratch) = ensure_answer_scratch(unicorn) else {
+        return false;
+    };
+    // Factory signature: r0 -> view id byte, r1 -> answer info.  The answer
+    // info stays all-zero on purpose (invalid port, no HMI answer chain); the
+    // view id byte lives at the top of the zeroed scratch.
+    if !write_u8(unicorn, scratch + 15, MAP_RENDER_VIEW_ID as u8) {
+        return false;
+    }
+    MAP_RENDER_KICK_CAPTURING.store(true, Ordering::Relaxed);
+    let function = base_address + CREATE_RC_JOB_RENDER_PIXMAP_VIEW;
+    if !call_guest_function(
+        unicorn,
+        original_pc,
+        function,
+        [scratch + 15, scratch, 0, 0],
+    ) {
+        MAP_RENDER_KICK_CAPTURING.store(false, Ordering::Relaxed);
+        log::warn!("PROCMAPENGINE: failed to call pure render job factory");
+        return false;
+    }
+    true
+}
+
 fn trigger_pending_map_render(
     unicorn: &mut Unicorn<'_, Context>,
     original_pc: u32,
@@ -1620,6 +1758,17 @@ fn trigger_pending_map_render(
     let base_address = PROCMAP_BASE.load(Ordering::Relaxed);
     if base_address == 0 {
         return false;
+    }
+
+    // r655: once the copy-to-active branch has filled the active MO lists,
+    // every periodic kick becomes a *pure* render job injection.  The full
+    // trigger handler is not needed any more and its answer chain (answers
+    // 0x78/0x5a/0x57/0x63 to port 0x2711) makes the HMI demo handler re-write
+    // the Milwaukee camera into view+0x84, restarting the whole request
+    // machine.  A RenderPixmapView job with an all-zero answer info draws the
+    // active lists and the answer lands on invalid port 0.
+    if MAP_MO_COPY_DONE.load(Ordering::Relaxed) {
+        return kick_pixmap_render(unicorn, original_pc, base_address);
     }
 
     if MAP_RENDER_CONTROL_START_PENDING.swap(false, Ordering::Relaxed) {
@@ -6979,6 +7128,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                             } else {
                                 read_u32_or_invalid(uc, arr)
                             };
+                            if mos > 0 {
+                                MAP_MO_COPY_DONE.store(true, Ordering::Relaxed);
+                            }
                             log::info!(
                                 "PROCMAPENGINE render trace MOUpd copy-active t={}ms stored={:#x} stored28={:#x} mos={} count={:#x}",
                                 crate::libs::dapi::emu_t0_elapsed_ms(),
