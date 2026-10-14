@@ -5741,6 +5741,57 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             .unwrap();
     }
 
+    // r587: 43 layers iterate, every per-layer element list is empty
+    // ({vtable, 0, 0}).  Those lists are filled per frame by
+    // `map_tclSceneManager::DetermineMapObjects` (0x430f34), called from
+    // PreProcess at 0x52e340/0x52e870, which also pushes map objects into the
+    // DTM grid via `MasterHeightDataManager::s32InsertMO` (0x43cad8).
+    // Watch the call sites (were they reached at all?), the entry (rect +
+    // flag), and the insert count.
+    {
+        let det = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let page_lo = base_address + (0x0052_e000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != 0x0052_e340 && original != 0x0052_e870 {
+                    return;
+                }
+                let count = det.fetch_add(1, Ordering::Relaxed);
+                if count >= 20 {
+                    return;
+                }
+                log::info!(
+                    "PROCMAPENGINE render trace PreProcess->DetermineMapObjects call site {:#x}: scene={:#x} mcp={:#x} rect={:#x} lists={:#x} r5={:#x}",
+                    original,
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32
+                );
+            })
+            .unwrap();
+        let ins = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let addr = base_address + 0x0043_cad8u32 - ORIGINAL_BASE;
+        unicorn
+            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                let count = ins.fetch_add(1, Ordering::Relaxed);
+                if count >= 40 {
+                    return;
+                }
+                log::info!(
+                    "PROCMAPENGINE render trace s32InsertMO entry at {:#x}: map_object={:#x} count={:#x}",
+                    addr,
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    count
+                );
+            })
+            .unwrap();
+    }
+
     // Message-map router `PortControl_CCAClientHandlerBase::vDispatchMessage`
     // (0x592454): keys are (u16 svc @inner+0x14, u16 fn @inner+0+0x18) pairs
     // (the map's static seed table at 0x713ea8 holds {0x70006, 0x140006,
