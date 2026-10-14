@@ -6112,6 +6112,19 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                     uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
                                     count
                                 );
+                                log::info!(
+                                    "PROCMAPENGINE render trace MDM::GetBlockIDs rows fxa4={:#x} fxa8={:#x} fxb4={:#x} fxb8={:#x} fxac={:#x} fxb0={:#x} fxbc={:#x} fxc0={:#x} fx114={:#x} fx118={:#x}",
+                                    read_u32_or_invalid(uc, req + 0xa4),
+                                    read_u32_or_invalid(uc, req + 0xa8),
+                                    read_u32_or_invalid(uc, req + 0xb4),
+                                    read_u32_or_invalid(uc, req + 0xb8),
+                                    read_u32_or_invalid(uc, req + 0xac),
+                                    read_u32_or_invalid(uc, req + 0xb0),
+                                    read_u32_or_invalid(uc, req + 0xbc),
+                                    read_u32_or_invalid(uc, req + 0xc0),
+                                    read_u32_or_invalid(uc, req + 0x114),
+                                    read_u32_or_invalid(uc, req + 0x118)
+                                );
                             })
                             .unwrap();
                     }
