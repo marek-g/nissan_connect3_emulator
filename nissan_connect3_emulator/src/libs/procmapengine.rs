@@ -6243,6 +6243,76 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                             })
                             .unwrap();
                     }
+                    // Return site (bl at 0x511fd8 -> 0x511fdc) and a one-shot
+                    // armed trace of the very first GetBlockIDs body to see
+                    // which error leg it leaves through.
+                    {
+                        let ret = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                        let page_lo = base_address + (0x0051_1000u32 - ORIGINAL_BASE);
+                        let page_hi = page_lo + 0xfff;
+                        unicorn
+                            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                                let original =
+                                    pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                                if original != 0x0051_1fdcu32 {
+                                    return;
+                                }
+                                let count = ret.fetch_add(1, Ordering::Relaxed);
+                                if count >= 40 {
+                                    return;
+                                }
+                                log::info!(
+                                    "PROCMAPENGINE render trace MDM::GetBlockIDs return r0={:#x} count={:#x}",
+                                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                                    count
+                                );
+                            })
+                            .unwrap();
+                    }
+                    let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let steps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let page_lo = base_address + (0x0050_7000u32 - ORIGINAL_BASE);
+                    let page_hi = page_lo + 0xfff;
+                    let page_lo2 = base_address + (0x0050_8000u32 - ORIGINAL_BASE);
+                    let page_hi2 = page_lo2 + 0xfff;
+                    for (lo, hi) in [(page_lo, page_hi), (page_lo2, page_hi2)] {
+                        let armed = std::sync::Arc::clone(&armed);
+                        let steps = std::sync::Arc::clone(&steps);
+                        let start = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        let _start = start;
+                        unicorn
+                            .add_code_hook(lo as u64, hi as u64, move |uc, _, _| {
+                                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                                let original =
+                                    pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                                if original == 0x0050_7de0u32 {
+                                    // arm only for the first invocation
+                                    if steps.load(Ordering::Relaxed) == 0 {
+                                        armed.store(true, Ordering::Relaxed);
+                                    }
+                                    return;
+                                }
+                                if !armed.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                let n = steps.fetch_add(1, Ordering::Relaxed);
+                                if n >= 700 {
+                                    armed.store(false, Ordering::Relaxed);
+                                    return;
+                                }
+                                if original < 0x0050_7de0u32 || original > 0x0050_8490u32 {
+                                    armed.store(false, Ordering::Relaxed);
+                                    return;
+                                }
+                                log::info!(
+                                    "PROCMAPENGINE gbids-step {:#010x} (left {})",
+                                    original,
+                                    700 - n
+                                );
+                            })
+                            .unwrap();
+                    }
                 }
                 // The request static (0x78fcd4) tracks outstanding work at
                 // +0x1f4/+0x1f8 ("LeftToFetch: %d/%d") and per-state block
