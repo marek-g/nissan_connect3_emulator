@@ -71,14 +71,20 @@ struct GpuCommand {
 /// into program-slot offsets +0xec/+0xf0).  r659: street elements draw with
 /// an empty slot 0x19 (`shd_42100000.glsl` is a `[BinaryShader]` manifest
 /// only), binding 526 VBOs but reaching no `glDraw*`.
-const SYNTH_VERT_SHADER: &str = "attribute vec2 a_position;
+const SYNTH_VERT_SHADER: &str = "attribute vec4 a_position;
+attribute vec4 a_color;
+uniform mat4 u_matModelView;
+uniform mat4 u_matViewProj;
+varying vec4 v_color;
 void main() {
-    gl_Position = vec4(a_position, 0.0, 1.0);
+    gl_Position = u_matViewProj * (u_matModelView * a_position);
+    v_color = a_color;
 }
 ";
 const SYNTH_FRAG_SHADER: &str = "precision mediump float;
+varying vec4 v_color;
 void main() {
-    gl_FragColor = vec4(1.0, 0.0, 1.0, 1.0);
+    gl_FragColor = v_color;
 }
 ";
 
@@ -2451,15 +2457,37 @@ fn gpu_vertex_attrib_pointer(
     data: Vec<u8>,
 ) -> bool {
     if data.is_empty() {
+        // Never leave the attribute as a client array: with no VBO bound the
+        // offset argument becomes a CPU address, and the engine's "clear this
+        // attribute" calls pass 0x0/odd guest offsets that segfault the host
+        // driver the moment a draw touches the attribute (r662: NVIDIA
+        // dereferences NULL during the first road `glDrawArrays`).  Back the
+        // attribute with a private zero-filled VBO instead.
+        let _ = pointer;
         return gpu_void_clear(move || unsafe {
-            gl::VertexAttribPointer(
-                index,
-                size,
-                kind,
-                normalized,
-                stride,
-                std::ptr::null(),
-            );
+            static ZERO_VBO: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let zero = *ZERO_VBO.get_or_init(|| {
+                let mut buffer = 0u32;
+                gl::GenBuffers(1, &mut buffer);
+                if buffer == 0 {
+                    buffer = next_fallback_id();
+                }
+                let zeros = [0u8; 4096];
+                gl::BindBuffer(gl::ARRAY_BUFFER, buffer);
+                gl::BufferData(
+                    gl::ARRAY_BUFFER,
+                    zeros.len() as isize,
+                    zeros.as_ptr() as *const _,
+                    gl::STATIC_DRAW,
+                );
+                buffer
+            });
+            let mut previous = 0i32;
+            gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut previous);
+            gl::BindBuffer(gl::ARRAY_BUFFER, zero);
+            gl::VertexAttribPointer(index, size, kind, normalized, 0, std::ptr::null());
+            gl::BindBuffer(gl::ARRAY_BUFFER, previous as u32);
+            drain_host_gl_errors();
         });
     }
 
