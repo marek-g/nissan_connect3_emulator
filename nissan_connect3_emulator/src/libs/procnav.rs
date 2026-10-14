@@ -2007,46 +2007,17 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
             let mut seq: u16 = 0;
             let mut drift: f64 = 0.0;
             let queue = "mbx_1024".to_string();
-            // r633b: companion refresher - the r633 mode-1 experiment proved
-            // mode-1 jobs are filed into the class-3 queue and never execute
-            // (no view+0x84 writes at the 2 s cadence in run_r633), so the
-            // refresher must be mode 3 again.  r628's churn came from the
-            // DRIFT (each message changed the request rect and re-armed the
-            // state machine); a fixed-position mode-3 message re-commits
-            // view+0x2b8 to Krakow every 2 s with an identical rect, which
-            // the request machine treats as content-match.
-            {
-                let ns2 = namespace.clone();
-                let q2 = queue.clone();
-                let _ = std::thread::Builder::new()
-                    .name("renfi-commit".into())
-                    .spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_secs(16));
-                        let mut sq: u16 = 0x4000;
-                        loop {
-                            sq = sq.wrapping_add(1);
-                            let blob =
-                                renfi_set_camera_parameters_message(sq, 19.91809, 50.06254, 40, 3);
-                            let mut guard = ns2.lock().unwrap();
-                            crate::common::osal_queues::OsalQueueService::ensure_queue(
-                                &mut guard.mq, &q2,
-                            );
-                            if crate::common::osal_queues::OsalQueueService::guest_post(
-                                &mut guard.mq,
-                                &q2,
-                                blob,
-                                0,
-                            ) {
-                                guard.notify_waiters();
-                            }
-                            drop(guard);
-                            if sq < 0x4005 {
-                                log::info!("PROCNAV: renfi commit #{sq:#x} posted");
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(2_000));
-                        }
-                    });
-            }
+            // r635: BOTH refresher variants removed.  Mode 1 (r633) never
+            // executed (Create files non-mode-3 jobs into the class-3 queue
+            // that no loop drains - zero view+0x84 writes at the cadence in
+            // run_r633).  Mode 3 (r634) executed but each call re-arms the
+            // static CAMERAVIEWPOINT request (state 2 -> 0), and the MOUpd
+            // job that carries the copy flag then executes while the state
+            // is already 1 again, so the copy-to-active branch never fires
+            // (run_r634: state never sat at 2, zero FillActive calls).
+            // The state-2 window length must exceed the job-execution lag
+            // (seconds under queue congestion), so the cadence stays at the
+            // proven 10 s drift nudge.
             loop {
                 seq = seq.wrapping_add(1);
                 let blob = renfi_set_camera_parameters_message(
