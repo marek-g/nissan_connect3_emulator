@@ -6009,21 +6009,29 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 }
                 let count = drawn.fetch_add(1, Ordering::Relaxed);
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
-                // At the call site `r0 == r12 == *(*(list+4))` (the
-                // `cpy r0, r12` at 0x52cd28), so the callee address is
-                // simply [r0 + 0x38].
-                let target = if r0 == 0 {
+                // 0x52cd18 `ldr r12,[r0]`, 0x52cd28 `cpy r0,r12`, 0x52cd34
+                // `ldr r12,[r12]`: at 0x52cd40 r0 is the mid object and r12
+                // its vtable, so the callee is `[[r0] + 0x38]`, not
+                // `[r0 + 0x38]` (the r637 target=0xe1510003 reading was the
+                // wrong slot).
+                let vtbl = if r0 == 0 {
                     0
                 } else {
-                    read_u32_or_invalid(uc, r0.wrapping_add(0x38))
+                    read_u32_or_invalid(uc, r0)
+                };
+                let target = if vtbl == 0 || vtbl == u32::MAX {
+                    0
+                } else {
+                    read_u32_or_invalid(uc, vtbl.wrapping_add(0x38))
                 };
                 if count >= 60 {
                     return;
                 }
                 log::info!(
-                    "PROCMAPENGINE render trace MOUpd elem-draw t={}ms this={:#x} a_r1={:#x} a_r2={:#x} a_r3={:#x} idx={} iter={:#x} target={:#x} n={}",
+                    "PROCMAPENGINE render trace MOUpd elem-draw t={}ms this={:#x} vtbl={:#x} a_r1={:#x} a_r2={:#x} a_r3={:#x} idx={} iter={:#x} target={:#x} n={}",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     r0,
+                    vtbl,
                     uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
                     uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
                     uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
