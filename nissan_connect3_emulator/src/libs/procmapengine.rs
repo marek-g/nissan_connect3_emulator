@@ -6272,6 +6272,31 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     }
                     let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let steps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    // The synch-data response join job: DAPI's fn 0x103 answer
+                    // must lead through `map_tclJobSDMHandleGetBlockIDs::
+                    // Execute` (0x4bfd08) - it decrements req+0x1f8 per block
+                    // (0x4c0184) and sets it to -1 when complete (0x4c040c),
+                    // which arms the 1->2 state promotion.
+                    {
+                        let sdm = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                        let addr = base_address + 0x004b_fd08u32 - ORIGINAL_BASE;
+                        unicorn
+                            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                                let count = sdm.fetch_add(1, Ordering::Relaxed);
+                                if count >= 40 {
+                                    return;
+                                }
+                                let thisp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                                log::info!(
+                                    "PROCMAPENGINE render trace SDMHandleGetBlockIDs::Execute entry at {:#x}: job={:#x} r4={:#x} count={:#x}",
+                                    addr,
+                                    thisp,
+                                    read_u32_or_invalid(uc, thisp + 4),
+                                    count
+                                );
+                            })
+                            .unwrap();
+                    }
                     let page_lo = base_address + (0x0050_7000u32 - ORIGINAL_BASE);
                     let page_hi = page_lo + 0xfff;
                     let page_lo2 = base_address + (0x0050_8000u32 - ORIGINAL_BASE);
