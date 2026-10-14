@@ -313,6 +313,15 @@ static MAP_DATA_CLIENT_SERVICE_REF_NODE: AtomicU32 = AtomicU32::new(0);
 // rendererfi request has to carry it in payload+0x04: `getRenfIMapViewId`
 // 0x3947cc drops the request when it does not equal that field.
 pub(crate) static RENFI_APPLICATION_INSTANCE: AtomicU32 = AtomicU32::new(0);
+// r639: host-ms timestamp of the last write of the Milwaukee default camera
+// (0xc4f45dfb) into `view+0x84`.  The HMI's `MapEngine_TriggerPixmapViewRender`
+// handler unconditionally posts `CreateRCJobSetCameraParameters(...Milwaukee)`
+// (decompiled 0x53b36c) every ~1.5 s, so the FillActiveMO job rect is Milwaukee
+// half the time and the harvest gate is a lottery.  The renfi driver watches
+// this stamp and echo-backs a Kraków nudge right after each Milwaukee write,
+// making the (job, DOM) centre pair Kraków-aligned in nearly every cycle.
+pub(crate) static CAM_MILWAUKEE_STAMP: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 static RENFI_HEADER_DUMPS: AtomicU32 = AtomicU32::new(0);
 /// Register-id DAPIAPP assigned to the map-data (CCA svc 0x26) client
 /// registration, taken from its ServiceRegister conf. DAPI's map worker
@@ -6246,6 +6255,12 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     0xda0c48u64, // 0xda0bc4 + 0x84
                     0xda0c48u64 + 3,
                     move |uc, _t, _address, _size, value| {
+                        // r639: stamp every Milwaukee restoration for the
+                        // renfi echo-back (see CAM_MILWAUKEE_STAMP).
+                        if value as u32 == 0xc4f4_5dfb {
+                            CAM_MILWAUKEE_STAMP
+                                .store(crate::libs::dapi::emu_t0_elapsed_ms(), Ordering::Relaxed);
+                        }
                         static COUNT: AtomicU32 = AtomicU32::new(0);
                         static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                         if LAST.swap(value as u32, Ordering::Relaxed) == value as u32 {
