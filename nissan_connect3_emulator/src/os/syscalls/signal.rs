@@ -603,7 +603,11 @@ fn read_timeout_deadline(unicorn: &Unicorn<'_, Context>, timeout: u32) -> Option
     // The kernel uses an absolute CLOCK_REALTIME deadline. The emulator has no
     // guest wall clock yet, so approximate the remaining wait as relative to
     // now. This preserves timeouts for short waits without busy-polling.
-    Some(Instant::now() + std::time::Duration::new(seconds, nanoseconds as u32))
+    // The duration is guest time -> dilated host deadline (vtime).
+    Some(crate::emulator::vtime::deadline(std::time::Duration::new(
+        seconds,
+        nanoseconds as u32,
+    )))
 }
 
 pub fn deliver_signal(unicorn: &mut Unicorn<'_, Context>, tid: u32, signum: u32) -> i32 {

@@ -1002,7 +1002,7 @@ fn synthesize_periodic_ail_power_state_req(
     let now = Instant::now();
     let ready = SYNTH_PWR_PERIODIC_NEXT.with(|cell| match cell.get() {
         None => {
-            cell.set(Some(now + Duration::from_millis(1000)));
+            cell.set(Some(now + crate::emulator::vtime::host_interval(Duration::from_millis(1000))));
             true
         }
         Some(next) => now >= next,
@@ -1057,7 +1057,7 @@ fn synthesize_periodic_ail_power_state_req(
         TARGET_QUEUE,
         content
     );
-    SYNTH_PWR_PERIODIC_NEXT.with(|cell| cell.set(Some(now + Duration::from_millis(1000))));
+    SYNTH_PWR_PERIODIC_NEXT.with(|cell| cell.set(Some(now + crate::emulator::vtime::host_interval(Duration::from_millis(1000)))));
     return_to_caller(unicorn, 8);
     true
 }
@@ -1229,7 +1229,7 @@ fn synthesize_periodic_map_power_state_req(unicorn: &mut Unicorn<'_, Context>, b
     let now = Instant::now();
     let ready = SYNTH_MAP_PWR_PERIODIC_NEXT.with(|cell| match cell.get() {
         None => {
-            cell.set(Some(now + Duration::from_millis(1000)));
+            cell.set(Some(now + crate::emulator::vtime::host_interval(Duration::from_millis(1000))));
             true
         }
         Some(next) => now >= next,
@@ -1282,7 +1282,7 @@ fn synthesize_periodic_map_power_state_req(unicorn: &mut Unicorn<'_, Context>, b
         TARGET_QUEUE,
         content
     );
-    SYNTH_MAP_PWR_PERIODIC_NEXT.with(|cell| cell.set(Some(now + Duration::from_millis(1000))));
+    SYNTH_MAP_PWR_PERIODIC_NEXT.with(|cell| cell.set(Some(now + crate::emulator::vtime::host_interval(Duration::from_millis(1000)))));
     return_to_caller(unicorn, 8);
     true
 }
@@ -1452,7 +1452,7 @@ fn synthesize_periodic_dapi_power_state_req(unicorn: &mut Unicorn<'_, Context>, 
     let now = Instant::now();
     let ready = SYNTH_DAPI_PWR_PERIODIC_NEXT.with(|cell| match cell.get() {
         None => {
-            cell.set(Some(now + Duration::from_millis(1000)));
+            cell.set(Some(now + crate::emulator::vtime::host_interval(Duration::from_millis(1000))));
             true
         }
         Some(next) => now >= next,
@@ -1505,7 +1505,7 @@ fn synthesize_periodic_dapi_power_state_req(unicorn: &mut Unicorn<'_, Context>, 
         TARGET_QUEUE,
         content
     );
-    SYNTH_DAPI_PWR_PERIODIC_NEXT.with(|cell| cell.set(Some(now + Duration::from_millis(1000))));
+    SYNTH_DAPI_PWR_PERIODIC_NEXT.with(|cell| cell.set(Some(now + crate::emulator::vtime::host_interval(Duration::from_millis(1000)))));
     return_to_caller(unicorn, 8);
     true
 }

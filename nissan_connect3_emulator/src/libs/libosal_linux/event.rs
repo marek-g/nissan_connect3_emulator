@@ -163,7 +163,10 @@ fn handle_event_wait(
     let now = Instant::now();
     let existing_deadline = existing_deadline(event, unicorn.get_data().thread_id());
     if timeout != u32::MAX {
-        let deadline = existing_deadline.unwrap_or_else(|| now + Duration::from_millis(timeout as u64));
+        let deadline =
+            existing_deadline.unwrap_or_else(|| crate::emulator::vtime::deadline(
+                Duration::from_millis(timeout as u64),
+            ));
         if now >= deadline || mode == 0 || timeout == 0 {
             remove_thread_waiter(event, unicorn.get_data().thread_id());
             write_u32(unicorn, event.wrapping_add(EVENT_IN_WAIT), 0);
@@ -188,7 +191,9 @@ fn handle_event_wait(
     let block_until = if timeout == u32::MAX {
         now + Duration::from_secs(60)
     } else {
-        existing_deadline.unwrap_or_else(|| now + Duration::from_millis(timeout as u64))
+        existing_deadline.unwrap_or_else(|| {
+            crate::emulator::vtime::deadline(Duration::from_millis(timeout as u64))
+        })
     };
 
     write_u32(unicorn, event.wrapping_add(EVENT_REQUESTED), requested_mask);

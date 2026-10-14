@@ -25,7 +25,7 @@ use crate::emulator::thread::{BlockReason, GuestThread, ThreadAction, ThreadStat
 use crate::emulator::utils::{pack_u32, read_string, unpack_u32};
 use crate::os::syscalls::signal;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -77,19 +77,11 @@ fn read_deadline(unicorn: &Unicorn<'_, Context>, addr: u32) -> Deadline {
         return Deadline::Invalid;
     }
 
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap();
-    let now_nanos = now.as_secs() as i128 * 1_000_000_000 + now.subsec_nanos() as i128;
-    let abs_nanos = secs as i128 * 1_000_000_000 + nsecs as i128;
-
-    match abs_nanos - now_nanos {
-        delta if delta < 0 => Deadline::At(Instant::now()), // already expired
-        delta => Deadline::At(
-            Instant::now()
-                + Duration::new(delta as u64 / 1_000_000_000, (delta % 1_000_000_000) as u32),
-        ),
-    }
+    // The timespec is an absolute CLOCK_REALTIME deadline - and the guest's
+    // realtime clock is the dilated virtual epoch (`vtime`), so map it through
+    // `epoch_deadline` (remaining virtual time / F), not against host wall.
+    let abs = Duration::new(secs as u64, nsecs as u32);
+    Deadline::At(crate::emulator::vtime::epoch_deadline(abs))
 }
 
 /// mq_open(name, oflag, mode, attr) - ipc/mqueue.c SYSCALL_DEFINE4(mq_open)

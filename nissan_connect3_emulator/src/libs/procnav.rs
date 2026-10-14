@@ -1485,7 +1485,7 @@ fn spawn_gps_provider(unicorn: &mut Unicorn<'_, Context>) {
         .spawn(move || {
             // Let FC bring-up finish (component threads, queue opens, handler
             // registration) before the first push.
-            std::thread::sleep(std::time::Duration::from_secs(10));
+            crate::emulator::vtime::sleep_virtual(std::time::Duration::from_secs(10));
             let mut seq: u16 = 0;
             loop {
                 seq = seq.wrapping_add(1);
@@ -1519,7 +1519,7 @@ fn spawn_gps_provider(unicorn: &mut Unicorn<'_, Context>) {
                 } else {
                     log::debug!("GPS provider: {queue} full, skipping #{seq}");
                 }
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                crate::emulator::vtime::sleep_virtual(std::time::Duration::from_millis(500));
             }
         });
     match result {
@@ -1653,7 +1653,7 @@ fn spawn_posfi_provider(unicorn: &mut Unicorn<'_, Context>) {
         .name("posfi-provider".into())
         .spawn(move || {
             // Give the engine time to open mbx_1024 and finish AIL bring-up.
-            std::thread::sleep(std::time::Duration::from_secs(12));
+            crate::emulator::vtime::sleep_virtual(std::time::Duration::from_secs(12));
             let mut seq: u16 = 0;
             let queue = "mbx_1024".to_string();
             loop {
@@ -1705,7 +1705,7 @@ fn spawn_posfi_provider(unicorn: &mut Unicorn<'_, Context>) {
                 // renfi commits (the flip-flop r627 exposed).  Tick every
                 // 20 s instead so the CCP lives.
                 let interval_ms = if seq <= 4 { 1_000 } else { 20_000 };
-                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                crate::emulator::vtime::sleep_virtual(std::time::Duration::from_millis(interval_ms));
             }
         });
     match result {
@@ -2003,7 +2003,7 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
         .spawn(move || {
             // Let the posfi provider move the CCP first; this one only points the
             // view at the same spot.
-            std::thread::sleep(std::time::Duration::from_secs(15));
+            crate::emulator::vtime::sleep_virtual(std::time::Duration::from_secs(15));
             let mut seq: u16 = 0;
             let mut drift: f64 = 0.0;
             let queue = "mbx_1024".to_string();
@@ -2076,7 +2076,7 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
                 // re-arm cadence only re-triggers rounds (r628 regression);
                 // stay at 10 s.
                 drift += 0.000085;
-                std::thread::sleep(std::time::Duration::from_millis(10_000));
+                crate::emulator::vtime::sleep_virtual(std::time::Duration::from_millis(10_000));
             }
         });
     match result {

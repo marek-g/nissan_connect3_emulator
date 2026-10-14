@@ -9,5 +9,6 @@ pub mod scheduler;
 pub mod thread;
 pub mod users;
 pub mod utils;
+pub mod vtime;
 
 mod elf_loader;

@@ -1,22 +1,23 @@
 use crate::emulator::context::Context;
 use crate::emulator::thread::{BlockReason, ThreadAction};
 use crate::emulator::utils::{pack_u32, unpack_u32};
-use std::sync::OnceLock;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 /// The clocks the unit counts from power-on (`CLOCK_MONOTONIC` and its raw
 /// variant): the emulator's own start is its boot time.  Reporting host wall
 /// clock here would make the guest's `tv_sec * 1000` millisecond conversion wrap
 /// inside `u32`, so every elapsed-time comparison in every process would jump.
+/// With `EMU_REALTIME_FACTOR` set, both branches report the dilated virtual
+/// clock ([`crate::emulator::vtime`]) - the monotonic clock ticks at `F` x
+/// wall speed and the realtime clock is the host epoch at boot advanced at
+/// that same dilated rate, so all guest elapsed/absolute time comparisons
+/// stay mutually consistent.
 fn clock_value(clock_id: u32) -> Duration {
     if matches!(clock_id, 1 | 4) {
-        static BOOT: OnceLock<Instant> = OnceLock::new();
-        BOOT.get_or_init(Instant::now).elapsed()
+        crate::emulator::vtime::vnow()
     } else {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
+        crate::emulator::vtime::vepoch()
     }
 }
 
@@ -68,9 +69,7 @@ pub fn gettimeofday(unicorn: &mut Unicorn<'_, Context>, time_val: u32, time_zone
         time_zone,
     );
 
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap();
+    let now = crate::emulator::vtime::vepoch();
 
     if time_val != 0 {
         unicorn
@@ -115,12 +114,14 @@ pub fn nanosleep(unicorn: &mut Unicorn<'_, Context>, req: u32, rem: u32) -> u32 
     unicorn.mem_read(req as u64 + 4, &mut buf).unwrap();
     let nanoseconds = unpack_u32(&buf);
 
-    // block the current guest thread (other threads keep running) until the deadline
+    // block the current guest thread (other threads keep running) until the
+    // deadline.  The requested duration is guest time; under a dilation
+    // factor the host must wait `duration / F` wall time for it (vtime).
     let duration = Duration::new(seconds as u64, nanoseconds as u32);
     unicorn
         .get_data()
         .set_action(ThreadAction::Block(BlockReason::SleepUntil(
-            Instant::now() + duration,
+            crate::emulator::vtime::deadline(duration),
         )));
 
     log::trace!(
