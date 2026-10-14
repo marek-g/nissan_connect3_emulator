@@ -5972,25 +5972,108 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 })
                 .unwrap();
             // Else leg 0x435d78 (view>4 || lod>3) - page hook, dispatch on pc.
+            // r613: extend the dispatch with the two render-tail gates found
+            // in `MapObjectsUpdate` (0x4357c8).  0x435940 (`LAB_00435940`) runs
+            // after `Combine(stored_job, new_job)` succeeded with r5 = stored
+            // job: dump its +0x28 (request state) and +0x50 (block-load
+            // complete flag, set by the answer leg at 0x4b4e18 region).
+            // 0x436014 is the `state == 2` copy branch - the point where the
+            // stored job's MO list is finally copied into the per-view active
+            // "inside" arrays that `DetermineMapObjects` walks.
             let els = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            // r613: `FillActiveMOArrayFromRCMapObjectsRequest` (0x428eec) only
+            // harvests when the stored job rect (+0x40..+0x4c centre, or
+            // +0x30..+0x3c surround) covers the requested centre rect
+            // (param_4) and its MO list is non-empty.  Dump those inputs at
+            // entry (function entry - a reliable TB-start hook).
+            {
+                let fa = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let addr = base_address + 0x0042_8eecu32 - ORIGINAL_BASE;
+                unicorn
+                    .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                        let count = fa.fetch_add(1, Ordering::Relaxed);
+                        if count >= 40 {
+                            return;
+                        }
+                        let job = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                        let rect3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                        let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                        let rect4 = read_u32_or_invalid(uc, sp);
+                        log::info!(
+                            "PROCMAPENGINE render trace FillActiveMO entry t={}ms job={:#x} mask={:#x} jobrect=[{:#x},{:#x},{:#x},{:#x}] surround=[{:#x},{:#x}] centre=[{:#x},{:#x},{:#x},{:#x}] count={:#x}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            job,
+                            (uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32) & 0xffff,
+                            if job == 0 { 0 } else { read_u32_or_invalid(uc, job + 0x40) },
+                            if job == 0 { 0 } else { read_u32_or_invalid(uc, job + 0x44) },
+                            if job == 0 { 0 } else { read_u32_or_invalid(uc, job + 0x48) },
+                            if job == 0 { 0 } else { read_u32_or_invalid(uc, job + 0x4c) },
+                            if rect3 == 0 { 0 } else { read_u32_or_invalid(uc, rect3) },
+                            if rect3 == 0 { 0 } else { read_u32_or_invalid(uc, rect3 + 4) },
+                            read_u32_or_invalid(uc, rect4),
+                            read_u32_or_invalid(uc, rect4 + 4),
+                            read_u32_or_invalid(uc, rect4 + 8),
+                            read_u32_or_invalid(uc, rect4 + 0xc),
+                            count
+                        );
+                    })
+                    .unwrap();
+            }
+            let lab = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let cp2 = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let page_lo = base_address + (0x0043_5000u32 - ORIGINAL_BASE);
             let page_hi = page_lo + 0xfff;
+            let lab_c = lab.clone();
+            let cp2_c = cp2.clone();
             unicorn
                 .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
                     let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
                     let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
-                    if original != 0x0043_5d78u32 {
-                        return;
+                    match original {
+                        0x0043_5d78u32 => {
+                            let count = els.fetch_add(1, Ordering::Relaxed);
+                            if count >= 20 {
+                                return;
+                            }
+                            log::info!(
+                                "PROCMAPENGINE render trace MapObjectsUpdate-else-leg 0x435d78 hit at {:#x} count={:#x}",
+                                original,
+                                count
+                            );
+                        }
+                        0x0043_5940u32 => {
+                            let count = lab_c.fetch_add(1, Ordering::Relaxed);
+                            if count >= 40 {
+                                return;
+                            }
+                            let job = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                            let newjob = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+                            log::info!(
+                                "PROCMAPENGINE render trace MOUpd combined t={}ms stored={:#x} stored28={:#x} stored50={:#x} newjob={:#x} count={:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                job,
+                                read_u32_or_invalid(uc, job + 0x28),
+                                read_u8_or_invalid(uc, job + 0x50),
+                                newjob,
+                                count
+                            );
+                        }
+                        0x0043_6014u32 => {
+                            let count = cp2_c.fetch_add(1, Ordering::Relaxed);
+                            if count >= 40 {
+                                return;
+                            }
+                            let job = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                            log::info!(
+                                "PROCMAPENGINE render trace MOUpd copy-active t={}ms stored={:#x} stored28={:#x} count={:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                job,
+                                read_u32_or_invalid(uc, job + 0x28),
+                                count
+                            );
+                        }
+                        _ => {}
                     }
-                    let count = els.fetch_add(1, Ordering::Relaxed);
-                    if count >= 20 {
-                        return;
-                    }
-                    log::info!(
-                        "PROCMAPENGINE render trace MapObjectsUpdate-else-leg 0x435d78 hit at {:#x} count={:#x}",
-                        original,
-                        count
-                    );
                 })
                 .unwrap();
             // `FillActiveMOArrayFromRCMapObjectsRequest` (which alone fills the
