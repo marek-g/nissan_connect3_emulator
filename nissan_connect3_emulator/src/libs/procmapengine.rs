@@ -608,6 +608,59 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         })
         .unwrap();
 
+    // r641: the class-0x44 (service-status) branch of `bDispatchCCAMessages`
+    // gates on the app-interface state at `[this]+0x30` being 3:
+    //   0x66cb20 ldr r2,[r8] / ldr r3,[r2,#0x30] / cmp r3,#3 / bne 0x66c93c
+    // and 0x66c93c is the silent drop (`mov r6,#1; bl 0x388ef0` releases the
+    // message pool cell).  Stalled runs (r638/r639/r640a/b) pop the fabricated
+    // svc-0x26 pair 18 times and `vServiceStateChanged` never runs - catch
+    // whether the pair reaches the gate at all and what the state value is.
+    {
+        let gate_hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let drop_hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let page_lo = base_address + (0x0066_c000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                let r10 = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
+                if original == 0x0066_cb20u32 {
+                    let count = gate_hits.fetch_add(1, Ordering::Relaxed);
+                    if count >= 40 {
+                        return;
+                    }
+                    let thisx = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+                    let app = read_u32_or_invalid(uc, thisx);
+                    let state = read_u32_or_invalid(uc, app.wrapping_add(0x30));
+                    log::info!(
+                        "PROCMAPENGINE: CCA class-44 gate t={}ms thread=[{}] app={:#x} state={:#x} fwdq={:#x} n={}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        app,
+                        state,
+                        r10,
+                        count
+                    );
+                } else if original == 0x0066_c93cu32 {
+                    let count = drop_hits.fetch_add(1, Ordering::Relaxed);
+                    if count >= 24 {
+                        return;
+                    }
+                    let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCMAPENGINE: CCA dispatch drop t={}ms thread=[{}] cmp_r3={:#x} fwdq={:#x} n={}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        r3,
+                        r10,
+                        count
+                    );
+                }
+            })
+            .unwrap();
+    }
+
     if std::env::var_os("EMU_PROCMAPENGINE_TRACE_INIT")
         .is_some_and(|value| !value.is_empty() && value != "0")
     {
