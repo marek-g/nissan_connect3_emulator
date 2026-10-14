@@ -182,8 +182,47 @@ fn stamp_unique_id_for_receiver(queue: &str, body: &mut [u8]) {
 
 /// Temporary: show the id fields of every DAPI map-service ServiceData that passes,
 /// so the offsets `stamp_unique_id_for_receiver` keys on can be verified.
-fn trace_dapi_map_service_data(queue: &str, body: &[u8]) {
-    if body.len() <= 0x1a || body[0x0b] != 0x45 {
+// r640: pop-trace for the fabricated DAPI-fastmap ServiceStatus pair
+// (service id 0x26, mbx_1024).  Stalled runs (r638/r639) re-posted the pair
+// 18 times and `OnUpdateServiceStateDAPIFastmap` never ran - the r611 note
+// says a consumer that skips the administration walk swallows it.  Log every
+// pop of a 0x26 status message with the popping thread to identify that
+// consumer.
+fn trace_fastmap_status_pop(unicorn: &Unicorn<'_, Context>, queue: &str, data: &[u8]) {
+    if queue != "mbx_1024" {
+        return;
+    }
+    let hit = data.get(0x14..0x16) == Some(&[0x26, 0][..]) || data.get(0x1c..0x1e) == Some(&[0x26, 0][..]);
+    if !hit {
+        return;
+    }
+    static C: AtomicU32 = AtomicU32::new(0);
+    if C.fetch_add(1, Ordering::Relaxed) >= 60 {
+        return;
+    }
+    let word = |o: usize| -> u32 {
+        data.get(o..o + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .unwrap_or(0)
+    };
+    log::info!(
+        "MSGTRACE svc26-status popped t={}ms thread=[{}] lr={:#x} queue={} len={} w0={:#x} w4={:#x} w10={:#x} w14={:#x} w18={:#x} w1c={:#x} b18={:#x}",
+        crate::libs::dapi::emu_t0_elapsed_ms(),
+        unicorn.get_data().inner.thread_id(),
+        unicorn.reg_read(RegisterARM::LR).unwrap_or(0) as u32,
+        queue,
+        data.len(),
+        word(0),
+        word(4),
+        word(0x10),
+        word(0x14),
+        word(0x18),
+        word(0x1c),
+        data.get(0x18).copied().unwrap_or(0xff),
+    );
+}
+
+fn trace_dapi_map_service_data(queue: &str, body: &[u8]) {    if body.len() <= 0x1a || body[0x0b] != 0x45 {
         return;
     }
     if u16::from_le_bytes([body[0x14], body[0x15]]) != 0x26 {
@@ -1895,6 +1934,7 @@ fn bridge_guest_osal_queue(
             };
 
             if let Some(message) = message {
+                trace_fastmap_status_pop(unicorn, name, &message.data);
                 if name == OSAL_CB_HDR_LI_MAIN
                     && callback_message_command(&message.data) == Some(OSAL_START_PROC_COMMAND)
                 {
@@ -2024,6 +2064,7 @@ fn bridge_dyn_mbx_queue(
             };
 
             if let Some(message) = message {
+                trace_fastmap_status_pop(unicorn, name, &message.data);
                 if !message.data.is_empty()
                     && unicorn.mem_write(msg_ptr as u64, &message.data).is_err()
                 {
@@ -2254,6 +2295,7 @@ fn bridge_mbx_queue(
                     if name == "mbx_1024" {
                         let mut dropped = 0usize;
                         while let Some(blob) = message.as_ref().map(|m| &m.data) {
+                            trace_fastmap_status_pop(unicorn, name, blob);
                             // content starts at blob[8]: sub-id @ +0x00,
                             // class @ +0x0b, register-id @ +0x0e, service
                             // @ +0x14, seq @ +0x1c (all relative to content).
