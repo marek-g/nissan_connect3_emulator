@@ -5991,11 +5991,16 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 let addr = base_address + 0x0042_8eecu32 - ORIGINAL_BASE;
                 unicorn
                     .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
-                        let count = fa.fetch_add(1, Ordering::Relaxed);
-                        if count >= 40 {
+                        let job = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                        if job == 0 {
+                            // PLU also calls for (view,lod) combos whose slot
+                            // is empty; those trivially bail. Not interesting.
                             return;
                         }
-                        let job = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                        let count = fa.fetch_add(1, Ordering::Relaxed);
+                        if count >= 300 {
+                            return;
+                        }
                         let rect3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
                         let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
                         let rect4 = read_u32_or_invalid(uc, sp);
@@ -6041,20 +6046,29 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                 count
                             );
                         }
-                        0x0043_5940u32 => {
+                        0x0043_5db0u32 => {
                             let count = lab_c.fetch_add(1, Ordering::Relaxed);
-                            if count >= 40 {
+                            if count >= 60 {
                                 return;
                             }
+                            // Right after `bl Combine`: r5 = stored (slot)
+                            // job, r8 = incoming job; the reads below observe
+                            // the forwarded state/flag (`Combine` writes
+                            // stored+0x28/+0x50 from the incoming job before
+                            // returning).
                             let job = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
                             let newjob = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+                            let res = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                             log::info!(
-                                "PROCMAPENGINE render trace MOUpd combined t={}ms stored={:#x} stored28={:#x} stored50={:#x} newjob={:#x} count={:#x}",
+                                "PROCMAPENGINE render trace MOUpd combined t={}ms stored={:#x} stored28={:#x} stored50={:#x} newjob={:#x} new28={:#x} new50={:#x} res={:#x} count={:#x}",
                                 crate::libs::dapi::emu_t0_elapsed_ms(),
                                 job,
                                 read_u32_or_invalid(uc, job + 0x28),
                                 read_u8_or_invalid(uc, job + 0x50),
                                 newjob,
+                                read_u32_or_invalid(uc, newjob + 0x28),
+                                read_u8_or_invalid(uc, newjob + 0x50),
+                                res,
                                 count
                             );
                         }
