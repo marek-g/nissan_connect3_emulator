@@ -2678,3 +2678,35 @@ map-target `glBufferSubData` log (r693):
   samples confirm real vertices with negative w.  `map bufferData` re-
   reservations of engine vbos with `src=0` keep happening at resource
   (re)creation - harmless while uploads follow them.
+
+## r703-r709: arming the combined-streets pass, render-thread death via poTransPos3D
+
+* r703/r706/r707 emulate `map_tclMapElm_Street::vAddTLParams` (0x40f730) from
+  the live `vFinishCombinedDrawing` entry probe (0x55adf0).  The DTM elements
+  store their scb at `this+0x40` (plain-Street's `this[0x17c]+0x40` line-config
+  chain is NULL for them, gate log r706), so the emulation takes that with the
+  neutral slot 0; entries come from the per-node section arrays when present
+  (`scb+0x160/0x164/0x16c`) else one real fallback strip `(0, scb[0x2c])`.
+  r706-708 prove arming works: entry probe shows `primcount=[1,0]`,
+  `first0=<arena>`, `z_res[0]=<res>`.
+* r707's per-PC trace inside page 0x409000 then showed only `loop-head` and no
+  return - the r708 log pins why: `ERROR 0x3b20dc: [69] Execution error:
+  READ_UNMAPPED` + `[69] thread exited with code 1`.  An ARMED
+  `vDrawCombinedStreets` pass (loaded program slot only) additionally executes
+  `rl_tclRenderLayer3D::vLoadModelViewMatrix` (0x3b20d4 via 0x409598) which
+  dereferences `*0x73c31c` (`poTransPos3D`, a `math_tclVector3`).  The real
+  unit only sets it for tilted/DTM views; in the emulator it is NULL, so the
+  render thread died in the first armed pass - all of r706-708's "renderer
+  stopped after arming" was this crash, not a hang and not dead probes
+  (`loop-head` firing proves the 0x409000 page dispatch is alive).
+* Fix (r709, sanctioned provider fabrication): the `vpcs` entry probe points
+  0x73c31c at a zeroed 12-byte vector in the TL arena (0x5a000000+0x1000)
+  whenever it is unmapped; `vLoadModelViewMatrix` then writes a neutral (0,0,-0)
+  translation into `m_aflMdlMatrix[2]`, which is what the top-down view wants.
+* Stepping stones decoded on the way: wrapper `glMultiDrawArraysEXT` = 0x552edc
+  (`DAT_00791460` resolved once via `eglGetProcAddress`, NULL-fallback is a
+  `glDrawArrays` loop - neither ever seen, so the crash precedes it); armed
+  gate chain 0x4092b4 primCount -> 0x4092d4 apoVBOResource(+0xc) -> 0x409300
+  bank=mcp[5]!=0 -> 0x409318 lineCfgOffset != 0xffff -> tile ptrs mcp+0x38 ->
+  mode 0x22/0x19 by mcp[0xa4]; skip paths leave via 0x409508 (reset+continue)
+  or 0x4098f4.
