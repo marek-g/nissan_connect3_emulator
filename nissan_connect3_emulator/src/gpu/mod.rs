@@ -90,14 +90,18 @@ void main() {
 
 const GL_VERTEX_SHADER_TYPE: u32 = 0x8b31;
 
+/// `glCreateShader` type per shader object, so `glShaderBinary` can tell
+/// vertex from fragment.  Global (not thread-local): guest GL calls can be
+/// routed from different host workers than the ones that queried the state.
+static GL_SHADER_STAGES: std::sync::LazyLock<Mutex<HashMap<u32, u32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Synthesized source waiting for `glCompileShader` after a
+/// `glShaderBinary` substitution.
+static GL_SYNTH_SHADER_SOURCE: std::sync::LazyLock<Mutex<HashMap<u32, String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
 thread_local! {
     static PENDING_GL_ERROR: Cell<bool> = const { Cell::new(false) };
-    /// `glCreateShader` type per shader object, so `glShaderBinary` can tell
-    /// vertex from fragment.
-    static GL_SHADER_STAGES: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
-    /// Synthesized source waiting for `glCompileShader` after a
-    /// `glShaderBinary` substitution.
-    static GL_SYNTH_SHADER_SOURCE: RefCell<HashMap<u32, String>> = RefCell::new(HashMap::new());
     /// Caps the map-target matrix-upload trace.
     static MATRIX_LOG_SEEN: Cell<u32> = const { Cell::new(0) };
     static API_LOG_COUNT: Cell<u32> = const { Cell::new(0) };
@@ -3101,7 +3105,9 @@ fn route_shader_source(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let shader = ureg(unicorn, RegisterARM::R0);
     // Real source supersedes any `glShaderBinary` substitution waiting for
     // this shader (the HMI probes binary support then compiles source).
-    GL_SYNTH_SHADER_SOURCE.with(|m| m.borrow_mut().remove(&shader));
+    if let Ok(mut m) = GL_SYNTH_SHADER_SOURCE.lock() {
+        m.remove(&shader);
+    }
     let count = (ureg(unicorn, RegisterARM::R1) as usize).min(64);
     let strings_ptr = ureg(unicorn, RegisterARM::R2);
     let lengths_ptr = ureg(unicorn, RegisterARM::R3);
@@ -3438,7 +3444,7 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
                 if id == 0 || id == u32::MAX {
                     continue;
                 }
-                let stage = GL_SHADER_STAGES.with(|m| m.borrow().get(&id).copied());
+                let stage = GL_SHADER_STAGES.lock().ok().and_then(|m| m.get(&id).copied());
                 let source = match stage {
                     Some(GL_VERTEX_SHADER_TYPE) => SYNTH_VERT_SHADER,
                     _ => SYNTH_FRAG_SHADER,
@@ -3447,14 +3453,42 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
                 // point of binaries), so upload and compile the substituted
                 // source right here or `glLinkProgram` links empty shaders.
                 if let Ok(cstring) = CString::new(source) {
+                    let diag_stage = stage;
                     gpu_void_clear(move || unsafe {
                         let pointer = cstring.as_ptr();
                         let length = cstring.as_bytes().len() as i32;
                         gl::ShaderSource(id, 1, &pointer, &length);
                         gl::CompileShader(id);
+                        static SUB_LOGS: AtomicU32 = AtomicU32::new(0);
+                        let hits = SUB_LOGS.fetch_add(1, Ordering::Relaxed);
+                        if hits < 6 {
+                            let mut status = 0i32;
+                            gl::GetShaderiv(id, gl::COMPILE_STATUS, &mut status);
+                            let mut log_len = 0i32;
+                            gl::GetShaderiv(id, gl::INFO_LOG_LENGTH, &mut log_len);
+                            let mut info =
+                                vec![0u8; (log_len.max(0).min(255) as usize) + 1];
+                            if log_len > 0 {
+                                gl::GetShaderInfoLog(
+                                    id,
+                                    info.len() as i32,
+                                    &mut log_len,
+                                    info.as_mut_ptr() as *mut std::ffi::c_char,
+                                );
+                            }
+                            log::info!(
+                                "GPU: synth shader substitute id={} stage={:?} compile={} info={}",
+                                id,
+                                diag_stage,
+                                status,
+                                String::from_utf8_lossy(&info).trim()
+                            );
+                        }
                     });
                 }
-                GL_SYNTH_SHADER_SOURCE.with(|m| m.borrow_mut().remove(&id));
+                if let Ok(mut m) = GL_SYNTH_SHADER_SOURCE.lock() {
+                    m.remove(&id);
+                }
             }
             return Some(0);
         }
@@ -3538,11 +3572,28 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
             return Some(0);
         }
         "glAttachShader" => {
-            gpu_void_v2(
-                gl::AttachShader,
-                ureg(unicorn, RegisterARM::R0),
-                ureg(unicorn, RegisterARM::R1),
-            );
+            let prog = ureg(unicorn, RegisterARM::R0);
+            let shader = ureg(unicorn, RegisterARM::R1);
+            if current_gpu_target() == GpuTarget::Map {
+                static ATTACH_LOGS: AtomicU32 = AtomicU32::new(0);
+                let hits = ATTACH_LOGS.fetch_add(1, Ordering::Relaxed);
+                if hits < 10 {
+                    let _ = gpu_void_clear(move || unsafe {
+                        let mut status = 0i32;
+                        gl::GetShaderiv(shader, gl::COMPILE_STATUS, &mut status);
+                        let mut source_len = 0i32;
+                        gl::GetShaderiv(shader, gl::SHADER_SOURCE_LENGTH, &mut source_len);
+                        log::info!(
+                            "GPU: map attach prog={} shader={} compile={} source_len={}",
+                            prog,
+                            shader,
+                            status,
+                            source_len
+                        );
+                    });
+                }
+            }
+            gpu_void_v2(gl::AttachShader, prog, shader);
             return Some(0);
         }
         "glBindBuffer" => {
@@ -3722,7 +3773,38 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
             return Some(0);
         }
         "glLinkProgram" => {
-            gpu_void_v1(gl::LinkProgram, ureg(unicorn, RegisterARM::R0));
+            let program = ureg(unicorn, RegisterARM::R0);
+            gpu_void_v1(gl::LinkProgram, program);
+            if current_gpu_target() == GpuTarget::Map {
+                static LINK_LOGS: AtomicU32 = AtomicU32::new(0);
+                let hits = LINK_LOGS.fetch_add(1, Ordering::Relaxed);
+                if hits < 30 {
+                    let _ = gpu_void_clear(move || unsafe {
+                        let mut status = 0i32;
+                        let mut uniforms = 0i32;
+                        gl::GetProgramiv(program, gl::LINK_STATUS, &mut status);
+                        gl::GetProgramiv(program, gl::ACTIVE_UNIFORMS, &mut uniforms);
+                        let mut log_len = 0i32;
+                        gl::GetProgramiv(program, gl::INFO_LOG_LENGTH, &mut log_len);
+                        let mut info = vec![0u8; (log_len.max(0).min(255) as usize) + 1];
+                        if log_len > 0 {
+                            gl::GetProgramInfoLog(
+                                program,
+                                info.len() as i32,
+                                &mut log_len,
+                                info.as_mut_ptr() as *mut std::ffi::c_char,
+                            );
+                        }
+                        log::info!(
+                            "GPU: map link prog={} link={} uniforms={} info={}",
+                            program,
+                            status,
+                            uniforms,
+                            String::from_utf8_lossy(&info).trim()
+                        );
+                    });
+                }
+            }
             return Some(0);
         }
         "glDetachShader" => {
@@ -3787,7 +3869,9 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
             let created = gpu_ret_u1(gl::CreateShader, kind);
             if let Some(id) = created {
                 if id != 0 {
-                    GL_SHADER_STAGES.with(|m| m.borrow_mut().insert(id, kind));
+                    if let Ok(mut m) = GL_SHADER_STAGES.lock() {
+                        m.insert(id, kind);
+                    }
                 }
             }
             return created;
@@ -3798,7 +3882,10 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
         }
         "glCompileShader" => {
             let id = ureg(unicorn, RegisterARM::R0);
-            let synth = GL_SYNTH_SHADER_SOURCE.with(|m| m.borrow_mut().remove(&id));
+            let synth = GL_SYNTH_SHADER_SOURCE
+                .lock()
+                .ok()
+                .and_then(|mut m| m.remove(&id));
             if let Some(source) = synth {
                 match CString::new(source) {
                     Ok(cstring) => {
@@ -3822,8 +3909,12 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
         }
         "glDeleteShader" => {
             let id = ureg(unicorn, RegisterARM::R0);
-            GL_SHADER_STAGES.with(|m| m.borrow_mut().remove(&id));
-            GL_SYNTH_SHADER_SOURCE.with(|m| m.borrow_mut().remove(&id));
+            if let Ok(mut m) = GL_SHADER_STAGES.lock() {
+                m.remove(&id);
+            }
+            if let Ok(mut m) = GL_SYNTH_SHADER_SOURCE.lock() {
+                m.remove(&id);
+            }
             gpu_void_v1(gl::DeleteShader, id);
             return Some(0);
         }
