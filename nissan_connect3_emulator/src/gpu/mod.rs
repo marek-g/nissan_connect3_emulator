@@ -75,10 +75,22 @@ const SYNTH_VERT_SHADER: &str = "attribute vec4 a_position;
 attribute vec4 a_color;
 uniform mat4 u_matModelView;
 uniform mat4 u_matViewProj;
+uniform mat4 u_m4ProjMat;
+uniform mat4 u_m4ProjMatStreets;
+uniform mat4 u_m4OrthoProjMat;
+uniform mat4 u_m4MetersModelViewWOTransVec;
+uniform mat4 u_matNormal;
 varying vec4 v_color;
 void main() {
     gl_Position = u_matViewProj * (u_matModelView * a_position);
     v_color = a_color;
+    // Keep every matrix uniform alive (never folded away by the compiler) so
+    // the engine's name-based `vFindUniformLocations` resolves all of them and
+    // the draw probe can observe which matrices the engine actually uploads.
+    float _keep = u_m4ProjMat[0][0] + u_m4ProjMatStreets[0][0]
+        + u_m4OrthoProjMat[0][0] + u_m4MetersModelViewWOTransVec[0][0]
+        + u_matNormal[0][0];
+    gl_Position += vec4(_keep * 0.0);
 }
 ";
 const SYNTH_FRAG_SHADER: &str = "precision mediump float;
@@ -2917,8 +2929,29 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
             samples.push(clip);
         }
     }
+    let matrix_catalog: Vec<String> = LAST_UPLOADED_MATRICES
+        .lock()
+        .map(|matrices| {
+            matrices
+                .iter()
+                .map(|(loc, matrix)| {
+                    format!(
+                        "loc{}:[{:.3},{:.3},{:.3},{:.3}|t{:.0},{:.0},{:.0}]",
+                        loc,
+                        matrix[0],
+                        matrix[5],
+                        matrix[10],
+                        matrix[15],
+                        matrix[12],
+                        matrix[13],
+                        matrix[14]
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     log::info!(
-        "GPU: map draw probe mode={} first={} count={} viewport={:?} program={} uniforms={} names={:?} array_vbo={} engine_head={:?} attrib0=(en={} size={} type={:#x} stride={} vbo={}) attrib1=(en={} size={} type={:#x} stride={} vbo={}) mv={} vp={} clips=[{}]",
+        "GPU: map draw probe mode={} first={} count={} viewport={:?} program={} uniforms={} names={:?} array_vbo={} engine_head={:?} attrib0=(en={} size={} type={:#x} stride={} vbo={}) attrib1=(en={} size={} type={:#x} stride={} vbo={}) mv={} vp={} mats=[{}] clips=[{}]",
         mode,
         first,
         count,
@@ -2932,6 +2965,7 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         states[1].0, states[1].1, states[1].2, states[1].3, states[1].4,
         matrices.0.is_some(),
         matrices.1.is_some(),
+        matrix_catalog.join(" "),
         samples
             .iter()
             .map(|clip| format!("({:.1},{:.1},{:.1},{:.1})", clip[0], clip[1], clip[2], clip[3]))
