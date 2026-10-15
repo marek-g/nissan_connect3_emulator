@@ -574,6 +574,67 @@ fn publish_map_surface_pixels(pixels: &[u8]) {
     }
 }
 
+/// r728: read the SDL window's default framebuffer on the compositor
+/// context (right after `blit_hmi_pixels_to_window` painted the composed
+/// HMI-over-map frame) and dump it as PPM to `EMU_MAP_DUMP_DIR`, every
+/// 20th frame for the first 400 swaps.
+fn dump_window_pixels(backend: &mut Backend) {
+    let Ok(dir) = std::env::var("EMU_MAP_DUMP_DIR") else {
+        return;
+    };
+    static WINDOW_SWAPS: AtomicU32 = AtomicU32::new(0);
+    let n = WINDOW_SWAPS.fetch_add(1, Ordering::Relaxed);
+    if n >= 400 || n % 20 != 19 {
+        return;
+    }
+    let (mut draw_w, mut draw_h) = (800i32, 480i32);
+    let mut win_w = 800i32;
+    let mut win_h = 480i32;
+    unsafe {
+        sys::SDL_GetWindowSize(backend.window_raw, &mut win_w, &mut win_h);
+        sys::SDL_GL_GetDrawableSize(backend.window_raw, &mut draw_w, &mut draw_h);
+    }
+    if draw_w <= 0 || draw_h <= 0 || draw_w > 4096 || draw_h > 4096 {
+        return;
+    }
+    let mut pixels = vec![0u8; (draw_w as usize) * (draw_h as usize) * 4];
+    unsafe {
+        gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+        gl::Finish();
+        gl::ReadPixels(
+            0,
+            0,
+            draw_w,
+            draw_h,
+            gl::RGBA,
+            gl::UNSIGNED_BYTE,
+            pixels.as_mut_ptr() as *mut _,
+        );
+        drain_host_gl_errors();
+    }
+    let mut out: Vec<u8> =
+        Vec::with_capacity(32 + (draw_w as usize) * (draw_h as usize) * 3);
+    out.extend_from_slice(format!("P6\n{} {}\n255\n", draw_w, draw_h).as_bytes());
+    for row in pixels.chunks(draw_w as usize * 4).rev() {
+        for px in row.chunks(4) {
+            out.push(px[0]);
+            out.push(px[1]);
+            out.push(px[2]);
+        }
+    }
+    let path = format!("{}/window_{:04}.ppm", dir, n);
+    let _ = std::fs::write(&path, out);
+    log::info!(
+        "GPU: window dump {} ({}x{}, drawable {}x{}) -> {}",
+        n,
+        win_w,
+        win_h,
+        draw_w,
+        draw_h,
+        path
+    );
+}
+
 unsafe fn compile_helper_shader(kind: u32, src: *const u8) -> u32 {
     let shader = gl::CreateShader(kind);
     gl::ShaderSource(shader, 1, &src, core::ptr::null());
@@ -1357,6 +1418,10 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
                 }
                 backend.current_target = None;
                 blit_hmi_pixels_to_window(backend);
+                // r728: emulator-side capture of the composed window (the
+                // desktop screenshot tools on this host keep failing
+                // silently), written as PPM next to the map dumps.
+                dump_window_pixels(backend);
                 let _ = backend.window.gl_swap_window();
                 unsafe {
                     sys::SDL_GL_MakeCurrent(backend.window_raw, backend.hmi_context);
