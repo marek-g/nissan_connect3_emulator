@@ -2822,8 +2822,8 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
     gl::GetIntegerv(gl::VIEWPORT, viewport.as_mut_ptr());
     let mut program = 0i32;
     gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut program);
-    let mut states = [(0i32, 0i32, 0i32, 0i32, 0i32); 2];
-    let mut attrib_pointers = [0i32; 2];
+    let mut states = [(0i32, 0i32, 0i32, 0i32, 0i32); 4];
+    let mut attrib_pointers = [0i32; 4];
     for (index, state) in states.iter_mut().enumerate() {
         let index = index as u32;
         gl::GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_ENABLED, &mut state.0);
@@ -3044,8 +3044,19 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
                 .collect()
         })
         .unwrap_or_default();
+    let attrib_dump = states
+        .iter()
+        .enumerate()
+        .map(|(index, state)| {
+            format!(
+                "{}:(en={} sz={} ty={:#x} st={} vbo={} ap={:#x})",
+                index, state.0, state.1, state.2, state.3, state.4, attrib_pointers[index]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     log::info!(
-        "GPU: map draw probe mode={} first={} count={} viewport={:?} program={} uniforms={} names={:?} array_vbo={} engine_head={:?} attrib0=(en={} size={} type={:#x} stride={} vbo={}) attrib1=(en={} size={} type={:#x} stride={} vbo={}) ap0={:#x} ap1={:#x} mv={} vp={} vis={}/{} mats=[{}] clips=[{}]",
+        "GPU: map draw probe mode={} first={} count={} viewport={:?} program={} uniforms={} names={:?} array_vbo={} engine_head={:?} attribs=[{}] mv={} vp={} vis={}/{} mats=[{}] clips=[{}]",
         mode,
         first,
         count,
@@ -3055,10 +3066,7 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         uniform_names,
         array_binding,
         engine_vbo_head,
-        states[0].0, states[0].1, states[0].2, states[0].3, states[0].4,
-        states[1].0, states[1].1, states[1].2, states[1].3, states[1].4,
-        attrib_pointers[0],
-        attrib_pointers[1],
+        attrib_dump,
         matrices.0.is_some(),
         matrices.1.is_some(),
         visible_vertices,
