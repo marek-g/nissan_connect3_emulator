@@ -641,8 +641,10 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         })
         .unwrap();
 
-    // r743: page probes below re-enabled unconditionally: bisection shows the
-    // boot stalls without them (TB-layout / pacing effect), keep registered.
+    // r743: pure-observation page probes (r63x CCA/message-pool/render-job
+    // traces) - gated; the stall that once suggested a pacing dependency was
+    // traced to `add_fastmap_channel_trace_hooks` (r743b), not these.
+    if render_trace_enabled() {
     // r641: the class-0x44 (service-status) branch of `bDispatchCCAMessages`
     // gates on the app-interface state at `[this]+0x30` being 3:
     //   0x66cb20 ldr r2,[r8] / ldr r3,[r2,#0x30] / cmp r3,#3 / bne 0x66c93c
@@ -1106,6 +1108,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             })
             .unwrap();
     }
+    }  // render_trace_enabled
 
     // r655: capture the job pointer produced by the pure-render kick.  The
     // factory wrapper 0x4c5b0c returns through 0x4c5b20 (`ldmia sp!,{r4,pc}`,
@@ -1161,8 +1164,10 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             .unwrap();
     }
 
-    // r743: page probes below re-enabled unconditionally: bisection shows the
-    // boot stalls without them (TB-layout / pacing effect), keep registered.
+    // r743: pure-observation page probes (r63x CCA/message-pool/render-job
+    // traces) - gated; the stall that once suggested a pacing dependency was
+    // traced to `add_fastmap_channel_trace_hooks` (r743b), not these.
+    if render_trace_enabled() {
     // r658: which leg does `map_tclJobRCRenderPixmapView::Execute` take?  r657
     // shows the kick jobs taken (GetPeekedElement x14) with zero GL, so
     // Execute must bail before RenderView.  Probe the four decision legs:
@@ -1260,6 +1265,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             })
             .unwrap();
     }
+    }  // render_trace_enabled
 
     if std::env::var_os("EMU_PROCMAPENGINE_TRACE_INIT")
         .is_some_and(|value| !value.is_empty() && value != "0")
