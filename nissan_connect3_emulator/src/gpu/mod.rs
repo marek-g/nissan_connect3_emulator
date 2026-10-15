@@ -3651,6 +3651,42 @@ fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
             }
             None => index,
         }
+    } else if current_gpu_target() == GpuTarget::Map
+        && index == 1
+        && (ureg(unicorn, RegisterARM::R1) as i32) == 2
+        && (stack_arg(unicorn, 0) as i32) == 8
+        && stack_arg(unicorn, 1) == 0
+    {
+        // r718: the combined pass' manifest slots read the OTHER way round
+        // than the client-array family: its position leg arrives as `idx=1
+        // offset=0` and its direction leg as `idx=0 offset=coordcount<<3`
+        // (r717 offset-mode log: `idx=1 offset=0x0` alternating with the
+        // retargeted `idx=1 offset=0x5ed0`, while loc0 only ever saw the
+        // big family's client stagings).  With a bound VBO this same-shape
+        // vec2 leg is the position leg: force it onto `a_VertexXY` so both
+        // legs land on distinct synth locations.
+        let bound = gpu_u32_clear(|| unsafe {
+            let mut binding = 0i32;
+            gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut binding);
+            drain_host_gl_errors();
+            binding.max(0) as u32
+        });
+        match bound
+            .filter(|binding| *binding != 0)
+            .and_then(|_| synth_attrib_loc("a_VertexXY"))
+        {
+            Some(loc) => {
+                static XY_LOGS: AtomicU32 = AtomicU32::new(0);
+                if XY_LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+                    log::info!(
+                        "GPU: map xy-leg idx1 stride=8 offset=0 bound_vbo={} -> attrib {loc} (a_VertexXY)",
+                        bound.unwrap_or(0)
+                    );
+                }
+                loc
+            }
+            None => index,
+        }
     } else {
         index
     };
