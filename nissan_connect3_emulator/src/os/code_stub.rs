@@ -91,32 +91,6 @@ fn arm_instruction_relocatable(word: u32) -> bool {
     true
 }
 
-/// Lock-free decision step for `add_code_observer`: read the site instruction
-/// and test relocatability only (nothing is written). Library-registration code
-/// runs while the MMU mutex is held (via `Mmu::update_library_hooks`), so it
-/// must NOT allocate caves; it decides the fallback structure here and defers
-/// the real install to a trap-safe context (see procmapengine's
-/// `install_pending_observers`).
-pub fn code_observer_site_relocatable(
-    unicorn: &mut Unicorn<'_, Context>,
-    address: u32,
-    name: &str,
-) -> bool {
-    let mut word = [0u8; 4];
-    if unicorn.mem_read(address as u64, &mut word).is_err() {
-        log::warn!("observer {name} at {address:#x}: site not readable");
-        return false;
-    }
-    let original = u32::from_le_bytes(word);
-    if !arm_instruction_relocatable(original) {
-        log::warn!(
-            "observer {name} at {address:#x}: instruction {original:#010x} is not relocatable, keeping page hook"
-        );
-        return false;
-    }
-    true
-}
-
 /// Install an observer at a mid-function ARM instruction address without
 /// paying Unicorn's per-instruction page-hook cost: the instruction word is
 /// copied into a 16-byte RWX cave (`cave+0` instruction, `+4 ldr pc,[pc,#0]`,

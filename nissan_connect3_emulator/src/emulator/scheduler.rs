@@ -307,6 +307,12 @@ pub fn run_process_loop(
         let mmu_arc = unicorn.get_data().mmu.clone();
         mmu_arc.lock().unwrap().update_library_hooks(unicorn);
     }
+    // Deferred code observers that library registration armed (it runs with
+    // the MMU mutex held and cannot allocate its code caves): try the install
+    // once here, deterministically - the ELF text is fully loaded, the MMU
+    // mutex is free, and the guest has not executed a single instruction yet.
+    // The call self-gates to the process it belongs to.
+    crate::libs::procmapengine::install_pending_observers(unicorn);
 
     let mut last_park_report: Option<String> = None;
     let mut passes: u64 = 0;
