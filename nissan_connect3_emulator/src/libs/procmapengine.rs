@@ -2349,10 +2349,11 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
                 let list = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
                 let layer = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let count = MAP_RENDERER_DRAW_LIST_VCALL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-                if count < 120 {
+                if count < 100 || count % 512 == 0 {
                     log::info!(
-                        "PROCMAPENGINE: DrawList vcall {} object={:#x} vtable={:#x} target={:#x} list={:#x} layer={:#x} trace={}",
+                        "PROCMAPENGINE: DrawList vcall {} t={}ms object={:#x} vtable={:#x} target={:#x} list={:#x} layer={:#x} trace={}",
                         kind,
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
                         object,
                         vtable,
                         target,
