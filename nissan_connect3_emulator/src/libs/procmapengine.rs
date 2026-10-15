@@ -430,6 +430,14 @@ fn clear_map_job_saved_callee_regs() {
     MAP_JOB_QUEUE_SAVED_CALLEE_REGS.with(|cell| cell.set(None));
 }
 
+/// Diagnostics/probe hooks of the render pipeline are registered only when
+/// `EMU_PROCMAP_TRACE=1` (they cost a Unicorn callback per executed
+/// instruction on their watched pages, see AGENTS.md page-hook notes).
+pub fn render_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("EMU_PROCMAP_TRACE").is_some_and(|v| !v.is_empty() && v != "0"))
+}
+
 pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     PROCMAP_BASE.store(base_address, Ordering::Relaxed);
     APP_STATE_STARTED.store(false, Ordering::Relaxed);
@@ -633,6 +641,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         })
         .unwrap();
 
+    if render_trace_enabled() {
     // r641: the class-0x44 (service-status) branch of `bDispatchCCAMessages`
     // gates on the app-interface state at `[this]+0x30` being 3:
     //   0x66cb20 ldr r2,[r8] / ldr r3,[r2,#0x30] / cmp r3,#3 / bne 0x66c93c
@@ -1096,6 +1105,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             })
             .unwrap();
     }
+    }  // render_trace_enabled
 
     // r655: capture the job pointer produced by the pure-render kick.  The
     // factory wrapper 0x4c5b0c returns through 0x4c5b20 (`ldmia sp!,{r4,pc}`,
@@ -1151,6 +1161,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             .unwrap();
     }
 
+    if render_trace_enabled() {
     // r658: which leg does `map_tclJobRCRenderPixmapView::Execute` take?  r657
     // shows the kick jobs taken (GetPeekedElement x14) with zero GL, so
     // Execute must bail before RenderView.  Probe the four decision legs:
@@ -1248,6 +1259,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             })
             .unwrap();
     }
+    }  // render_trace_enabled
 
     if std::env::var_os("EMU_PROCMAPENGINE_TRACE_INIT")
         .is_some_and(|value| !value.is_empty() && value != "0")
@@ -1260,10 +1272,14 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         add_ail_power_trace_hooks(unicorn, base_address);
         add_cca_trace_hooks(unicorn, base_address);
     }
+    if render_trace_enabled() {
     add_ail_power_dispatch_state_hook(unicorn, base_address);
     add_procmap_switch_trace_hook(unicorn, base_address);
+    }
     suppress_duplicate_procmap_start_conf(unicorn, base_address);
+    if render_trace_enabled() {
     add_procmap_type3_state_hook(unicorn, base_address);
+    }
 
     let repair_addr = base_address + PORTCONTROL_INIT_RESULT;
     let activate_after_init = std::env::var_os("EMU_PROCMAPENGINE_SKIP_INITIAL_RENDER_TRIGGER")
@@ -1283,7 +1299,9 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
 
     add_street_coord_buffer_probe_hooks(unicorn, base_address);
 
+    if render_trace_enabled() {
     add_natural_map_engine_start_hooks(unicorn, base_address);
+    }
 
     let handler_hook_addr = base_address + PORTCONTROL_HANDLER_RESULT;
     unicorn
@@ -1324,9 +1342,13 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     }
 
     add_map_view_hooks(unicorn, base_address);
+    if render_trace_enabled() {
     add_map_data_main_loop_trace_hooks(unicorn, base_address);
     add_get_block_ids_answer_trace_hooks(unicorn, base_address);
+    }
+    if render_trace_enabled() {  // EMU_PROCMAP_TRACE=1 re-enables the r5xx-r6xx render traces
     add_fastmap_channel_trace_hooks(unicorn, base_address);
+    }
 
     let force_early_active = std::env::var("EMU_PROCMAPENGINE_FORCE_ACTIVE_STATE")
         .is_ok_and(|value| !value.is_empty() && value != "0");
@@ -6695,287 +6717,6 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 );
             })
             .unwrap();
-        // r733: cell-array feeders.  `AddToMapCell` (0x422f24) /
-        // `AddLineSegmentToMapCells` (0x422f6c) are the plain-scene vtable
-        // feeders of the per-bank cell arrays that the `s32InsertMO` loop
-        // consumes; the 0x561bb8/0x55f784 twins are the DTM-side feeders
-        // (which the working road pass must be using).  Counting both tells
-        // whether scene cells never get fed at all or get fed on another
-        // bank than the render pass queries.
-        for (feed_addr, feed_name) in
-            [(0x0042_2f24u32, "AddToMapCell"), (0x0042_2f6c, "AddLineSegToMapCells")]
-        {
-            let feed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            // r741: page-dispatch instead of narrow entry hook (see r733b).
-            let page_lo = base_address + ((feed_addr & !0xfffu32) - ORIGINAL_BASE);
-            let page_hi = page_lo + 0xfff;
-            let want = base_address + (feed_addr - ORIGINAL_BASE);
-            unicorn
-                .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
-                    if pc != want {
-                        return;
-                    }
-                    let count = feed.fetch_add(1, Ordering::Relaxed);
-                    if count >= 8 || count % 512 != 0 {
-                        return;
-                    }
-                    log::info!(
-                        "PROCMAPENGINE render trace {} entry r0={:#x} r1={:#x} r2={:#x} r3={:#x} n={}",
-                        feed_name,
-                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
-                        uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
-                        uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
-                        uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
-                        count
-                    );
-                })
-                .unwrap();
-        }
-        // r739: the Execute loop ran Convert 34 times but reached
-        // CreateMapObjectsFromRawMapDataBlock once; watch the convert-result
-        // compare at 0x4b5704 (page-range dispatch) logging r0 (Convert's
-        // return) and r11 (sentinel) to see 33 failures' shape.
-        {
-            let cmps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let page_lo = base_address + (0x004b_5000u32 - ORIGINAL_BASE);
-            let page_hi = page_lo + 0xfff;
-            unicorn
-                .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
-                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
-                // r740: the narrow entry hook on CreateMapObjectsFromRawMap
-                // -DataBlock saw 1 of provably 34 calls (Convert returned
-                // indices 0..33, none equal to the 0xffff sentinel, and the
-                // bl at 0x4b5760 is unconditional) - AGENTS.md false-negative
-                // quirk.  Count calls from the call site instead.
-                if original == 0x004b_5760 {
-                    let n = cmps.load(Ordering::Relaxed);
-                    if n <= 48 {
-                        log::info!(
-                            "PROCMAPENGINE render trace loadblocks-cmofr-call block={} n={}",
-                            uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
-                            n
-                        );
-                    }
-                }
-                if original != 0x004b_5704 {
-                    return;
-                }
-                let n = cmps.fetch_add(1, Ordering::Relaxed);
-                if n >= 48 {
-                    return;
-                }
-                log::info!(
-                    "PROCMAPENGINE render trace loadblocks-convert-ret r0={:#x} sentinel_r11={:#x} n={}",
-                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
-                    uc.reg_read(RegisterARM::R11).unwrap_or(0) as u32,
-                    n
-                );
-            })
-                .unwrap();
-        }
-        // r740: reliable count of the CreateMultipleMapElements fan-out:
-        // all 9 bl sites inside AddDataToMapObject (page probe, the narrow
-        // CME entry hook under-counts like the CreateMapObjects one did).
-        // r0 at each site is the map_tenMapElementTypes constant the call
-        // site hard-codes - the log spells out which element families the
-        // 34 payload blocks actually contain.
-        {
-            let cme = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let page_lo = base_address + (0x0050_a000u32 - ORIGINAL_BASE);
-            let page_hi = page_lo + 0xfff;
-            unicorn
-                .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
-                    let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
-                    if original == 0x0050_ae20 {
-                        let n = cme.load(Ordering::Relaxed);
-                        if n <= 200 {
-                            log::info!(
-                                "PROCMAPENGINE render trace adddata-callsite block={:#x} mo={:#x} n={}",
-                                uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
-                                uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
-                                n
-                            );
-                        }
-                        return;
-                    }
-                    if !matches!(
-                        original,
-                        0x0050_a540
-                            | 0x0050_a5a0
-                            | 0x0050_a600
-                            | 0x0050_a660
-                            | 0x0050_a6bc
-                            | 0x0050_a718
-                            | 0x0050_a778
-                            | 0x0050_a7d8
-                            | 0x0050_a7ec
-                    ) {
-                        return;
-                    }
-                    let n = cme.fetch_add(1, Ordering::Relaxed);
-                    if n >= 200 {
-                        return;
-                    }
-                    log::info!(
-                        "PROCMAPENGINE render trace cme-callsite at {:#x} elem_type={:#x} n={}",
-                        original,
-                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
-                        n
-                    );
-                })
-                .unwrap();
-        }
-        // r737: ConvertFastMapBlockFromSharedMemory creates its raw block
-        // then parses payload sections; 33/34 conversions still returned
-        // null to the Execute loop, so parsing fails somewhere.  The section
-        // dispatcher at 0x50d2d0 reads a u8 tag at r11 (table for tags 2..8,
-        // everything else branches to 0x50da84).  Page-watch the whole 4 KiB
-        // block (AGENTS.md: mid-TB narrow hooks lie) and log every tag plus
-        // default-branch hits to see what the 34 SD payload blocks hold.
-        {
-            let tagseen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let default_hit = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let page_lo = base_address + (0x0050_d000u32 - ORIGINAL_BASE);
-            let page_hi = page_lo + 0x1fff;
-            unicorn
-                .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
-                    let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
-                    match original {
-                        0x0050_d2d0 => {
-                            let n = tagseen.fetch_add(1, Ordering::Relaxed);
-                            if n >= 160 {
-                                return;
-                            }
-                            let r11 = uc.reg_read(RegisterARM::R11).unwrap_or(0) as u32;
-                            let tag = read_u32_or_invalid(uc, r11) & 0xff;
-                            log::info!(
-                                "PROCMAPENGINE render trace fmp-section tag={:#x} sec={:#x} len={:#x} heap={:#x} n={}",
-                                tag,
-                                r11,
-                                read_u32_or_invalid(uc, r11.wrapping_add(4)),
-                                read_u32_or_invalid(
-                                    uc,
-                                    base_address + (0x0079_07f4u32 - ORIGINAL_BASE)
-                                ),
-                                n
-                            );
-                        }
-                        0x0050_da84 => {
-                            let n = default_hit.fetch_add(1, Ordering::Relaxed);
-                            if n >= 40 {
-                                return;
-                            }
-                            let r11 = uc.reg_read(RegisterARM::R11).unwrap_or(0) as u32;
-                            log::info!(
-                                "PROCMAPENGINE render trace fmp-section-default tag={:#x} sec={:#x} n={}",
-                                read_u32_or_invalid(uc, r11) & 0xff,
-                                r11,
-                                n
-                            );
-                        }
-                        // r738: heap-NULL (0x50e428) / heap-alloc-failure
-                        // (0x50e458) branches inside the section handlers.
-                        0x0050_e428 | 0x0050_e458 => {
-                            let n = default_hit.fetch_add(1, Ordering::Relaxed);
-                            if n < 40 {
-                                log::info!(
-                                    "PROCMAPENGINE render trace fmp-heap-branch at {:#x} n={}",
-                                    original,
-                                    n
-                                );
-                            }
-                        }
-                        _ => {}
-                    }
-                })
-                .unwrap();
-        }
-        // r733c: the raw-block -> element creation chain, upstream of all
-        // the dead feeders above.  `map_tclJobMDMHandleLoadBlocks::Execute`
-        // converts each LoadBlocks payload via ConvertFastMapBlockFromShared
-        // Memory (whose CreateNewRawDataBlock hits prove conversion runs)
-        // and then unconditionally calls CreateMapObjectsFromRawMapDataBlock,
-        // which fans out per-MO into AddDataToMapObject(r0=element type) ->
-        // CreateMultipleMapElements(r0=element type).  Logging r0 tells
-        // whether landuse/polygon element types are ever created at all.
-        for (mk_addr, mk_name) in [
-            (0x004b_5420u32, "JobMDMHandleLoadBlocks::Execute"),
-            (0x0051_e000u32, "Init/51e000(heap-owner)"),
-            (0x0047_db4cu32, "Init/47db4c"),
-            (0x0050_acc4u32, "CreateMapObjectsFromRawMapDataBlock"),
-            (0x0050_8f1cu32, "AddDataToMapObject"),
-            (0x003c_18f0u32, "CreateMultipleMapElements"),
-        ] {
-            let mk = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let addr = base_address + (mk_addr - ORIGINAL_BASE);
-            unicorn
-                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
-                    let count = mk.fetch_add(1, Ordering::Relaxed);
-                    if count >= 64 || count % 512 != 0 {
-                        return;
-                    }
-                    log::info!(
-                        "PROCMAPENGINE render trace {} entry r0={:#x} r1={:#x} r2={:#x} r3={:#x} n={}",
-                        mk_name,
-                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
-                        uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
-                        uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
-                        uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
-                        count
-                    );
-                })
-                .unwrap();
-        }
-        // r733b: the DTM draw-layer feeders (same slot/vpcs pipeline the
-        // working street pass uses - we only emulate the street element's
-        // vAddTLParams there).  One per element family: MapElm base,
-        // DTMStreet, Landuse_Line, Polygons (0x3f80e4 sits right before
-        // map_tclMapElm_Polygons' ctor).  If the landuse/polygon versions
-        // run, polygon elements DO reach the DTM layers and only the draw
-        // arming is missing; if none run, the element-build step upstream
-        // is dead.
-        for (add_addr, add_name) in [
-            (0x003c_0074u32, "AddToDTMDrawLayers/base"),
-            (0x003c_5fc8u32, "AddToDTMDrawLayers/43"),
-            (0x003e_ba50u32, "AddToDTMDrawLayers/Area"),
-            (0x003e_fb28u32, "AddToDTMDrawLayers/LanduseLine"),
-            (0x003f_80e4u32, "AddToDTMDrawLayers/Polygons"),
-            (0x003e_a9e8u32, "LanduseArea::Draw"),
-            (0x0042_a8ecu32, "UpdateDrawLayerListsForDTM"),
-        ] {
-            let feed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            // r741: narrow entry hooks proved unreliable here (they under-
-            // counted AddDataToMapObject 34 -> 1, AGENTS.md quirk), so watch
-            // the whole entry page and dispatch on the exact pc instead.
-            let page_lo = base_address + ((add_addr & !0xfffu32) - ORIGINAL_BASE);
-            let page_hi = page_lo + 0xfff;
-            let want = base_address + (add_addr - ORIGINAL_BASE);
-            unicorn
-                .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
-                    if pc != want {
-                        return;
-                    }
-                    let count = feed.fetch_add(1, Ordering::Relaxed);
-                    if count >= 8 || count % 512 != 0 {
-                        return;
-                    }
-                    log::info!(
-                        "PROCMAPENGINE render trace {} entry r0={:#x} r1={:#x} r2={:#x} r3={:#x} n={}",
-                        add_name,
-                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
-                        uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
-                        uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
-                        uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
-                        count
-                    );
-                })
-                .unwrap();
-        }
         // `DetermineMapObjects` only inserts MOs into the DTM grid when the
         // per-view cell array (scene+0x30+view*4, `*count` there) is non-zero;
         // those arrays are fed by the raw data blocks created from the

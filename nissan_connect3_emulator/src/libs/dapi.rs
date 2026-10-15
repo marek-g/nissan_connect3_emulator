@@ -259,18 +259,26 @@ pub fn dapiapp_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     hook_service_register_handler(unicorn, base_address);
     hook_service_data_errors(unicorn, base_address);
     hook_service_data_scan(unicorn, base_address);
+    if crate::libs::procmapengine::render_trace_enabled() {
     hook_fastmap_worker_steps(unicorn, base_address);
+    }
     hook_service_state_setter(unicorn, base_address);
     hook_registry_guard(unicorn, base_address);
     hook_error_job_origin(unicorn, base_address);
     hook_service_status_handler(unicorn, base_address);
     hook_srvctrl_worker_lookup(unicorn, base_address);
+    if crate::libs::procmapengine::render_trace_enabled() {
     hook_rs_region_outlines_gate(unicorn, base_address);
+    }
     hook_rs_broadcasts(unicorn, base_address);
+    if crate::libs::procmapengine::render_trace_enabled() {
     hook_rs_media_info(unicorn, base_address);
+    }
     hook_media_info_vector(unicorn, base_address);
     hook_dapi_device_config(unicorn, base_address);
+    if crate::libs::procmapengine::render_trace_enabled() {
     hook_dapi_file_lookup(unicorn, base_address);
+    }
     hook_device_manager_init(unicorn, base_address);
     hook_device_manager_flow(unicorn, base_address);
     if std::env::var("EMU_PATCH_DAPI_ADMIN_LOCK")
@@ -1009,6 +1017,7 @@ fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     // the message) and filled by `bGetDapFiMsgFromAction`, so the words dumped
     // one instruction later are exactly what DAPI read out of procmapengine's
     // GetBlockIDs request (dataset id, data type, map scale, bbox).
+    if crate::libs::procmapengine::render_trace_enabled() {
     let page_lo = base_address + (0x0084_a000u32 - ORIGINAL_BASE);
     let page_hi = page_lo + 0xfff;
     let stash = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1102,6 +1111,7 @@ fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
             );
         })
         .unwrap();
+    }
 }
 
 /// Step-by-step page watch inside `dap_map_tclWorker::u16ProcessOpenChannel`
@@ -1719,6 +1729,7 @@ fn hook_srvctrl_worker_lookup(unicorn: &mut Unicorn<'_, Context>, base_address: 
     // is a freshly created `rs_tclWorker`, and the method it runs is the code that
     // answers with error 0x305 - so capture the vtable it dispatches through.
     // Hooked as a page range on purpose (mid-TB narrow hooks can never fire).
+    if crate::libs::procmapengine::render_trace_enabled() {
     let page_lo = base_address + 0x0082_a000u32 - ORIGINAL_BASE;
     let page_hi = page_lo + 0xfff;
     unicorn
@@ -1749,6 +1760,7 @@ fn hook_srvctrl_worker_lookup(unicorn: &mut Unicorn<'_, Context>, base_address: 
             );
         })
         .unwrap();
+    }
 }
 
 /// `rs_tclWorker::enProcessGetRegionOutlines` (0x869ab4) answers the regionselectionfi
