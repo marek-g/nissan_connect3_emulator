@@ -2813,13 +2813,11 @@ the directory re-post driver - gating it stalls boot before LoadBlocks),
 host-state stores (`X.store(`/`fetch_or(` on module statics consumed by
 providers) and cross-module helper calls, not just `mem_write`/`reg_write`.
 
-Remaining known cost (kept by design): 0x409000 vpcs page + 0x55a000 vfin/
-vpcs-return page (road pipeline stamping), the FUNC helpers around job-queue
-fabrication, dapi wait/latency hooks. Future speed-up: convert those entry/
-page observers to the svc-stub trampolining idea (`add_code_stub` extended
-with observe-and-continue) so their cost drops to the hit moments only.
+Remaining known cost (kept by design): the FUNC helpers around job-queue
+fabrication, dapi wait/latency hooks. The street-page conversion to svc
+trampolining proposed there was implemented in r744 (see below).
 
-## r744 (2026-10-15): svc observer trampolines for the last 2 hot pages (IN PROGRESS)
+## r744 (2026-10-15): svc observer trampolines for the last 2 hot pages (RESOLVED)
 
 Goal: the two remaining always-on page-range hooks (0x409000 `vDrawCombinedStreets`
 entry, 0x55a000 `vFinishCombinedDrawing` entry) fired a host callback for EVERY
@@ -2828,7 +2826,10 @@ Only ONE functional site lived in each page (0x409250 pyd-force + poTransPos3D
 stamp, 0x55adf0 emulate_add_tl_params + frame bump + VF_BEST stamp); everything
 else in them (0x55ae30/54/60, 0x55af54/58/9c decision legs, 0x4092b4/9508 r707
 legs, 0x449000/0x446000/0x40f000 probes) is pure diagnostics -> now gated behind
-`EMU_PROCMAP_TRACE=1`.
+`EMU_PROCMAP_TRACE=1`. Default boot now registers ZERO page-range hooks for the
+street pipeline ("street observers live (attempt 1), page-range hooks not
+needed"); verified roads still render (multi-draw x6 @171s, real SD colors in
+window dump).
 
 Mechanism (`os/code_stub.rs::add_code_observer`): copy the 4-byte site
 instruction into a 16-byte RWX cave `[orig, ldr pc,[pc,#0], pad, site+4]`, patch
@@ -2843,21 +2844,33 @@ R15 as Rd/Rn/Rm, no B/BL/BX/BLX/MRS/MSR/coprocessor. Both sites pass
 `ldr pc,[pc,#0]` in the cave (not `b`) because `heap_alloc` caves are ~1.2 GB
 from the sites, far beyond B's +/-32 MB.
 
-LESSON (deadlock, cost one full 20-min boot to find): library registrars run
-with the MMU mutex ALREADY HELD - both callers of `Mmu::update_library_hooks`
-(`os/syscalls/mman.rs`, `emulator/scheduler.rs`) do `mmu_arc.lock().unwrap().
-update_library_hooks(...)`, and `add_library_hook` -> `*_add_code_hooks` runs
-inside that guard. The first r744 revision allocated the caves at registration
-(`data.mmu.clone().lock()` -> `heap_alloc`) => recursive `std::sync::Mutex` lock,
-spawn thread frozen, procmapengine never started (symptom: spawn logged, ZERO
-`PROCMAPENGINE:` lines, no map). Existing lazy allocators (`ensure_guest_call_stub`,
-`ensure_tl_arena`) escaped this only because they run inside hooks (guest context,
-mmu not held). Rule: **no `mmu.lock()` in any `*_add_code_hooks` path**. Fix:
-registration does a lock-free decision (`code_observer_site_relocatable` =
-mem_read + decode, no locks, decides the page-hook fallback structure) and sets
-`OBS_INSTALL_PENDING`; `install_pending_observers` (heap_alloc + svc patch,
-retries on alloc failure) is driven from `hook_syscall` entry, which never holds
-the mmu mutex and is hit within the first guest syscalls - guaranteed before
-procmapengine's first render pass. Page-hook fallback stays registered per-site
-iff that site's decode fails at registration; decode is deterministic so
-observer+page-hook double-execution can never happen outside trace mode.
+LESSON 1 (deadlock): library registrars run with the MMU mutex ALREADY HELD -
+both callers of `Mmu::update_library_hooks` (`os/syscalls/mman.rs`,
+`emulator/scheduler.rs`) do `mmu_arc.lock().unwrap().update_library_hooks(...)`,
+and `add_library_hook` -> `*_add_code_hooks` runs inside that guard. The first
+r744 revision allocated the caves at registration (`data.mmu.clone().lock()` ->
+`heap_alloc`) => recursive `std::sync::Mutex` lock, spawn thread frozen,
+procmapengine never started (symptom: spawn logged, ZERO `PROCMAPENGINE:`
+lines, no map). Existing lazy allocators (`ensure_guest_call_stub`,
+`ensure_tl_arena`) escaped this only because they run inside hooks (guest
+context, mmu not held). Rule: **no `mmu.lock()` in any `*_add_code_hooks` path**.
+
+LESSON 2 (multi-VM - cost three boot lotteries): **every guest process runs on
+its own host thread with its own Unicorn VM/address space** (comment in
+`Process::setup`, `run_process_loop`). Module statics + the `hook_syscall`-driven
+retry loop made installs fire in the WRONG VM: `mem_read(0x55adf0)` reads a
+foreign address space (observed zero/stale words - NOT unloaded text; in the
+right VM the bytes are always good, the registration-time check passed silently
+in run r744b), `add_code_hook` fallbacks landed in foreign VMs, and the chatty
+processes burned the 64-attempt budget in milliseconds. Any cross-process
+deferred VM mutation MUST gate on `unicorn.get_data().elf_path` (here
+`ends_with("procmapengine.out")`).
+
+Final wiring: registration only stores `PROCMAP_RT_BASE` + arms
+`PROCMAP_OBS_TRIES=1` (lock-free); the deterministic install runs in
+`run_process_loop` right after `update_library_hooks` - ELF fully loaded, MMU
+mutex free, guest not yet executing - one attempt, always succeeds; the
+`hook_syscall` entry call remains as a VM-gated safety net with give-up
+fallback (registers the extracted `register_vfin/vpcs_page_fallback` page hooks
+in the right VM, r743 behavior). Trace mode registers the fallbacks
+unconditionally as the diagnostic legs.

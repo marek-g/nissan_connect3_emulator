@@ -9765,28 +9765,46 @@ static PROCMAP_RT_BASE: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 static OBS_VPCS_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static PROCMAP_OBS_CAVES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 const OBS_CAVES_SIZE: u32 = 0x40;
-/// Set by `add_street_coord_buffer_probe_hooks` when both observer sites are
-/// relocatable; consumed by `install_pending_observers` (syscall-hook context).
-pub static OBS_INSTALL_PENDING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// Patch the two deferred observer sites. Called from the syscall/intr-hook
 /// context (which never holds the MMU mutex) because the cave allocation takes
 /// it. Safe to call on every trap: it starts with a relaxed swap. Retries
 /// until the cave allocation succeeds.
+/// Deferred-observer state machine (`hook_syscall` drives it on every svc):
+/// 0 = idle (nobody armed), 1..=OBS_TRIES_MAX = install attempts pending,
+/// u32::MAX = finished (observers live or fallback registered).
+const OBS_TRIES_IDLE: u32 = 0;
+const OBS_TRIES_MAX: u32 = 64;
+const OBS_TRIES_DONE: u32 = u32::MAX;
+static PROCMAP_OBS_TRIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Patch the two deferred observer sites. Called from the syscall/intr-hook
+/// context (which never holds the MMU mutex) because the cave allocation takes
+/// it. Cheap relaxed load when idle. Retries until the site words read as
+/// relocatable ARM prologues - during process load the pages can still be
+/// zero/stale; the guest cannot execute those sites before their text exists,
+/// so success is guaranteed well before the first render pass. On give-up
+/// (pathological only) registers the page-range fallbacks instead.
 pub fn install_pending_observers(unicorn: &mut Unicorn<'_, Context>) {
-    if !OBS_INSTALL_PENDING.swap(false, Ordering::Relaxed) {
+    // One Unicorn VM per process: only the procmapengine VM holds the site
+    // bytes and code-hook table we care about; attempts from other VMs would
+    // read foreign address spaces and register hooks in the wrong VM.
+    if !unicorn.get_data().elf_path.ends_with("procmapengine.out") {
         return;
     }
+    let tries = PROCMAP_OBS_TRIES.load(Ordering::Relaxed);
+    if tries == OBS_TRIES_IDLE || tries == OBS_TRIES_DONE {
+        return;
+    }
+    PROCMAP_OBS_TRIES.fetch_add(1, Ordering::Relaxed);
     let base_address = PROCMAP_RT_BASE.load(Ordering::Relaxed);
     if base_address == 0 {
         return;
     }
     let Some(caves) = ensure_observer_caves(unicorn) else {
-        OBS_INSTALL_PENDING.store(true, Ordering::Relaxed);
         return;
     };
-    crate::os::code_stub::add_code_observer(
+    let vfin_ok = crate::os::code_stub::add_code_observer(
         unicorn,
         "procmapengine",
         base_address + (0x0055_adf0u32 - ORIGINAL_BASE),
@@ -9794,7 +9812,7 @@ pub fn install_pending_observers(unicorn: &mut Unicorn<'_, Context>) {
         caves,
         vfin_entry_observer,
     );
-    crate::os::code_stub::add_code_observer(
+    let vpcs_ok = crate::os::code_stub::add_code_observer(
         unicorn,
         "procmapengine",
         base_address + (0x0040_9250u32 - ORIGINAL_BASE),
@@ -9802,6 +9820,21 @@ pub fn install_pending_observers(unicorn: &mut Unicorn<'_, Context>) {
         caves + 0x10,
         vpcs_entry_observer,
     );
+    if vfin_ok && vpcs_ok {
+        PROCMAP_OBS_TRIES.store(OBS_TRIES_DONE, Ordering::Relaxed);
+        log::info!("PROCMAPENGINE: street observers live (attempt {tries}), page-range hooks not needed");
+    } else if tries >= OBS_TRIES_MAX {
+        PROCMAP_OBS_TRIES.store(OBS_TRIES_DONE, Ordering::Relaxed);
+        log::error!(
+            "PROCMAPENGINE: observer install gave up after {tries} attempts, registering page fallbacks"
+        );
+        if !vfin_ok {
+            register_vfin_page_fallback(unicorn, base_address);
+        }
+        if !vpcs_ok {
+            register_vpcs_page_fallback(unicorn, base_address);
+        }
+    }
 }
 
 fn ensure_observer_caves(unicorn: &mut Unicorn<'_, Context>) -> Option<u32> {
@@ -10074,30 +10107,12 @@ fn vpcs_entry_observer(uc: &mut Unicorn<'_, Context>) -> u32 {
     0
 }
 
-fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
-    // r744: install the functional sites as svc observers; the page-range
-    // hooks below then only run as fallback (if a site's first instruction
-    // was not relocatable) or for the EMU_PROCMAP_TRACE=1 legs.  Library
-    // registration runs with the MMU mutex held (Mmu::update_library_hooks),
-    // so caves cannot be allocated here: decide relocatability lock-free and
-    // defer the actual svc patching to `install_pending_observers`, driven
-    // from the syscall hook where the MMU mutex is free.
-    PROCMAP_RT_BASE.store(base_address, Ordering::Relaxed);
-    let (vfin_ok, vpcs_ok) = (
-        crate::os::code_stub::code_observer_site_relocatable(
-            unicorn,
-            base_address + (0x0055_adf0u32 - ORIGINAL_BASE),
-            "vFinishCombinedDrawing@observer",
-        ),
-        crate::os::code_stub::code_observer_site_relocatable(
-            unicorn,
-            base_address + (0x0040_9250u32 - ORIGINAL_BASE),
-            "vDrawCombinedStreets@observer",
-        ),
-    );
-    if vfin_ok && vpcs_ok {
-        OBS_INSTALL_PENDING.store(true, Ordering::Relaxed);
-    }
+
+// r744: page-range fallbacks for the two functional observer sites. In the
+// normal (fast) path these are never registered: `install_pending_observers`
+// patches `svc #0` trampolines instead. Trace mode registers them as well
+// (their diagnostic legs then also run).
+fn register_vfin_page_fallback(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
     let entry_hits = Arc::new(AtomicU32::new(0));
@@ -10106,7 +10121,6 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
     let skip_hits = Arc::new(AtomicU32::new(0));
     let page_lo = base_address + (0x0055_a000u32 - ORIGINAL_BASE);
     let page_hi = page_lo + 0xfff;
-    if render_trace_enabled() || !vfin_ok {
     unicorn
         .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
             let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
@@ -10397,108 +10411,11 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
             }
         })
         .unwrap();
-    }
+}
 
-    // r691: does `bProcessData` reach the per-node `bl vUpdateVBO` site at
-    // 0x449118 (inside LAB_00449168, right after processThickLine)?
-    if render_trace_enabled() {
-    {
-        let call_hits = Arc::new(AtomicU32::new(0));
-        let page_lo = base_address + (0x0044_9000u32 - ORIGINAL_BASE);
-        let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
-                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
-                if original != 0x0044_9118u32 {
-                    return;
-                }
-                let count = call_hits.fetch_add(1, Ordering::Relaxed);
-                if count >= 16 {
-                    return;
-                }
-                let scb = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
-                let pos_src = read_u32_or_invalid(uc, scb.wrapping_add(0x30));
-                let dir_src = read_u32_or_invalid(uc, scb.wrapping_add(0x34));
-                let node = (uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32) & 0xffff;
-                log::info!(
-                    "PROCMAPENGINE street-coord probe t={}ms vUpdateVBO-call scb={:#x} node={} pos_src={:#x} dir_src={:#x} n={}",
-                    crate::libs::dapi::emu_t0_elapsed_ms(),
-                    scb,
-                    node,
-                    pos_src,
-                    dir_src,
-                    count
-                );
-            })
-            .unwrap();
-    }
-    }
-
-    // r691: `uti_DTM_StreetCoord_Buffer::vUpdateVBO` entry - dumps the exact
-    // gate values (`param_4 == 0`, `+0x30 != 0`, `+0x34 != 0`, `+0x118 != 0`)
-    // that decide whether the `glBufferSubData` uploads run.
-    if render_trace_enabled() {
-    {
-        let entry_hits = Arc::new(AtomicU32::new(0));
-        let page_lo = base_address + (0x0044_6000u32 - ORIGINAL_BASE);
-        let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
-                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
-                if original != 0x0044_6f9cu32 {
-                    return;
-                }
-                let count = entry_hits.fetch_add(1, Ordering::Relaxed);
-                if count >= 16 {
-                    return;
-                }
-                let scb = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
-                let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
-                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
-                let param4 = read_u32_or_invalid(uc, sp);
-                let pos_src = read_u32_or_invalid(uc, scb.wrapping_add(0x30));
-                let dir_src = read_u32_or_invalid(uc, scb.wrapping_add(0x34));
-                let dir_res = read_u32_or_invalid(uc, scb.wrapping_add(0x118));
-                let dir_res_id = read_u32_or_invalid(uc, dir_res.wrapping_add(0xc));
-                // r692: upload size = `piVar2[node] << 3` with piVar10/2 =
-                // `[scb+0x160]/[scb+0x164]`; `u32UpdateVBO` silently returns
-                // when size == 0, the only remaining explanation for the zero
-                // `glBufferSubData` count with every other gate open.
-                let sections = read_u32_or_invalid(uc, scb.wrapping_add(0x2c));
-                let starts = read_u32_or_invalid(uc, scb.wrapping_add(0x160));
-                let counts = read_u32_or_invalid(uc, scb.wrapping_add(0x164));
-                let first_start = read_u32_or_invalid(uc, starts);
-                let first_count = read_u32_or_invalid(uc, counts);
-                log::info!(
-                    "PROCMAPENGINE street-coord probe t={}ms vUpdateVBO scb={:#x} param3={:#x} param4={:#x} pos_src={:#x} dir_src={:#x} dir_res={:#x} dir_res_id={:#x} sections={sections} starts={starts:#x} counts={counts:#x} first=({first_start},{first_count}) n={}",
-                    crate::libs::dapi::emu_t0_elapsed_ms(),
-                    scb,
-                    r3,
-                    param4,
-                    pos_src,
-                    dir_src,
-                    dir_res,
-                    dir_res_id,
-                    count
-                );
-                crate::gpu::note_road_geometry_uploaded();
-            })
-            .unwrap();
-    }
-    }
-
-    // r694: `map_tclMapElm_Street::vDrawCombinedStreets` entry (0x409250).
-    // The whole visible-road pipeline ends here: it draws the street banks
-    // with `glMultiDrawArraysEXT` but first gates on the DTM z-values branch,
-    // which needs `map_tclMapMCP::bIsDTMEnabled()` = feature-bit AND
-    // `map_tclPyramidLoaderUtil::ms_bPydFileExists` (0x713d33).  With DTM off
-    // the engine feeds a_VertexZ = 0 as a constant, which the RH streets
-    // projection (`w = -z_mv`, camera at z_mv = +1253) rejects entirely -
-    // zero visible road pixels even with real geometry uploaded.  Log entry,
-    // the flag and the z-resource array to see which half is missing.
-    if render_trace_enabled() || !vpcs_ok {
+fn register_vpcs_page_fallback(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
     {
         let entry_hits = Arc::new(AtomicU32::new(0));
         let page_lo = base_address + (0x0040_9000u32 - ORIGINAL_BASE);
@@ -10693,7 +10610,125 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
             })
             .unwrap();
     }
+}
+fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    // r744: arm the deferred svc-observer install. Registration runs while
+    // the MMU mutex is held (Mmu::update_library_hooks), and the site pages
+    // may not even hold their ELF text yet (observed: reads of zero/stale
+    // words right after mmap), so NO decision is taken here. The syscall
+    // hook retries `install_pending_observers` until the site words read as
+    // relocatable ARM prologues (well before procmapengine can execute them);
+    // only the pathological give-up path registers the page-range fallbacks.
+    PROCMAP_RT_BASE.store(base_address, Ordering::Relaxed);
+    if PROCMAP_OBS_TRIES.load(Ordering::Relaxed) == OBS_TRIES_IDLE {
+        PROCMAP_OBS_TRIES.store(1, Ordering::Relaxed);
     }
+    if render_trace_enabled() {
+        register_vfin_page_fallback(unicorn, base_address);
+        register_vpcs_page_fallback(unicorn, base_address);
+    }
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+
+    // r691: does `bProcessData` reach the per-node `bl vUpdateVBO` site at
+    // 0x449118 (inside LAB_00449168, right after processThickLine)?
+    if render_trace_enabled() {
+    {
+        let call_hits = Arc::new(AtomicU32::new(0));
+        let page_lo = base_address + (0x0044_9000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != 0x0044_9118u32 {
+                    return;
+                }
+                let count = call_hits.fetch_add(1, Ordering::Relaxed);
+                if count >= 16 {
+                    return;
+                }
+                let scb = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let pos_src = read_u32_or_invalid(uc, scb.wrapping_add(0x30));
+                let dir_src = read_u32_or_invalid(uc, scb.wrapping_add(0x34));
+                let node = (uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32) & 0xffff;
+                log::info!(
+                    "PROCMAPENGINE street-coord probe t={}ms vUpdateVBO-call scb={:#x} node={} pos_src={:#x} dir_src={:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    scb,
+                    node,
+                    pos_src,
+                    dir_src,
+                    count
+                );
+            })
+            .unwrap();
+    }
+    }
+
+    // r691: `uti_DTM_StreetCoord_Buffer::vUpdateVBO` entry - dumps the exact
+    // gate values (`param_4 == 0`, `+0x30 != 0`, `+0x34 != 0`, `+0x118 != 0`)
+    // that decide whether the `glBufferSubData` uploads run.
+    if render_trace_enabled() {
+    {
+        let entry_hits = Arc::new(AtomicU32::new(0));
+        let page_lo = base_address + (0x0044_6000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != 0x0044_6f9cu32 {
+                    return;
+                }
+                let count = entry_hits.fetch_add(1, Ordering::Relaxed);
+                if count >= 16 {
+                    return;
+                }
+                let scb = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                let param4 = read_u32_or_invalid(uc, sp);
+                let pos_src = read_u32_or_invalid(uc, scb.wrapping_add(0x30));
+                let dir_src = read_u32_or_invalid(uc, scb.wrapping_add(0x34));
+                let dir_res = read_u32_or_invalid(uc, scb.wrapping_add(0x118));
+                let dir_res_id = read_u32_or_invalid(uc, dir_res.wrapping_add(0xc));
+                // r692: upload size = `piVar2[node] << 3` with piVar10/2 =
+                // `[scb+0x160]/[scb+0x164]`; `u32UpdateVBO` silently returns
+                // when size == 0, the only remaining explanation for the zero
+                // `glBufferSubData` count with every other gate open.
+                let sections = read_u32_or_invalid(uc, scb.wrapping_add(0x2c));
+                let starts = read_u32_or_invalid(uc, scb.wrapping_add(0x160));
+                let counts = read_u32_or_invalid(uc, scb.wrapping_add(0x164));
+                let first_start = read_u32_or_invalid(uc, starts);
+                let first_count = read_u32_or_invalid(uc, counts);
+                log::info!(
+                    "PROCMAPENGINE street-coord probe t={}ms vUpdateVBO scb={:#x} param3={:#x} param4={:#x} pos_src={:#x} dir_src={:#x} dir_res={:#x} dir_res_id={:#x} sections={sections} starts={starts:#x} counts={counts:#x} first=({first_start},{first_count}) n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    scb,
+                    r3,
+                    param4,
+                    pos_src,
+                    dir_src,
+                    dir_res,
+                    dir_res_id,
+                    count
+                );
+                crate::gpu::note_road_geometry_uploaded();
+            })
+            .unwrap();
+    }
+    }
+
+    // r694: `map_tclMapElm_Street::vDrawCombinedStreets` entry (0x409250).
+    // The whole visible-road pipeline ends here: it draws the street banks
+    // with `glMultiDrawArraysEXT` but first gates on the DTM z-values branch,
+    // which needs `map_tclMapMCP::bIsDTMEnabled()` = feature-bit AND
+    // `map_tclPyramidLoaderUtil::ms_bPydFileExists` (0x713d33).  With DTM off
+    // the engine feeds a_VertexZ = 0 as a constant, which the RH streets
+    // projection (`w = -z_mv`, camera at z_mv = +1253) rejects entirely -
+    // zero visible road pixels even with real geometry uploaded.  Log entry,
+    // the flag and the z-resource array to see which half is missing.
 
     // r701: `vAddTLParams` (0x40f730, called at the END of
     // `map_tclMapElm_Street::Draw`) is what fills `ms_apu32First`/
