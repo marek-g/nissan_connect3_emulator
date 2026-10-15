@@ -9233,6 +9233,10 @@ fn read_cstring(unicorn: &mut Unicorn<'_, Context>, address: u32) -> String {
 /// r703: private guest arena backing the `vAddTLParams` multi-draw arrays
 /// (the engine would allocate them with `map_malloc`, which a host-side hook
 /// cannot call).  2 KiB per slot array x 10 slots fits in 2 x 0x800 pages.
+/// r721: bit `n` set once `emulate_add_tl_params` stashed a live
+/// translation vector for bank `n` at `arena + 0x1800 + n * 12`.
+static TL_VEC_VALID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn ensure_tl_arena(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     static TL_ARENA: AtomicU32 = AtomicU32::new(0);
     let cached = TL_ARENA.load(Ordering::Relaxed);
@@ -9356,36 +9360,39 @@ fn emulate_add_tl_params(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     // dapi buffer lacks a mapped vector.
     let dapi = read_u32_or_invalid(unicorn, thisx.wrapping_add(0xc));
     let trans = dapi.wrapping_add(0x8c + u32::from(bank) * 12);
-    // r719: only the pass that actually draws may own the global.  The
-    // modelview is composed once per `vpcs` pass from this one vector, so
-    // arming a foreign (non-street) element right before the pass poisoned
-    // it with that tile's vector (r718: (1200, 0, -3030) from dapi
-    // 0xea4378 stamped last, strokes pinned to the right edge, while the
-    // street element's own vector (-4490, 0, -1253) - which matches the
-    // render layer's own t=(-4272, -952, +1250) - sat unused).  Gate the
-    // stamp on the element being the current DTM street coord buffer's.
-    let curr_scb = read_u32_or_invalid(
-        unicorn,
-        base_address
-            .wrapping_add(MS_CURR_SCB - ORIGINAL_BASE)
-            .wrapping_add(u32::from(bank) * 4),
-    );
-    if dapi >= 0x1000 && scb == curr_scb && unicorn.mem_read(trans as u64, &mut [0u8; 12]).is_ok() {
-        let pp_addr = base_address.wrapping_add(0x0073_c31cu32 - ORIGINAL_BASE);
-        let _ = unicorn.mem_write(pp_addr as u64, &trans.to_le_bytes());
-        static TRANS_LOGS: AtomicU32 = AtomicU32::new(0);
-        if TRANS_LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
-            let x = f32::from_bits(read_u32_or_invalid(unicorn, trans));
-            let y = f32::from_bits(read_u32_or_invalid(unicorn, trans.wrapping_add(4)));
-            let z = f32::from_bits(read_u32_or_invalid(unicorn, trans.wrapping_add(8)));
-            log::info!(
-                "PROCMAPENGINE street-coord probe t={}ms poTransPos3D := dapi {:#x}+{:#x} -> ({x:.1}, {y:.1}, {z:.1}) scb={:#x} n={}",
-                crate::libs::dapi::emu_t0_elapsed_ms(),
-                dapi,
-                0x8c + u32::from(bank) * 12,
-                scb,
-                TRANS_LOGS.load(Ordering::Relaxed)
-            );
+    // r721: do NOT write the shared `poTransPos3D` global from here.  Many
+    // element families arm through this function and the modelview is
+    // composed once per `vpcs` pass from whichever vector was stamped last
+    // (r718: a foreign tile's (1200, 0, -3030) poisoned the street pass
+    // while the street element's own (-4490, 0, -1253) - matching the
+    // render layer's t=(-4272, -952, +1250) - sat unused; r719's scb gate
+    // never fired because `ms_apoCurrDTMStreetCoordBuffer` is still unset
+    // at arm time).  Instead copy the vector into a per-bank slot in the
+    // TL arena and let the `vpcs` entry probe - which knows its own bank -
+    // point the pointer at its own element's vector.
+    if dapi >= 0x1000 && bank < 48 && unicorn.mem_read(trans as u64, &mut [0u8; 12]).is_ok() {
+        let arena = ensure_tl_arena(unicorn);
+        if arena != 0 {
+            let mut vec12 = [0u8; 12];
+            let _ = unicorn.mem_read(trans as u64, &mut vec12);
+            let stash = arena + 0x1800 + u32::from(bank) * 12;
+            if unicorn.mem_write(stash as u64, &vec12).is_ok() {
+                TL_VEC_VALID.fetch_or(1u64 << bank, Ordering::Relaxed);
+                static TRANS_LOGS: AtomicU32 = AtomicU32::new(0);
+                if TRANS_LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+                    let x = f32::from_le_bytes([vec12[0], vec12[1], vec12[2], vec12[3]]);
+                    let y = f32::from_le_bytes([vec12[4], vec12[5], vec12[6], vec12[7]]);
+                    let z = f32::from_le_bytes([vec12[8], vec12[9], vec12[10], vec12[11]]);
+                    log::info!(
+                        "PROCMAPENGINE street-coord probe t={}ms poTransPos3D-vec bank={} dapi {:#x}+{:#x} -> ({x:.1}, {y:.1}, {z:.1}) n={}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        bank,
+                        dapi,
+                        0x8c + u32::from(bank) * 12,
+                        TRANS_LOGS.load(Ordering::Relaxed)
+                    );
+                }
+            }
         }
     }
     let inout = read_u8_or_invalid(
@@ -10068,21 +10075,46 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                 let pp_addr = base_address.wrapping_add(0x0073_c31cu32 - ORIGINAL_BASE);
                 let pos_ptr = read_u32_or_invalid(uc, pp_addr);
                 let mapped = pos_ptr >= 0x1000 && uc.mem_read(pos_ptr as u64, &mut [0u8; 12]).is_ok();
-                if !mapped {
-                    let arena = ensure_tl_arena(uc);
-                    if arena != 0 {
-                        let _ = uc
-                            .mem_write(pp_addr as u64, &(arena + 0x1000).to_le_bytes());
-                        static PT_LOGS: AtomicU32 = AtomicU32::new(0);
-                        if PT_LOGS.fetch_add(1, Ordering::Relaxed) < 4 {
-                            log::info!(
-                                "PROCMAPENGINE street-coord probe t={}ms poTransPos3D {:#x} -> arena {:#x} (neutral translation) n={}",
-                                crate::libs::dapi::emu_t0_elapsed_ms(),
-                                pos_ptr,
-                                arena + 0x1000,
-                                PT_LOGS.load(Ordering::Relaxed)
-                            );
-                        }
+                // r721: prefer the vector the arm of THIS pass' bank stashed
+                // in the TL arena (see `emulate_add_tl_params`): a shared
+                // global lets foreign tiles poison the composed modelview,
+                // the per-bank stash keeps each `vpcs` pass on its own
+                // element's genuine SD-backed translation.
+                let entry_mcp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let entry_bank = ((read_u32_or_invalid(uc, entry_mcp.wrapping_add(4)) >> 8) & 0xff) as u32;
+                let stashed = entry_bank < 48
+                    && TL_VEC_VALID.load(Ordering::Relaxed) & (1u64 << entry_bank) != 0;
+                let arena = ensure_tl_arena(uc);
+                if stashed && arena != 0 {
+                    let stash = arena + 0x1800 + entry_bank * 12;
+                    let _ = uc.mem_write(pp_addr as u64, &stash.to_le_bytes());
+                    static STASH_LOGS: AtomicU32 = AtomicU32::new(0);
+                    if STASH_LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+                        let mut vec12 = [0u8; 12];
+                        let _ = uc.mem_read(stash as u64, &mut vec12);
+                        let x = f32::from_le_bytes([vec12[0], vec12[1], vec12[2], vec12[3]]);
+                        let y = f32::from_le_bytes([vec12[4], vec12[5], vec12[6], vec12[7]]);
+                        let z = f32::from_le_bytes([vec12[8], vec12[9], vec12[10], vec12[11]]);
+                        log::info!(
+                            "PROCMAPENGINE street-coord probe t={}ms poTransPos3D bank={} -> stash {:#x} ({x:.1}, {y:.1}, {z:.1}) n={}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            entry_bank,
+                            stash,
+                            STASH_LOGS.load(Ordering::Relaxed)
+                        );
+                    }
+                } else if !mapped && arena != 0 {
+                    let _ = uc
+                        .mem_write(pp_addr as u64, &(arena + 0x1000).to_le_bytes());
+                    static PT_LOGS: AtomicU32 = AtomicU32::new(0);
+                    if PT_LOGS.fetch_add(1, Ordering::Relaxed) < 4 {
+                        log::info!(
+                            "PROCMAPENGINE street-coord probe t={}ms poTransPos3D {:#x} -> arena {:#x} (neutral translation) n={}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            pos_ptr,
+                            arena + 0x1000,
+                            PT_LOGS.load(Ordering::Relaxed)
+                        );
                     }
                 }
                 let count = entry_hits.fetch_add(1, Ordering::Relaxed);
