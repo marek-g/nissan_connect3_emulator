@@ -9480,7 +9480,14 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     }
                 });
                 if watched && scb > 0x1000 {
-                    for (lo_off, hi_off) in [(0x28u64, 0x3cu64), (0x114, 0x11c), (0x150, 0x158)] {
+                    for (lo_off, hi_off) in [
+                        (0x28u64, 0x3cu64),
+                        (0x114, 0x11c),
+                        (0x150, 0x158),
+                        (0x108, 0x120),
+                        (0x134, 0x144),
+                        (0x15c, 0x168),
+                    ] {
                         let watch_count = Arc::new(AtomicU32::new(0));
                         let res = uc.add_mem_hook(
                             unicorn_engine::unicorn_const::HookType::MEM_WRITE,
@@ -9616,8 +9623,17 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                 let dir_src = read_u32_or_invalid(uc, scb.wrapping_add(0x34));
                 let dir_res = read_u32_or_invalid(uc, scb.wrapping_add(0x118));
                 let dir_res_id = read_u32_or_invalid(uc, dir_res.wrapping_add(0xc));
+                // r692: upload size = `piVar2[node] << 3` with piVar10/2 =
+                // `[scb+0x160]/[scb+0x164]`; `u32UpdateVBO` silently returns
+                // when size == 0, the only remaining explanation for the zero
+                // `glBufferSubData` count with every other gate open.
+                let sections = read_u32_or_invalid(uc, scb.wrapping_add(0x2c));
+                let starts = read_u32_or_invalid(uc, scb.wrapping_add(0x160));
+                let counts = read_u32_or_invalid(uc, scb.wrapping_add(0x164));
+                let first_start = read_u32_or_invalid(uc, starts);
+                let first_count = read_u32_or_invalid(uc, counts);
                 log::info!(
-                    "PROCMAPENGINE street-coord probe t={}ms vUpdateVBO scb={:#x} param3={:#x} param4={:#x} pos_src={:#x} dir_src={:#x} dir_res={:#x} dir_res_id={:#x} n={}",
+                    "PROCMAPENGINE street-coord probe t={}ms vUpdateVBO scb={:#x} param3={:#x} param4={:#x} pos_src={:#x} dir_src={:#x} dir_res={:#x} dir_res_id={:#x} sections={sections} starts={starts:#x} counts={counts:#x} first=({first_start},{first_count}) n={}",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     scb,
                     r3,
