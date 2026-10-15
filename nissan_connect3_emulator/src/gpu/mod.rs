@@ -3091,6 +3091,9 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
             let mut clip = pos;
             if let Some(model_view) = matrices.0 {
                 clip = apply(clip, &model_view);
+                // Mirror the synth shader's r701 modelview z-fold so `vis`
+                // predicts the pixels that would actually rasterize.
+                clip[2] = -clip[2].abs();
             }
             if let Some(view_proj) = matrices.1 {
                 clip = apply(clip, &view_proj);
