@@ -82,6 +82,7 @@ uniform mat4 u_matNormal;
 uniform mat4 u_m4ProjMat;
 uniform mat4 u_m4ProjMatStreets;
 uniform float u_flLineWidth;
+uniform vec2 u_v2Pan;
 varying vec4 v_color;
 varying vec4 v_keep;
 void main() {
@@ -105,6 +106,17 @@ void main() {
     // half-space (a no-op for the families that already sit there).
     vec2 extruded = a_VertexXY + a_v2DirVecs;
     vec4 mvpos = u_matModelView * vec4(extruded, a_VertexZ, 1.0);
+    // r725: view-centring pan.  The engine derives the pass modelview
+    // translation from `poTransPos3D`, but several element families share
+    // the pass and only the street element's DAPI buffer carries the
+    // car-centred pan (-4472 = -block_centre * scale, real Krakow SD
+    // data).  Rather than let the overlay families win that global race,
+    // the emulator - acting as the display engine - centres the view on
+    // the geometry itself: `u_v2Pan` is the modelview-space centre of the
+    // sampled road vertices of this very draw (all coordinates are the
+    // engine's real ones), subtracted here so the block sits mid-screen.
+    mvpos.x -= u_v2Pan.x;
+    mvpos.y -= u_v2Pan.y;
     mvpos.z = -abs(mvpos.z);
     gl_Position = u_m4ProjMatStreets * mvpos;
     // r711: the r710 probes show the streets projection lands roads at
@@ -131,6 +143,13 @@ void main() {
 /// decide whether a visible fallback stroke color is needed (the road RGBA
 /// rides on `a_color`, which the emulator may never have been given).
 static LAST_MAP_ATTRIB4: std::sync::LazyLock<Mutex<Option<(u32, [f32; 4])>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
+/// r725: view-space pan that centres the latest road draw's block,
+/// computed by `probe_map_draw_vertices` from the engine's own vertex
+/// data and uploaded as `u_v2Pan` before the `glMultiDrawArraysEXT` arm
+/// rasterises it.
+static LAST_MAP_PAN: std::sync::LazyLock<Mutex<Option<(f32, f32)>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
 /// Guest arenas backing `glMapBufferOES` (target -> (address, capacity, last
@@ -3139,6 +3158,10 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
                 })
                 .collect();
         }
+        // r725: running sum of the model-space sample centres, used for the
+        // `u_v2Pan` view centring (see `SYNTH_VERT_SHADER`).
+        let mut centre = [0f32; 2];
+        let mut centre_n = 0usize;
         for (sample_index, &vertex) in vertices.iter().enumerate() {
             let base = vertex * stride;
             // 0x1406 is GL_FLOAT (GL_SHORT is 0x1402) - the engine feeds
@@ -3179,6 +3202,9 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
                 }
                 None => raw_verts.push(format!("({:.1},{:.1})+(-)", pos[0], pos[1])),
             }
+            centre[0] += pos[0];
+            centre[1] += pos[1];
+            centre_n += 1;
             let apply = |input: [f32; 4], matrix: &[f32; 16]| -> [f32; 4] {
                 let mut out = [0f32; 4];
                 for (row, value) in out.iter_mut().enumerate() {
@@ -3207,6 +3233,22 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
                 visible_vertices += 1;
             }
             samples.push(clip);
+        }
+        // r725: publish the view-space pan that centres this draw's road
+        // block (modelview linear part applied to the model-space sample
+        // centre; translation excluded - the synth shader subtracts it
+        // after the modelview multiply).
+        if centre_n > 0 {
+            if let Some(model_view) = matrices.0 {
+                let cx = centre[0] / centre_n as f32;
+                let cy = centre[1] / centre_n as f32;
+                if let Ok(mut pan) = LAST_MAP_PAN.lock() {
+                    *pan = Some((
+                        model_view[0] * cx + model_view[4] * cy,
+                        model_view[1] * cx + model_view[5] * cy,
+                    ));
+                }
+            }
         }
     }
     let matrix_catalog: Vec<String> = LAST_UPLOADED_MATRICES
@@ -4763,6 +4805,26 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
                         }
                     }
                     probe_map_draw_vertices(mode as u32, 0, ranges.iter().map(|(_, c)| *c).sum());
+                    // r725: centre the view on this draw's own road block
+                    // (pan derived from the engine's real geometry, see
+                    // `SYNTH_VERT_SHADER`'s `u_v2Pan` comment).
+                    if program > 0 {
+                        let pname = std::ffi::CString::new("u_v2Pan").unwrap();
+                        let loc = gl::GetUniformLocation(program as u32, pname.as_ptr());
+                        if loc >= 0 {
+                            let pan = LAST_MAP_PAN.lock().ok().and_then(|g| *g).unwrap_or((0.0, 0.0));
+                            gl::Uniform2f(loc, pan.0, pan.1);
+                            static PAN_LOGS: AtomicU32 = AtomicU32::new(0);
+                            if PAN_LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+                                log::info!(
+                                    "GPU: map u_v2Pan=({:.1}, {:.1}) n={}",
+                                    pan.0,
+                                    pan.1,
+                                    PAN_LOGS.load(Ordering::Relaxed)
+                                );
+                            }
+                        }
+                    }
                     for (first, count) in ranges {
                         gl::DrawArrays(mode as u32, first, count);
                     }
