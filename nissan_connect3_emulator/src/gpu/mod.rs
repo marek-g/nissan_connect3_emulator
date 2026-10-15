@@ -4083,6 +4083,24 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
             let target = ureg(unicorn, RegisterARM::R0);
             let size = (ureg(unicorn, RegisterARM::R1) as usize).min(MAX_TEXTURE_BYTES);
             let data_addr = ureg(unicorn, RegisterARM::R2);
+            if current_gpu_target() == GpuTarget::Map {
+                static BUFFER_LOGS: AtomicU32 = AtomicU32::new(0);
+                let hits = BUFFER_LOGS.fetch_add(1, Ordering::Relaxed);
+                if hits < 10 {
+                    let mut head = [0u8; 16];
+                    let read_ok = unicorn
+                        .mem_read(data_addr as u64, &mut head)
+                        .is_ok();
+                    log::info!(
+                        "GPU: map bufferData target={:#x} size={:#x} src={:#x} read={} head={:02x?}",
+                        target,
+                        size,
+                        data_addr,
+                        read_ok,
+                        head
+                    );
+                }
+            }
             let data = if data_addr == 0 || size == 0 {
                 Vec::new()
             } else {
