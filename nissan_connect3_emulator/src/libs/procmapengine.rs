@@ -9385,6 +9385,19 @@ fn emulate_add_tl_params(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
             write_entry(unicorn, count_ptr, count_val);
             write_u32(unicorn, global(MS_PRIM_COUNT), prim + 1);
         }
+    } else if prim < capacity {
+        // r707: the per-node section arrays (`+0x160/0x164/0x16c`) stay NULL
+        // in the emulator (write-watch r705 saw no writer), but the whole
+        // uploaded section is real geometry: `scb+0x2c` is the vertex count
+        // the engine itself uploaded to this element's VBO (`vDrawCombinedStreets`
+        // feeds exactly that count back as the dir-section offset), so one
+        // (0, sections) strip covers the element's real road line.
+        let sections = read_u32_or_invalid(unicorn, scb.wrapping_add(0x2c));
+        if (1..0x100_0000).contains(&sections) {
+            write_entry(unicorn, first_ptr, 0);
+            write_entry(unicorn, count_ptr, sections);
+            write_u32(unicorn, global(MS_PRIM_COUNT), prim + 1);
+        }
     }
     // Per-slot stamping: the engine re-reads these every combined draw, so
     // refresh them from the current element's scb on every call (mirrors
