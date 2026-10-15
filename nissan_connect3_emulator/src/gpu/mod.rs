@@ -2788,6 +2788,7 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
     let mut program = 0i32;
     gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut program);
     let mut states = [(0i32, 0i32, 0i32, 0i32, 0i32); 2];
+    let mut attrib_pointers = [0i32; 2];
     for (index, state) in states.iter_mut().enumerate() {
         let index = index as u32;
         gl::GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_ENABLED, &mut state.0);
@@ -2795,6 +2796,11 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         gl::GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_TYPE, &mut state.2);
         gl::GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_STRIDE, &mut state.3);
         gl::GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &mut state.4);
+        // VBO offset (bytes) the attribute was specified with; offset-mode
+        // strips do not start at buffer byte 0.
+        let mut pointer: *mut std::ffi::c_void = std::ptr::null_mut();
+        gl::GetVertexAttribPointerv(index, gl::ARRAY_BUFFER, std::ptr::addr_of_mut!(pointer) as *const *mut std::ffi::c_void);
+        attrib_pointers[index as usize] = pointer as i32;
     }
     // Uniform inventory of the bound program: tells whether the synth shader
     // actually linked into this program (r669: name lookup found no matrix
@@ -2884,6 +2890,10 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         }
     }
     let mut samples: Vec<[f32; 4]> = Vec::new();
+    // How many spread samples end up inside the normalized clip cube: the
+    // discriminator between "matrix wrong" (0 always) and "this strip just
+    // happens to be off-screen" (occasionally >0).
+    let mut visible_vertices = 0u32;
     // The road program transform is `u_m4ProjMatStreets * (u_matModelView *
     // pos)`.  If the engine never uploaded a streets projection (its loop has
     // no case for a dead `u_matViewProj` and case 6 may stay gated), fall back
@@ -2915,12 +2925,13 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
             .map(|k| first.max(0) as usize + k * spread / (want.max(2) - 1).max(1))
             .collect();
         let mut raw = vec![0u8; ((first.max(0) as usize + spread + 1) * stride + 8).min(1 << 20)];
+        let data_offset = attrib_pointers[0].max(0) as usize;
         let mut previous = 0i32;
         gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut previous);
         gl::BindBuffer(gl::ARRAY_BUFFER, binding);
         gl::GetBufferSubData(
             gl::ARRAY_BUFFER,
-            0,
+            data_offset as isize,
             raw.len() as isize,
             raw.as_mut_ptr() as *mut _,
         );
@@ -2968,6 +2979,12 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
             if let Some(view_proj) = matrices.1 {
                 clip = apply(clip, &view_proj);
             }
+            if clip[0].abs() <= clip[3].abs()
+                && clip[1].abs() <= clip[3].abs()
+                && clip[2].abs() <= clip[3].abs()
+            {
+                visible_vertices += 1;
+            }
             samples.push(clip);
         }
     }
@@ -2993,7 +3010,7 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         })
         .unwrap_or_default();
     log::info!(
-        "GPU: map draw probe mode={} first={} count={} viewport={:?} program={} uniforms={} names={:?} array_vbo={} engine_head={:?} attrib0=(en={} size={} type={:#x} stride={} vbo={}) attrib1=(en={} size={} type={:#x} stride={} vbo={}) mv={} vp={} mats=[{}] clips=[{}]",
+        "GPU: map draw probe mode={} first={} count={} viewport={:?} program={} uniforms={} names={:?} array_vbo={} engine_head={:?} attrib0=(en={} size={} type={:#x} stride={} vbo={}) attrib1=(en={} size={} type={:#x} stride={} vbo={}) mv={} vp={} vis={}/{} mats=[{}] clips=[{}]",
         mode,
         first,
         count,
@@ -3007,6 +3024,8 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         states[1].0, states[1].1, states[1].2, states[1].3, states[1].4,
         matrices.0.is_some(),
         matrices.1.is_some(),
+        visible_vertices,
+        samples.len(),
         matrix_catalog.join(" "),
         samples
             .iter()
