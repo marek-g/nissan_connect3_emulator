@@ -118,6 +118,22 @@ static MAP_BUFFER_ARENAS: std::sync::LazyLock<
     Mutex<std::collections::HashMap<u32, (u32, usize, usize)>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// Set once the engine's `vUpdateVBO` gate passes (street-coord probe in
+/// `procmapengine.rs`): from that instant the road VBOs carry real geometry,
+/// and the map draw probe starts observing big strips (clocks of the engine
+/// and GPU backend threads are not aligned, so the draw probe keys on this
+/// fact instead of elapsed time).
+static ROAD_GEOMETRY_UPLOADED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn note_road_geometry_uploaded() {
+    ROAD_GEOMETRY_UPLOADED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn road_geometry_uploaded() -> bool {
+    ROAD_GEOMETRY_UPLOADED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 const GL_VERTEX_SHADER_TYPE: u32 = 0x8b31;
 
 /// `glCreateShader` type per shader object, so `glShaderBinary` can tell
@@ -2820,20 +2836,19 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
     // keep probing big strip draws (count > 3000) separately so post-upload
     // frames are observed.
     static LARGE_PROBES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    // r695: the street upload lands minutes into the run (bProcessData fires
-    // once the DAPI data chain settles, t=130..250s depending on the run), so
-    // a plain budget spends itself on the pre-upload frames.  Only probe big
-    // strips once `EMU_PROBE_AFTER_MS` (default 240000) has elapsed since the
-    // backend started, and stamp every probe line with that clock so it can
-    // be correlated with the engine-side probe timestamps.
+    // r697: the backend clock is not the emulator clock, so gate the big
+    // strip probes on the engine-side fact instead of time: the street-coord
+    // probe in `procmapengine.rs` sets `ROAD_GEOMETRY_UPLOADED` the first
+    // time `vUpdateVBO` passes its gates, i.e. exactly when road VBOs start
+    // carrying real data.  `EMU_PROBE_AFTER_MS=0` forces probes regardless.
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let elapsed_ms = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
-    let probe_after_ms: u64 = std::env::var("EMU_PROBE_AFTER_MS")
+    let force = std::env::var("EMU_PROBE_AFTER_MS")
         .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(240_000);
+        .filter(|value| value == "0")
+        .is_some();
     let (budget, spent) = if count > 3000 {
-        if elapsed_ms < probe_after_ms {
+        if !force && !road_geometry_uploaded() {
             return;
         }
         (100, LARGE_PROBES.fetch_add(1, Ordering::Relaxed))

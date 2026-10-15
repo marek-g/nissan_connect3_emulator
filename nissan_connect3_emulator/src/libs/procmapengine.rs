@@ -9644,6 +9644,7 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     dir_res_id,
                     count
                 );
+                crate::gpu::note_road_geometry_uploaded();
             })
             .unwrap();
     }
