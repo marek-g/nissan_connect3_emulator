@@ -2778,7 +2778,7 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
     let mut uniform_count = 0i32;
     let mut uniform_names: Vec<String> = Vec::new();
     if program != 0 {
-        gl::GetIntegerv(gl::ACTIVE_UNIFORMS, &mut uniform_count);
+        gl::GetProgramiv(program as u32, gl::ACTIVE_UNIFORMS, &mut uniform_count);
         for index in 0..uniform_count.max(0).min(8) {
             let mut name = [0u8; 64];
             let mut length = 0i32;
@@ -2824,7 +2824,7 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
     let mut matrices = (None, None);
     if program != 0 {
         let mut uniform_count = 0i32;
-        gl::GetIntegerv(gl::ACTIVE_UNIFORMS, &mut uniform_count);
+        gl::GetProgramiv(program as u32, gl::ACTIVE_UNIFORMS, &mut uniform_count);
         for index in 0..uniform_count.max(0).min(16) {
             let mut name = [0u8; 64];
             let mut length = 0i32;
@@ -2969,6 +2969,16 @@ fn refresh_map_client_arrays(unicorn: &mut Unicorn<'_, Context>) {
             scratch.resize(len, 0);
         }
         if unicorn.mem_read(pointer as u64, &mut scratch[..len]).is_err() {
+            static REFRESH_FAIL_LOGS: AtomicU32 = AtomicU32::new(0);
+            let misses = REFRESH_FAIL_LOGS.fetch_add(1, Ordering::Relaxed);
+            if misses < 6 {
+                log::info!(
+                    "GPU: map client array refresh SKIP idx={} ptr={:#x} len={} (read failed)",
+                    index,
+                    pointer,
+                    len
+                );
+            }
             continue;
         }
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -3160,9 +3170,47 @@ fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     }
 
     // Client-array vs VBO-offset semantics are decided by the ARRAY_BUFFER
-    // binding at call time.  The map engine binds its own geometry VBOs and
-    // passes offsets, so blindly reading `pointer` as guest RAM and re-pointing
-    // the attribute at a scratch VBO hands the draw zeroed strips (r669 probe).
+    // binding at call time.  The map engine keeps road geometry in its own
+    // geometry VBOs and passes offsets, and it does NOT keep that buffer bound
+    // across the VAP call (r671: idx=0 ptr=0x20, idx=1 ptr=0x24 with
+    // ARRAY_BUFFER=0 at VAP time, then `glBindBuffer(ARRAY_BUFFER, 9)` right
+    // before the draw).  An offset below a page is never a heap pointer, so
+    // treat it as offset semantics unconditionally; bigger small values may
+    // still arrive bound, and a genuinely unbound small-pointer client array
+    // would fault on real hardware too.
+    if current_gpu_target() == GpuTarget::Map && pointer < 0x10000 {
+        let bound = gpu_u32_clear(|| unsafe {
+            let mut binding = 0i32;
+            gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut binding);
+            drain_host_gl_errors();
+            binding.max(0) as u32
+        });
+        static OFFSET_LOGS: AtomicU32 = AtomicU32::new(0);
+        let hits = OFFSET_LOGS.fetch_add(1, Ordering::Relaxed);
+        if hits < 8 {
+            log::info!(
+                "GPU: map VAP offset-mode idx={} size={} type={:#x} stride={} offset={:#x} bound_vbo={}",
+                index,
+                size,
+                kind,
+                stride,
+                pointer,
+                bound.unwrap_or(0)
+            );
+        }
+        gpu_void_clear(move || unsafe {
+            gl::VertexAttribPointer(
+                index,
+                size,
+                kind,
+                normalized,
+                stride,
+                pointer as *const std::ffi::c_void,
+            );
+            drain_host_gl_errors();
+        });
+        return 0;
+    }
     if current_gpu_target() == GpuTarget::Map {
         let bound = gpu_u32_clear(|| unsafe {
             let mut binding = 0i32;
@@ -3171,19 +3219,6 @@ fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
             binding.max(0) as u32
         });
         if bound.unwrap_or(0) != 0 {
-            static OFFSET_LOGS: AtomicU32 = AtomicU32::new(0);
-            let hits = OFFSET_LOGS.fetch_add(1, Ordering::Relaxed);
-            if hits < 8 {
-                log::info!(
-                    "GPU: map VAP offset-mode idx={} size={} type={:#x} stride={} offset={:#x} bound_vbo={}",
-                    index,
-                    size,
-                    kind,
-                    stride,
-                    pointer,
-                    bound.unwrap_or(0)
-                );
-            }
             gpu_void_clear(move || unsafe {
                 gl::VertexAttribPointer(
                     index,
@@ -3319,6 +3354,23 @@ fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
                     regs.insert(
                         index,
                         (pointer, len, hash, buffer),
+                    );
+                }
+                static REG_LOGS: AtomicU32 = AtomicU32::new(0);
+                let reg_hits = REG_LOGS.fetch_add(1, Ordering::Relaxed);
+                if reg_hits < 8 {
+                    let head: Vec<i16> = scratch[..len]
+                        .chunks_exact(2)
+                        .take(8)
+                        .map(|w| i16::from_le_bytes([w[0], w[1]]))
+                        .collect();
+                    log::info!(
+                        "GPU: map vap register idx={} ptr={:#x} len={} vbo={} head={:?}",
+                        index,
+                        pointer,
+                        len,
+                        buffer,
+                        head
                     );
                 }
             }
@@ -3511,7 +3563,6 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
                 count
             };
             let drew = if current_gpu_target() == GpuTarget::Map {
-                refresh_map_client_arrays(unicorn);
                 // Keep any host GL error the road draw produces: the draw is
                 // the first thing in the emulator that exercises client-array
                 // sourced GL_SHORT attributes, and a silently rejected draw
