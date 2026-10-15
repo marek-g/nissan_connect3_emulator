@@ -6729,6 +6729,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         // CreateMultipleMapElements(r0=element type).  Logging r0 tells
         // whether landuse/polygon element types are ever created at all.
         for (mk_addr, mk_name) in [
+            (0x004b_5420u32, "JobMDMHandleLoadBlocks::Execute"),
             (0x0050_acc4u32, "CreateMapObjectsFromRawMapDataBlock"),
             (0x0050_8f1cu32, "AddDataToMapObject"),
             (0x003c_18f0u32, "CreateMultipleMapElements"),
@@ -6808,18 +6809,26 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     }
                     let uid = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                     let kind = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    // r735: which converter is feeding the cache?  34 blocks
+                    // are created but CreateMapObjectsFromRawMapDataBlock ran
+                    // once, so the callers of these 34 differ from the
+                    // LoadBlocks job; log LR (as original VA) to pin them.
+                    let lr = (uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32)
+                        .wrapping_sub(base_address)
+                        .wrapping_add(ORIGINAL_BASE);
                     let w0 = read_u32_or_invalid(uc, uid);
                     let w1 = read_u32_or_invalid(uc, uid + 4);
                     let w2 = read_u32_or_invalid(uc, uid + 8);
                     log::info!(
-                        "PROCMAPENGINE render trace CreateNewRawDataBlock entry at {:#x}: uid={:#x} [{:#x},{:#x},{:#x}] type={:#x} count={:#x}",
+                        "PROCMAPENGINE render trace CreateNewRawDataBlock entry at {:#x}: uid={:#x} [{:#x},{:#x},{:#x}] type={:#x} count={:#x} lr={:#x}",
                         addr,
                         uid,
                         w0,
                         w1,
                         w2,
                         kind,
-                        count
+                        count,
+                        lr
                     );
                 })
                 .unwrap();
