@@ -9614,6 +9614,23 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                 // `vFinishCombinedDrawing` entry (r0 = street element,
                 // r1 = mode, r2 = MCP): arm the multi-draw arrays the very
                 // soon-as `vDrawCombinedStreets` requires (r703).
+                static VF_IN: AtomicU32 = AtomicU32::new(0);
+                let hits = VF_IN.fetch_add(1, Ordering::Relaxed);
+                if hits < 8 {
+                    log::info!(
+                        "PROCMAPENGINE street-coord probe t={}ms vFinishCombinedDrawing entry r0={:#x} r1={:#x} r2={:#x} r3={:#x} lr={:#x} n={}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0),
+                        uc.reg_read(RegisterARM::R1).unwrap_or(0),
+                        uc.reg_read(RegisterARM::R2).unwrap_or(0),
+                        uc.reg_read(RegisterARM::R3).unwrap_or(0),
+                        uc.reg_read(RegisterARM::LR)
+                            .unwrap_or(0)
+                            .wrapping_sub(u64::from(base_address))
+                            .wrapping_add(u64::from(ORIGINAL_BASE)) as u32,
+                        hits
+                    );
+                }
                 emulate_add_tl_params(uc, base_address);
             } else if original == 0x0055_ae60u32 {
                 // vPrepareStreetCoordBuffer entry: r0=this, r1=MCP.
@@ -9885,8 +9902,17 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     uc,
                     base_address.wrapping_add(0x0073_c1a8u32 - ORIGINAL_BASE),
                 );
+                let lr = uc
+                    .reg_read(RegisterARM::LR)
+                    .unwrap_or(0)
+                    .wrapping_sub(u64::from(base_address))
+                    .wrapping_add(u64::from(ORIGINAL_BASE)) as u32;
+                let first0 = read_u32_or_invalid(
+                    uc,
+                    base_address.wrapping_add(0x0073_c150u32 - ORIGINAL_BASE),
+                );
                 log::info!(
-                    "PROCMAPENGINE street-coord probe t={}ms vDrawCombinedStreets bank={} pyd_exists={} z_res=[{:#x},{:#x}] primcount=[{},{}] n={}",
+                    "PROCMAPENGINE street-coord probe t={}ms vDrawCombinedStreets bank={} pyd_exists={} z_res=[{:#x},{:#x}] primcount=[{},{}] first0={:#x} lr={:#x} n={}",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     bank,
                     pyd,
@@ -9894,6 +9920,8 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     z1,
                     pc0,
                     pc1,
+                    first0,
+                    lr,
                     count
                 );
             })
