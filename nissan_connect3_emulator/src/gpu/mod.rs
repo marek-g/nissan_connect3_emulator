@@ -3670,8 +3670,25 @@ fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     );
 
     if pointer == 0 {
-        gpu_vertex_attrib_pointer(index, size, kind, normalized, stride, pointer, Vec::new());
-        return 0;
+        // r716g: offset 0 with an ARRAY_BUFFER bound on the map target is
+        // real VBO-offset semantics - the combined pass latches
+        // `a_VertexXY` at offset 0 of its bound resource VBO (r716 probe:
+        // loc0 froze on the internal ZERO_VBO id=6 and every xy leg read
+        // zeros).  Only the unbound case is the engine's "clear this
+        // attribute" idiom that wants the zero-VBO stand-in.
+        let zero_only = current_gpu_target() != GpuTarget::Map
+            || gpu_u32_clear(|| unsafe {
+                let mut binding = 0i32;
+                gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut binding);
+                drain_host_gl_errors();
+                binding.max(0) as u32
+            })
+            .unwrap_or(0)
+                == 0;
+        if zero_only {
+            gpu_vertex_attrib_pointer(index, size, kind, normalized, stride, pointer, Vec::new());
+            return 0;
+        }
     }
 
     // Client-array vs VBO-offset semantics are decided by the ARRAY_BUFFER
