@@ -72,9 +72,9 @@ struct GpuCommand {
 /// an empty slot 0x19 (`shd_42100000.glsl` is a `[BinaryShader]` manifest
 /// only), binding 526 VBOs but reaching no `glDraw*`.
 const SYNTH_VERT_SHADER: &str = "attribute vec2 a_VertexXY;
-attribute vec4 a_color;
 attribute vec2 a_v2DirVecs;
 attribute float a_VertexZ;
+attribute vec4 a_color;
 uniform mat4 u_matViewProj;
 uniform mat4 u_matModelView;
 uniform mat4 u_m4MetersModelViewWOTransVec;
@@ -3082,14 +3082,16 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         // a_v2DirVecs`, so the clip model must read the direction leg too -
         // sampling only the extrusion vectors gave misleading `vis` (r713:
         // all samples y=0 while the pixels sat in the top-right corner).
+        // r715: `a_v2DirVecs` is location 1 (engine manifest order xy, dir,
+        // z, color - r715 detail VAPs show the direction leg at index 1).
         let mut dir_values: Vec<[f32; 2]> = Vec::new();
-        let dir_binding = states.get(2).map(|state| state.4.max(0) as u32).unwrap_or(0);
+        let dir_binding = states.get(1).map(|state| state.4.max(0) as u32).unwrap_or(0);
         if dir_binding != 0 {
             let dir_stride = states
-                .get(2)
+                .get(1)
                 .map(|state| if state.3 > 0 { state.3 as usize } else { 4 })
                 .unwrap_or(8);
-            let dir_offset = attrib_pointers.get(2).copied().unwrap_or(0).max(0) as usize;
+            let dir_offset = attrib_pointers.get(1).copied().unwrap_or(0).max(0) as usize;
             let mut draw = vec![0u8; ((first.max(0) as usize + spread + 1) * dir_stride + 8).min(1 << 20)];
             gl::BindBuffer(gl::ARRAY_BUFFER, dir_binding);
             {
@@ -3105,7 +3107,7 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
                 }
             }
             gl::BindBuffer(gl::ARRAY_BUFFER, previous as u32);
-            let dir_float = states.get(2).map(|state| state.2 as u32 == gl::FLOAT).unwrap_or(true);
+            let dir_float = states.get(1).map(|state| state.2 as u32 == gl::FLOAT).unwrap_or(true);
             dir_values = vertices
                 .iter()
                 .map(|&vertex| {
@@ -5101,6 +5103,18 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
             if current_gpu_target() == GpuTarget::Map && index < 8 && values.len() == 4 {
                 if let Ok(mut last) = LAST_MAP_ATTRIB4.lock() {
                     *last = Some((index, [values[0], values[1], values[2], values[3]]));
+                }
+                static V4F_LOGS: AtomicU32 = AtomicU32::new(0);
+                if V4F_LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
+                    log::info!(
+                        "GPU: map 4fv idx={} v=[{:.3}, {:.3}, {:.3}, {:.3}] n={}",
+                        index,
+                        values[0],
+                        values[1],
+                        values[2],
+                        values[3],
+                        V4F_LOGS.load(Ordering::Relaxed)
+                    );
                 }
             }
             gpu_void_clear(move || unsafe {
