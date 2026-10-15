@@ -9669,16 +9669,23 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                 if original != 0x0040_9250u32 {
                     return;
                 }
+                // r698: with DTM enabled and z-resources empty the combined
+                // streets pass jumps to the exit label and never draws.  Clear
+                // the pyramid flag (medium-level fact we fabricate anyway) so
+                // `bIsDTMEnabled()` is false, the engine takes the constant-z
+                // leg and issues `glMultiDrawArraysEXT`.  Runs on every entry,
+                // before the logging cap.
+                let pyd_addr = base_address.wrapping_add(0x0071_3d33u32 - ORIGINAL_BASE);
+                if read_u32_or_invalid(uc, pyd_addr) & 0xff != 0 {
+                    let _ = uc.mem_write(pyd_addr as u64, &[0u8; 1]);
+                }
                 let count = entry_hits.fetch_add(1, Ordering::Relaxed);
                 if count >= 16 {
                     return;
                 }
                 let mcp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let bank = (read_u32_or_invalid(uc, mcp.wrapping_add(4)) >> 8) & 0xff;
-                let pyd = read_u32_or_invalid(
-                    uc,
-                    base_address.wrapping_add(0x0071_3d33u32 - ORIGINAL_BASE),
-                ) & 0xff;
+                let pyd = 0;
                 let z0 = read_u32_or_invalid(
                     uc,
                     base_address.wrapping_add(0x0073_c2ccu32 - ORIGINAL_BASE),
