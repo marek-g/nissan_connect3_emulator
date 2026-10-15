@@ -9229,6 +9229,181 @@ fn read_cstring(unicorn: &mut Unicorn<'_, Context>, address: u32) -> String {
     }
 }
 
+/// r703: private guest arena backing the `vAddTLParams` multi-draw arrays
+/// (the engine would allocate them with `map_malloc`, which a host-side hook
+/// cannot call).  2 KiB per slot array x 10 slots fits in 2 x 0x800 pages.
+fn ensure_tl_arena(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+    static TL_ARENA: AtomicU32 = AtomicU32::new(0);
+    let cached = TL_ARENA.load(Ordering::Relaxed);
+    if cached != 0 {
+        return if cached == u32::MAX { 0 } else { cached };
+    }
+    for candidate in [0x5a00_0000u32, 0x5c00_0000, 0x4a00_0000, 0x4c00_0000] {
+        if unicorn
+            .mem_map(u64::from(candidate), 0x2000, Prot::READ | Prot::WRITE)
+            .is_ok()
+        {
+            let _ = unicorn.mem_write(u64::from(candidate), &[0u8; 0x2000]);
+            TL_ARENA.store(candidate, Ordering::Relaxed);
+            log::info!(
+                "PROCMAPENGINE street-coord arena t={}ms TL multi-draw arena mapped at {candidate:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms()
+            );
+            return candidate;
+        }
+    }
+    TL_ARENA.store(u32::MAX, Ordering::Relaxed);
+    log::warn!("PROCMAPENGINE street-coord arena: no candidate address could be mapped");
+    0
+}
+
+/// r703: stand-in for `map_tclMapElm_Street::vAddTLParams` (0x40f730).
+///
+/// The combined-streets pass (`vDrawCombinedStreets`, 0x409250) draws the
+/// road banks with `glMultiDrawArraysEXT(5, ms_apu32First[b], ms_apu32Count[b],
+/// ms_au32PrimCount[b])` and early-exits unless `ms_au32PrimCount[b] != 0` and
+/// `ms_apoVBOResource[b]` (with a live GL id at `+0xc`) are set.  Those
+/// globals are ONLY ever filled by `vAddTLParams`, which the real device calls
+/// from `map_tclMapElm_Street::Draw` (0x40fc64, the plain-street TL modes
+/// 0x36..0x55).  The emulator's render-control jobs never dispatch that pass
+/// (r702: `Draw` entry has zero hits while `vFinishCombinedDrawing` runs per
+/// DTM street element), so primCount stays 0, the multi-draw is never armed,
+/// and roads never rasterize (r700/r701).  The same gap also explains
+/// `ms_apoVBOResourceZValues = [0,0]`: `vAddTLParams` is its only writer.
+///
+/// This function performs the identical bookkeeping from the
+/// `vFinishCombinedDrawing` entry hook (r0 = street element, r1 = mode,
+/// r2 = MCP - the exact values the real `Draw` call site passes), reading
+/// every value out of the engine's own line-config / `uti_DTM_StreetCoord_Buffer`
+/// objects.  It fabricates no geometry: the (first, count) pairs, resources,
+/// color arrays and z/texcoord resources all come straight from the scb the
+/// element built while uploading its real road vertices.
+fn emulate_add_tl_params(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    // `map_tclMapElm_Street` static arrays (10 slots of 4 bytes unless noted).
+    const MS_APU32_FIRST: u32 = 0x0073_c150;
+    const MS_APO_VBO_RESOURCE: u32 = 0x0073_c178;
+    const MS_IN_OUT_INDEX: u32 = 0x0073_c1a0; // 1 byte
+    const MS_PRIM_COUNT: u32 = 0x0073_c1a4;
+    const MS_SIZE_OF_MULDRAW: u32 = 0x0073_c1f4;
+    const MS_CURR_SCB: u32 = 0x0073_c220;
+    const MS_VBO_TEXCOORD: u32 = 0x0073_c248;
+    const MS_LINE_CFG_OFFSET: u32 = 0x0073_c270; // 10 x u16
+    const MS_COLOR_ARRAY_SIZE: u32 = 0x0073_c284;
+    const MS_VBO_Z_VALUES: u32 = 0x0073_c2cc;
+    const MS_APU32_COUNT: u32 = 0x0073_c2f4;
+    const MS_COLOR_ARRAY: u32 = 0x0073_c320;
+    const MS_APO_IMAGE: u32 = 0x0073_c348;
+
+    let mode = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+    if mode.wrapping_sub(0x36) >= 0x20 {
+        // `vFinishCombinedDrawing` only draws (and the real `Draw` only adds
+        // params) for the TL modes.
+        return;
+    }
+    let thisx = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+    let mcp = unicorn.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+    if thisx < 0x1000 || mcp < 0x1000 {
+        return;
+    }
+    let settings = read_u32_or_invalid(unicorn, thisx.wrapping_add(0x17c));
+    if settings < 0x1000 {
+        return;
+    }
+    let scb = read_u32_or_invalid(unicorn, settings.wrapping_add(0x40));
+    if scb < 0x1000 {
+        return;
+    }
+    let slot = read_u8_or_invalid(unicorn, settings.wrapping_add(0x46));
+    if slot >= 10 {
+        return;
+    }
+    let node = read_u16_or_invalid(unicorn, thisx.wrapping_add(0x180)).wrapping_sub(1);
+    let bank = read_u8_or_invalid(unicorn, mcp.wrapping_add(5));
+    let inout = read_u8_or_invalid(
+        unicorn,
+        base_address.wrapping_add(MS_IN_OUT_INDEX - ORIGINAL_BASE),
+    );
+    let global = |off: u32| {
+        base_address
+            .wrapping_add(off - ORIGINAL_BASE)
+            .wrapping_add(slot * 4)
+    };
+
+    let mut first_ptr = read_u32_or_invalid(unicorn, global(MS_APU32_FIRST));
+    let mut count_ptr = read_u32_or_invalid(unicorn, global(MS_APU32_COUNT));
+    if first_ptr < 0x1000 || count_ptr < 0x1000 {
+        let arena = ensure_tl_arena(unicorn);
+        if arena == 0 {
+            return;
+        }
+        first_ptr = arena + slot * 200;
+        count_ptr = arena + 2000 + slot * 200;
+        write_u32(unicorn, global(MS_APU32_FIRST), first_ptr);
+        write_u32(unicorn, global(MS_APU32_COUNT), count_ptr);
+        write_u32(unicorn, global(MS_SIZE_OF_MULDRAW), 0x32);
+    }
+    let capacity = read_u32_or_invalid(unicorn, global(MS_SIZE_OF_MULDRAW)).max(1);
+    let prim = read_u32_or_invalid(unicorn, global(MS_PRIM_COUNT));
+    let write_entry = |uc: &mut Unicorn<'_, Context>, base: u32, value: u32| {
+        let addr = base.wrapping_add(prim.min(capacity - 1) * 4);
+        let _ = uc.mem_write(addr as u64, &value.to_le_bytes());
+    };
+    let node_map = read_u32_or_invalid(unicorn, scb.wrapping_add(0x16c));
+    let starts = read_u32_or_invalid(unicorn, scb.wrapping_add(0x160));
+    let counts = read_u32_or_invalid(unicorn, scb.wrapping_add(0x164));
+    if prim < capacity && node_map >= 0x1000 && starts >= 0x1000 && counts >= 0x1000 {
+        let section = read_u16_or_invalid(unicorn, node_map.wrapping_add(node * 2));
+        let first_val = read_u32_or_invalid(unicorn, starts.wrapping_add(section * 4));
+        let count_val = read_u32_or_invalid(unicorn, counts.wrapping_add(section * 4));
+        if first_val != 0xffff_ffff && (1..0x100_0000).contains(&count_val) {
+            write_entry(unicorn, first_ptr, first_val);
+            write_entry(unicorn, count_ptr, count_val);
+            write_u32(unicorn, global(MS_PRIM_COUNT), prim + 1);
+        }
+    }
+    // Per-slot stamping: the engine re-reads these every combined draw, so
+    // refresh them from the current element's scb on every call (mirrors
+    // `vAddTLParams` running once per element draw).
+    let vbo_res = read_u32_or_invalid(unicorn, scb.wrapping_add(0x118));
+    write_u32(unicorn, global(MS_APO_VBO_RESOURCE), vbo_res);
+    let cfg_offset = read_u16_or_invalid(unicorn, settings.wrapping_add(0x44)) as u16;
+    write_u16(
+        unicorn,
+        base_address
+            .wrapping_add(MS_LINE_CFG_OFFSET - ORIGINAL_BASE)
+            .wrapping_add(slot * 2),
+        cfg_offset,
+    );
+    let z_res = read_u32_or_invalid(unicorn, scb.wrapping_add(bank * 4 + 0x134));
+    write_u32(unicorn, global(MS_VBO_Z_VALUES), z_res);
+    let color_size = read_u32_or_invalid(unicorn, scb.wrapping_add(0x14c));
+    write_u32(unicorn, global(MS_COLOR_ARRAY_SIZE), color_size);
+    let tex_res = read_u32_or_invalid(unicorn, scb.wrapping_add(bank * 4 + 0x174));
+    write_u32(unicorn, global(MS_VBO_TEXCOORD), tex_res);
+    let image = read_u32_or_invalid(unicorn, scb.wrapping_add((inout + bank * 2 + 0x62) * 4));
+    write_u32(unicorn, global(MS_APO_IMAGE), image);
+    let color_array = read_u32_or_invalid(unicorn, scb.wrapping_add(0x148));
+    write_u32(unicorn, global(MS_COLOR_ARRAY), color_array);
+    write_u32(unicorn, global(MS_CURR_SCB), scb);
+    static STAMP_LOGS: AtomicU32 = AtomicU32::new(0);
+    if STAMP_LOGS.fetch_add(1, Ordering::Relaxed) < 12 {
+        log::info!(
+            "PROCMAPENGINE street-coord probe t={}ms vAddTLParams-emu mode={:#x} slot={} bank={} scb={:#x} node={} prim {}->{:#x} first={:#x} count={:#x} vbo_res={:#x}",
+            crate::libs::dapi::emu_t0_elapsed_ms(),
+            mode,
+            slot,
+            bank,
+            scb,
+            node,
+            prim,
+            read_u32_or_invalid(unicorn, global(MS_PRIM_COUNT)),
+            read_u32_or_invalid(unicorn, first_ptr),
+            read_u32_or_invalid(unicorn, count_ptr),
+            read_u32_or_invalid(unicorn, global(MS_APO_VBO_RESOURCE)),
+        );
+    }
+}
+
 fn read_u32_or_invalid(unicorn: &mut Unicorn<'_, Context>, address: u32) -> u32 {
     let mut bytes = [0u8; 4];
     match unicorn.mem_read(address as u64, &mut bytes) {
@@ -9435,7 +9610,12 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
         .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
             let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
             let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
-            if original == 0x0055_ae60u32 {
+            if original == 0x0055_adf0u32 {
+                // `vFinishCombinedDrawing` entry (r0 = street element,
+                // r1 = mode, r2 = MCP): arm the multi-draw arrays the very
+                // soon-as `vDrawCombinedStreets` requires (r703).
+                emulate_add_tl_params(uc, base_address);
+            } else if original == 0x0055_ae60u32 {
                 // vPrepareStreetCoordBuffer entry: r0=this, r1=MCP.
                 let count = entry_hits.fetch_add(1, Ordering::Relaxed);
                 if count >= 24 {
