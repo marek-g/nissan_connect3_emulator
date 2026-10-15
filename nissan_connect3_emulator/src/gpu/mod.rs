@@ -2455,6 +2455,7 @@ fn gpu_gen_ids(kind: GenKind, count: i32) -> Option<Vec<u32>> {
     if count <= 0 {
         return Some(Vec::new());
     }
+    let target = current_gpu_target();
     match kind {
         GenKind::Buffer => GL_LIVE_BUFFERS.fetch_add(count as u64, Ordering::Relaxed),
         GenKind::Framebuffer => GL_LIVE_FRAMEBUFFERS.fetch_add(count as u64, Ordering::Relaxed),
@@ -2471,6 +2472,15 @@ fn gpu_gen_ids(kind: GenKind, count: i32) -> Option<Vec<u32>> {
                 GenKind::Texture => gl::GenTextures(count, ids.as_mut_ptr()),
             }
             drain_host_gl_errors();
+        }
+        // r698: host ids live in one namespace per context and the internal
+        // scratch/ZERO gens share it with the engine, so log every id handed
+        // to a guest to tell whose buffer 9 really is.
+        if matches!(kind, GenKind::Buffer) {
+            static GEN_LOGS: AtomicU32 = AtomicU32::new(0);
+            if GEN_LOGS.fetch_add(1, Ordering::Relaxed) < 40 {
+                log::info!("GPU: guest gen buffers target={:?} ids={:?}", target, ids);
+            }
         }
         GpuOutput {
             out_u32: ids,
@@ -2593,6 +2603,7 @@ fn gpu_vertex_attrib_pointer(
                 if buffer == 0 {
                     buffer = next_fallback_id();
                 }
+                log::info!("GPU: internal ZERO_VBO id={buffer}");
                 let zeros = [0u8; 4096];
                 gl::BindBuffer(gl::ARRAY_BUFFER, buffer);
                 gl::BufferData(
@@ -2620,6 +2631,12 @@ fn gpu_vertex_attrib_pointer(
         gl::GenBuffers(1, &mut buffer);
         if buffer == 0 {
             buffer = next_fallback_id();
+        }
+        static SCRATCH_GEN_LOGS: AtomicU32 = AtomicU32::new(0);
+        if SCRATCH_GEN_LOGS.fetch_add(1, Ordering::Relaxed) < 40 {
+            log::info!(
+                "GPU: internal client-leg scratch id={buffer} index={index}"
+            );
         }
         gl::BindBuffer(gl::ARRAY_BUFFER, buffer);
         gl::BufferData(
@@ -4574,6 +4591,7 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
             let offset = ureg(unicorn, RegisterARM::R1) as isize;
             let size = (ureg(unicorn, RegisterARM::R2) as usize).min(MAX_TEXTURE_BYTES);
             let data_addr = ureg(unicorn, RegisterARM::R3);
+            let mut readback_vbo: Option<u32> = None;
             if current_gpu_target() == GpuTarget::Map {
                 // r693: this call is the road-geometry upload; `log_api`
                 // throttles per thread and hid it in every run so far, so log
@@ -4591,12 +4609,37 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
                     log::info!(
                         "GPU: map bufferSubData target={target:#x} offset={offset:#x} size={size:#x} src={data_addr:#x} read={read_ok} bound_vbo={binding} head={head:02x?}",
                     );
+                    readback_vbo = Some(binding);
                 }
             }
             let data = read_best_effort_bytes(unicorn, data_addr, size)
                 .map(|(_, data)| data)
                 .unwrap_or_default();
             gpu_buffer_sub_data(target, offset, size, data);
+            if let Some(binding) = readback_vbo {
+                let readback_offset = offset.max(0) as isize;
+                let _ = gpu_void_clear(move || unsafe {
+                    // r698: read the bytes back from exactly the buffer the
+                    // draw probe samples, to see whether the upload persists
+                    // on the host or something wipes it later.
+                    let mut previous = 0i32;
+                    gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut previous);
+                    let mut raw = [0u8; 16];
+                    gl::BindBuffer(gl::ARRAY_BUFFER, binding);
+                    gl::GetBufferSubData(
+                        gl::ARRAY_BUFFER,
+                        readback_offset,
+                        raw.len() as isize,
+                        raw.as_mut_ptr() as *mut _,
+                    );
+                    gl::BindBuffer(gl::ARRAY_BUFFER, previous.max(0) as u32);
+                    drain_host_gl_errors();
+                    log::info!(
+                        "GPU: map subdata readback vbo={binding} offset={:#x} raw={raw:02x?}",
+                        readback_offset,
+                    );
+                });
+            }
             return Some(0);
         }
         "glFramebufferRenderbuffer" => {
