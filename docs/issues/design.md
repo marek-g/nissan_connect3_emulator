@@ -2818,3 +2818,46 @@ vpcs-return page (road pipeline stamping), the FUNC helpers around job-queue
 fabrication, dapi wait/latency hooks. Future speed-up: convert those entry/
 page observers to the svc-stub trampolining idea (`add_code_stub` extended
 with observe-and-continue) so their cost drops to the hit moments only.
+
+## r744 (2026-10-15): svc observer trampolines for the last 2 hot pages (IN PROGRESS)
+
+Goal: the two remaining always-on page-range hooks (0x409000 `vDrawCombinedStreets`
+entry, 0x55a000 `vFinishCombinedDrawing` entry) fired a host callback for EVERY
+instruction executed inside those 4 KiB pages - the engine's hottest functions.
+Only ONE functional site lived in each page (0x409250 pyd-force + poTransPos3D
+stamp, 0x55adf0 emulate_add_tl_params + frame bump + VF_BEST stamp); everything
+else in them (0x55ae30/54/60, 0x55af54/58/9c decision legs, 0x4092b4/9508 r707
+legs, 0x449000/0x446000/0x40f000 probes) is pure diagnostics -> now gated behind
+`EMU_PROCMAP_TRACE=1`.
+
+Mechanism (`os/code_stub.rs::add_code_observer`): copy the 4-byte site
+instruction into a 16-byte RWX cave `[orig, ldr pc,[pc,#0], pad, site+4]`, patch
+the site with `svc #0`, and extend `CodeStub` with `resume: Option<u32>`: the
+intr-hook dispatcher (which fires with PC already past the svc, key = pc-4) runs
+the observer handler and then sets PC = cave instead of the stub semantics
+(R0 = result, PC = LR). The original instruction thus executes exactly once
+(relocated) and control returns to site+4. Relocation safety is a conservative
+decoder (`arm_instruction_relocatable`): unconditional AL instructions only, no
+R15 as Rd/Rn/Rm, no B/BL/BX/BLX/MRS/MSR/coprocessor. Both sites pass
+(`0xe52de004` = `str lr,[sp,#-4]!`; `0xe92d4ff0` = `stmdb sp!,{r4-r11,lr}`).
+`ldr pc,[pc,#0]` in the cave (not `b`) because `heap_alloc` caves are ~1.2 GB
+from the sites, far beyond B's +/-32 MB.
+
+LESSON (deadlock, cost one full 20-min boot to find): library registrars run
+with the MMU mutex ALREADY HELD - both callers of `Mmu::update_library_hooks`
+(`os/syscalls/mman.rs`, `emulator/scheduler.rs`) do `mmu_arc.lock().unwrap().
+update_library_hooks(...)`, and `add_library_hook` -> `*_add_code_hooks` runs
+inside that guard. The first r744 revision allocated the caves at registration
+(`data.mmu.clone().lock()` -> `heap_alloc`) => recursive `std::sync::Mutex` lock,
+spawn thread frozen, procmapengine never started (symptom: spawn logged, ZERO
+`PROCMAPENGINE:` lines, no map). Existing lazy allocators (`ensure_guest_call_stub`,
+`ensure_tl_arena`) escaped this only because they run inside hooks (guest context,
+mmu not held). Rule: **no `mmu.lock()` in any `*_add_code_hooks` path**. Fix:
+registration does a lock-free decision (`code_observer_site_relocatable` =
+mem_read + decode, no locks, decides the page-hook fallback structure) and sets
+`OBS_INSTALL_PENDING`; `install_pending_observers` (heap_alloc + svc patch,
+retries on alloc failure) is driven from `hook_syscall` entry, which never holds
+the mmu mutex and is hit within the first guest syscalls - guaranteed before
+procmapengine's first render pass. Page-hook fallback stays registered per-site
+iff that site's decode fails at registration; decode is deterministic so
+observer+page-hook double-execution can never happen outside trace mode.
