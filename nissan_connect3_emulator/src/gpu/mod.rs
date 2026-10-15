@@ -3305,8 +3305,83 @@ fn route_shader_source(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     0
 }
 
+/// The engine cannot resolve road attribute locations from the
+/// `[BinaryShader]` manifest (nothing declares them in text), so it calls
+/// `glVertexAttribPointer(-1, ...)` with live client pointers for
+/// `a_VertexXY` and `a_v2DirVecs` (r683: legs `(-1, vec2, 8, 0xf60800)` and
+/// `(-1, vec2, 8, 0xf60a08)` on every street element; `a_color` resolves to
+/// index 1 fine).  Redirect each unseen pointer to the synthesized program's
+/// real attribute location in first-seen order, so the latched state matches
+/// what the real driver derives from the binary shader's symbol table.
+fn redirect_negative_attrib(pointer: u32, magnitude: f32) -> Option<u32> {
+    static NEG_REGS: std::sync::LazyLock<Mutex<std::collections::HashMap<u32, u32>>> =
+        std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(loc) = NEG_REGS.lock().ok().and_then(|m| m.get(&pointer).copied()) {
+        return Some(loc);
+    }
+    static NEXT_INDEX: AtomicU32 = AtomicU32::new(0);
+    // The engine emits the position leg before the direction leg in every
+    // element window (verified across r669-r683), so first-seen order is the
+    // stable discriminator; both stagings carry unit-ish float magnitudes, so
+    // content comparison would be ambiguous.
+    const NAMES: [&str; 2] = ["a_VertexXY", "a_v2DirVecs"];
+    let order = (NEXT_INDEX.fetch_add(1, Ordering::Relaxed) as usize).min(NAMES.len() - 1);
+    let name = NAMES[order];
+    let c_and_log_name = name.to_string();
+    let name = name.to_string();
+    let loc = gpu_u32_clear(move || unsafe {
+        let mut program = 0i32;
+        gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut program);
+        if program <= 0 {
+            return u32::MAX;
+        }
+        let c_name = std::ffi::CString::new(name).unwrap();
+        let loc = gl::GetAttribLocation(program as u32, c_name.as_ptr());
+        if loc >= 0 {
+            // The engine's enable pass uses ordinal indices (r683:
+            // `glEnableVertexAttribArray(0/1)` x25), so a redirected
+            // attribute above ordinal 1 would stay disabled and fetch the
+            // (0,0,0,1) constant - enable it here.
+            gl::EnableVertexAttribArray(loc as u32);
+        }
+        drain_host_gl_errors();
+        loc.max(0) as u32
+    })?;
+    if loc == u32::MAX {
+        return None;
+    }
+    if let Ok(mut m) = NEG_REGS.lock() {
+        m.insert(pointer, loc);
+    }
+    static NEG_LOGS: AtomicU32 = AtomicU32::new(0);
+    if NEG_LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+        log::info!(
+            "GPU: map negative-index VAP redirected ptr={pointer:#x} mag={magnitude:.2} -> attrib {loc} ({c_and_log_name})"
+        );
+    }
+    Some(loc)
+}
+
 fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let index = ureg(unicorn, RegisterARM::R0);
+    let index = if current_gpu_target() == GpuTarget::Map
+        && index == u32::MAX
+        && stack_arg(unicorn, 1) >= 0x10000
+    {
+        let pointer = stack_arg(unicorn, 1);
+        let mut head = [0u8; 8];
+        let magnitude = match unicorn.mem_read(pointer as u64, &mut head) {
+            Ok(()) => {
+                let x = f32::from_le_bytes([head[0], head[1], head[2], head[3]]);
+                let y = f32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+                x.abs().max(y.abs())
+            }
+            Err(_) => 0.0,
+        };
+        redirect_negative_attrib(pointer, magnitude).unwrap_or(index)
+    } else {
+        index
+    };
     let size = ureg(unicorn, RegisterARM::R1) as i32;
     let kind = ureg(unicorn, RegisterARM::R2);
     let normalized = ureg(unicorn, RegisterARM::R3) as u8;
@@ -3369,29 +3444,13 @@ fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
         });
         return 0;
     }
-    if current_gpu_target() == GpuTarget::Map {
-        let bound = gpu_u32_clear(|| unsafe {
-            let mut binding = 0i32;
-            gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut binding);
-            drain_host_gl_errors();
-            binding.max(0) as u32
-        });
-        if bound.unwrap_or(0) != 0 {
-            gpu_void_clear(move || unsafe {
-                gl::VertexAttribPointer(
-                    index,
-                    size,
-                    kind,
-                    normalized,
-                    stride,
-                    pointer as *const std::ffi::c_void,
-                );
-                drain_host_gl_errors();
-            });
-            return 0;
-        }
-    }
-
+    // A pointer at or above 64 KiB is engine heap (the staging arenas live
+    // there), never a VBO byte offset: the engine's real offsets are all
+    // well below that (r683: 0x390..0x63e0).  Treat it as a client array
+    // regardless of the current ARRAY_BUFFER binding - the engine binds its
+    // own VBOs around the call but passes heap pointers (the real driver
+    // latches the pointer at VAP time and the binding at draw time does not
+    // matter).
     let per_vertex = (stride.max(0) as usize)
         .max(size.max(1) as usize)
         .max(4)
@@ -3756,6 +3815,7 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
                 count
             };
             let drew = if current_gpu_target() == GpuTarget::Map {
+                refresh_map_client_arrays(unicorn);
                 refresh_map_engine_uniforms(unicorn);
                 // Keep any host GL error the road draw produces: the draw is
                 // the first thing in the emulator that exercises client-array
