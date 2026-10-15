@@ -6720,6 +6720,34 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 })
                 .unwrap();
         }
+        // r739: the Execute loop ran Convert 34 times but reached
+        // CreateMapObjectsFromRawMapDataBlock once; watch the convert-result
+        // compare at 0x4b5704 (page-range dispatch) logging r0 (Convert's
+        // return) and r11 (sentinel) to see 33 failures' shape.
+        {
+            let cmps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let page_lo = base_address + (0x004b_5000u32 - ORIGINAL_BASE);
+            let page_hi = page_lo + 0xfff;
+            unicorn
+                .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != 0x004b_5704 {
+                    return;
+                }
+                let n = cmps.fetch_add(1, Ordering::Relaxed);
+                if n >= 48 {
+                    return;
+                }
+                log::info!(
+                    "PROCMAPENGINE render trace loadblocks-convert-ret r0={:#x} sentinel_r11={:#x} n={}",
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R11).unwrap_or(0) as u32,
+                    n
+                );
+            })
+                .unwrap();
+        }
         // r737: ConvertFastMapBlockFromSharedMemory creates its raw block
         // then parses payload sections; 33/34 conversions still returned
         // null to the Execute loop, so parsing fails somewhere.  The section
