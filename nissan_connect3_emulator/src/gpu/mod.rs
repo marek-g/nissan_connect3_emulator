@@ -582,10 +582,24 @@ fn dump_window_pixels(backend: &mut Backend) {
     let Ok(dir) = std::env::var("EMU_MAP_DUMP_DIR") else {
         return;
     };
-    static WINDOW_SWAPS: AtomicU32 = AtomicU32::new(0);
-    let n = WINDOW_SWAPS.fetch_add(1, Ordering::Relaxed);
-    if n >= 400 || n % 20 != 19 {
+    static WINDOW_NEXT: std::sync::LazyLock<std::sync::Mutex<std::time::Instant>> =
+        std::sync::LazyLock::new(|| Mutex::new(std::time::Instant::now()));
+    static WINDOW_DUMPS: AtomicU32 = AtomicU32::new(0);
+    let due = {
+        let Ok(next) = WINDOW_NEXT.lock() else {
+            return;
+        };
+        std::time::Instant::now() >= *next
+    };
+    if !due {
         return;
+    }
+    let n = WINDOW_DUMPS.fetch_add(1, Ordering::Relaxed);
+    if n >= 40 {
+        return;
+    }
+    if let Ok(mut next) = WINDOW_NEXT.lock() {
+        *next = std::time::Instant::now() + std::time::Duration::from_secs(30);
     }
     let (mut draw_w, mut draw_h) = (800i32, 480i32);
     let mut win_w = 800i32;
