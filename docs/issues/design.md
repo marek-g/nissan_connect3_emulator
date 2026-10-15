@@ -2710,3 +2710,23 @@ map-target `glBufferSubData` log (r693):
   bank=mcp[5]!=0 -> 0x409318 lineCfgOffset != 0xffff -> tile ptrs mcp+0x38 ->
   mode 0x22/0x19 by mcp[0xa4]; skip paths leave via 0x409508 (reset+continue)
   or 0x4098f4.
+
+## r712 milestone: first road pixels on the map surface
+
+* `map_pub_0004.ppm` (run r712): 983 non-background pixels (white `ffffff`),
+  a coherent ~20px-wide diagonal stroke drifting +3.7px/row with a segment
+  break at y=11..15 - real extruded road geometry from the SD-card VBO drawn
+  through the engine's own `glMultiDrawArraysEXT` path.
+* Winning chain: wrapper 0x552edc resolution (r710: eglGetProcAddress r0 + 0
+  fallback), `poTransPos3D` arena vector (r709, was killing the render thread
+  since the first arming), synth depth pin `z=0.5w` (r711), and the dir-leg
+  retarget (r711g): the combined pass latches BOTH `a_VertexXY` (offset 0)
+  and `a_v2DirVecs` (offset coordcount<<3) under manifest id 0, so the
+  stride-8 vec2 offset leg over a bound resource VBO is retargeted to the
+  synth program's real `a_v2DirVecs` location.
+* Open: strokes land in the top-right corner (bbox x[647..799] y[0..41]).
+  The combined pass' composed modelview carries `t=(0,0,0)` (probe r712
+  loc4), so block-local coordinates map near the clip boundary instead of
+  the view-centered placement the real unit shows (big-strip family carries
+  `t=(-4272,-952)` from `ms_aflCurrentModelViewMat`).  Next: feed the map
+  view center/pan into the combined-pass mv so tiles sit around the car.
