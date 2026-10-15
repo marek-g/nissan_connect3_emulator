@@ -2898,18 +2898,31 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         gl::BindBuffer(gl::ARRAY_BUFFER, previous as u32);
         for vertex in 0..want {
             let base = (first.max(0) as usize + vertex) * stride;
-            let word = |offset: usize| -> i16 {
-                let lo = *raw.get(base + offset).unwrap_or(&0) as u16;
-                let hi = *raw.get(base + offset + 1).unwrap_or(&0) as u16;
-                (lo | (hi << 8)) as i16
+            // 0x1406 is GL_FLOAT (GL_SHORT is 0x1402) - the engine feeds
+            // packed float2 strips, so decode by the reported attribute type.
+            let is_float = states[0].2 as u32 == gl::FLOAT;
+            let word = |offset: usize| -> f32 {
+                if is_float {
+                    let b: [u8; 4] = [
+                        *raw.get(base + offset).unwrap_or(&0),
+                        *raw.get(base + offset + 1).unwrap_or(&0),
+                        *raw.get(base + offset + 2).unwrap_or(&0),
+                        *raw.get(base + offset + 3).unwrap_or(&0),
+                    ];
+                    f32::from_le_bytes(b)
+                } else {
+                    let lo = *raw.get(base + offset).unwrap_or(&0) as u16;
+                    let hi = *raw.get(base + offset + 1).unwrap_or(&0) as u16;
+                    (lo | (hi << 8)) as i16 as f32
+                }
             };
             let mut pos = [0f32; 4];
-            pos[0] = word(0) as f32;
+            pos[0] = word(0);
             if components > 1 {
-                pos[1] = word(2) as f32;
+                pos[1] = word(if is_float { 4 } else { 2 });
             }
             if components > 2 {
-                pos[2] = word(4) as f32;
+                pos[2] = word(if is_float { 8 } else { 4 });
             }
             pos[3] = 1.0;
             let apply = |input: [f32; 4], matrix: &[f32; 16]| -> [f32; 4] {
