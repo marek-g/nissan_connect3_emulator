@@ -2815,7 +2815,17 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
     // to the cached-geometry element family (zeroed VBO legs) while the road
     // strips - latched by the freshly registered client legs - draw later in
     // the same frame (r685: cap 4 only ever saw the cached family).
-    if PROBES.fetch_add(1, Ordering::Relaxed) >= 40 {
+    // r693: the street upload (bProcessData -> glBufferSubData into the road
+    // VBO) lands minutes into the run, long after the general cap is spent;
+    // keep probing big strip draws (count > 3000) separately so post-upload
+    // frames are observed.
+    static LARGE_PROBES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let (budget, spent) = if count > 3000 {
+        (100, LARGE_PROBES.fetch_add(1, Ordering::Relaxed))
+    } else {
+        (40, PROBES.fetch_add(1, Ordering::Relaxed))
+    };
+    if spent >= budget {
         return;
     }
     let mut viewport = [0i32; 4];
@@ -4533,6 +4543,19 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
             let offset = ureg(unicorn, RegisterARM::R1) as isize;
             let size = (ureg(unicorn, RegisterARM::R2) as usize).min(MAX_TEXTURE_BYTES);
             let data_addr = ureg(unicorn, RegisterARM::R3);
+            if current_gpu_target() == GpuTarget::Map {
+                // r693: this call is the road-geometry upload; `log_api`
+                // throttles per thread and hid it in every run so far, so log
+                // it explicitly for the map target.
+                static SUB_LOGS: AtomicU32 = AtomicU32::new(0);
+                if SUB_LOGS.fetch_add(1, Ordering::Relaxed) < 12 {
+                    let mut head = [0u8; 16];
+                    let read_ok = unicorn.mem_read(data_addr as u64, &mut head).is_ok();
+                    log::info!(
+                        "GPU: map bufferSubData target={target:#x} offset={offset:#x} size={size:#x} src={data_addr:#x} read={read_ok} head={head:02x?}",
+                    );
+                }
+            }
             let data = read_best_effort_bytes(unicorn, data_addr, size)
                 .map(|(_, data)| data)
                 .unwrap_or_default();
