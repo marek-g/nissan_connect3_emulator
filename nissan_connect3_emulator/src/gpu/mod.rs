@@ -3123,7 +3123,42 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
             } else {
                 count
             };
-            if gpu_void_v3(gl::DrawArrays, mode, first, count) {
+            let drew = if current_gpu_target() == GpuTarget::Map {
+                // Keep any host GL error the road draw produces: the draw is
+                // the first thing in the emulator that exercises client-array
+                // sourced GL_SHORT attributes, and a silently rejected draw
+                // would otherwise look like "rendered but invisible".
+                gpu_void_clear(move || unsafe {
+                    gl::DrawArrays(mode, first, count);
+                    let mut errors = [0u32; 4];
+                    let mut n = 0usize;
+                    while n < errors.len() {
+                        let err = gl::GetError();
+                        if err == 0 {
+                            break;
+                        }
+                        errors[n] = err;
+                        n += 1;
+                    }
+                    if n > 0 {
+                        static DRAW_ERROR_LOGS: std::sync::atomic::AtomicU32 =
+                            std::sync::atomic::AtomicU32::new(0);
+                        let hits = DRAW_ERROR_LOGS.fetch_add(1, Ordering::Relaxed);
+                        if hits < 10 {
+                            log::info!(
+                                "GPU: map draw mode={} first={} count={} host errors={:?}",
+                                mode,
+                                first,
+                                count,
+                                &errors[..n]
+                            );
+                        }
+                    }
+                })
+            } else {
+                gpu_void_v3(gl::DrawArrays, mode, first, count)
+            };
+            if drew {
                 note_real_gl_output(unicorn, "draw");
             }
             return Some(0);
