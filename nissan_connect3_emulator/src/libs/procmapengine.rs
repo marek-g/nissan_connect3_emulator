@@ -6732,6 +6732,21 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
                 let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                // r740: the narrow entry hook on CreateMapObjectsFromRawMap
+                // -DataBlock saw 1 of provably 34 calls (Convert returned
+                // indices 0..33, none equal to the 0xffff sentinel, and the
+                // bl at 0x4b5760 is unconditional) - AGENTS.md false-negative
+                // quirk.  Count calls from the call site instead.
+                if original == 0x004b_5760 {
+                    let n = cmps.load(Ordering::Relaxed);
+                    if n <= 48 {
+                        log::info!(
+                            "PROCMAPENGINE render trace loadblocks-cmofr-call block={} n={}",
+                            uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                            n
+                        );
+                    }
+                }
                 if original != 0x004b_5704 {
                     return;
                 }
@@ -6746,6 +6761,59 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     n
                 );
             })
+                .unwrap();
+        }
+        // r740: reliable count of the CreateMultipleMapElements fan-out:
+        // all 9 bl sites inside AddDataToMapObject (page probe, the narrow
+        // CME entry hook under-counts like the CreateMapObjects one did).
+        // r0 at each site is the map_tenMapElementTypes constant the call
+        // site hard-codes - the log spells out which element families the
+        // 34 payload blocks actually contain.
+        {
+            let cme = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let page_lo = base_address + (0x0050_a000u32 - ORIGINAL_BASE);
+            let page_hi = page_lo + 0xfff;
+            unicorn
+                .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                    let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                    if original == 0x0050_ae20 {
+                        let n = cme.load(Ordering::Relaxed);
+                        if n <= 200 {
+                            log::info!(
+                                "PROCMAPENGINE render trace adddata-callsite block={:#x} mo={:#x} n={}",
+                                uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                                uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                                n
+                            );
+                        }
+                        return;
+                    }
+                    if !matches!(
+                        original,
+                        0x0050_a540
+                            | 0x0050_a5a0
+                            | 0x0050_a600
+                            | 0x0050_a660
+                            | 0x0050_a6bc
+                            | 0x0050_a718
+                            | 0x0050_a778
+                            | 0x0050_a7d8
+                            | 0x0050_a7ec
+                    ) {
+                        return;
+                    }
+                    let n = cme.fetch_add(1, Ordering::Relaxed);
+                    if n >= 200 {
+                        return;
+                    }
+                    log::info!(
+                        "PROCMAPENGINE render trace cme-callsite at {:#x} elem_type={:#x} n={}",
+                        original,
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                        n
+                    );
+                })
                 .unwrap();
         }
         // r737: ConvertFastMapBlockFromSharedMemory creates its raw block
