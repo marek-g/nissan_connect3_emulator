@@ -2167,8 +2167,19 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             // returned pointer directly.  Hand out the address of our own
             // code stub registered for that name (libGLESv2 table), so the
             // indirect call traps back into `gl_api` like any import.
-            let name_ptr = ureg(unicorn, RegisterARM::R1);
-            let name = read_guest_cstr(unicorn, name_ptr, 64);
+            // r710: the name is the single argument - in r0 (the `glMulti-
+            // DrawArraysEXT` wrapper at 0x552edc proves it: `ldr r0,[0x553014];
+            // bl eglGetProcAddress`), and its result is cached WITHOUT
+            // null-checks (`str r0,[r10]; blx [r10]`), so a failed lookup must
+            // answer 0 (the wrapper then takes its documented `glDrawArrays`
+            // fallback loop) - answering 1 turns the cached value into a jump
+            // target and kills the render thread.
+            let mut name_ptr = ureg(unicorn, RegisterARM::R0);
+            let mut name = read_guest_cstr(unicorn, name_ptr, 64);
+            if name.is_empty() {
+                name_ptr = ureg(unicorn, RegisterARM::R1);
+                name = read_guest_cstr(unicorn, name_ptr, 64);
+            }
             let address = unicorn
                 .get_data()
                 .code_stubs
@@ -2180,7 +2191,7 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
                         .find(|(_, stub)| stub.name == name)
                         .map(|(address, _)| *address)
                 })
-                .unwrap_or(1);
+                .unwrap_or(0);
             static PROC_LOGS: AtomicU32 = AtomicU32::new(0);
             if PROC_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
                 log::info!("GPU: eglGetProcAddress({name:?}) -> {address:#x}");
