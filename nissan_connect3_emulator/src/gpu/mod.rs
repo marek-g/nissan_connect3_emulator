@@ -3021,6 +3021,9 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         }
     }
     let mut samples: Vec<[f32; 4]> = Vec::new();
+    // r714: raw sampled operand values (xy leg, dir leg) for ground-truth
+    // arithmetic on where the strip actually sits relative to the view.
+    let mut raw_verts: Vec<String> = Vec::new();
     // How many spread samples end up inside the normalized clip cube: the
     // discriminator between "matrix wrong" (0 always) and "this strip just
     // happens to be off-screen" (occasionally >0).
@@ -3155,9 +3158,16 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
                 pos[2] = word(if is_float { 8 } else { 4 });
             }
             pos[3] = 1.0;
-            if let Some(dir) = dir_values.get(sample_index) {
-                pos[0] += dir[0];
-                pos[1] += dir[1];
+            match dir_values.get(sample_index) {
+                Some(dir) => {
+                    raw_verts.push(format!(
+                        "({:.1},{:.1})+({:.1},{:.1})",
+                        pos[0], pos[1], dir[0], dir[1]
+                    ));
+                    pos[0] += dir[0];
+                    pos[1] += dir[1];
+                }
+                None => raw_verts.push(format!("({:.1},{:.1})+(-)", pos[0], pos[1])),
             }
             let apply = |input: [f32; 4], matrix: &[f32; 16]| -> [f32; 4] {
                 let mut out = [0f32; 4];
@@ -3222,7 +3232,7 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         .collect::<Vec<_>>()
         .join(" ");
     log::info!(
-        "GPU: map draw probe t={}ms mode={} first={} count={} viewport={:?} program={} uniforms={} names={:?} array_vbo={} engine_head={:?} attribs=[{}] mv={} vp={} vis={}/{} mats=[{}] clips=[{}]",
+        "GPU: map draw probe t={}ms mode={} first={} count={} viewport={:?} program={} uniforms={} names={:?} array_vbo={} engine_head={:?} attribs=[{}] mv={} vp={} vis={}/{} mats=[{}] clips=[{}] verts=[{}]",
         elapsed_ms,
         mode,
         first,
@@ -3254,6 +3264,7 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
             })
             .collect::<Vec<_>>()
             .join(" "),
+        raw_verts.join(" "),
     );
 }
 
