@@ -746,6 +746,20 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ("probe-msgreg", PROBE_MSGREG, 2),
         ("probe-msgconf", PROBE_MSGCONF, 2),
     ] {
+        // r743: pure-observation probes are only registered under
+        // EMU_PROCMAP_TRACE=1.  Kept unconditionally: `power-repost`
+        // (reposts the power message), `probe-sd-bentry`/`probe-sd-binit`
+        // (capture + patch the send wrapper) and `probe-sd-refres`/
+        // `probe-sd-regres` (fabricate the sensorfi CCA reference).
+        if !crate::libs::procmapengine::render_trace_enabled()
+            && name != "power-repost"
+            && !matches!(
+                name,
+                "probe-sd-bentry" | "probe-sd-binit" | "probe-sd-refres" | "probe-sd-regres"
+            )
+        {
+            continue;
+        }
         let address = (base_address + offset) as u64;
         let repost_count = repost_count.clone();
         let reg_count = reg_count.clone();
@@ -1433,7 +1447,10 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     // Page-granular watchers replacing the narrow hooks that unicorn 2.1.5
     // silently drops (see `XP_TARGETS`); the callbacks dispatch on the exact
     // fetch address, so the extra cost is one table lookup per instruction
-    // inside these pages.
+    // inside these pages.  Pure observation - registered only under
+    // EMU_PROCMAP_TRACE=1 (r743: per-instruction host callbacks on hot pages
+    // are the emulator's main hook cost).
+    if crate::libs::procmapengine::render_trace_enabled() {
     for (page, span) in XP_PAGES {
         let address = (base_address + (page - ORIGINAL_BASE)) as u64;
         let result = unicorn.add_code_hook(
@@ -1448,6 +1465,7 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
             Ok(_) => log::info!("PROCNAV: xp-watch page {address:#x}+{span:#x}"),
             Err(error) => log::warn!("PROCNAV: cannot hook xp page {address:#x}: {error}"),
         }
+    }
     }
 
     // The sensorfi GPS provider is part of the emulator's device simulation
