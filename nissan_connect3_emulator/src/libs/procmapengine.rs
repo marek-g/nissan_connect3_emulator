@@ -9757,4 +9757,37 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
             })
             .unwrap();
     }
+
+    // r702: `map_tclMapElm_Street::Draw` (0x40fb18, __thiscall:
+    // r1 = draw mode) only calls `vAddTLParams` when `mode - 0x36 < 0x20`
+    // (the TL/3D street modes); `vAddTLParams` never runs, so sample the
+    // mode values the element dispatch actually uses.
+    {
+        let mode_hits = Arc::new(AtomicU32::new(0));
+        let page_lo = base_address + (0x0040_f000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != 0x0040_fb18u32 {
+                    return;
+                }
+                let count = mode_hits.fetch_add(1, Ordering::Relaxed);
+                if count >= 48 && count % 512 != 0 {
+                    return;
+                }
+                let mode = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let mcp = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let bank = (read_u32_or_invalid(uc, mcp.wrapping_add(4)) >> 8) & 0xff;
+                log::info!(
+                    "PROCMAPENGINE street-coord probe t={}ms Street::Draw mode={:#x} bank={} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    mode,
+                    bank,
+                    count
+                );
+            })
+            .unwrap();
+    }
 }
