@@ -9647,4 +9647,55 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
             })
             .unwrap();
     }
+
+    // r694: `map_tclMapElm_Street::vDrawCombinedStreets` entry (0x409250).
+    // The whole visible-road pipeline ends here: it draws the street banks
+    // with `glMultiDrawArraysEXT` but first gates on the DTM z-values branch,
+    // which needs `map_tclMapMCP::bIsDTMEnabled()` = feature-bit AND
+    // `map_tclPyramidLoaderUtil::ms_bPydFileExists` (0x713d33).  With DTM off
+    // the engine feeds a_VertexZ = 0 as a constant, which the RH streets
+    // projection (`w = -z_mv`, camera at z_mv = +1253) rejects entirely -
+    // zero visible road pixels even with real geometry uploaded.  Log entry,
+    // the flag and the z-resource array to see which half is missing.
+    {
+        let entry_hits = Arc::new(AtomicU32::new(0));
+        let page_lo = base_address + (0x0040_9000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != 0x0040_9250u32 {
+                    return;
+                }
+                let count = entry_hits.fetch_add(1, Ordering::Relaxed);
+                if count >= 16 {
+                    return;
+                }
+                let mcp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let bank = (read_u32_or_invalid(uc, mcp.wrapping_add(4)) >> 8) & 0xff;
+                let pyd = read_u32_or_invalid(
+                    uc,
+                    base_address.wrapping_add(0x0071_3d33u32 - ORIGINAL_BASE),
+                ) & 0xff;
+                let z0 = read_u32_or_invalid(
+                    uc,
+                    base_address.wrapping_add(0x0073_c2ccu32 - ORIGINAL_BASE),
+                );
+                let z1 = read_u32_or_invalid(
+                    uc,
+                    base_address.wrapping_add(0x0073_c2d0u32 - ORIGINAL_BASE),
+                );
+                log::info!(
+                    "PROCMAPENGINE street-coord probe t={}ms vDrawCombinedStreets bank={} pyd_exists={} z_res=[{:#x},{:#x}] n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    bank,
+                    pyd,
+                    z0,
+                    z1,
+                    count
+                );
+            })
+            .unwrap();
+    }
 }
