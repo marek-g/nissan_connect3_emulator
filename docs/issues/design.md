@@ -2530,3 +2530,54 @@ r579 (probes at `MapData_AddJobToQueue`/`MDMHandleLoadBlocks::Execute`/
   - the FBO/texture cache is host-side GL infrastructure the emulator may never
   have created) and `map_tclSceneManager::MapObjectsUpdate` (0x4357c8, needs
   `ms_pkSceneManager` 0x790788 != 0).
+
+## r636-r666: render kick closed, shader-binary substitution, first stable road draws
+
+Era summary (details in commit messages r636-r665):
+
+* **Render kick** (r636-r657): post-copy wait-skip injects pure render jobs
+  (`CreateRCJobRenderPixmapView` 0x4c5b0c + `AddJobToRenderControlQueue`
+  0x3a79b8, zero answer-info, so no HMI answer chain runs).  Jobs need both
+  `job+0x1c = view id (1)` and `job+0x1d = 0` stamped: pooled job memory
+  arrives with phase=1 from earlier use, which sends `Execute` down the
+  view-queue re-queue leg instead of the draw leg
+  (`SetContentChanged`+`RenderView`+`FlipView` at 0x4d6500).  With both
+  stamps the draw leg runs every kick and `FlipView` swaps.
+* **Root cause of zero road pixels** (r659-r660): `DTMStreet::Draw` (0x55b210)
+  gates on shader-program slot 0x19 (`ms_arShaderPrograms` 0x716174 +
+  0x19*0x150, name at +0x14c = `3D/Shaders/shd_42100000.glsl`).  Every
+  `.glsl` on the card's ffs is a `[BinaryShader]` manifest pointing at
+  Vivante-precompiled `.bin` blobs - unusable on any other GPU, so
+  `LoadShaderBinary` failed, the slot stayed 0 and `Draw` bound VBOs but
+  skipped all `glDraw*`.
+* **Substitution** (r661): the GLES stub intercepts Map-target
+  `glShaderBinary`, ignores the Vivante blob and records a synthesized GLSL
+  ES program (`a_position`/`a_color` + `u_matViewProj`/`u_matModelView`),
+  uploaded+compiled at `glAttachShader`.  This works because the engine's
+  interface discovery is name-based (`vFindUniformLocations`/
+  `vFindAttribLocations` strcmp against its own tables, uniform-name->slot
+  offset map e.g. u_matViewProj=slot+4, u_matModelView=slot+8, color goes
+  through `glVertexAttrib4fv([slot+0xdc])` = `a_color`), so a synthesized
+  program that declares the engine vocabulary receives real matrices/colors.
+  Required real `glGetActiveUniform`/`glGetActiveAttrib` proxies (the stub
+  previously answered them from the dummy fallback).
+* **Host segfault fix** (r663): engine "clear attribute" `glVertexAttribPointer`
+  legs with ptr=0/empty data left attributes as NULL client arrays; NVIDIA
+  dereferenced them during the first road `glDrawArrays`.  Empty data now
+  backs the attribute with a private zero-filled VBO (never a client array).
+  Roads draw stably: 9 real `glDrawArrays` (~10.4k verts, GL_SHORT vec2 client
+  arrays copied to scratch VBOs) + one Map swap per frame after copy.
+* **Matrix uploads** (r665): engine uploads one mat4 (scale ~36.8 + camera
+  translation, i.e. the full clip transform) to `u_matModelView` (loc 0);
+  `u_matViewProj` (loc 1) never gets uploaded and stays identity - harmless
+  for the synth program since `VP * (MV * pos)` with `VP=I` is the engine's
+  intended result.
+* **Presentation chain verified** (r665): engine never calls glBindFramebuffer
+  -> draws into the Map context's private initial default FBO; Map swap
+  ReadPixels -> `publish_map_surface_pixels`; `mixLayers` runs with
+  `layer_copy=0` and the HMI frame keeps ~200k partial-alpha pixels over the
+  enabled map window, so the composited map can show.  Still unconfirmed
+  visually whether the post-copy readback itself contains road pixels -
+  r666 adds `EMU_MAP_DUMP_DIR` PPM dumps + saturated/distinct color metrics
+  per publish to separate "empty engine FBO readback" from "lost in
+  compositing".

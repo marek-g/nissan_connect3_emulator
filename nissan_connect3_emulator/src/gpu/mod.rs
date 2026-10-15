@@ -415,9 +415,11 @@ pub fn map_surface_guest_base(unicorn: &Unicorn<'_, Context>) -> Option<u32> {
 fn publish_map_surface_pixels(pixels: &[u8]) {
     static PUBLISH_COUNT: AtomicU32 = AtomicU32::new(0);
     let n = PUBLISH_COUNT.fetch_add(1, Ordering::Relaxed);
-    if n < 5 || n % 60 == 0 {
+    if n < 60 || n % 60 == 0 {
         let mut nonblack = 0usize;
         let mut nonblack_visible = 0usize;
+        let mut saturated = 0usize;
+        let mut distinct = std::collections::HashSet::new();
         for px in pixels.chunks(4) {
             if px[0] | px[1] | px[2] != 0 {
                 nonblack += 1;
@@ -425,14 +427,46 @@ fn publish_map_surface_pixels(pixels: &[u8]) {
                     nonblack_visible += 1;
                 }
             }
+            if (px[0] as i32 - px[1] as i32).abs().max((px[1] as i32 - px[2] as i32).abs()) > 40 {
+                saturated += 1;
+            }
+            if distinct.len() < 4096 {
+                distinct.insert((px[0], px[1], px[2]));
+            }
         }
         log::info!(
-            "GPU: map surface publish n={} nonblack={} visible={} sample={:02x?}",
+            "GPU: map surface publish n={} nonblack={} visible={} saturated={} distinct={} sample={:02x?}",
             n,
             nonblack,
             nonblack_visible,
+            saturated,
+            distinct.len(),
             &pixels[(240 * 800 + 400) * 4..(240 * 800 + 400) * 4 + 4]
         );
+        // Visual check of the map-target readback: dump the raw RGBA as PPM
+        // (`EMU_MAP_DUMP_DIR`), bottom-up rows flipped so the image matches
+        // the screen orientation.  Used to tell an empty engine FBO readback
+        // apart from pixels lost later in the HMI compositing chain.
+        if let Ok(dir) = std::env::var("EMU_MAP_DUMP_DIR") {
+            let mut out = format!(
+                "P6\n{} {}\n255\n",
+                MAP_SURFACE_WIDTH, MAP_SURFACE_HEIGHT
+            );
+            out.reserve(MAP_SURFACE_WIDTH * MAP_SURFACE_HEIGHT * 3);
+            for row in pixels
+                .chunks(MAP_SURFACE_WIDTH * 4)
+                .rev()
+                .take(MAP_SURFACE_HEIGHT)
+            {
+                for px in row.chunks(4) {
+                    out.push(px[0] as char);
+                    out.push(px[1] as char);
+                    out.push(px[2] as char);
+                }
+            }
+            let path = format!("{}/map_pub_{:04}.ppm", dir, n);
+            let _ = std::fs::write(&path, out);
+        }
     }
     if let Ok(mut host) = MAP_SURFACE_BYTES.lock() {
         *host = pixels.to_vec();
