@@ -641,7 +641,8 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         })
         .unwrap();
 
-    if render_trace_enabled() {
+    // r743: page probes below re-enabled unconditionally: bisection shows the
+    // boot stalls without them (TB-layout / pacing effect), keep registered.
     // r641: the class-0x44 (service-status) branch of `bDispatchCCAMessages`
     // gates on the app-interface state at `[this]+0x30` being 3:
     //   0x66cb20 ldr r2,[r8] / ldr r3,[r2,#0x30] / cmp r3,#3 / bne 0x66c93c
@@ -1105,7 +1106,6 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             })
             .unwrap();
     }
-    }  // render_trace_enabled
 
     // r655: capture the job pointer produced by the pure-render kick.  The
     // factory wrapper 0x4c5b0c returns through 0x4c5b20 (`ldmia sp!,{r4,pc}`,
@@ -1161,7 +1161,8 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             .unwrap();
     }
 
-    if render_trace_enabled() {
+    // r743: page probes below re-enabled unconditionally: bisection shows the
+    // boot stalls without them (TB-layout / pacing effect), keep registered.
     // r658: which leg does `map_tclJobRCRenderPixmapView::Execute` take?  r657
     // shows the kick jobs taken (GetPeekedElement x14) with zero GL, so
     // Execute must bail before RenderView.  Probe the four decision legs:
@@ -1259,7 +1260,6 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             })
             .unwrap();
     }
-    }  // render_trace_enabled
 
     if std::env::var_os("EMU_PROCMAPENGINE_TRACE_INIT")
         .is_some_and(|value| !value.is_empty() && value != "0")
@@ -1299,9 +1299,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
 
     add_street_coord_buffer_probe_hooks(unicorn, base_address);
 
-    if render_trace_enabled() {
     add_natural_map_engine_start_hooks(unicorn, base_address);
-    }
 
     let handler_hook_addr = base_address + PORTCONTROL_HANDLER_RESULT;
     unicorn
@@ -1342,13 +1340,16 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     }
 
     add_map_view_hooks(unicorn, base_address);
-    if render_trace_enabled() {
+    // NB: these two families look like trace hooks but their callbacks
+    // fabricate the DAPI map service reference and drive guest jobs
+    // (`ensure_dapi_map_service_reference`, `synthesize_client_service_reference`,
+    // `call_guest_function`) - they must always be registered (r743 bisection).
     add_map_data_main_loop_trace_hooks(unicorn, base_address);
     add_get_block_ids_answer_trace_hooks(unicorn, base_address);
-    }
-    if render_trace_enabled() {  // EMU_PROCMAP_TRACE=1 re-enables the r5xx-r6xx render traces
+    // r743: NOT a trace - `vOnServiceStateChange` observer sets
+    // FASTMAP_STATUS_APPLIED (stops the directory re-post driver) and the
+    // family watches MDM globals the provider logic reads.  Keep always on.
     add_fastmap_channel_trace_hooks(unicorn, base_address);
-    }
 
     let force_early_active = std::env::var("EMU_PROCMAPENGINE_FORCE_ACTIVE_STATE")
         .is_ok_and(|value| !value.is_empty() && value != "0");
