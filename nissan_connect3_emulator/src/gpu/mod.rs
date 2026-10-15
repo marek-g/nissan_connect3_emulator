@@ -3470,6 +3470,30 @@ fn route_shader_source(unicorn: &mut Unicorn<'_, Context>) -> u32 {
 /// index 1 fine).  Redirect each unseen pointer to the synthesized program's
 /// real attribute location in first-seen order, so the latched state matches
 /// what the real driver derives from the binary shader's symbol table.
+/// Resolve an attribute of the synthesized map program by name and make
+/// sure it is enabled (the engine's enable pass only uses ordinal indices
+/// r683, so a redirected attribute above ordinal 1 would stay disabled and
+/// fetch the (0,0,0,1) constant).  Runs on the backend so the current
+/// program is the map target's.
+fn synth_attrib_loc(name: &str) -> Option<u32> {
+    let name = name.to_string();
+    let loc = gpu_u32_clear(move || unsafe {
+        let mut program = 0i32;
+        gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut program);
+        if program <= 0 {
+            return u32::MAX;
+        }
+        let c_name = std::ffi::CString::new(name).unwrap();
+        let loc = gl::GetAttribLocation(program as u32, c_name.as_ptr());
+        if loc >= 0 {
+            gl::EnableVertexAttribArray(loc as u32);
+        }
+        drain_host_gl_errors();
+        loc.max(0) as u32
+    })?;
+    (loc != u32::MAX).then_some(loc)
+}
+
 fn redirect_negative_attrib(pointer: u32, magnitude: f32) -> Option<u32> {
     static NEG_REGS: std::sync::LazyLock<Mutex<std::collections::HashMap<u32, u32>>> =
         std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -3483,30 +3507,8 @@ fn redirect_negative_attrib(pointer: u32, magnitude: f32) -> Option<u32> {
     // content comparison would be ambiguous.
     const NAMES: [&str; 2] = ["a_VertexXY", "a_v2DirVecs"];
     let order = (NEXT_INDEX.fetch_add(1, Ordering::Relaxed) as usize).min(NAMES.len() - 1);
-    let name = NAMES[order];
-    let c_and_log_name = name.to_string();
-    let name = name.to_string();
-    let loc = gpu_u32_clear(move || unsafe {
-        let mut program = 0i32;
-        gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut program);
-        if program <= 0 {
-            return u32::MAX;
-        }
-        let c_name = std::ffi::CString::new(name).unwrap();
-        let loc = gl::GetAttribLocation(program as u32, c_name.as_ptr());
-        if loc >= 0 {
-            // The engine's enable pass uses ordinal indices (r683:
-            // `glEnableVertexAttribArray(0/1)` x25), so a redirected
-            // attribute above ordinal 1 would stay disabled and fetch the
-            // (0,0,0,1) constant - enable it here.
-            gl::EnableVertexAttribArray(loc as u32);
-        }
-        drain_host_gl_errors();
-        loc.max(0) as u32
-    })?;
-    if loc == u32::MAX {
-        return None;
-    }
+    let c_and_log_name = NAMES[order].to_string();
+    let loc = synth_attrib_loc(&c_and_log_name)?;
     if let Ok(mut m) = NEG_REGS.lock() {
         m.insert(pointer, loc);
     }
@@ -3537,18 +3539,40 @@ fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
         };
         redirect_negative_attrib(pointer, magnitude).unwrap_or(index)
     } else if current_gpu_target() == GpuTarget::Map
-        && index == u32::MAX
-        && stack_arg(unicorn, 1) < 0x10000
+        && index == 0
         && (ureg(unicorn, RegisterARM::R1) as i32) == 2
+        && (stack_arg(unicorn, 0) as i32) == 8
+        && stack_arg(unicorn, 1) > 0
+        && stack_arg(unicorn, 1) < 0x10000
     {
-        // r711: the combined-streets legs are `glVertexAttribPointer(-1, 2,
-        // FLOAT, 0, 8, coordcount << 3)` (VBO byte offsets, unresolved
-        // `a_v2DirVecs` index): the offset varies per element, so the call
-        // site (LR) is the stable redirect key, and the engine always emits
-        // the position leg before the direction leg (r683).  Size-2 only:
-        // the size-1 z leg wants a constant, not an array.
-        let key = 0x8000_0000 | (ureg(unicorn, RegisterARM::LR) & 0x7fff_ffff);
-        redirect_negative_attrib(key, 1.0).unwrap_or(index)
+        // r711g: the combined-streets pass latches BOTH road legs under its
+        // manifest id 0 - `a_VertexXY` at offset 0 and `a_v2DirVecs` at
+        // `coordcount << 3` over the bound resource VBO (r711f: `idx=0
+        // stride=8 offset=0x5ed0 bound_vbo=9/12`), so the second write
+        // clobbers the first.  A stride-8 vec2 offset leg with a live VBO
+        // binding is unambiguously the direction leg: retarget it to the
+        // synthesized program's `a_v2DirVecs` location.
+        let bound = gpu_u32_clear(|| unsafe {
+            let mut binding = 0i32;
+            gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut binding);
+            drain_host_gl_errors();
+            binding.max(0) as u32
+        });
+        match bound.filter(|binding| *binding != 0).and_then(|_| synth_attrib_loc("a_v2DirVecs"))
+        {
+            Some(loc) => {
+                static DIR_LOGS: AtomicU32 = AtomicU32::new(0);
+                if DIR_LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+                    log::info!(
+                        "GPU: map dir-leg idx0 stride=8 offset={:#x} bound_vbo={} -> attrib {loc} (a_v2DirVecs)",
+                        stack_arg(unicorn, 1),
+                        bound.unwrap_or(0)
+                    );
+                }
+                loc
+            }
+            None => index,
+        }
     } else {
         index
     };
