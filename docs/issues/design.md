@@ -2632,3 +2632,49 @@ uniform background.  This arc found why, layer by layer:
   byte-offset aware reads, spread sampling across strips, per-call GL error
   attribution (`host errors=[1280]` on the zeroed draws still to be chased),
   and a matrix catalog keyed by location.
+
+## r686-r700: the road-upload chain is alive; the "zeroed VBO" evidence was a probe artifact (2026-10-15)
+
+r684's "data-loss = dead mapbuffer path" story is superseded.  The street
+geometry fill is `DTMStreet::Draw -> vPrepareStreetCoordBuffer (0x55ae60) ->
+uti_DTM_StreetCoord_Buffer::bProcessData (0x448e38) -> vUpdateVBO (0x446f9c)
+-> rl_tclTextureManager::u32UpdateVBO -> glBufferSubData`, driven by per-bank
+`uti_DTM_StreetCoord_Buffer` objects (pos source `+0x30`, dir source `+0x34`,
+section start/count arrays `+0x160/+0x164`, coord count `+0x114`, dir resource
+`+0x118`).  Evidence from page probes (r689-r692) and the new explicit
+map-target `glBufferSubData` log (r693):
+
+* `bProcessData` runs from ~t=138s (once per DTMStreet element per
+  time-slice; DPM/time-slice skips are normal), all upload gates pass
+  (`param4=0`, pos/dir sources non-NULL, resource ids 9/12/14/16/18/20 =
+  engine `glGenBuffers` ids reserved with `BufferData(2*count*8, NULL)`),
+  and uploads land with real floats (pos head = node-local coords ~+-1,
+  dir head = TS-unit offsets ~25-230).
+* The uploads were invisible in logs because `log_api()` throttles per
+  thread (`count < 3000`, `glBufferSubData` is not "important") - the
+  render thread exhausts its budget within seconds of starting.  NEVER
+  conclude "call never happens" from the throttled GL trace; add an
+  explicit log (as in r693) first.
+* **`glGetBufferSubData` never returns bytes on this host** (NVIDIA GB10,
+  EGL/SDL ES context): every probe sample and every r698 readback was
+  zeros, right after the engine's own accepted upload.  r700 reads VBO
+  windows through `glMapBufferRange(MAP_READ_BIT)` instead - all earlier
+  `engine_head=zeros`/`vis=0` evidence is suspect.
+* The combined-streets pass (`map_tclMapElm_Street::vDrawCombinedStreets`
+  0x409250) draws the banks with `glMultiDrawArraysEXT` but its z-values
+  branch requires `bIsDTMEnabled()` AND a non-NULL z resource
+  (`ms_apoVBOResourceZValues`); with DTM on and z resources empty it jumps
+  to the exit label and never draws (r695: entered, `pyd_exists=1`,
+  `z_res=[0,0]`, `multi-draw=0`).  r698 forces `ms_bPydFileExists`
+  (0x713d33) to 0 at function entry - a medium-level fact we fabricate
+  anyway - so the engine takes the `glVertexAttrib1f(zloc, 0)` constant-z
+  leg and issues the multi-draw.  `ms_au32PrimCount` (0x73c1a4, filled by
+  `vAddTLParams` at the END of the previous Street Draw - the pass is
+  pipelined) must be non-zero too; r700 logs it.
+* Open follow-ups: with constant z=0 the RH streets projection gives
+  `w = -z_mv` (map view `t_z=+1042..1253`), which clip-rejects everything;
+  the sanctioned fix is a synth-vertex-shader sign normalization
+  (`mv.z = -abs(mv.z)`), to be applied only if r700's map-based probe
+  samples confirm real vertices with negative w.  `map bufferData` re-
+  reservations of engine vbos with `src=0` keep happening at resource
+  (re)creation - harmless while uploads follow them.
