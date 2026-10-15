@@ -3120,6 +3120,10 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
             }
             if let Some(view_proj) = matrices.1 {
                 clip = apply(clip, &view_proj);
+                // r711: the synth shader pins `gl_Position.z = 0.5 * w`
+                // (no terrain to depth-sort), so depth never clips - mirror
+                // it here or `vis` under-predicts the rasterized pixels.
+                clip[2] = 0.5 * clip[3];
             }
             if clip[0].abs() <= clip[3].abs()
                 && clip[1].abs() <= clip[3].abs()
