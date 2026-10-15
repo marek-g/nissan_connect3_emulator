@@ -4221,7 +4221,12 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
             // ES source for its shader objects instead (see
             // `SYNTH_VERT_SHADER`).  Everyone else keeps the old
             // unsupported-binary answer so their source fallback runs.
-            if current_gpu_target() != GpuTarget::Map || std::env::var_os("EMU_SYNTH_SHADERS").is_none() {
+            // On by default (a bare `nissan_connect3_emulator` run draws the
+            // map); set `EMU_SYNTH_SHADERS=0` to restore the reject-binaries
+            // behavior.
+            if current_gpu_target() != GpuTarget::Map
+                || std::env::var("EMU_SYNTH_SHADERS").as_deref() == Ok("0")
+            {
                 PENDING_GL_ERROR.with(|flag| flag.set(true));
                 return Some(0);
             }
