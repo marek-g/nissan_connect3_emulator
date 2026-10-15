@@ -62,3 +62,11 @@ Fixing this collapses the good-run lottery and stabilizes regression testing.
   calls whose result needs no backend state), or detect the DAPI-side
   stall and re-prioritize; tracked here so a failing run gets retried
   before being read as a regression.
+
+## r743b: hook gating changed boot timing? (RESOLVED - not timing)
+
+Gating `add_fastmap_channel_trace_hooks` behind EMU_PROCMAP_TRACE stalled boot
+(copy=0, LoadBlocks=0) in three consecutive runs; restoring it fixed boot at
+first try. The cause was functional (`FASTMAP_STATUS_APPLIED` flag written by
+that family's observer), not the removal of per-instruction pacing. Recorded
+so future hook cleanups classify by callback side effects, not naming.
