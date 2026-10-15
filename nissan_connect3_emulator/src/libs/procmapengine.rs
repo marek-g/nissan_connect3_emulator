@@ -9241,6 +9241,13 @@ static TL_VEC_VALID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// `poTransPos3D`; the street pass then ignores the per-bank stash.
 static VF_VEC_OWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// r724: the largest-|x| (view-centring pan) stamp seen at `vfin` entry,
+/// stored as f32 bit patterns; `u32::MAX` marks "none yet".
+static VF_BEST_X: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+static VF_BEST_VEC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static VF_BEST_Z: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn ensure_tl_arena(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     static TL_ARENA: AtomicU32 = AtomicU32::new(0);
     let cached = TL_ARENA.load(Ordering::Relaxed);
@@ -9761,20 +9768,69 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                 let vf_dapi = read_u32_or_invalid(uc, vf_this.wrapping_add(0xc));
                 let vf_trans = vf_dapi.wrapping_add(0x8c + u32::from(vf_bank) * 12);
                 if vf_dapi >= 0x1000 && uc.mem_read(vf_trans as u64, &mut [0u8; 12]).is_ok() {
+                    // r724: `vFinishCombinedDrawing` runs for several
+                    // element families and each family's `Street::Draw`-
+                    // style stamp would overwrite the previous one (route
+                    // overlay (1219, 0, -3030) vs street centre (-4472, 0,
+                    // -1253)).  The pan stamp that centres the view is
+                    // `-block_centre * scale` and is by far the largest in
+                    // magnitude (real SD-backed data: 0x1044248 carries the
+                    // car's Krakow block), so keep the stamp with the
+                    // largest |x| and hand it to every drawn pass.
+                    let x_bits = read_u32_or_invalid(uc, vf_trans);
+                    let y_bits = read_u32_or_invalid(uc, vf_trans.wrapping_add(4));
+                    let z_bits = read_u32_or_invalid(uc, vf_trans.wrapping_add(8));
+                    let x = f32::from_bits(x_bits);
+                    let best_bits = VF_BEST_X.load(Ordering::Relaxed);
+                    if best_bits == u32::MAX
+                        || x.abs() > f32::from_bits(best_bits).abs()
+                    {
+                        let _ = VF_BEST_X
+                            .store(x.to_bits(), Ordering::Relaxed);
+                        VF_BEST_VEC.store(
+                            (u64::from(x_bits))
+                                | (u64::from(y_bits) << 32),
+                            Ordering::Relaxed,
+                        );
+                        VF_BEST_Z.store(z_bits, Ordering::Relaxed);
+                    }
                     let pp_addr = base_address.wrapping_add(0x0073_c31cu32 - ORIGINAL_BASE);
-                    if uc.mem_write(pp_addr as u64, &vf_trans.to_le_bytes()).is_ok() {
+                    let stash_addr = {
+                        let arena = ensure_tl_arena(uc);
+                        arena + 0x1c00
+                    };
+                    let best_x = f32::from_bits(VF_BEST_X.load(Ordering::Relaxed));
+                    let best_xy = VF_BEST_VEC.load(Ordering::Relaxed);
+                    let best_z = VF_BEST_Z.load(Ordering::Relaxed);
+                    let bytes: [u8; 12] = [
+                        (best_xy & 0xff) as u8,
+                        ((best_xy >> 8) & 0xff) as u8,
+                        ((best_xy >> 16) & 0xff) as u8,
+                        ((best_xy >> 24) & 0xff) as u8,
+                        ((best_xy >> 32) & 0xff) as u8,
+                        ((best_xy >> 40) & 0xff) as u8,
+                        ((best_xy >> 48) & 0xff) as u8,
+                        ((best_xy >> 56) & 0xff) as u8,
+                        (best_z & 0xff) as u8,
+                        ((best_z >> 8) & 0xff) as u8,
+                        ((best_z >> 16) & 0xff) as u8,
+                        ((best_z >> 24) & 0xff) as u8,
+                    ];
+                    if uc.mem_write(stash_addr as u64, &bytes).is_ok()
+                        && uc.mem_write(pp_addr as u64, &stash_addr.to_le_bytes()).is_ok()
+                    {
                         VF_VEC_OWNED.store(true, Ordering::Relaxed);
                         static VF_LOGS: AtomicU32 = AtomicU32::new(0);
                         if VF_LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
-                            let x = f32::from_bits(read_u32_or_invalid(uc, vf_trans));
-                            let y = f32::from_bits(read_u32_or_invalid(uc, vf_trans.wrapping_add(4)));
-                            let z = f32::from_bits(read_u32_or_invalid(uc, vf_trans.wrapping_add(8)));
                             log::info!(
-                                "PROCMAPENGINE street-coord probe t={}ms poTransPos3D := vfin this={:#x} dapi {:#x}+{:#x} -> ({x:.1}, {y:.1}, {z:.1}) n={}",
+                                "PROCMAPENGINE street-coord probe t={}ms poTransPos3D best=({:.1}, {:.1}, {:.1}) (this-pass {x:.1}, {:.1}, {:.1}) dapi {:#x} n={}",
                                 crate::libs::dapi::emu_t0_elapsed_ms(),
-                                vf_this,
+                                best_x,
+                                f32::from_bits(((best_xy >> 32) & 0xffff_ffff) as u32),
+                                f32::from_bits(best_z),
+                                f32::from_bits(y_bits),
+                                f32::from_bits(z_bits),
                                 vf_dapi,
-                                0x8c + u32::from(vf_bank) * 12,
                                 VF_LOGS.load(Ordering::Relaxed)
                             );
                         }
