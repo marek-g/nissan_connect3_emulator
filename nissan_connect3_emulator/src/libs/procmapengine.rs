@@ -6731,7 +6731,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             let tagseen = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let default_hit = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let page_lo = base_address + (0x0050_d000u32 - ORIGINAL_BASE);
-            let page_hi = page_lo + 0xfff;
+            let page_hi = page_lo + 0x1fff;
             unicorn
                 .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
                     let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
@@ -6745,10 +6745,14 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                             let r11 = uc.reg_read(RegisterARM::R11).unwrap_or(0) as u32;
                             let tag = read_u32_or_invalid(uc, r11) & 0xff;
                             log::info!(
-                                "PROCMAPENGINE render trace fmp-section tag={:#x} sec={:#x} len={:#x} n={}",
+                                "PROCMAPENGINE render trace fmp-section tag={:#x} sec={:#x} len={:#x} heap={:#x} n={}",
                                 tag,
                                 r11,
                                 read_u32_or_invalid(uc, r11.wrapping_add(4)),
+                                read_u32_or_invalid(
+                                    uc,
+                                    base_address + (0x0079_07f4u32 - ORIGINAL_BASE)
+                                ),
                                 n
                             );
                         }
@@ -6765,6 +6769,18 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                 n
                             );
                         }
+                        // r738: heap-NULL (0x50e428) / heap-alloc-failure
+                        // (0x50e458) branches inside the section handlers.
+                        0x0050_e428 | 0x0050_e458 => {
+                            let n = default_hit.fetch_add(1, Ordering::Relaxed);
+                            if n < 40 {
+                                log::info!(
+                                    "PROCMAPENGINE render trace fmp-heap-branch at {:#x} n={}",
+                                    original,
+                                    n
+                                );
+                            }
+                        }
                         _ => {}
                     }
                 })
@@ -6780,6 +6796,8 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         // whether landuse/polygon element types are ever created at all.
         for (mk_addr, mk_name) in [
             (0x004b_5420u32, "JobMDMHandleLoadBlocks::Execute"),
+            (0x0051_e000u32, "Init/51e000(heap-owner)"),
+            (0x0047_db4cu32, "Init/47db4c"),
             (0x0050_acc4u32, "CreateMapObjectsFromRawMapDataBlock"),
             (0x0050_8f1cu32, "AddDataToMapObject"),
             (0x003c_18f0u32, "CreateMultipleMapElements"),
