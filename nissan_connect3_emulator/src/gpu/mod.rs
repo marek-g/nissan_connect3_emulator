@@ -4410,6 +4410,48 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
             gpu_buffer_data(target, size, data);
             return Some(0);
         }
+        "glMultiDrawArraysEXT" => {
+            // `vDrawCombinedStreets` draws every street bank with one
+            // `glMultiDrawArraysEXT(5, first[], count[], primcount)` whose
+            // first/count vectors live in guest memory (`ms_apu32First`,
+            // `ms_apu32Count`).  Expand to host `glDrawArrays` per primitive;
+            // the client-array refresh runs once for the shared VBO latches.
+            let mode = ureg(unicorn, RegisterARM::R0) as i32;
+            let first_ptr = ureg(unicorn, RegisterARM::R1);
+            let count_ptr = ureg(unicorn, RegisterARM::R2);
+            let primcount = (ureg(unicorn, RegisterARM::R3) as i32).clamp(0, 4096);
+            if primcount > 0 && first_ptr != 0 && count_ptr != 0 {
+                let firsts = read_u32_array(unicorn, first_ptr, primcount as usize);
+                let counts = read_u32_array(unicorn, count_ptr, primcount as usize);
+                static MULTI_LOGS: AtomicU32 = AtomicU32::new(0);
+                if MULTI_LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+                    log::info!(
+                        "GPU: map multi-draw mode={mode} primcount={primcount} first={:?} count={:?}",
+                        firsts.iter().take(4).collect::<Vec<_>>(),
+                        counts.iter().take(4).collect::<Vec<_>>()
+                    );
+                }
+                refresh_map_client_arrays(unicorn);
+                refresh_map_engine_uniforms(unicorn);
+                let ranges: Vec<(i32, i32)> = firsts
+                    .iter()
+                    .zip(counts.iter())
+                    .map(|(first, count)| (*first as i32, *count as i32))
+                    .filter(|(_, count)| *count > 0)
+                    .collect();
+                let drew = gpu_void_clear(move || unsafe {
+                    probe_map_draw_vertices(mode as u32, 0, ranges.iter().map(|(_, c)| *c).sum());
+                    for (first, count) in ranges {
+                        gl::DrawArrays(mode as u32, first, count);
+                    }
+                    drain_host_gl_errors();
+                });
+                if drew {
+                    note_real_gl_output(unicorn, "draw");
+                }
+            }
+            return Some(0);
+        }
         "glMapBufferOES" => {
             // The engine's dynamic-geometry path (r684): it reserves VBOs with
             // `glBufferData(size, NULL)`, then fills them through
