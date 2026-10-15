@@ -2923,7 +2923,15 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         // VBO offset (bytes) the attribute was specified with; offset-mode
         // strips do not start at buffer byte 0.
         let mut pointer: *mut std::ffi::c_void = std::ptr::null_mut();
-        gl::GetVertexAttribPointerv(index, gl::ARRAY_BUFFER, std::ptr::addr_of_mut!(pointer) as *const *mut std::ffi::c_void);
+        // r718: the pname must be VERTEX_ATTRIB_ARRAY_POINTER (0x886F);
+        // ARRAY_BUFFER (0x8892) is not valid here, the query silently
+        // failed with INVALID_ENUM and the probe printed ap=0 for every
+        // attribute for many runs - the real latches were fine.
+        gl::GetVertexAttribPointerv(
+            index,
+            gl::VERTEX_ATTRIB_ARRAY_POINTER,
+            std::ptr::addr_of_mut!(pointer) as *const *mut std::ffi::c_void,
+        );
         attrib_pointers[index as usize] = pointer as i32;
     }
     // Uniform inventory of the bound program: tells whether the synth shader
