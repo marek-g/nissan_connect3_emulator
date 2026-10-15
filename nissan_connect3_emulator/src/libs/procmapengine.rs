@@ -6720,6 +6720,39 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 })
                 .unwrap();
         }
+        // r733c: the raw-block -> element creation chain, upstream of all
+        // the dead feeders above.  `map_tclJobMDMHandleLoadBlocks::Execute`
+        // converts each LoadBlocks payload via ConvertFastMapBlockFromShared
+        // Memory (whose CreateNewRawDataBlock hits prove conversion runs)
+        // and then unconditionally calls CreateMapObjectsFromRawMapDataBlock,
+        // which fans out per-MO into AddDataToMapObject(r0=element type) ->
+        // CreateMultipleMapElements(r0=element type).  Logging r0 tells
+        // whether landuse/polygon element types are ever created at all.
+        for (mk_addr, mk_name) in [
+            (0x0050_acc4u32, "CreateMapObjectsFromRawMapDataBlock"),
+            (0x0050_8f1cu32, "AddDataToMapObject"),
+            (0x003c_18f0u32, "CreateMultipleMapElements"),
+        ] {
+            let mk = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let addr = base_address + (mk_addr - ORIGINAL_BASE);
+            unicorn
+                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                    let count = mk.fetch_add(1, Ordering::Relaxed);
+                    if count >= 64 || count % 512 != 0 {
+                        return;
+                    }
+                    log::info!(
+                        "PROCMAPENGINE render trace {} entry r0={:#x} r1={:#x} r2={:#x} r3={:#x} n={}",
+                        mk_name,
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                        uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                        uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+                        uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
+                        count
+                    );
+                })
+                .unwrap();
+        }
         // r733b: the DTM draw-layer feeders (same slot/vpcs pipeline the
         // working street pass uses - we only emulate the street element's
         // vAddTLParams there).  One per element family: MapElm base,
