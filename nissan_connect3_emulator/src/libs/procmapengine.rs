@@ -9669,6 +9669,38 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     );
                 }
                 emulate_add_tl_params(uc, base_address);
+            } else if original == 0x0055_ae30u32 || original == 0x0055_ae54u32 {
+                // r708: `vDrawCombinedStreets` return sites (both vpcs calls
+                // in `vFinishCombinedDrawing`, r705 entry-probe lr).  r707's
+                // decision-PC trace inside the `vpcs` page logged nothing for
+                // the ARMED pass although the primcount gate opened - either
+                // the bounded-hook checks are missing from those already
+                // translated TBs (unicorn 2.1.5 quirk) or the function left
+                // before the loop.  Read the primcount/first arrays right
+                // after the return from this page-proven hook: a consumed
+                // primcount proves the loop ran (and the draw path was taken
+                // or skipped internally), a surviving one proves it left
+                // before the reset.
+                static RET_TRACE: AtomicU32 = AtomicU32::new(0);
+                let hits = RET_TRACE.fetch_add(1, Ordering::Relaxed);
+                if hits < 24 {
+                    let pc0 = read_u32_or_invalid(
+                        uc,
+                        base_address.wrapping_add(0x0073_c1a4u32 - ORIGINAL_BASE),
+                    );
+                    let pc1 = read_u32_or_invalid(
+                        uc,
+                        base_address.wrapping_add(0x0073_c1a8u32 - ORIGINAL_BASE),
+                    );
+                    log::info!(
+                        "PROCMAPENGINE street-coord probe t={}ms vpcs-return at {:#x} primcount=[{},{}] n={}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        original,
+                        pc0,
+                        pc1,
+                        hits
+                    );
+                }
             } else if original == 0x0055_ae60u32 {
                 // vPrepareStreetCoordBuffer entry: r0=this, r1=MCP.
                 let count = entry_hits.fetch_add(1, Ordering::Relaxed);
@@ -9909,7 +9941,9 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     // call.  Trace every decision PC of the armed branch to
                     // find where it leaves.
                     let (site, log_slot) = match original {
+                        0x0040_92b4 => ("loop-head", true),
                         0x0040_9508 => ("skip-resetslot", true),
+                        0x0040_9514 => ("slot-continue", true),
                         0x0040_96f0 => ("post-flags", true),
                         0x0040_9828 => ("legs-entry", true),
                         0x0040_9884 => ("z-vbo-check", true),
@@ -9920,7 +9954,9 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                         0x0040_9b1c => ("mv-compose", false),
                         _ => return,
                     };
-                    static SITES: [std::sync::OnceLock<std::sync::Mutex<u64>>; 9] = [
+                    static SITES: [std::sync::OnceLock<std::sync::Mutex<u64>>; 11] = [
+                        std::sync::OnceLock::new(),
+                        std::sync::OnceLock::new(),
                         std::sync::OnceLock::new(),
                         std::sync::OnceLock::new(),
                         std::sync::OnceLock::new(),
@@ -9932,15 +9968,17 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                         std::sync::OnceLock::new(),
                     ];
                     let idx: usize = match original {
-                        0x0040_9508 => 0,
-                        0x0040_96f0 => 1,
-                        0x0040_9828 => 2,
-                        0x0040_9884 => 3,
-                        0x0040_98b4 => 4,
-                        0x0040_98ec => 5,
-                        0x0040_996c => 6,
-                        0x0040_99dc => 7,
-                        _ => 8,
+                        0x0040_92b4 => 0,
+                        0x0040_9508 => 1,
+                        0x0040_9514 => 2,
+                        0x0040_96f0 => 3,
+                        0x0040_9828 => 4,
+                        0x0040_9884 => 5,
+                        0x0040_98b4 => 6,
+                        0x0040_98ec => 7,
+                        0x0040_996c => 8,
+                        0x0040_99dc => 9,
+                        _ => 10,
                     };
                     let slot = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32 & 0xff;
                     let cell = SITES[idx].get_or_init(|| std::sync::Mutex::new(0));
