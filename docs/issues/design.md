@@ -2787,3 +2787,34 @@ Still open (visible in win_r732_final.png): stroke width far too large
 roads are a few px wide; multiply `a_VertexXY` by ~0.1 or feed
 `u_flLineWidth`), placement slightly left/up of centre, and the popup
 chain (parked per user until roads were visible - now unblocked).
+
+## r743-r743c (2026-10-15): hook cost audit - EMU_PROCMAP_TRACE gate (RESOLVED)
+
+Problem: ~350 `add_code_hook` registrations, most pure observation; page-range
+hooks fire a host callback per executed guest instruction on their pages and
+were the dominant emulator cost.
+
+Done: deleted the r733-r742 polygon probes; introduced
+`procmapengine::render_trace_enabled()` (`EMU_PROCMAP_TRACE=1`) and gated all
+pure-observation registrations: 2 inline r63x page-probe regions, `add_
+natural...` NO - see lesson, procnav XP_PAGES watch + ~35 log-only probes
+(kept: power-repost, probe-sd-bentry/binit, probe-sd-refres/regres), 6 dapi
+page probes. Default boot verified: roads render, multi-draw at 150 s wall
+(72% host GPU), window dump shows the grey road pixels.
+
+**Lesson (r743b stall):** several "trace" families carry functional logic in
+their callbacks and MUST stay registered: `add_fastmap_channel_trace_hooks`
+(`vOnServiceStateChange` observer sets `FASTMAP_STATUS_APPLIED`, which stops
+the directory re-post driver - gating it stalls boot before LoadBlocks),
+`add_get_block_ids_answer_trace_hooks` (`ensure_dapi_map_service_reference`),
+`add_map_data_main_loop_trace_hooks` (`synthesize_client_service_reference`,
+`call_guest_function`), `add_natural_map_engine_start_hooks`
+(`initialize_map_data_medium`). Hook classification must therefore look for
+host-state stores (`X.store(`/`fetch_or(` on module statics consumed by
+providers) and cross-module helper calls, not just `mem_write`/`reg_write`.
+
+Remaining known cost (kept by design): 0x409000 vpcs page + 0x55a000 vfin/
+vpcs-return page (road pipeline stamping), the FUNC helpers around job-queue
+fabrication, dapi wait/latency hooks. Future speed-up: convert those entry/
+page observers to the svc-stub trampolining idea (`add_code_stub` extended
+with observe-and-continue) so their cost drops to the hit moments only.
