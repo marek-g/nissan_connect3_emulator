@@ -2927,14 +2927,21 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
     gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut array_binding);
     if array_binding > 0 {
         // ARRAY_BUFFER_BINDING is already `array_binding`, so no re-bind is
-        // needed for the read.
+        // needed for the read (r700: via map, `GetBufferSubData` is dead on
+        // this host).
         let mut raw = vec![0u8; 32];
-        gl::GetBufferSubData(
-            gl::ARRAY_BUFFER,
-            0,
-            raw.len() as isize,
-            raw.as_mut_ptr() as *mut _,
-        );
+        unsafe {
+            let data = gl::MapBufferRange(
+                gl::ARRAY_BUFFER,
+                0,
+                raw.len() as isize,
+                gl::MAP_READ_BIT,
+            );
+            if !data.is_null() {
+                std::ptr::copy_nonoverlapping(data as *const u8, raw.as_mut_ptr(), raw.len());
+                gl::UnmapBuffer(gl::ARRAY_BUFFER);
+            }
+        }
         engine_vbo_head = raw
             .chunks_exact(2)
             .map(|w| i16::from_le_bytes([w[0], w[1]]))
@@ -3021,12 +3028,20 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         let mut previous = 0i32;
         gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut previous);
         gl::BindBuffer(gl::ARRAY_BUFFER, binding);
-        gl::GetBufferSubData(
-            gl::ARRAY_BUFFER,
-            data_offset as isize,
-            raw.len() as isize,
-            raw.as_mut_ptr() as *mut _,
-        );
+        // r700: `GetBufferSubData` never returns bytes on this host (every
+        // readback in every run was zeros, even right after an upload the
+        // log proved was accepted), so read the window through a read-only
+        // map instead.
+        {
+            let data =
+                gl::MapBufferRange(gl::ARRAY_BUFFER, data_offset as isize, raw.len() as isize, gl::MAP_READ_BIT);
+            if !data.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data as *const u8, raw.as_mut_ptr(), raw.len());
+                    gl::UnmapBuffer(gl::ARRAY_BUFFER);
+                }
+            }
+        }
         gl::BindBuffer(gl::ARRAY_BUFFER, previous as u32);
         for &vertex in &vertices {
             let base = vertex * stride;
@@ -4626,23 +4641,38 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
             if let Some(binding) = readback_vbo {
                 let readback_offset = offset.max(0) as isize;
                 let _ = gpu_void_clear(move || unsafe {
-                    // r698: read the bytes back from exactly the buffer the
-                    // draw probe samples, to see whether the upload persists
-                    // on the host or something wipes it later.
+                    // r700: `GetBufferSubData` has never returned non-zero
+                    // bytes on this host in any run, so redo the readback
+                    // through a read-only map and report the GL errors that
+                    // `drain_host_gl_errors` would otherwise swallow.
                     let mut previous = 0i32;
                     gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut previous);
                     let mut raw = [0u8; 16];
                     gl::BindBuffer(gl::ARRAY_BUFFER, binding);
-                    gl::GetBufferSubData(
+                    let mut raw_err = 0u32;
+                    let data = gl::MapBufferRange(
                         gl::ARRAY_BUFFER,
                         readback_offset,
-                        raw.len() as isize,
-                        raw.as_mut_ptr() as *mut _,
+                        16,
+                        gl::MAP_READ_BIT,
                     );
+                    if data.is_null() {
+                        raw_err = gl::GetError();
+                    } else {
+                        std::ptr::copy_nonoverlapping(
+                            data as *const u8,
+                            raw.as_mut_ptr(),
+                            raw.len(),
+                        );
+                        if gl::UnmapBuffer(gl::ARRAY_BUFFER) == 0 {
+                            raw_err = 0xffff;
+                        }
+                    }
                     gl::BindBuffer(gl::ARRAY_BUFFER, previous.max(0) as u32);
+                    let pending = gl::GetError();
                     drain_host_gl_errors();
                     log::info!(
-                        "GPU: map subdata readback vbo={binding} offset={:#x} raw={raw:02x?}",
+                        "GPU: map subdata readback vbo={binding} offset={:#x} raw={raw:02x?} map_err={raw_err:#x} pending={pending:#x}",
                         readback_offset,
                     );
                 });
