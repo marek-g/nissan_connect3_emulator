@@ -4567,8 +4567,14 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
                 if SUB_LOGS.fetch_add(1, Ordering::Relaxed) < 12 {
                     let mut head = [0u8; 16];
                     let read_ok = unicorn.mem_read(data_addr as u64, &mut head).is_ok();
+                    let binding = gpu_u32_clear(move || unsafe {
+                        let mut bound = 0i32;
+                        gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut bound);
+                        bound.max(0) as u32
+                    })
+                    .unwrap_or(0);
                     log::info!(
-                        "GPU: map bufferSubData target={target:#x} offset={offset:#x} size={size:#x} src={data_addr:#x} read={read_ok} head={head:02x?}",
+                        "GPU: map bufferSubData target={target:#x} offset={offset:#x} size={size:#x} src={data_addr:#x} read={read_ok} bound_vbo={binding} head={head:02x?}",
                     );
                 }
             }
