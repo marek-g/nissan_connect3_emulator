@@ -6655,6 +6655,23 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     read_u32_or_invalid(uc, uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32 + 8),
                     read_u32_or_invalid(uc, uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32 + 0xc)
                 );
+                // r733: the `s32InsertMO` loop at 0x431884 walks
+                // `[scene+0x30+bank*4] -> (count @ +0, mo** @ +0xc)` and is
+                // skipped when the count is 0 (r732: zero insertions in
+                // every run).  Log the per-bank cell-array object and its
+                // count at call time so the empty-feed can be pinned to a
+                // bank.
+                for bank in 0..3u32 {
+                    let cell_obj =
+                        read_u32_or_invalid(uc, scene.wrapping_add(0x30 + bank * 4));
+                    log::info!(
+                        "PROCMAPENGINE render trace DetermineMapObjects bank={} cell_obj={:#x} count={:#x} arr={:#x}",
+                        bank,
+                        cell_obj,
+                        read_u32_or_invalid(uc, cell_obj),
+                        read_u32_or_invalid(uc, cell_obj.wrapping_add(0xc)),
+                    );
+                }
             })
             .unwrap();
         let ins = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -6673,8 +6690,36 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 );
             })
             .unwrap();
-        // r603: the scene-root write-watch answered its question (roots exist
-        // at 0x9083e068..) and was removed to keep the host section budget down.
+        // r733: cell-array feeders.  `AddToMapCell` (0x422f24) /
+        // `AddLineSegmentToMapCells` (0x422f6c) are the plain-scene vtable
+        // feeders of the per-bank cell arrays that the `s32InsertMO` loop
+        // consumes; the 0x561bb8/0x55f784 twins are the DTM-side feeders
+        // (which the working road pass must be using).  Counting both tells
+        // whether scene cells never get fed at all or get fed on another
+        // bank than the render pass queries.
+        for (feed_addr, feed_name) in
+            [(0x0042_2f24u32, "AddToMapCell"), (0x0042_2f6c, "AddLineSegToMapCells")]
+        {
+            let feed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let addr = base_address + (feed_addr - ORIGINAL_BASE);
+            unicorn
+                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                    let count = feed.fetch_add(1, Ordering::Relaxed);
+                    if count >= 8 || count % 512 != 0 {
+                        return;
+                    }
+                    log::info!(
+                        "PROCMAPENGINE render trace {} entry r0={:#x} r1={:#x} r2={:#x} r3={:#x} n={}",
+                        feed_name,
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                        uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                        uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+                        uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
+                        count
+                    );
+                })
+                .unwrap();
+        }
         // `DetermineMapObjects` only inserts MOs into the DTM grid when the
         // per-view cell array (scene+0x30+view*4, `*count` there) is non-zero;
         // those arrays are fed by the raw data blocks created from the
