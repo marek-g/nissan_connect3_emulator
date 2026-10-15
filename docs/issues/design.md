@@ -2730,3 +2730,60 @@ map-target `glBufferSubData` log (r693):
   the view-centered placement the real unit shows (big-strip family carries
   `t=(-4272,-952)` from `ms_aflCurrentModelViewMat`).  Next: feed the map
   view center/pan into the combined-pass mv so tiles sit around the car.
+
+## r713-r732: real streets composite into the emulator window (milestone, 2026-10-15)
+
+`win_r732_final.png` (window dump, r732): the Krakow road network - real
+SD/cryptnav geometry read by DAPI, drawn by procmapengine's own combined
+pass - is visible behind the "Starting navigation." popup.  Chain of fixes:
+
+- r713/r723/r724 `poTransPos3D` (0x73c31c): the real `Street::Draw`
+  (0x40fbf8) stamps it with the element's tile vector `dapi + 0x8c +
+  bank*12` (the pointer is used directly - vpcs derefs `*P` as math_tclVector3
+  and `vLoadModelViewMatrix` stores `(x, y, -z)` into `m_aflMdlMatrix[2]`).
+  Many element families (route overlays, dapi 0xea4378, vector (1200, 0,
+  -3030)) race for that one global; the street element's vector
+  (0x1044248 -> (-4472, 0, -1253) = -block_centre*scale, matching the
+  render layer's own pan t=(-4272, -952, +1250)) must win.  The vfin entry
+  now tracks the largest-|x| stamp (the view-centring pan is by far the
+  largest) and re-stamps every pass from a TL-arena copy.
+- r716 attribute ordinals: the engine manifest order is xy, dir, z, color
+  (big-strip family feeds the direction leg at index 1; color 4fv index=3
+  carries REAL SD road styles - 1,1,1,1 and 0.09,0.09,0.09).  Synth shader
+  declarations reordered to match; combined-pass legs are mirrored
+  (position idx1/offset0, direction idx0/offset coordcount<<3) - r718
+  retargets both onto distinct synth locations.
+- r716g/r717 VAP semantics: pointer==0 with ARRAY_BUFFER bound on the map
+  target is VBO-offset semantics, not the engine's "clear attribute" idiom
+  (a_VertexXY had frozen on ZERO_VBO id 6 reading zeros).
+- r719 probe bug: `glGetVertexAttribPointerv` must be queried with
+  VERTEX_ATTRIB_ARRAY_POINTER (0x886F), not ARRAY_BUFFER (0x8892) - the
+  query had silently failed with INVALID_ENUM in every probe ever, so ap
+  printed 0 for runs while the real latches were already correct.
+- r722 uniform staleness: `vUpdateShaderUniforms` (0x3ad57c) uploads
+  `u_matModelView` = `rl_tclRenderLayer3D::m_aflMdlMatrix` (case 3,
+  0x71ab50) only when `rl_tclTextureManager::ms_au32CurrentFrameNumber`
+  (0x71adc0, per view) changes - `vDraw` (0x55a064) calls it every pass,
+  but the frame counter never moves in the emulator, so the first-frame
+  modelview was frozen.  The vfin entry bumps all 4 view entries per pass.
+- r725 `u_v2Pan`: the family race on poTransPos3D cannot be fully won
+  from data (some passes legitimately carry their own vectors), so the
+  display engine centres the view on the drawn geometry: the draw probe
+  computes the modelview-space centre of the sampled real vertices and
+  the multi-draw arm uploads it as `u_v2Pan`, subtracted in the synth
+  vertex shader after the modelview multiply.  Coordinates stay 100%
+  engine/SD data.
+- r728/r731 window capture: `spectacle`/`import` fail silently on this
+  host, so the backend dumps its own composed frame (`dump_window_pixels`,
+  every 30 s, `window_NNNN.ppm`) from the default framebuffer on the
+  compositor context.
+- r730 map frame persistence: the engine re-runs the street pass only on
+  data updates; its flat repaints (clear, no redraw) were overwriting the
+  composited map with an empty readback.  The map readback now keeps the
+  last content-bearing frame (flat frames detected via stride sampling).
+
+Still open (visible in win_r732_final.png): stroke width far too large
+(the +-1 extrusion vectors are consumed unscaled at 36.8 px/m - real unit
+roads are a few px wide; multiply `a_VertexXY` by ~0.1 or feed
+`u_flLineWidth`), placement slightly left/up of centre, and the popup
+chain (parked per user until roads were visible - now unblocked).
