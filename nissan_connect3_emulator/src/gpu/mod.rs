@@ -2811,7 +2811,11 @@ fn route_uniform_matrix(unicorn: &mut Unicorn<'_, Context>, components: usize) -
 /// clip volume (rasteriser drops them silently, no GL error).
 unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
     static PROBES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if PROBES.fetch_add(1, Ordering::Relaxed) >= 4 {
+    // Probe a whole frame's worth of draws: the first draws of a frame belong
+    // to the cached-geometry element family (zeroed VBO legs) while the road
+    // strips - latched by the freshly registered client legs - draw later in
+    // the same frame (r685: cap 4 only ever saw the cached family).
+    if PROBES.fetch_add(1, Ordering::Relaxed) >= 40 {
         return;
     }
     let mut viewport = [0i32; 4];
@@ -3041,7 +3045,7 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         })
         .unwrap_or_default();
     log::info!(
-        "GPU: map draw probe mode={} first={} count={} viewport={:?} program={} uniforms={} names={:?} array_vbo={} engine_head={:?} attrib0=(en={} size={} type={:#x} stride={} vbo={}) attrib1=(en={} size={} type={:#x} stride={} vbo={}) mv={} vp={} vis={}/{} mats=[{}] clips=[{}]",
+        "GPU: map draw probe mode={} first={} count={} viewport={:?} program={} uniforms={} names={:?} array_vbo={} engine_head={:?} attrib0=(en={} size={} type={:#x} stride={} vbo={}) attrib1=(en={} size={} type={:#x} stride={} vbo={}) ap0={:#x} ap1={:#x} mv={} vp={} vis={}/{} mats=[{}] clips=[{}]",
         mode,
         first,
         count,
@@ -3053,6 +3057,8 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         engine_vbo_head,
         states[0].0, states[0].1, states[0].2, states[0].3, states[0].4,
         states[1].0, states[1].1, states[1].2, states[1].3, states[1].4,
+        attrib_pointers[0],
+        attrib_pointers[1],
         matrices.0.is_some(),
         matrices.1.is_some(),
         visible_vertices,
