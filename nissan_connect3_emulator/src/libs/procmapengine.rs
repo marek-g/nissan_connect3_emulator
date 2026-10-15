@@ -9680,7 +9680,7 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     let _ = uc.mem_write(pyd_addr as u64, &[0u8; 1]);
                 }
                 let count = entry_hits.fetch_add(1, Ordering::Relaxed);
-                if count >= 40 {
+                if count >= 40 && count % 2048 != 0 {
                     return;
                 }
                 let mcp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -9714,6 +9714,44 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     z1,
                     pc0,
                     pc1,
+                    count
+                );
+            })
+            .unwrap();
+    }
+
+    // r701: `vAddTLParams` (0x40f730, called at the END of
+    // `map_tclMapElm_Street::Draw`) is what fills `ms_apu32First`/
+    // `ms_apu32Count`/`ms_au32PrimCount` for the next
+    // `vDrawCombinedStreets`; `multi-draw` never fired and the entry probe
+    // shows `primcount=[0,0]`, so either it never runs or its node-count
+    // argument (`Draw` passes `this[0x180] - 1`, the TL node count) is empty.
+    {
+        let entry_hits = Arc::new(AtomicU32::new(0));
+        let page_lo = base_address + (0x0040_f000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != 0x0040_f730u32 {
+                    return;
+                }
+                let count = entry_hits.fetch_add(1, Ordering::Relaxed);
+                if count >= 24 && count % 1024 != 0 {
+                    return;
+                }
+                let thisx = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let nodes = (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32) & 0xffff;
+                let bank = (uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32) & 0xff;
+                let count180 = read_u32_or_invalid(uc, thisx.wrapping_add(0x180)) & 0xffff;
+                log::info!(
+                    "PROCMAPENGINE street-coord probe t={}ms vAddTLParams this={:#x} nodes={} this[0x180]={} bank={} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    thisx,
+                    nodes,
+                    count180,
+                    bank,
                     count
                 );
             })

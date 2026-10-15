@@ -87,21 +87,30 @@ varying vec4 v_keep;
 void main() {
     // Reconstructed from `shd_42100000v.bin`'s embedded symbol table
     // (a_VertexXY, a_v2DirVecs, a_VertexZ, a_color, u_flLineWidth,
-    // u_matModelView, u_m4ProjMatStreets): the street strip carries a
-    // centerline plus per-vertex direction vectors, extruded by the line
-    // width uniform, then pushed through model-view and the streets
-    // projection.  The four extra matrix uniforms mirror the engine's
-    // uniform-table layout: `vUpdateShaderUniforms` walks the location
-    // table from index 1 and BREAKS at the first -1, so names between
-    // index 1 and `u_m4ProjMatStreets` (index 6) must resolve or the
-    // streets projection upload (case 6) never happens.  They are kept
-    // alive through `v_keep`, clamped to +/-1e-38 - a visually zero
-    // delta the optimizer cannot fold away.
-    vec2 extruded = a_VertexXY + a_v2DirVecs * u_flLineWidth;
-    gl_Position = u_m4ProjMatStreets * (u_matModelView * vec4(extruded, a_VertexZ, 1.0));
+    // u_matModelView, u_m4ProjMatStreets).  r700 readback of the road VBO
+    // settles the operand roles: the section behind the `a_VertexXY` leg
+    // (offset 0) holds near-unit extrusion vectors (+-1) while the section
+    // behind the `a_v2DirVecs` leg (offset count*8) holds the block-local
+    // line positions (25..230) - the names are swapped relative to the
+    // r682 guess, and the extrusion length is already baked into the
+    // vectors, so a plain sum reproduces the thick line for every element
+    // family (families that only feed `a_VertexXY` see a zero constant in
+    // the other attrib).  `u_flLineWidth` must still resolve as a uniform
+    // for the engine's location table (slot +0x1c), so it stays alive via
+    // the same `clamp(+-1e-38)` sink NVIDIA cannot fold.  The streets
+    // projection is a right-handed perspective (`w = -z_mv`) while the
+    // engine's modelview carries the camera at +z and - with DTM off - the
+    // vertices at z=0, which would put every road behind the camera; the
+    // emulator has no terrain, so fold the modelview z to the negative
+    // half-space (a no-op for the families that already sit there).
+    vec2 extruded = a_VertexXY + a_v2DirVecs;
+    vec4 mvpos = u_matModelView * vec4(extruded, a_VertexZ, 1.0);
+    mvpos.z = -abs(mvpos.z);
+    gl_Position = u_m4ProjMatStreets * mvpos;
     v_color = a_color;
     v_keep = clamp(u_matViewProj[0] + u_m4MetersModelViewWOTransVec[0]
-        + u_matNormal[0] + u_m4ProjMat[0], -1e-38, 1e-38);
+        + u_matNormal[0] + u_m4ProjMat[0] + u_flLineWidth * 1e-38,
+        -1e-38, 1e-38);
 }
 ";
 const SYNTH_FRAG_SHADER: &str = "precision mediump float;
