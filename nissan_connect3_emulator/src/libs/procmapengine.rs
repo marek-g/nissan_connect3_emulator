@@ -9753,7 +9753,351 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashSet::new());
 }
 
+
+// r744: svc-trampoline observers replacing the two hot page-range hooks of
+// this module (0x409000 + 0x55a000 fired a host callback for EVERY executed
+// instruction inside the engine's hottest functions).  The functional site
+// logic moved below now runs from the intr-hook dispatcher via
+// `crate::os::code_stub::add_code_observer`: vFinishCombinedDrawing entry
+// (0x55adf0) and vDrawCombinedStreets entry (0x409250).  `base_address`
+// comes from the module-wide PROCMAP_RT_BASE set at registration.
+static PROCMAP_RT_BASE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static OBS_VPCS_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PROCMAP_OBS_CAVES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const OBS_CAVES_SIZE: u32 = 0x40;
+/// Set by `add_street_coord_buffer_probe_hooks` when both observer sites are
+/// relocatable; consumed by `install_pending_observers` (syscall-hook context).
+pub static OBS_INSTALL_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Patch the two deferred observer sites. Called from the syscall/intr-hook
+/// context (which never holds the MMU mutex) because the cave allocation takes
+/// it. Safe to call on every trap: it starts with a relaxed swap. Retries
+/// until the cave allocation succeeds.
+pub fn install_pending_observers(unicorn: &mut Unicorn<'_, Context>) {
+    if !OBS_INSTALL_PENDING.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let base_address = PROCMAP_RT_BASE.load(Ordering::Relaxed);
+    if base_address == 0 {
+        return;
+    }
+    let Some(caves) = ensure_observer_caves(unicorn) else {
+        OBS_INSTALL_PENDING.store(true, Ordering::Relaxed);
+        return;
+    };
+    crate::os::code_stub::add_code_observer(
+        unicorn,
+        "procmapengine",
+        base_address + (0x0055_adf0u32 - ORIGINAL_BASE),
+        "vFinishCombinedDrawing@observer",
+        caves,
+        vfin_entry_observer,
+    );
+    crate::os::code_stub::add_code_observer(
+        unicorn,
+        "procmapengine",
+        base_address + (0x0040_9250u32 - ORIGINAL_BASE),
+        "vDrawCombinedStreets@observer",
+        caves + 0x10,
+        vpcs_entry_observer,
+    );
+}
+
+fn ensure_observer_caves(unicorn: &mut Unicorn<'_, Context>) -> Option<u32> {
+    let current = PROCMAP_OBS_CAVES.load(Ordering::Relaxed);
+    if current != 0 {
+        return Some(current);
+    }
+    let mmu_arc = {
+        let data = unicorn.get_data();
+        data.mmu.clone()
+    };
+    let addr = mmu_arc.lock().unwrap().heap_alloc(
+        unicorn,
+        OBS_CAVES_SIZE,
+        Prot::READ | Prot::WRITE | Prot::EXEC,
+        "[procmap-observe-caves]",
+    );
+    if addr == 0 || unicorn.mem_write(addr as u64, &[0u8; OBS_CAVES_SIZE as usize]).is_err() {
+        log::warn!("PROCMAPENGINE: failed to allocate observer caves");
+        return None;
+    }
+    PROCMAP_OBS_CAVES.store(addr, Ordering::Relaxed);
+    log::info!("PROCMAPENGINE: observer caves at {addr:#x}");
+    Some(addr)
+}
+
+fn vfin_entry_observer(uc: &mut Unicorn<'_, Context>) -> u32 {
+    let base_address = PROCMAP_RT_BASE.load(Ordering::Relaxed);
+                // `vFinishCombinedDrawing` entry (r0 = street element,
+                // r1 = mode, r2 = MCP): arm the multi-draw arrays the very
+                // soon-as `vDrawCombinedStreets` requires (r703).
+                static VF_IN: AtomicU32 = AtomicU32::new(0);
+                let hits = VF_IN.fetch_add(1, Ordering::Relaxed);
+                if hits < 8 {
+                    log::info!(
+                        "PROCMAPENGINE street-coord probe t={}ms vFinishCombinedDrawing entry r0={:#x} r1={:#x} r2={:#x} r3={:#x} lr={:#x} n={}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0),
+                        uc.reg_read(RegisterARM::R1).unwrap_or(0),
+                        uc.reg_read(RegisterARM::R2).unwrap_or(0),
+                        uc.reg_read(RegisterARM::R3).unwrap_or(0),
+                        uc.reg_read(RegisterARM::LR)
+                            .unwrap_or(0)
+                            .wrapping_sub(u64::from(base_address))
+                            .wrapping_add(u64::from(ORIGINAL_BASE)) as u32,
+                        hits
+                    );
+                }
+                emulate_add_tl_params(uc, base_address);
+                // r722: `rl_tclOpenGLShader::vUpdateShaderUniforms` is
+                // called unconditionally by `vDraw` (0x55a064, this page)
+                // but re-uploads the program's uniform block - which
+                // includes `u_matModelView` from
+                // `rl_tclRenderLayer3D::m_aflMdlMatrix`, refreshed each
+                // pass by `vLoadModelViewMatrix` from the `poTransPos3D`
+                // vector - only when the view's
+                // `rl_tclTextureManager::ms_au32CurrentFrameNumber` entry
+                // (0x71adc0) changed.  The real unit bumps it once per
+                // rendered frame; the emulator never runs the frame loop,
+                // so the gate stayed shut since the first upload and every
+                // pass drew with a stale modelview.  Bump all view entries
+                // per finish-drawing pass so the engine re-uploads by
+                // itself.
+                let frame_addr = base_address.wrapping_add(0x0071_adecu32 - ORIGINAL_BASE);
+                for view in 0..4u32 {
+                    let addr = frame_addr.wrapping_add(view * 4);
+                    let value = read_u32_or_invalid(uc, addr);
+                    let _ = uc.mem_write(addr as u64, &value.wrapping_add(1).to_le_bytes());
+                }
+                // r723: this entry IS the street pass - `r0` is the DTM
+                // street element whose DAPI buffer (`this+0xc`) carries the
+                // map-centre translation (r713: dapi 0x1044248 -> (-4490.6,
+                // 0, -1253.3), matching the render layer's own pan
+                // t=(-4272, -952, +1250)).  Stamp `poTransPos3D` here, once
+                // per pass, exactly like the real unit's per-element
+                // `Street::Draw` write at 0x40fbf8: the per-bank stash from
+                // `emulate_add_tl_params` could not keep the street vector,
+                // because the (dead-simple) route/overlay elements arm
+                // through the same bank and stashed theirs last (r721/r722:
+                // every drawn pass still used (1200, 0, -3030)).
+                let vf_this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let vf_mcp = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let vf_bank = read_u8_or_invalid(uc, vf_mcp.wrapping_add(5));
+                let vf_dapi = read_u32_or_invalid(uc, vf_this.wrapping_add(0xc));
+                let vf_trans = vf_dapi.wrapping_add(0x8c + u32::from(vf_bank) * 12);
+                if vf_dapi >= 0x1000 && uc.mem_read(vf_trans as u64, &mut [0u8; 12]).is_ok() {
+                    // r724: `vFinishCombinedDrawing` runs for several
+                    // element families and each family's `Street::Draw`-
+                    // style stamp would overwrite the previous one (route
+                    // overlay (1219, 0, -3030) vs street centre (-4472, 0,
+                    // -1253)).  The pan stamp that centres the view is
+                    // `-block_centre * scale` and is by far the largest in
+                    // magnitude (real SD-backed data: 0x1044248 carries the
+                    // car's Krakow block), so keep the stamp with the
+                    // largest |x| and hand it to every drawn pass.
+                    let x_bits = read_u32_or_invalid(uc, vf_trans);
+                    let y_bits = read_u32_or_invalid(uc, vf_trans.wrapping_add(4));
+                    let z_bits = read_u32_or_invalid(uc, vf_trans.wrapping_add(8));
+                    let x = f32::from_bits(x_bits);
+                    let best_bits = VF_BEST_X.load(Ordering::Relaxed);
+                    if best_bits == u32::MAX
+                        || x.abs() > f32::from_bits(best_bits).abs()
+                    {
+                        let _ = VF_BEST_X
+                            .store(x.to_bits(), Ordering::Relaxed);
+                        VF_BEST_VEC.store(
+                            (u64::from(x_bits))
+                                | (u64::from(y_bits) << 32),
+                            Ordering::Relaxed,
+                        );
+                        VF_BEST_Z.store(z_bits, Ordering::Relaxed);
+                    }
+                    let pp_addr = base_address.wrapping_add(0x0073_c31cu32 - ORIGINAL_BASE);
+                    let stash_addr = {
+                        let arena = ensure_tl_arena(uc);
+                        arena + 0x1c00
+                    };
+                    let best_x = f32::from_bits(VF_BEST_X.load(Ordering::Relaxed));
+                    let best_xy = VF_BEST_VEC.load(Ordering::Relaxed);
+                    let best_z = VF_BEST_Z.load(Ordering::Relaxed);
+                    let bytes: [u8; 12] = [
+                        (best_xy & 0xff) as u8,
+                        ((best_xy >> 8) & 0xff) as u8,
+                        ((best_xy >> 16) & 0xff) as u8,
+                        ((best_xy >> 24) & 0xff) as u8,
+                        ((best_xy >> 32) & 0xff) as u8,
+                        ((best_xy >> 40) & 0xff) as u8,
+                        ((best_xy >> 48) & 0xff) as u8,
+                        ((best_xy >> 56) & 0xff) as u8,
+                        (best_z & 0xff) as u8,
+                        ((best_z >> 8) & 0xff) as u8,
+                        ((best_z >> 16) & 0xff) as u8,
+                        ((best_z >> 24) & 0xff) as u8,
+                    ];
+                    if uc.mem_write(stash_addr as u64, &bytes).is_ok()
+                        && uc.mem_write(pp_addr as u64, &stash_addr.to_le_bytes()).is_ok()
+                    {
+                        VF_VEC_OWNED.store(true, Ordering::Relaxed);
+                        static VF_LOGS: AtomicU32 = AtomicU32::new(0);
+                        if VF_LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+                            log::info!(
+                                "PROCMAPENGINE street-coord probe t={}ms poTransPos3D best=({:.1}, {:.1}, {:.1}) (this-pass {x:.1}, {:.1}, {:.1}) dapi {:#x} n={}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                best_x,
+                                f32::from_bits(((best_xy >> 32) & 0xffff_ffff) as u32),
+                                f32::from_bits(best_z),
+                                f32::from_bits(y_bits),
+                                f32::from_bits(z_bits),
+                                vf_dapi,
+                                VF_LOGS.load(Ordering::Relaxed)
+                            );
+                        }
+                    }
+                }
+    0
+}
+
+fn vpcs_entry_observer(uc: &mut Unicorn<'_, Context>) -> u32 {
+    let base_address = PROCMAP_RT_BASE.load(Ordering::Relaxed);
+                let pyd_addr = base_address.wrapping_add(0x0071_3d33u32 - ORIGINAL_BASE);
+                if read_u32_or_invalid(uc, pyd_addr) & 0xff != 0 {
+                    let _ = uc.mem_write(pyd_addr as u64, &[0u8; 1]);
+                }
+                // r709: an ARMED pass also executes `rl_tclRenderLayer3D::
+                // vLoadModelViewMatrix` (0x3b20d4 via 0x409598, reached once
+                // the slot's shader program handle is loaded) which
+                // dereferences `*0x73c31c` - the `poTransPos3D` pointer the
+                // real unit only fills for tilted/DTM views.  It stays NULL
+                // in the emulator, so since the first successful arming the
+                // render thread died with READ_UNMAPPED at 0x3b20dc inside
+                // it (r706-r708: `[69] Execution error: READ_UNMAPPED`,
+                // `thread exited with code 1`).  Point the pointer at a
+                // zeroed 3-float vector in the TL arena: the top-down view
+                // wants a neutral translation, and `vLoadModelViewMatrix`
+                // then just stores (0, 0, -0) into `m_aflMdlMatrix[2]`.
+                let pp_addr = base_address.wrapping_add(0x0073_c31cu32 - ORIGINAL_BASE);
+                let pos_ptr = read_u32_or_invalid(uc, pp_addr);
+                let mapped = pos_ptr >= 0x1000 && uc.mem_read(pos_ptr as u64, &mut [0u8; 12]).is_ok();
+                // r721: prefer the vector the arm of THIS pass' bank stashed
+                // in the TL arena (see `emulate_add_tl_params`): a shared
+                // global lets foreign tiles poison the composed modelview,
+                // the per-bank stash keeps each `vpcs` pass on its own
+                // element's genuine SD-backed translation.
+                let entry_mcp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let entry_bank = ((read_u32_or_invalid(uc, entry_mcp.wrapping_add(4)) >> 8) & 0xff) as u32;
+                let stashed = !VF_VEC_OWNED.load(Ordering::Relaxed)
+                    && entry_bank < 48
+                    && TL_VEC_VALID.load(Ordering::Relaxed) & (1u64 << entry_bank) != 0;
+                let arena = ensure_tl_arena(uc);
+                if stashed && arena != 0 {
+                    let stash = arena + 0x1800 + entry_bank * 12;
+                    let _ = uc.mem_write(pp_addr as u64, &stash.to_le_bytes());
+                    static STASH_LOGS: AtomicU32 = AtomicU32::new(0);
+                    if STASH_LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+                        let mut vec12 = [0u8; 12];
+                        let _ = uc.mem_read(stash as u64, &mut vec12);
+                        let x = f32::from_le_bytes([vec12[0], vec12[1], vec12[2], vec12[3]]);
+                        let y = f32::from_le_bytes([vec12[4], vec12[5], vec12[6], vec12[7]]);
+                        let z = f32::from_le_bytes([vec12[8], vec12[9], vec12[10], vec12[11]]);
+                        log::info!(
+                            "PROCMAPENGINE street-coord probe t={}ms poTransPos3D bank={} -> stash {:#x} ({x:.1}, {y:.1}, {z:.1}) n={}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            entry_bank,
+                            stash,
+                            STASH_LOGS.load(Ordering::Relaxed)
+                        );
+                    }
+                } else if !mapped && arena != 0 {
+                    let _ = uc
+                        .mem_write(pp_addr as u64, &(arena + 0x1000).to_le_bytes());
+                    static PT_LOGS: AtomicU32 = AtomicU32::new(0);
+                    if PT_LOGS.fetch_add(1, Ordering::Relaxed) < 4 {
+                        log::info!(
+                            "PROCMAPENGINE street-coord probe t={}ms poTransPos3D {:#x} -> arena {:#x} (neutral translation) n={}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            pos_ptr,
+                            arena + 0x1000,
+                            PT_LOGS.load(Ordering::Relaxed)
+                        );
+                    }
+                }
+                let count = OBS_VPCS_HITS.fetch_add(1, Ordering::Relaxed);
+                if count >= 40 && count % 2048 != 0 {
+                    return 0;
+                }
+                let mcp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let bank = (read_u32_or_invalid(uc, mcp.wrapping_add(4)) >> 8) & 0xff;
+                let pyd = 0;
+                let z0 = read_u32_or_invalid(
+                    uc,
+                    base_address.wrapping_add(0x0073_c2ccu32 - ORIGINAL_BASE),
+                );
+                let z1 = read_u32_or_invalid(
+                    uc,
+                    base_address.wrapping_add(0x0073_c2d0u32 - ORIGINAL_BASE),
+                );
+                // r700: `glMultiDrawArraysEXT` is issued only when
+                // `ms_au32PrimCount[bank] != 0` (0x73c1a4, filled by
+                // `vAddTLParams` at the END of the previous Street Draw).
+                let pc0 = read_u32_or_invalid(
+                    uc,
+                    base_address.wrapping_add(0x0073_c1a4u32 - ORIGINAL_BASE),
+                );
+                let pc1 = read_u32_or_invalid(
+                    uc,
+                    base_address.wrapping_add(0x0073_c1a8u32 - ORIGINAL_BASE),
+                );
+                let lr = uc
+                    .reg_read(RegisterARM::LR)
+                    .unwrap_or(0)
+                    .wrapping_sub(u64::from(base_address))
+                    .wrapping_add(u64::from(ORIGINAL_BASE)) as u32;
+                let first0 = read_u32_or_invalid(
+                    uc,
+                    base_address.wrapping_add(0x0073_c150u32 - ORIGINAL_BASE),
+                );
+                log::info!(
+                    "PROCMAPENGINE street-coord probe t={}ms vDrawCombinedStreets bank={} pyd_exists={} z_res=[{:#x},{:#x}] primcount=[{},{}] first0={:#x} lr={:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    bank,
+                    pyd,
+                    z0,
+                    z1,
+                    pc0,
+                    pc1,
+                    first0,
+                    lr,
+                    count
+                );
+    0
+}
+
 fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    // r744: install the functional sites as svc observers; the page-range
+    // hooks below then only run as fallback (if a site's first instruction
+    // was not relocatable) or for the EMU_PROCMAP_TRACE=1 legs.  Library
+    // registration runs with the MMU mutex held (Mmu::update_library_hooks),
+    // so caves cannot be allocated here: decide relocatability lock-free and
+    // defer the actual svc patching to `install_pending_observers`, driven
+    // from the syscall hook where the MMU mutex is free.
+    PROCMAP_RT_BASE.store(base_address, Ordering::Relaxed);
+    let (vfin_ok, vpcs_ok) = (
+        crate::os::code_stub::code_observer_site_relocatable(
+            unicorn,
+            base_address + (0x0055_adf0u32 - ORIGINAL_BASE),
+            "vFinishCombinedDrawing@observer",
+        ),
+        crate::os::code_stub::code_observer_site_relocatable(
+            unicorn,
+            base_address + (0x0040_9250u32 - ORIGINAL_BASE),
+            "vDrawCombinedStreets@observer",
+        ),
+    );
+    if vfin_ok && vpcs_ok {
+        OBS_INSTALL_PENDING.store(true, Ordering::Relaxed);
+    }
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
     let entry_hits = Arc::new(AtomicU32::new(0));
@@ -9762,6 +10106,7 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
     let skip_hits = Arc::new(AtomicU32::new(0));
     let page_lo = base_address + (0x0055_a000u32 - ORIGINAL_BASE);
     let page_hi = page_lo + 0xfff;
+    if render_trace_enabled() || !vfin_ok {
     unicorn
         .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
             let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
@@ -10052,9 +10397,11 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
             }
         })
         .unwrap();
+    }
 
     // r691: does `bProcessData` reach the per-node `bl vUpdateVBO` site at
     // 0x449118 (inside LAB_00449168, right after processThickLine)?
+    if render_trace_enabled() {
     {
         let call_hits = Arc::new(AtomicU32::new(0));
         let page_lo = base_address + (0x0044_9000u32 - ORIGINAL_BASE);
@@ -10086,10 +10433,12 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
             })
             .unwrap();
     }
+    }
 
     // r691: `uti_DTM_StreetCoord_Buffer::vUpdateVBO` entry - dumps the exact
     // gate values (`param_4 == 0`, `+0x30 != 0`, `+0x34 != 0`, `+0x118 != 0`)
     // that decide whether the `glBufferSubData` uploads run.
+    if render_trace_enabled() {
     {
         let entry_hits = Arc::new(AtomicU32::new(0));
         let page_lo = base_address + (0x0044_6000u32 - ORIGINAL_BASE);
@@ -10138,6 +10487,7 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
             })
             .unwrap();
     }
+    }
 
     // r694: `map_tclMapElm_Street::vDrawCombinedStreets` entry (0x409250).
     // The whole visible-road pipeline ends here: it draws the street banks
@@ -10148,6 +10498,7 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
     // projection (`w = -z_mv`, camera at z_mv = +1253) rejects entirely -
     // zero visible road pixels even with real geometry uploaded.  Log entry,
     // the flag and the z-resource array to see which half is missing.
+    if render_trace_enabled() || !vpcs_ok {
     {
         let entry_hits = Arc::new(AtomicU32::new(0));
         let page_lo = base_address + (0x0040_9000u32 - ORIGINAL_BASE);
@@ -10342,6 +10693,7 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
             })
             .unwrap();
     }
+    }
 
     // r701: `vAddTLParams` (0x40f730, called at the END of
     // `map_tclMapElm_Street::Draw`) is what fills `ms_apu32First`/
@@ -10349,6 +10701,7 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
     // `vDrawCombinedStreets`; `multi-draw` never fired and the entry probe
     // shows `primcount=[0,0]`, so either it never runs or its node-count
     // argument (`Draw` passes `this[0x180] - 1`, the TL node count) is empty.
+    if render_trace_enabled() {
     {
         let entry_hits = Arc::new(AtomicU32::new(0));
         let page_lo = base_address + (0x0040_f000u32 - ORIGINAL_BASE);
@@ -10380,11 +10733,13 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
             })
             .unwrap();
     }
+    }
 
     // r702: `map_tclMapElm_Street::Draw` (0x40fb18, __thiscall:
     // r1 = draw mode) only calls `vAddTLParams` when `mode - 0x36 < 0x20`
     // (the TL/3D street modes); `vAddTLParams` never runs, so sample the
     // mode values the element dispatch actually uses.
+    if render_trace_enabled() {
     {
         let mode_hits = Arc::new(AtomicU32::new(0));
         let page_lo = base_address + (0x0040_f000u32 - ORIGINAL_BASE);
@@ -10412,5 +10767,6 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                 );
             })
             .unwrap();
+    }
     }
 }

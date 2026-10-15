@@ -11,6 +11,12 @@ use crate::os::syscalls::{
 use unicorn_engine::{RegisterARM, Unicorn};
 
 pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
+    // Deferred code-observer patching: library registration decides observer
+    // sites while the MMU mutex is held, so the cave allocation + svc patching
+    // happens here instead (this context never holds that mutex). The call is
+    // a relaxed atomic swap in the common (nothing pending) case.
+    crate::libs::procmapengine::install_pending_observers(unicorn);
+
     // Guest C code expects ARM callee-saved registers to survive OSAL stubs and
     // Linux syscalls. Some host stub/syscall paths use R4-R10 as scratch space, so
     // preserve them unless the handler is rt_sigreturn, which intentionally restores
@@ -40,6 +46,13 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         let res = (stub.handler)(unicorn);
         crate::os::code_stub::set_current_stub_name("");
         restore_callee_saved_regs(unicorn, saved_callee_saved);
+        if let Some(cave) = stub.resume {
+            // Observer site: the handler only watched/patched state; resume
+            // in the cave that replays the `svc #0`-replaced instruction and
+            // branches back behind the site (R0 untouched, no LR return).
+            unicorn.reg_write(RegisterARM::PC, cave as u64).unwrap();
+            return;
+        }
         log::trace!(
             "{:#x}: [{}] [{} HOOK] {}() => {}",
             pc,
