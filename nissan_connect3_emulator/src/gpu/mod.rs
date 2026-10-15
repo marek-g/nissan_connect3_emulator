@@ -71,27 +71,34 @@ struct GpuCommand {
 /// into program-slot offsets +0xec/+0xf0).  r659: street elements draw with
 /// an empty slot 0x19 (`shd_42100000.glsl` is a `[BinaryShader]` manifest
 /// only), binding 526 VBOs but reaching no `glDraw*`.
-const SYNTH_VERT_SHADER: &str = "attribute vec4 a_position;
+const SYNTH_VERT_SHADER: &str = "attribute vec2 a_VertexXY;
 attribute vec4 a_color;
+attribute vec2 a_v2DirVecs;
+attribute float a_VertexZ;
 uniform mat4 u_matViewProj;
 uniform mat4 u_matModelView;
 uniform mat4 u_m4MetersModelViewWOTransVec;
 uniform mat4 u_matNormal;
 uniform mat4 u_m4ProjMat;
 uniform mat4 u_m4ProjMatStreets;
+uniform float u_flLineWidth;
 varying vec4 v_color;
 varying vec4 v_keep;
 void main() {
-    // Mirror the engine's own upload contract.  The per-frame uniform loop
-    // in `vUpdateShaderUniforms` walks the program's location table from
-    // index 1 and BREAKS at the first -1, so every matrix name up to
-    // `u_m4ProjMatStreets` (index 6) must resolve to a real location or the
-    // streets projection (case 6, rl_tclRenderLayer3D::m_aflStreetProjMatrix,
-    // diag(65536/w, 65536/h): TS units -> NDC) is never uploaded.  All seven
-    // matrices are therefore genuinely consumed: the four observers feed
-    // `v_keep`, which the fragment shader adds after clamping to +/-1e-38
-    // (a visually zero delta the optimizer cannot fold away).
-    gl_Position = u_m4ProjMatStreets * (u_matModelView * a_position);
+    // Reconstructed from `shd_42100000v.bin`'s embedded symbol table
+    // (a_VertexXY, a_v2DirVecs, a_VertexZ, a_color, u_flLineWidth,
+    // u_matModelView, u_m4ProjMatStreets): the street strip carries a
+    // centerline plus per-vertex direction vectors, extruded by the line
+    // width uniform, then pushed through model-view and the streets
+    // projection.  The four extra matrix uniforms mirror the engine's
+    // uniform-table layout: `vUpdateShaderUniforms` walks the location
+    // table from index 1 and BREAKS at the first -1, so names between
+    // index 1 and `u_m4ProjMatStreets` (index 6) must resolve or the
+    // streets projection upload (case 6) never happens.  They are kept
+    // alive through `v_keep`, clamped to +/-1e-38 - a visually zero
+    // delta the optimizer cannot fold away.
+    vec2 extruded = a_VertexXY + a_v2DirVecs * u_flLineWidth;
+    gl_Position = u_m4ProjMatStreets * (u_matModelView * vec4(extruded, a_VertexZ, 1.0));
     v_color = a_color;
     v_keep = clamp(u_matViewProj[0] + u_m4MetersModelViewWOTransVec[0]
         + u_matNormal[0] + u_m4ProjMat[0], -1e-38, 1e-38);
@@ -3009,6 +3016,63 @@ fn route_active_uniform(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     active_query(unicorn, false)
 }
 
+/// Per-draw uniform refresh for the synthesized road program.  The engine
+/// runs `vUpdateShaderUniforms` only once per program switch, so its one-shot
+/// uploads froze a stale matrix: r679 captured the 3D-perspective
+/// `m_aflStreetProjMatrix` the view code left behind before the map view ever
+/// sized itself.  Read the engine-computed values back from their globals
+/// (Ghidra VAs equal the runtime VAs for procmapengine) right before the
+/// draw and hand them to the program only when it declares the uniform.
+fn refresh_map_engine_uniforms(unicorn: &mut Unicorn<'_, Context>) {
+    const STREET_PROJ: u32 = 0x71_acd0; // rl_tclRenderLayer3D::m_aflStreetProjMatrix
+    const LINE_WIDTH: u32 = 0x71_b448;  // rl_tclRenderLayer3D::ms_flLineWidthPerPixel
+    let mut raw = [0u8; 64];
+    if unicorn.mem_read(STREET_PROJ as u64, &mut raw).is_err() {
+        return;
+    }
+    let mut matrix = [0f32; 16];
+    for (slot, bytes) in matrix.iter_mut().zip(raw.chunks_exact(4)) {
+        *slot = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    }
+    if matrix.iter().all(|value| *value == 0.0) {
+        // `vCalculateMapScale` memsets before filling: all-zero means the
+        // projection has not been computed yet, uploading it would only
+        // collapse the strip to the origin.
+        return;
+    }
+    let width = f32::from_bits(read_u32(unicorn, LINE_WIDTH));
+    let _ = gpu_void_clear(move || unsafe {
+        let mut program = 0i32;
+        gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut program);
+        if program <= 0 {
+            return;
+        }
+        let proj_name = std::ffi::CString::new("u_m4ProjMatStreets").unwrap();
+        let loc = gl::GetUniformLocation(program as u32, proj_name.as_ptr());
+        if loc >= 0 {
+            gl::UniformMatrix4fv(loc, 1, gl::FALSE, matrix.as_ptr());
+        }
+        let width_name = std::ffi::CString::new("u_flLineWidth").unwrap();
+        let loc = gl::GetUniformLocation(program as u32, width_name.as_ptr());
+        if loc >= 0 {
+            gl::Uniform1f(loc, width);
+        }
+        static UNIFORM_REFRESH_LOGS: AtomicU32 = AtomicU32::new(0);
+        if UNIFORM_REFRESH_LOGS.fetch_add(1, Ordering::Relaxed) < 4 {
+            log::info!(
+                "GPU: map engine uniform refresh proj[0]={:.5} proj[5]={:.5} t[{:.0},{:.0},{:.0}] width={:.5}",
+                matrix[0],
+                matrix[5],
+                matrix[12],
+                matrix[13],
+                matrix[14],
+                width
+            );
+        }
+        drain_host_gl_errors();
+    });
+}
+
 /// Re-read every registered map-target client array right before an engine
 /// draw and re-upload the backing VBO when its guest content changed.
 /// GL client-array semantics read the array at DRAW time; the engine fills
@@ -3663,6 +3727,7 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
                 count
             };
             let drew = if current_gpu_target() == GpuTarget::Map {
+                refresh_map_engine_uniforms(unicorn);
                 // Keep any host GL error the road draw produces: the draw is
                 // the first thing in the emulator that exercises client-array
                 // sourced GL_SHORT attributes, and a silently rejected draw
