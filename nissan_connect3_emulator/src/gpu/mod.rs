@@ -112,6 +112,12 @@ void main() {
 }
 ";
 
+/// Guest arenas backing `glMapBufferOES` (target -> (address, capacity, last
+/// requested size)); shared by the map and unmap arms of `gl_api`.
+static MAP_BUFFER_ARENAS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<u32, (u32, usize, usize)>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
 const GL_VERTEX_SHADER_TYPE: u32 = 0x8b31;
 
 /// `glCreateShader` type per shader object, so `glShaderBinary` can tell
@@ -2130,7 +2136,32 @@ pub fn egl_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> u32 {
             };
             return alloc_write_guest_cstr(unicorn, value);
         }
-        "eglGetProcAddress" => return 1,
+        "eglGetProcAddress" => {
+            // Bosch GL wrappers (e.g. procmapengine's `glMapBufferOES`) resolve
+            // OES extension entries through `eglGetProcAddress` and call the
+            // returned pointer directly.  Hand out the address of our own
+            // code stub registered for that name (libGLESv2 table), so the
+            // indirect call traps back into `gl_api` like any import.
+            let name_ptr = ureg(unicorn, RegisterARM::R1);
+            let name = read_guest_cstr(unicorn, name_ptr, 64);
+            let address = unicorn
+                .get_data()
+                .code_stubs
+                .lock()
+                .ok()
+                .and_then(|stubs| {
+                    stubs
+                        .iter()
+                        .find(|(_, stub)| stub.name == name)
+                        .map(|(address, _)| *address)
+                })
+                .unwrap_or(1);
+            static PROC_LOGS: AtomicU32 = AtomicU32::new(0);
+            if PROC_LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+                log::info!("GPU: eglGetProcAddress({name:?}) -> {address:#x}");
+            }
+            return address;
+        }
         "eglChooseConfig" => {
             let configs = ureg(unicorn, RegisterARM::R2);
             let config_size = ureg(unicorn, RegisterARM::R3);
@@ -4364,6 +4395,82 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
             };
             gpu_buffer_data(target, size, data);
             return Some(0);
+        }
+        "glMapBufferOES" => {
+            // The engine's dynamic-geometry path (r684): it reserves VBOs with
+            // `glBufferData(size, NULL)`, then fills them through
+            // `glMapBufferOES`/CPU writes/`glUnmapBufferOES` (its wrapper calls
+            // the pointer returned by `eglGetProcAddress`).  Hand out a
+            // reusable guest arena; the unmap uploads it into the VBO bound to
+            // the target, which is what the real driver's unmapping does.
+            let target = ureg(unicorn, RegisterARM::R0);
+            let size = (ureg(unicorn, RegisterARM::R1) as usize).min(MAX_TEXTURE_BYTES).max(16);
+            let mut arenas = match MAP_BUFFER_ARENAS.lock() {
+                Ok(arenas) => arenas,
+                Err(_) => return Some(0),
+            };
+            let (address, capacity, pending) = arenas.entry(target).or_insert((0, 0, 0));
+            if *capacity < size {
+                *address = alloc_guest_bytes(unicorn, size);
+                *capacity = if *address == 0 { 0 } else { size };
+            }
+            *pending = size;
+            static MAP_LOGS: AtomicU32 = AtomicU32::new(0);
+            if MAP_LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+                log::info!(
+                    "GPU: map MapBufferOES target={target:#x} size={size:#x} -> guest {:#x}",
+                    *address
+                );
+            }
+            let address = *address;
+            drop(arenas);
+            return Some(address);
+        }
+        "glUnmapBufferOES" => {
+            let target = ureg(unicorn, RegisterARM::R0);
+            let (address, size) = MAP_BUFFER_ARENAS
+                .lock()
+                .ok()
+                .and_then(|mut arenas| arenas.get_mut(&target).map(|e| (e.0, e.2)))
+                .unwrap_or((0, 0));
+            if address == 0 || size == 0 {
+                return Some(1);
+            }
+            let mut data = vec![0u8; size];
+            if unicorn.mem_read(address as u64, &mut data).is_err() {
+                return Some(1);
+            }
+            let (binding_pname, binding_enum) = if target == 0x8893 {
+                (gl::ELEMENT_ARRAY_BUFFER_BINDING, gl::ELEMENT_ARRAY_BUFFER)
+            } else {
+                (gl::ARRAY_BUFFER_BINDING, gl::ARRAY_BUFFER)
+            };
+            let head: Vec<f32> = data
+                .chunks_exact(4)
+                .take(4)
+                .map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .collect();
+            let _ = gpu_void_clear(move || unsafe {
+                let mut bound = 0i32;
+                gl::GetIntegerv(binding_pname, &mut bound);
+                if bound > 0 {
+                    gl::BindBuffer(binding_enum, bound as u32);
+                    gl::BufferData(
+                        binding_enum,
+                        data.len() as isize,
+                        data.as_ptr() as *const _,
+                        gl::DYNAMIC_DRAW,
+                    );
+                }
+                drain_host_gl_errors();
+            });
+            static UNMAP_LOGS: AtomicU32 = AtomicU32::new(0);
+            if UNMAP_LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+                log::info!(
+                    "GPU: map UnmapBufferOES target={target:#x} size={size:#x} head={head:?}",
+                );
+            }
+            return Some(1);
         }
         "glBufferSubData" => {
             let target = ureg(unicorn, RegisterARM::R0);

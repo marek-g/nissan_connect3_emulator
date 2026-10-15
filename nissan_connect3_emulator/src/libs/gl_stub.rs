@@ -105,6 +105,15 @@ pub fn libgles2_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address:
         (0x0003dbf0, "glEnableVertexAttribArray"),
         (0x0001c894, "glFinish"),
         (0x0001c7f4, "glFlush"),
+        // Dynamic-extension entries: procmapengine resolves `glMapBufferOES`
+        // and `glUnmapBufferOES` through `eglGetProcAddress` (its own wrappers
+        // at 0x552e8c/0x552e44 call through the returned pointer), so these
+        // names are not in its import table but MUST still resolve.  The
+        // offsets below are unused library bytes (just past the last stub);
+        // `add_code_stub` patches a `svc #0` there and `eglGetProcAddress`
+        // hands out the patched address by name.
+        (0x0003dc88, "glMapBufferOES"),
+        (0x0003dc8c, "glUnmapBufferOES"),
         (0x00014e30, "glFramebufferRenderbuffer"),
         (0x000152d8, "glFramebufferTexture2D"),
         (0x000266c0, "glFrontFace"),
