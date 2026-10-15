@@ -9344,6 +9344,35 @@ fn emulate_add_tl_params(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
         return;
     }
     let bank = read_u8_or_invalid(unicorn, mcp.wrapping_add(5));
+    // r713: the real `Street::Draw` (0x40fbf8) stamps `poTransPos3D`
+    // (0x73c31c) with the element's tile translation, `dapi + 0x8c +
+    // bank*12` inside its DAPI buffer (`this+0xc`).  That code never
+    // runs here (only DTMStreet::Draw does, and it leaves the global
+    // alone), so the combined pass' `vLoadModelViewMatrix` stored our
+    // r709 zero vector: `t=(0,0,0)` and every stroke pinned to the top
+    // right clip border (r712).  Mirror the real write so the genuine
+    // SD-backed pan flows into the composed modelview; the r709 arena
+    // fallback in the `vpcs` entry probe still covers elements whose
+    // dapi buffer lacks a mapped vector.
+    let dapi = read_u32_or_invalid(unicorn, thisx.wrapping_add(0xc));
+    let trans = dapi.wrapping_add(0x8c + u32::from(bank) * 12);
+    if dapi >= 0x1000 && unicorn.mem_read(trans as u64, &mut [0u8; 12]).is_ok() {
+        let pp_addr = base_address.wrapping_add(0x0073_c31cu32 - ORIGINAL_BASE);
+        let _ = unicorn.mem_write(pp_addr as u64, &trans.to_le_bytes());
+        static TRANS_LOGS: AtomicU32 = AtomicU32::new(0);
+        if TRANS_LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+            let x = f32::from_bits(read_u32_or_invalid(unicorn, trans));
+            let y = f32::from_bits(read_u32_or_invalid(unicorn, trans.wrapping_add(4)));
+            let z = f32::from_bits(read_u32_or_invalid(unicorn, trans.wrapping_add(8)));
+            log::info!(
+                "PROCMAPENGINE street-coord probe t={}ms poTransPos3D := dapi {:#x}+{:#x} -> ({x:.1}, {y:.1}, {z:.1}) n={}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                dapi,
+                0x8c + u32::from(bank) * 12,
+                TRANS_LOGS.load(Ordering::Relaxed)
+            );
+        }
+    }
     let inout = read_u8_or_invalid(
         unicorn,
         base_address.wrapping_add(MS_IN_OUT_INDEX - ORIGINAL_BASE),
