@@ -9306,19 +9306,43 @@ fn emulate_add_tl_params(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     if thisx < 0x1000 || mcp < 0x1000 {
         return;
     }
-    let settings = read_u32_or_invalid(unicorn, thisx.wrapping_add(0x17c));
-    if settings < 0x1000 {
+    // The plain `map_tclMapElm_Street` keeps its line config at `+0x17c`
+    // (holding the scb at `+0x40`, the config offset at `+0x44` and the
+    // color-array index at `+0x46`).  `map_tclMapElm_DTMStreet` (all elements
+    // seen in the emulator) instead stores the scb directly at `+0x40`
+    // (proven by the `vPrepareStreetCoordBuffer` probe), so fall back to that
+    // with the neutral slot 0 the `vDrawCombinedStreets` 0..9 loop reads.
+    let settings_raw = read_u32_or_invalid(unicorn, thisx.wrapping_add(0x17c));
+    let direct_scb = read_u32_or_invalid(unicorn, thisx.wrapping_add(0x40));
+    let (scb, slot, cfg_offset, node) = if settings_raw >= 0x1000 {
+        (
+            read_u32_or_invalid(unicorn, settings_raw.wrapping_add(0x40)),
+            read_u8_or_invalid(unicorn, settings_raw.wrapping_add(0x46)),
+            read_u16_or_invalid(unicorn, settings_raw.wrapping_add(0x44)) as u16,
+            read_u16_or_invalid(unicorn, thisx.wrapping_add(0x180)).wrapping_sub(1),
+        )
+    } else {
+        (direct_scb, 0u32, 0u16, 0u32)
+    };
+    static GATE_LOGS: AtomicU32 = AtomicU32::new(0);
+    if GATE_LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
+        log::info!(
+            "PROCMAPENGINE street-coord probe t={}ms vAddTLParams-emu gate mode={:#x} this={:#x} mcp={:#x} settings={:#x} scb_direct={:#x} scb={:#x} slot={} node={} n={}",
+            crate::libs::dapi::emu_t0_elapsed_ms(),
+            mode,
+            thisx,
+            mcp,
+            settings_raw,
+            direct_scb,
+            scb,
+            slot,
+            node,
+            GATE_LOGS.load(Ordering::Relaxed)
+        );
+    }
+    if scb < 0x1000 || slot >= 10 {
         return;
     }
-    let scb = read_u32_or_invalid(unicorn, settings.wrapping_add(0x40));
-    if scb < 0x1000 {
-        return;
-    }
-    let slot = read_u8_or_invalid(unicorn, settings.wrapping_add(0x46));
-    if slot >= 10 {
-        return;
-    }
-    let node = read_u16_or_invalid(unicorn, thisx.wrapping_add(0x180)).wrapping_sub(1);
     let bank = read_u8_or_invalid(unicorn, mcp.wrapping_add(5));
     let inout = read_u8_or_invalid(
         unicorn,
@@ -9367,7 +9391,6 @@ fn emulate_add_tl_params(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     // `vAddTLParams` running once per element draw).
     let vbo_res = read_u32_or_invalid(unicorn, scb.wrapping_add(0x118));
     write_u32(unicorn, global(MS_APO_VBO_RESOURCE), vbo_res);
-    let cfg_offset = read_u16_or_invalid(unicorn, settings.wrapping_add(0x44)) as u16;
     write_u16(
         unicorn,
         base_address
