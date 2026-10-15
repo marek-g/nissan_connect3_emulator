@@ -9356,7 +9356,21 @@ fn emulate_add_tl_params(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     // dapi buffer lacks a mapped vector.
     let dapi = read_u32_or_invalid(unicorn, thisx.wrapping_add(0xc));
     let trans = dapi.wrapping_add(0x8c + u32::from(bank) * 12);
-    if dapi >= 0x1000 && unicorn.mem_read(trans as u64, &mut [0u8; 12]).is_ok() {
+    // r719: only the pass that actually draws may own the global.  The
+    // modelview is composed once per `vpcs` pass from this one vector, so
+    // arming a foreign (non-street) element right before the pass poisoned
+    // it with that tile's vector (r718: (1200, 0, -3030) from dapi
+    // 0xea4378 stamped last, strokes pinned to the right edge, while the
+    // street element's own vector (-4490, 0, -1253) - which matches the
+    // render layer's own t=(-4272, -952, +1250) - sat unused).  Gate the
+    // stamp on the element being the current DTM street coord buffer's.
+    let curr_scb = read_u32_or_invalid(
+        unicorn,
+        base_address
+            .wrapping_add(MS_CURR_SCB - ORIGINAL_BASE)
+            .wrapping_add(u32::from(bank) * 4),
+    );
+    if dapi >= 0x1000 && scb == curr_scb && unicorn.mem_read(trans as u64, &mut [0u8; 12]).is_ok() {
         let pp_addr = base_address.wrapping_add(0x0073_c31cu32 - ORIGINAL_BASE);
         let _ = unicorn.mem_write(pp_addr as u64, &trans.to_le_bytes());
         static TRANS_LOGS: AtomicU32 = AtomicU32::new(0);
@@ -9365,10 +9379,11 @@ fn emulate_add_tl_params(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
             let y = f32::from_bits(read_u32_or_invalid(unicorn, trans.wrapping_add(4)));
             let z = f32::from_bits(read_u32_or_invalid(unicorn, trans.wrapping_add(8)));
             log::info!(
-                "PROCMAPENGINE street-coord probe t={}ms poTransPos3D := dapi {:#x}+{:#x} -> ({x:.1}, {y:.1}, {z:.1}) n={}",
+                "PROCMAPENGINE street-coord probe t={}ms poTransPos3D := dapi {:#x}+{:#x} -> ({x:.1}, {y:.1}, {z:.1}) scb={:#x} n={}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
                 dapi,
                 0x8c + u32::from(bank) * 12,
+                scb,
                 TRANS_LOGS.load(Ordering::Relaxed)
             );
         }
