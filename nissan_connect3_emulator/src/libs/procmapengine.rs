@@ -9416,6 +9416,12 @@ fn initialize_map_data_medium(unicorn: &mut Unicorn<'_, Context>, base_address: 
 /// its time-slice/DPM gate skips it, or the DAPI container comes back NULL.
 /// All four watch points live inside page 0x55a000 (a page-range hook, per
 /// the narrow-hook false-negative rule).
+thread_local! {
+    /// scb objects whose `+0x28..0x3c` window is already under a write-watch.
+    static WATCHED_SCBS: std::cell::RefCell<std::collections::HashSet<u32>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
 fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
@@ -9456,6 +9462,48 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     dir_res,
                     count
                 );
+                // r690: pos_src/dir_src (scb+0x30/0x34) are NULL in every
+                // observed run, so `vUpdateVBO`'s gate never opens and the
+                // road VBOs stay zero-filled.  Watch who (if anybody) writes
+                // those fields: register a write-watch for the first few
+                // distinct scb objects and log writer PCs.
+                let watched = WATCHED_SCBS.with(|set| {
+                    let mut set = set.borrow_mut();
+                    if set.len() >= 6 || !set.insert(scb) {
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if watched && scb > 0x1000 {
+                    let watch_count = Arc::new(AtomicU32::new(0));
+                    let res = uc.add_mem_hook(
+                        unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                        u64::from(scb) + 0x28,
+                        u64::from(scb) + 0x3c,
+                        move |writer: &mut Unicorn<'_, Context>, _kind, address, size, value| {
+                            if watch_count.fetch_add(1, Ordering::Relaxed) >= 40 {
+                                return true;
+                            }
+                            let pc = writer.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                            log::info!(
+                                "PROCMAPENGINE street-coord watch t={}ms WRITE scb+{:#x}={:#x} size={} pc={:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                address.wrapping_sub(u64::from(scb)),
+                                value,
+                                size,
+                                pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE)
+                            );
+                            true
+                        },
+                    );
+                    log::info!(
+                        "PROCMAPENGINE street-coord watch install scb={:#x} ok={}",
+                        scb,
+                        res.is_ok()
+                    );
+                    std::mem::forget(res);
+                }
             } else if original == 0x0055_af54u32 {
                 // `bl uti_DTM_StreetCoord_Buffer::bProcessData`: the upload
                 // path IS reached (container was non-NULL).
