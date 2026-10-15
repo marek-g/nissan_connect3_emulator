@@ -1281,6 +1281,8 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         })
         .unwrap();
 
+    add_street_coord_buffer_probe_hooks(unicorn, base_address);
+
     add_natural_map_engine_start_hooks(unicorn, base_address);
 
     let handler_hook_addr = base_address + PORTCONTROL_HANDLER_RESULT;
@@ -9402,4 +9404,99 @@ fn initialize_map_data_medium(unicorn: &mut Unicorn<'_, Context>, base_address: 
     }
 
     ok
+}
+/// r689: watch the street geometry upload chain.  Static analysis (design.md)
+/// shows `map_tclMapElm_DTMStreet::vPrepareStreetCoordBuffer` (0x55ae60) is
+/// the ONLY path that fills the road resource VBOs: it pulls the DTM coord
+/// container from the DAPI object (`this+0xc` vtable+0xdc) and hands it to
+/// `uti_DTM_StreetCoord_Buffer::bProcessData` (0x448e38), which calls
+/// `vUpdateVBO` -> `rl_tclTextureManager::u32UpdateVBO` -> `glBufferSubData`
+/// for the pos (`buffer+0x30`) and dir (`buffer+0x34`) arrays.  Every run so
+/// far logged zero `glBufferSubData`, so either the prepare pass never runs,
+/// its time-slice/DPM gate skips it, or the DAPI container comes back NULL.
+/// All four watch points live inside page 0x55a000 (a page-range hook, per
+/// the narrow-hook false-negative rule).
+fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU32;
+    let entry_hits = Arc::new(AtomicU32::new(0));
+    let process_calls = Arc::new(AtomicU32::new(0));
+    let process_results = Arc::new(AtomicU32::new(0));
+    let skip_hits = Arc::new(AtomicU32::new(0));
+    let page_lo = base_address + (0x0055_a000u32 - ORIGINAL_BASE);
+    let page_hi = page_lo + 0xfff;
+    unicorn
+        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+            let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+            if original == 0x0055_ae60u32 {
+                // vPrepareStreetCoordBuffer entry: r0=this, r1=MCP.
+                let count = entry_hits.fetch_add(1, Ordering::Relaxed);
+                if count >= 24 {
+                    return;
+                }
+                let thisx = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let mcp = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let dapi = read_u32_or_invalid(uc, thisx.wrapping_add(0xc));
+                let scb = read_u32_or_invalid(uc, thisx.wrapping_add(0x40));
+                let pos_src = read_u32_or_invalid(uc, scb.wrapping_add(0x30));
+                let dir_src = read_u32_or_invalid(uc, scb.wrapping_add(0x34));
+                let dir_res = read_u32_or_invalid(uc, scb.wrapping_add(0x118));
+                let bank = (read_u32_or_invalid(uc, mcp.wrapping_add(4)) >> 8) & 0xff;
+                log::info!(
+                    "PROCMAPENGINE street-coord probe t={}ms thread=[{}] enter bank={} this={:#x} dapi={:#x} scb={:#x} pos_src={:#x} dir_src={:#x} dir_res={:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    bank,
+                    thisx,
+                    dapi,
+                    scb,
+                    pos_src,
+                    dir_src,
+                    dir_res,
+                    count
+                );
+            } else if original == 0x0055_af54u32 {
+                // `bl uti_DTM_StreetCoord_Buffer::bProcessData`: the upload
+                // path IS reached (container was non-NULL).
+                let count = process_calls.fetch_add(1, Ordering::Relaxed);
+                if count >= 16 {
+                    return;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE street-coord probe t={}ms bProcessData scb={:#x} container={:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    r0,
+                    r2,
+                    count
+                );
+            } else if original == 0x0055_af58u32 {
+                // right after that `bl`: r0 = bProcessData return.
+                let count = process_results.fetch_add(1, Ordering::Relaxed);
+                if count >= 16 {
+                    return;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCMAPENGINE street-coord probe t={}ms bProcessData returned {:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    r0,
+                    count
+                );
+            } else if original == 0x0055_af9cu32 {
+                // LAB_0055af9c: the time-slice / DPM / NULL-container skip leg.
+                let count = skip_hits.fetch_add(1, Ordering::Relaxed);
+                if count >= 8 {
+                    return;
+                }
+                log::info!(
+                    "PROCMAPENGINE street-coord probe t={}ms skipped (timeslice/dpm/null) n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    count
+                );
+            }
+        })
+        .unwrap();
 }
