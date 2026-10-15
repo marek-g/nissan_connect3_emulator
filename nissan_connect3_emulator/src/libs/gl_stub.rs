@@ -114,6 +114,12 @@ pub fn libgles2_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address:
         // hands out the patched address by name.
         (0x0003dc88, "glMapBufferOES"),
         (0x0003dc8c, "glUnmapBufferOES"),
+        // Same eglGetProcAddress idiom in `vDrawCombinedStreets`: its wrapper
+        // calls the returned pointer whenever it is non-NULL, so this name
+        // MUST resolve to a real callable stub (the wrapper's NULL fallback -
+        // a glDrawArrays loop - is never taken once eglGetProcAddress answers
+        // with anything).
+        (0x0003dc90, "glMultiDrawArraysEXT"),
         (0x00014e30, "glFramebufferRenderbuffer"),
         (0x000152d8, "glFramebufferTexture2D"),
         (0x000266c0, "glFrontFace"),
