@@ -42,3 +42,23 @@ registry/trace IO answers, not a global crash. Suspect: the `0x5036e` (IO contro
 semantics differ from the device when the target device is absent, sending the pump into a
 retry loop. Reproduce: `run_r326.log` (all-alive but starved) vs `run_r345.log` (good).
 Fixing this collapses the good-run lottery and stabilizes regression testing.
+
+## Boot-rate lottery: DAPI cryptnav open loop stretches ~12x under host GPU load
+
+* r711/r711b/r711c (and earlier r704) reached 340-470 s of wall time without
+  ever emitting `MOUpd copy-active`: the same ~71-78 `DAPI filemgmt open`
+  cryptnav-probe iterations that complete in ~150 s in lucky runs (r705-710)
+  spread over ~440 s, ~27-35 s between successive open pairs, so the map
+  object update (and every downstream street probe) misses the run window.
+* Correlation: `nvidia-smi` showed 57 % GPU utilization by a co-tenant
+  (`gb10_inference`) during the failing runs; GB10's iGPU is shared with the
+  emulator's host GL, and the DAPI worker iterations block on guest GL calls
+  that queue behind the co-tenant.  Nothing in the r709-r711 diffs touches
+  the boot path (`eglgp`/`stubmd`/synth-shader lines are all simply never
+  reached).
+* Mitigations used: longer run windows (470 s), run retries.  Candidate real
+  fixes: make `gpu_void_clear` round-trips cheap (avoid a host round-trip per
+  trivial GL call from DAPI's worker threads - batch or answer lock-step for
+  calls whose result needs no backend state), or detect the DAPI-side
+  stall and re-prioritize; tracked here so a failing run gets retried
+  before being read as a regression.
