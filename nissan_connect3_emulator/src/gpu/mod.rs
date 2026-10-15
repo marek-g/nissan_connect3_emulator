@@ -175,6 +175,12 @@ pub fn set_map_layer_window(enabled: bool, x: u32, y: u32, w: u32, h: u32) {
 static VAP_SCRATCH: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static VAP_CACHE: std::sync::LazyLock<Mutex<std::collections::HashMap<u32, (u32, u64)>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+/// Map-target client-array registrations: attrib index -> (guest pointer,
+/// copied length, last-copied content hash, backing VBO).  Consulted by
+/// `refresh_map_client_arrays` right before every engine `glDrawArrays`.
+static VAP_ATTRIB_REGS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<u32, (u32, usize, u64, u32)>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 static MAP_SURFACE_GUEST_BASES: OnceLock<Mutex<HashMap<u32, u32>>> = OnceLock::new();
 
 static GPU_SENDER: OnceLock<mpsc::Sender<GpuCommand>> = OnceLock::new();
@@ -2775,7 +2781,7 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
             let mut size = 0i32;
             let mut kind = 0u32;
             gl::GetActiveUniform(
-                program,
+                program as u32,
                 index as u32,
                 name.len() as i32,
                 &mut length,
@@ -2788,7 +2794,7 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
             )
             .into_owned();
             let c_name = std::ffi::CString::new(name.clone()).unwrap_or_default();
-            let loc = gl::GetUniformLocation(program, c_name.as_ptr());
+            let loc = gl::GetUniformLocation(program as u32, c_name.as_ptr());
             if loc < 0 {
                 continue;
             }
@@ -2882,6 +2888,85 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
 
 fn route_active_uniform(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     active_query(unicorn, false)
+}
+
+/// Re-read every registered map-target client array right before an engine
+/// draw and re-upload the backing VBO when its guest content changed.
+/// GL client-array semantics read the array at DRAW time; the engine fills
+/// its vertex staging after `glVertexAttribPointer`, so the snapshot taken
+/// in the VAP wrapper is stale (r667: every road strip arrived as zeros).
+fn refresh_map_client_arrays(unicorn: &mut Unicorn<'_, Context>) {
+    let regs: Vec<(u32, u32, usize, u64, u32)> = match VAP_ATTRIB_REGS.lock() {
+        Ok(regs) => regs
+            .iter()
+            .map(|(index, (pointer, len, hash, vbo))| (*index, *pointer, *len, *hash, *vbo))
+            .collect(),
+        Err(_) => return,
+    };
+    let mut scratch = match VAP_SCRATCH.lock() {
+        Ok(scratch) => scratch,
+        Err(_) => return,
+    };
+    for (index, pointer, len, old_hash, vbo) in regs {
+        if len == 0 {
+            continue;
+        }
+        if scratch.len() < len {
+            scratch.resize(len, 0);
+        }
+        if unicorn.mem_read(pointer as u64, &mut scratch[..len]).is_err() {
+            continue;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&scratch[..len], &mut hasher);
+        let hash = std::hash::Hasher::finish(&hasher);
+        if hash == old_hash {
+            continue;
+        }
+        let data = scratch[..len].to_vec();
+        let head: Vec<i16> = data
+            .chunks_exact(2)
+            .take(6)
+            .map(|w| i16::from_le_bytes([w[0], w[1]]))
+            .collect();
+        let uploaded = gpu_void_clear(move || unsafe {
+            let mut previous = 0i32;
+            gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut previous);
+            gl::BindBuffer(gl::ARRAY_BUFFER, vbo);
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
+                data.len() as isize,
+                data.as_ptr() as *const _,
+                gl::DYNAMIC_DRAW,
+            );
+            gl::BindBuffer(gl::ARRAY_BUFFER, previous as u32);
+            drain_host_gl_errors();
+        });
+        if uploaded {
+            static REFRESH_LOGS: AtomicU32 = AtomicU32::new(0);
+            let hits = REFRESH_LOGS.fetch_add(1, Ordering::Relaxed);
+            if hits < 6 {
+                log::info!(
+                    "GPU: map client array refresh idx={} ptr={:#x} len={} vbo={} head={:?}",
+                    index,
+                    pointer,
+                    len,
+                    vbo,
+                    head
+                );
+            }
+            if let Ok(mut regs) = VAP_ATTRIB_REGS.lock() {
+                if let Some(reg) = regs.get_mut(&index) {
+                    reg.2 = hash;
+                }
+            }
+            if let Ok(mut cache) = VAP_CACHE.lock() {
+                if let Some(entry) = cache.get_mut(&pointer) {
+                    *entry = (vbo, hash);
+                }
+            }
+        }
+    }
 }
 
 fn route_active_attrib(unicorn: &mut Unicorn<'_, Context>) -> u32 {
@@ -3073,6 +3158,11 @@ fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
 
     if let Some(buffer) = cached {
         // Unchanged geometry: just point the attribute at the existing VBO.
+        if current_gpu_target() == GpuTarget::Map {
+            if let Ok(mut regs) = VAP_ATTRIB_REGS.lock() {
+                regs.insert(index, (pointer, len, hash, buffer));
+            }
+        }
         gpu_void_clear(move || unsafe {
             let mut previous = 0i32;
             gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut previous);
@@ -3121,6 +3211,20 @@ fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
         if let Some(&buffer) = output.out_u32.first() {
             if let Ok(mut cache) = VAP_CACHE.lock() {
                 cache.insert(pointer, (buffer, hash));
+            }
+            if current_gpu_target() == GpuTarget::Map {
+                // Remember which guest client array backs each attribute so
+                // the draw path can re-read it.  Client-array semantics are
+                // "read at draw time": the engine fills its vertex staging
+                // buffer AFTER glVertexAttribPointer, and a snapshot taken at
+                // VAP time only ever captures zeros (r667 probe: every road
+                // draw fed the host an all-zero strip).
+                if let Ok(mut regs) = VAP_ATTRIB_REGS.lock() {
+                    regs.insert(
+                        index,
+                        (pointer, len, hash, buffer),
+                    );
+                }
             }
         }
     }
@@ -3283,6 +3387,7 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
                 count
             };
             let drew = if current_gpu_target() == GpuTarget::Map {
+                refresh_map_client_arrays(unicorn);
                 // Keep any host GL error the road draw produces: the draw is
                 // the first thing in the emulator that exercises client-array
                 // sourced GL_SHORT attributes, and a silently rejected draw
@@ -3328,6 +3433,9 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
             let count = ureg(unicorn, RegisterARM::R1) as i32;
             let kind = ureg(unicorn, RegisterARM::R2);
             let offset = ureg(unicorn, RegisterARM::R3);
+            if current_gpu_target() == GpuTarget::Map {
+                refresh_map_client_arrays(unicorn);
+            }
             if gpu_void_clear(move || unsafe {
                 gl::DrawElements(mode, count, kind, offset as *const std::ffi::c_void);
             }) {
