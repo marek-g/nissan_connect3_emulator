@@ -6675,9 +6675,14 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             })
             .unwrap();
         let ins = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let addr = base_address + 0x0043_cad8u32 - ORIGINAL_BASE;
+        // r741: page dispatch (narrow entry hooks under-count, AGENTS.md).
+        let page_lo = base_address + (0x0043_c000u32 - ORIGINAL_BASE);
+        let addr = base_address + (0x0043_cad8u32 - ORIGINAL_BASE);
         unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            .add_code_hook(page_lo as u64, page_lo as u64 + 0xfff, move |uc, _, _| {
+                if uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32 != addr {
+                    return;
+                }
                 let count = ins.fetch_add(1, Ordering::Relaxed);
                 if count >= 40 {
                     return;
@@ -6701,9 +6706,16 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             [(0x0042_2f24u32, "AddToMapCell"), (0x0042_2f6c, "AddLineSegToMapCells")]
         {
             let feed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let addr = base_address + (feed_addr - ORIGINAL_BASE);
+            // r741: page-dispatch instead of narrow entry hook (see r733b).
+            let page_lo = base_address + ((feed_addr & !0xfffu32) - ORIGINAL_BASE);
+            let page_hi = page_lo + 0xfff;
+            let want = base_address + (feed_addr - ORIGINAL_BASE);
             unicorn
-                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                    if pc != want {
+                        return;
+                    }
                     let count = feed.fetch_add(1, Ordering::Relaxed);
                     if count >= 8 || count % 512 != 0 {
                         return;
@@ -6929,15 +6941,25 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         for (add_addr, add_name) in [
             (0x003c_0074u32, "AddToDTMDrawLayers/base"),
             (0x003c_5fc8u32, "AddToDTMDrawLayers/43"),
-            (0x003e_ba50u32, "AddToDTMDrawLayers/DTMStreet"),
-            (0x003e_fb28u32, "AddToDTMDrawLayers/Landuse"),
+            (0x003e_ba50u32, "AddToDTMDrawLayers/Area"),
+            (0x003e_fb28u32, "AddToDTMDrawLayers/LanduseLine"),
             (0x003f_80e4u32, "AddToDTMDrawLayers/Polygons"),
+            (0x003e_a9e8u32, "LanduseArea::Draw"),
             (0x0042_a8ecu32, "UpdateDrawLayerListsForDTM"),
         ] {
             let feed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let addr = base_address + (add_addr - ORIGINAL_BASE);
+            // r741: narrow entry hooks proved unreliable here (they under-
+            // counted AddDataToMapObject 34 -> 1, AGENTS.md quirk), so watch
+            // the whole entry page and dispatch on the exact pc instead.
+            let page_lo = base_address + ((add_addr & !0xfffu32) - ORIGINAL_BASE);
+            let page_hi = page_lo + 0xfff;
+            let want = base_address + (add_addr - ORIGINAL_BASE);
             unicorn
-                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                    if pc != want {
+                        return;
+                    }
                     let count = feed.fetch_add(1, Ordering::Relaxed);
                     if count >= 8 || count % 512 != 0 {
                         return;
