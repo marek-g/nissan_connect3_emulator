@@ -9449,8 +9449,10 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                 let dir_src = read_u32_or_invalid(uc, scb.wrapping_add(0x34));
                 let dir_res = read_u32_or_invalid(uc, scb.wrapping_add(0x118));
                 let bank = (read_u32_or_invalid(uc, mcp.wrapping_add(4)) >> 8) & 0xff;
+                let coord_count = read_u32_or_invalid(uc, scb.wrapping_add(0x114)) & 0xffff;
+                let node_arr = read_u32_or_invalid(uc, scb.wrapping_add(0x154));
                 log::info!(
-                    "PROCMAPENGINE street-coord probe t={}ms thread=[{}] enter bank={} this={:#x} dapi={:#x} scb={:#x} pos_src={:#x} dir_src={:#x} dir_res={:#x} n={}",
+                    "PROCMAPENGINE street-coord probe t={}ms thread=[{}] enter bank={} this={:#x} dapi={:#x} scb={:#x} pos_src={:#x} dir_src={:#x} dir_res={:#x} coord_count={} node_arr={:#x} n={}",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     uc.get_data().inner.thread_id(),
                     bank,
@@ -9460,6 +9462,8 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     pos_src,
                     dir_src,
                     dir_res,
+                    coord_count,
+                    node_arr,
                     count
                 );
                 // r690: pos_src/dir_src (scb+0x30/0x34) are NULL in every
@@ -9476,33 +9480,37 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     }
                 });
                 if watched && scb > 0x1000 {
-                    let watch_count = Arc::new(AtomicU32::new(0));
-                    let res = uc.add_mem_hook(
-                        unicorn_engine::unicorn_const::HookType::MEM_WRITE,
-                        u64::from(scb) + 0x28,
-                        u64::from(scb) + 0x3c,
-                        move |writer: &mut Unicorn<'_, Context>, _kind, address, size, value| {
-                            if watch_count.fetch_add(1, Ordering::Relaxed) >= 40 {
-                                return true;
-                            }
-                            let pc = writer.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
-                            log::info!(
-                                "PROCMAPENGINE street-coord watch t={}ms WRITE scb+{:#x}={:#x} size={} pc={:#x}",
-                                crate::libs::dapi::emu_t0_elapsed_ms(),
-                                address.wrapping_sub(u64::from(scb)),
-                                value,
-                                size,
-                                pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE)
-                            );
-                            true
-                        },
-                    );
-                    log::info!(
-                        "PROCMAPENGINE street-coord watch install scb={:#x} ok={}",
-                        scb,
-                        res.is_ok()
-                    );
-                    std::mem::forget(res);
+                    for (lo_off, hi_off) in [(0x28u64, 0x3cu64), (0x114, 0x11c), (0x150, 0x158)] {
+                        let watch_count = Arc::new(AtomicU32::new(0));
+                        let res = uc.add_mem_hook(
+                            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                            u64::from(scb) + lo_off,
+                            u64::from(scb) + hi_off,
+                            move |writer: &mut Unicorn<'_, Context>, _kind, address, size, value| {
+                                if watch_count.fetch_add(1, Ordering::Relaxed) >= 40 {
+                                    return true;
+                                }
+                                let pc = writer.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                                log::info!(
+                                    "PROCMAPENGINE street-coord watch t={}ms WRITE scb+{:#x}={:#x} size={} pc={:#x}",
+                                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                                    address.wrapping_sub(u64::from(scb)),
+                                    value,
+                                    size,
+                                    pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE)
+                                );
+                                true
+                            },
+                        );
+                        log::info!(
+                            "PROCMAPENGINE street-coord watch install scb={:#x} window={:#x}..{:#x} ok={}",
+                            scb,
+                            lo_off,
+                            hi_off,
+                            res.is_ok()
+                        );
+                        std::mem::forget(res);
+                    }
                 }
             } else if original == 0x0055_af54u32 {
                 // `bl uti_DTM_StreetCoord_Buffer::bProcessData`: the upload
@@ -9547,4 +9555,80 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
             }
         })
         .unwrap();
+
+    // r691: does `bProcessData` reach the per-node `bl vUpdateVBO` site at
+    // 0x449118 (inside LAB_00449168, right after processThickLine)?
+    {
+        let call_hits = Arc::new(AtomicU32::new(0));
+        let page_lo = base_address + (0x0044_9000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != 0x0044_9118u32 {
+                    return;
+                }
+                let count = call_hits.fetch_add(1, Ordering::Relaxed);
+                if count >= 16 {
+                    return;
+                }
+                let scb = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let pos_src = read_u32_or_invalid(uc, scb.wrapping_add(0x30));
+                let dir_src = read_u32_or_invalid(uc, scb.wrapping_add(0x34));
+                let node = (uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32) & 0xffff;
+                log::info!(
+                    "PROCMAPENGINE street-coord probe t={}ms vUpdateVBO-call scb={:#x} node={} pos_src={:#x} dir_src={:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    scb,
+                    node,
+                    pos_src,
+                    dir_src,
+                    count
+                );
+            })
+            .unwrap();
+    }
+
+    // r691: `uti_DTM_StreetCoord_Buffer::vUpdateVBO` entry - dumps the exact
+    // gate values (`param_4 == 0`, `+0x30 != 0`, `+0x34 != 0`, `+0x118 != 0`)
+    // that decide whether the `glBufferSubData` uploads run.
+    {
+        let entry_hits = Arc::new(AtomicU32::new(0));
+        let page_lo = base_address + (0x0044_6000u32 - ORIGINAL_BASE);
+        let page_hi = page_lo + 0xfff;
+        unicorn
+            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
+                if original != 0x0044_6f9cu32 {
+                    return;
+                }
+                let count = entry_hits.fetch_add(1, Ordering::Relaxed);
+                if count >= 16 {
+                    return;
+                }
+                let scb = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                let param4 = read_u32_or_invalid(uc, sp);
+                let pos_src = read_u32_or_invalid(uc, scb.wrapping_add(0x30));
+                let dir_src = read_u32_or_invalid(uc, scb.wrapping_add(0x34));
+                let dir_res = read_u32_or_invalid(uc, scb.wrapping_add(0x118));
+                let dir_res_id = read_u32_or_invalid(uc, dir_res.wrapping_add(0xc));
+                log::info!(
+                    "PROCMAPENGINE street-coord probe t={}ms vUpdateVBO scb={:#x} param3={:#x} param4={:#x} pos_src={:#x} dir_src={:#x} dir_res={:#x} dir_res_id={:#x} n={}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    scb,
+                    r3,
+                    param4,
+                    pos_src,
+                    dir_src,
+                    dir_res,
+                    dir_res_id,
+                    count
+                );
+            })
+            .unwrap();
+    }
 }
