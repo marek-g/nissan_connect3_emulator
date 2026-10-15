@@ -2906,11 +2906,15 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
             components * 2
         };
         let want = 4usize.min(count.max(0) as usize);
-        let raw_len = (first.max(0) as usize)
-            .saturating_add(want as usize)
-            .saturating_mul(stride)
-            + 8;
-        let mut raw = vec![0u8; raw_len.min(1 << 20)];
+        // Sample spread across the whole strip, not just the first quad:
+        // road strips routinely start off-screen (the first vertex may be a
+        // distant strip corner), and consecutive vertices of a strip share
+        // the same centerline point (left/right extrusion pair).
+        let spread = (count.max(1) as usize - 1).max(1);
+        let vertices: Vec<usize> = (0..want)
+            .map(|k| first.max(0) as usize + k * spread / (want.max(2) - 1).max(1))
+            .collect();
+        let mut raw = vec![0u8; ((first.max(0) as usize + spread + 1) * stride + 8).min(1 << 20)];
         let mut previous = 0i32;
         gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut previous);
         gl::BindBuffer(gl::ARRAY_BUFFER, binding);
@@ -2921,8 +2925,8 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
             raw.as_mut_ptr() as *mut _,
         );
         gl::BindBuffer(gl::ARRAY_BUFFER, previous as u32);
-        for vertex in 0..want {
-            let base = (first.max(0) as usize + vertex) * stride;
+        for &vertex in &vertices {
+            let base = vertex * stride;
             // 0x1406 is GL_FLOAT (GL_SHORT is 0x1402) - the engine feeds
             // packed float2 strips, so decode by the reported attribute type.
             let is_float = states[0].2 as u32 == gl::FLOAT;
@@ -3041,6 +3045,12 @@ fn refresh_map_engine_uniforms(unicorn: &mut Unicorn<'_, Context>) {
         return;
     }
     let width = f32::from_bits(read_u32(unicorn, LINE_WIDTH));
+    // `vUpdateShaderUniforms` case 7 feeds `u_flLineWidth` the constant
+    // 0.7f (0x3f333333, TS-unit half-width).  The engine only runs that loop
+    // once per program switch (before this program existed), and the
+    // `ms_flLineWidthPerPixel` global was still 0 in every observed run, so
+    // replay the constant when neither source has a value.
+    let width = if width == 0.0 { 0.7 } else { width };
     let _ = gpu_void_clear(move || unsafe {
         let mut program = 0i32;
         gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut program);
