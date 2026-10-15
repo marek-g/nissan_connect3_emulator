@@ -74,23 +74,16 @@ struct GpuCommand {
 const SYNTH_VERT_SHADER: &str = "attribute vec4 a_position;
 attribute vec4 a_color;
 uniform mat4 u_matModelView;
-uniform mat4 u_matViewProj;
-uniform mat4 u_m4ProjMat;
 uniform mat4 u_m4ProjMatStreets;
-uniform mat4 u_m4OrthoProjMat;
-uniform mat4 u_m4MetersModelViewWOTransVec;
-uniform mat4 u_matNormal;
 varying vec4 v_color;
 void main() {
-    gl_Position = u_matViewProj * (u_matModelView * a_position);
+    // Mirror the engine's own upload contract: `DTMStreet::Draw` writes the
+    // model-view into `u_matModelView` (slot+8) itself, and the per-frame
+    // uniform loop case 6 writes `rl_tclRenderLayer3D::m_aflStreetProjMatrix`
+    // into `u_m4ProjMatStreets` (slot+0x18).  Both uniforms are genuinely
+    // used here so nothing is DCE-d and the engine resolves real locations.
+    gl_Position = u_m4ProjMatStreets * (u_matModelView * a_position);
     v_color = a_color;
-    // Keep every matrix uniform alive (never folded away by the compiler) so
-    // the engine's name-based `vFindUniformLocations` resolves all of them and
-    // the draw probe can observe which matrices the engine actually uploads.
-    float _keep = u_m4ProjMat[0][0] + u_m4ProjMatStreets[0][0]
-        + u_m4OrthoProjMat[0][0] + u_m4MetersModelViewWOTransVec[0][0]
-        + u_matNormal[0][0];
-    gl_Position += vec4(_keep * v_color.x * 0.0);
 }
 ";
 const SYNTH_FRAG_SHADER: &str = "precision mediump float;
@@ -2866,7 +2859,7 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
                 .and_then(|matrices| matrices.get(&(loc as i32)).copied());
             if name == "u_matModelView" {
                 matrices.0 = stored;
-            } else if name == "u_m4OrthoProjMat" {
+            } else if name == "u_m4ProjMatStreets" {
                 matrices.1 = stored;
             }
         }
