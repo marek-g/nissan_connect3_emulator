@@ -2768,6 +2768,52 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         gl::GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_STRIDE, &mut state.3);
         gl::GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &mut state.4);
     }
+    // Uniform inventory of the bound program: tells whether the synth shader
+    // actually linked into this program (r669: name lookup found no matrix
+    // uniforms in the program the road draws bind).
+    let mut uniform_count = 0i32;
+    let mut uniform_names: Vec<String> = Vec::new();
+    if program != 0 {
+        gl::GetIntegerv(gl::ACTIVE_UNIFORMS, &mut uniform_count);
+        for index in 0..uniform_count.max(0).min(8) {
+            let mut name = [0u8; 64];
+            let mut length = 0i32;
+            let mut size = 0i32;
+            let mut kind = 0u32;
+            gl::GetActiveUniform(
+                program as u32,
+                index as u32,
+                name.len() as i32,
+                &mut length,
+                &mut size,
+                &mut kind,
+                name.as_mut_ptr() as *mut std::ffi::c_char,
+            );
+            uniform_names.push(
+                String::from_utf8_lossy(&name[..length.max(0).min(63) as usize]).into_owned(),
+            );
+        }
+    }
+    // Bytes at the head of whatever ARRAY_BUFFER the engine last bound: if the
+    // engine keeps road geometry in its own VBO, the vertex data lives there.
+    let mut engine_vbo_head: Vec<i16> = Vec::new();
+    let mut array_binding = 0i32;
+    gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut array_binding);
+    if array_binding > 0 {
+        // ARRAY_BUFFER_BINDING is already `array_binding`, so no re-bind is
+        // needed for the read.
+        let mut raw = vec![0u8; 32];
+        gl::GetBufferSubData(
+            gl::ARRAY_BUFFER,
+            0,
+            raw.len() as isize,
+            raw.as_mut_ptr() as *mut _,
+        );
+        engine_vbo_head = raw
+            .chunks_exact(2)
+            .map(|w| i16::from_le_bytes([w[0], w[1]]))
+            .collect();
+    }
     // The synth program is small; resolve its two matrix uniforms by name so
     // the probe applies them in the shader's order regardless of the
     // locations the driver assigned.
@@ -2868,12 +2914,16 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         }
     }
     log::info!(
-        "GPU: map draw probe mode={} first={} count={} viewport={:?} program={} attrib0=(en={} size={} type={:#x} stride={} vbo={}) attrib1=(en={} size={} type={:#x} stride={} vbo={}) mv={} vp={} clips=[{}]",
+        "GPU: map draw probe mode={} first={} count={} viewport={:?} program={} uniforms={} names={:?} array_vbo={} engine_head={:?} attrib0=(en={} size={} type={:#x} stride={} vbo={}) attrib1=(en={} size={} type={:#x} stride={} vbo={}) mv={} vp={} clips=[{}]",
         mode,
         first,
         count,
         viewport,
         program,
+        uniform_count,
+        uniform_names,
+        array_binding,
+        engine_vbo_head,
         states[0].0, states[0].1, states[0].2, states[0].3, states[0].4,
         states[1].0, states[1].1, states[1].2, states[1].3, states[1].4,
         matrices.0.is_some(),
@@ -3101,6 +3151,46 @@ fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     if pointer == 0 {
         gpu_vertex_attrib_pointer(index, size, kind, normalized, stride, pointer, Vec::new());
         return 0;
+    }
+
+    // Client-array vs VBO-offset semantics are decided by the ARRAY_BUFFER
+    // binding at call time.  The map engine binds its own geometry VBOs and
+    // passes offsets, so blindly reading `pointer` as guest RAM and re-pointing
+    // the attribute at a scratch VBO hands the draw zeroed strips (r669 probe).
+    if current_gpu_target() == GpuTarget::Map {
+        let bound = gpu_u32_clear(|| unsafe {
+            let mut binding = 0i32;
+            gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut binding);
+            drain_host_gl_errors();
+            binding.max(0) as u32
+        });
+        if bound.unwrap_or(0) != 0 {
+            static OFFSET_LOGS: AtomicU32 = AtomicU32::new(0);
+            let hits = OFFSET_LOGS.fetch_add(1, Ordering::Relaxed);
+            if hits < 8 {
+                log::info!(
+                    "GPU: map VAP offset-mode idx={} size={} type={:#x} stride={} offset={:#x} bound_vbo={}",
+                    index,
+                    size,
+                    kind,
+                    stride,
+                    pointer,
+                    bound.unwrap_or(0)
+                );
+            }
+            gpu_void_clear(move || unsafe {
+                gl::VertexAttribPointer(
+                    index,
+                    size,
+                    kind,
+                    normalized,
+                    stride,
+                    pointer as *const std::ffi::c_void,
+                );
+                drain_host_gl_errors();
+            });
+            return 0;
+        }
     }
 
     let per_vertex = (stride.max(0) as usize)
