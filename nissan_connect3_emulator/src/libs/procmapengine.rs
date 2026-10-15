@@ -10009,6 +10009,38 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                 if read_u32_or_invalid(uc, pyd_addr) & 0xff != 0 {
                     let _ = uc.mem_write(pyd_addr as u64, &[0u8; 1]);
                 }
+                // r709: an ARMED pass also executes `rl_tclRenderLayer3D::
+                // vLoadModelViewMatrix` (0x3b20d4 via 0x409598, reached once
+                // the slot's shader program handle is loaded) which
+                // dereferences `*0x73c31c` - the `poTransPos3D` pointer the
+                // real unit only fills for tilted/DTM views.  It stays NULL
+                // in the emulator, so since the first successful arming the
+                // render thread died with READ_UNMAPPED at 0x3b20dc inside
+                // it (r706-r708: `[69] Execution error: READ_UNMAPPED`,
+                // `thread exited with code 1`).  Point the pointer at a
+                // zeroed 3-float vector in the TL arena: the top-down view
+                // wants a neutral translation, and `vLoadModelViewMatrix`
+                // then just stores (0, 0, -0) into `m_aflMdlMatrix[2]`.
+                let pp_addr = base_address.wrapping_add(0x0073_c31cu32 - ORIGINAL_BASE);
+                let pos_ptr = read_u32_or_invalid(uc, pp_addr);
+                let mapped = pos_ptr >= 0x1000 && uc.mem_read(pos_ptr as u64, &mut [0u8; 12]).is_ok();
+                if !mapped {
+                    let arena = ensure_tl_arena(uc);
+                    if arena != 0 {
+                        let _ = uc
+                            .mem_write(pp_addr as u64, &(arena + 0x1000).to_le_bytes());
+                        static PT_LOGS: AtomicU32 = AtomicU32::new(0);
+                        if PT_LOGS.fetch_add(1, Ordering::Relaxed) < 4 {
+                            log::info!(
+                                "PROCMAPENGINE street-coord probe t={}ms poTransPos3D {:#x} -> arena {:#x} (neutral translation) n={}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                pos_ptr,
+                                arena + 0x1000,
+                                PT_LOGS.load(Ordering::Relaxed)
+                            );
+                        }
+                    }
+                }
                 let count = entry_hits.fetch_add(1, Ordering::Relaxed);
                 if count >= 40 && count % 2048 != 0 {
                     return;
