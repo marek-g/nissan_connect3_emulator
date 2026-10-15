@@ -9720,6 +9720,26 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     );
                 }
                 emulate_add_tl_params(uc, base_address);
+                // r722: `rl_tclOpenGLShader::vUpdateShaderUniforms` is
+                // called unconditionally by `vDraw` (0x55a064, this page)
+                // but re-uploads the program's uniform block - which
+                // includes `u_matModelView` from
+                // `rl_tclRenderLayer3D::m_aflMdlMatrix`, refreshed each
+                // pass by `vLoadModelViewMatrix` from the `poTransPos3D`
+                // vector - only when the view's
+                // `rl_tclTextureManager::ms_au32CurrentFrameNumber` entry
+                // (0x71adc0) changed.  The real unit bumps it once per
+                // rendered frame; the emulator never runs the frame loop,
+                // so the gate stayed shut since the first upload and every
+                // pass drew with a stale modelview.  Bump all view entries
+                // per finish-drawing pass so the engine re-uploads by
+                // itself.
+                let frame_addr = base_address.wrapping_add(0x0071_adecu32 - ORIGINAL_BASE);
+                for view in 0..4u32 {
+                    let addr = frame_addr.wrapping_add(view * 4);
+                    let value = read_u32_or_invalid(uc, addr);
+                    let _ = uc.mem_write(addr as u64, &value.wrapping_add(1).to_le_bytes());
+                }
             } else if original == 0x0055_ae30u32 || original == 0x0055_ae54u32 {
                 // r708: `vDrawCombinedStreets` return sites (both vpcs calls
                 // in `vFinishCombinedDrawing`, r705 entry-probe lr).  r707's
