@@ -90,7 +90,7 @@ void main() {
     float _keep = u_m4ProjMat[0][0] + u_m4ProjMatStreets[0][0]
         + u_m4OrthoProjMat[0][0] + u_m4MetersModelViewWOTransVec[0][0]
         + u_matNormal[0][0];
-    gl_Position += vec4(_keep * 0.0);
+    gl_Position += vec4(_keep * v_color.x * 0.0);
 }
 ";
 const SYNTH_FRAG_SHADER: &str = "precision mediump float;
@@ -3512,6 +3512,41 @@ fn route_tex_sub_image2d(unicorn: &mut Unicorn<'_, Context>) -> u32 {
 }
 
 fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32> {
+    let result = gl_backend_api_inner(unicorn, name);
+    // Attribute sticky host GL errors to the exact guest GL call: ES errors
+    // queue globally, so without this a draw reports the victim, not the
+    // culprit (r674: road draws failed with 1282 of unknown origin).
+    if current_gpu_target() == GpuTarget::Map {
+        static ERROR_TAG_LOGS: AtomicU32 = AtomicU32::new(0);
+        if ERROR_TAG_LOGS.fetch_add(1, Ordering::Relaxed) < 4000 {
+            let tagged = gpu_u32_clear(|| unsafe {
+                let mut seen = 0u32;
+                let mut first = 0u32;
+                for _ in 0..4 {
+                    match gl::GetError() {
+                        0 => break,
+                        err if seen == 0 => first = err,
+                        _ => {}
+                    }
+                    seen += 1;
+                }
+                first | seen.wrapping_shl(16)
+            });
+            let packed = tagged.unwrap_or(0);
+            if packed & 0xffff != 0 || packed >> 16 > 1 {
+                log::info!(
+                    "GPU: map GL error {:#x} attributed to {} (residual {})",
+                    packed & 0xffff,
+                    name,
+                    packed >> 16
+                );
+            }
+        }
+    }
+    result
+}
+
+fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32> {
     match name {
         "glShaderBinary" => {
             // The map engine hands us GPU-specific precompiled binaries
