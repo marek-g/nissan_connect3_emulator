@@ -2820,7 +2820,22 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
     // keep probing big strip draws (count > 3000) separately so post-upload
     // frames are observed.
     static LARGE_PROBES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    // r695: the street upload lands minutes into the run (bProcessData fires
+    // once the DAPI data chain settles, t=130..250s depending on the run), so
+    // a plain budget spends itself on the pre-upload frames.  Only probe big
+    // strips once `EMU_PROBE_AFTER_MS` (default 240000) has elapsed since the
+    // backend started, and stamp every probe line with that clock so it can
+    // be correlated with the engine-side probe timestamps.
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let elapsed_ms = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let probe_after_ms: u64 = std::env::var("EMU_PROBE_AFTER_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(240_000);
     let (budget, spent) = if count > 3000 {
+        if elapsed_ms < probe_after_ms {
+            return;
+        }
         (100, LARGE_PROBES.fetch_add(1, Ordering::Relaxed))
     } else {
         (40, PROBES.fetch_add(1, Ordering::Relaxed))
@@ -3066,7 +3081,8 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         .collect::<Vec<_>>()
         .join(" ");
     log::info!(
-        "GPU: map draw probe mode={} first={} count={} viewport={:?} program={} uniforms={} names={:?} array_vbo={} engine_head={:?} attribs=[{}] mv={} vp={} vis={}/{} mats=[{}] clips=[{}]",
+        "GPU: map draw probe t={}ms mode={} first={} count={} viewport={:?} program={} uniforms={} names={:?} array_vbo={} engine_head={:?} attribs=[{}] mv={} vp={} vis={}/{} mats=[{}] clips=[{}]",
+        elapsed_ms,
         mode,
         first,
         count,
