@@ -9680,7 +9680,7 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     let _ = uc.mem_write(pyd_addr as u64, &[0u8; 1]);
                 }
                 let count = entry_hits.fetch_add(1, Ordering::Relaxed);
-                if count >= 16 {
+                if count >= 40 {
                     return;
                 }
                 let mcp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -9694,13 +9694,26 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     uc,
                     base_address.wrapping_add(0x0073_c2d0u32 - ORIGINAL_BASE),
                 );
+                // r700: `glMultiDrawArraysEXT` is issued only when
+                // `ms_au32PrimCount[bank] != 0` (0x73c1a4, filled by
+                // `vAddTLParams` at the END of the previous Street Draw).
+                let pc0 = read_u32_or_invalid(
+                    uc,
+                    base_address.wrapping_add(0x0073_c1a4u32 - ORIGINAL_BASE),
+                );
+                let pc1 = read_u32_or_invalid(
+                    uc,
+                    base_address.wrapping_add(0x0073_c1a8u32 - ORIGINAL_BASE),
+                );
                 log::info!(
-                    "PROCMAPENGINE street-coord probe t={}ms vDrawCombinedStreets bank={} pyd_exists={} z_res=[{:#x},{:#x}] n={}",
+                    "PROCMAPENGINE street-coord probe t={}ms vDrawCombinedStreets bank={} pyd_exists={} z_res=[{:#x},{:#x}] primcount=[{},{}] n={}",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     bank,
                     pyd,
                     z0,
                     z1,
+                    pc0,
+                    pc1,
                     count
                 );
             })
