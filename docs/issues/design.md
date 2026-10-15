@@ -2581,3 +2581,54 @@ Era summary (details in commit messages r636-r665):
   r666 adds `EMU_MAP_DUMP_DIR` PPM dumps + saturated/distinct color metrics
   per publish to separate "empty engine FBO readback" from "lost in
   compositing".
+
+## r667-r685: from "draws but invisible" to the real vertex/uniform contract (2026-10-15)
+
+Roads executed real `glDrawArrays` since r663 yet every readback stayed the
+uniform background.  This arc found why, layer by layer:
+
+* **`0x1406` is `GL_FLOAT`, not `GL_SHORT`** - earlier probes decoded the road
+  attribs (vec2 stride 8, vec4 stride 16) as shorts; the correct decode says
+  the engine feeds float strips and its staging heads are float pairs.
+* **`vUpdateShaderUniforms` (0x3ad57c) semantics** (static): the per-program
+  loop walks the uniform-location table from index 1 and **breaks at the first
+  `-1`**, so any unresolvable name before `u_m4ProjMatStreets` (index 6)
+  silently suppresses every matrix upload after it.  It also runs only ONCE
+  per program switch (from `vUseProgram`), freezing whatever the matrix
+  globals held at that instant.  Cases: 3=meters, 5=`m_aflProjMatrix`,
+  6=`m_aflStreetProjMatrix`, 7=`u_flLineWidth` (constant 0.7f), 0x19=ortho.
+* **`shd_42100000v.bin` is not opaque**: the Vivante blob carries its GLSL
+  symbol table in plaintext (`strings`): attributes `a_VertexXY`,
+  `a_v2DirVecs`, `a_VertexZ`, `a_color`; uniforms `u_flLineWidth`,
+  `u_matModelView`, `u_m4ProjMatStreets`.  The synthesized road program was
+  rebuilt from it (r680): `gl_Position = u_m4ProjMatStreets *
+  (u_matModelView * vec4(a_VertexXY + a_v2DirVecs * u_flLineWidth,
+  a_VertexZ, 1.0))`, plus the four observer matrices kept alive through a
+  `clamp(+-1e-38)` varying (NVIDIA folds `x*0.0` sinks; clamp bounds are
+  provable but not foldable), so the engine's location table stays dense and
+  case 6 finally uploads.
+* **`m_aflStreetProjMatrix` (0x71acd0) is a real RH perspective** built by
+  `vBuildCustomRHPersProjMatrix` (0x3b2c20); `oGetScreenCoords` CPU-mirrors
+  `street_proj * modelview * pos`, confirming the shader combination.  Since
+  the engine's one-shot loop froze a pre-view value, the stub re-uploads the
+  live global (plus `u_flLineWidth`) before every Map draw (r680/682).
+* **Engine attribute supply is tri-modal** (r683): the `[BinaryShader]`
+  manifest exposes no attribute names, so `DTMStreet` calls
+  `glVertexAttribPointer(-1, ..., heap ptr)` for `a_VertexXY`/`a_v2DirVecs`
+  (client arrays!), passes `a_color` at ordinal 1 as a constant (disabled +
+  `glVertexAttrib4fv`), and caches geometry VBOs filled via a THIRD path,
+  below.  The stub redirects unseen `-1` heap-pointer legs to the synth
+  program's real attribute locations and enables them (r684).
+* **The real data-loss bug** (r684): the engine reserves its dynamic road
+  VBOs with `glBufferData(size, NULL)` (exactly `2*count*8` bytes - pos+dir!)
+  and fills them through `glMapBufferOES`/CPU/`glUnmapBufferOES` - but it
+  resolves those two OES entries via `eglGetProcAddress`, which our EGL stub
+  answered with the constant `1`: the wrapper's indirect call went nowhere,
+  every fill silently no-op'd, and the strips stayed zeroed forever.
+  Fixed in r685: `libGLESv2` gains code stubs at free library offsets,
+  `eglGetProcAddress` resolves names against the registered stub table, and
+  the unmap uploads the guest arena into the VBO bound to the target.
+* Probe upgrades along the way: `vis=n/m` clip-cube counter, attribute VBO
+  byte-offset aware reads, spread sampling across strips, per-call GL error
+  attribution (`host errors=[1280]` on the zeroed draws still to be chased),
+  and a matrix catalog keyed by location.
