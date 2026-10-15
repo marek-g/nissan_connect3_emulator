@@ -107,6 +107,11 @@ void main() {
     vec4 mvpos = u_matModelView * vec4(extruded, a_VertexZ, 1.0);
     mvpos.z = -abs(mvpos.z);
     gl_Position = u_m4ProjMatStreets * mvpos;
+    // r711: the r710 probes show the streets projection lands roads at
+    // z/w = -4.9..-12.9, so GL clip-space culls every fragment even with
+    // real geometry.  The emulator has no terrain or 3D layer to depth-sort
+    // against, so pin depth mid-range instead of fighting the RH fold.
+    gl_Position.z = 0.5 * gl_Position.w;
     v_color = a_color;
     v_keep = clamp(u_matViewProj[0] + u_m4MetersModelViewWOTransVec[0]
         + u_matNormal[0] + u_m4ProjMat[0] + u_flLineWidth * 1e-38,
@@ -120,6 +125,13 @@ void main() {
     gl_FragColor = v_color + v_keep;
 }
 ";
+
+/// r711: last engine-fed `glVertexAttrib4fv` constant on the map target
+/// (attribute index, RGBA); consulted by the `glMultiDrawArraysEXT` arm to
+/// decide whether a visible fallback stroke color is needed (the road RGBA
+/// rides on `a_color`, which the emulator may never have been given).
+static LAST_MAP_ATTRIB4: std::sync::LazyLock<Mutex<Option<(u32, [f32; 4])>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 
 /// Guest arenas backing `glMapBufferOES` (target -> (address, capacity, last
 /// requested size)); shared by the map and unmap arms of `gl_api`.
@@ -3520,6 +3532,19 @@ fn route_vertex_attrib_pointer(unicorn: &mut Unicorn<'_, Context>) -> u32 {
             Err(_) => 0.0,
         };
         redirect_negative_attrib(pointer, magnitude).unwrap_or(index)
+    } else if current_gpu_target() == GpuTarget::Map
+        && index == u32::MAX
+        && stack_arg(unicorn, 1) < 0x10000
+        && (ureg(unicorn, RegisterARM::R1) as i32) == 2
+    {
+        // r711: the combined-streets legs are `glVertexAttribPointer(-1, 2,
+        // FLOAT, 0, 8, coordcount << 3)` (VBO byte offsets, unresolved
+        // `a_v2DirVecs` index): the offset varies per element, so the call
+        // site (LR) is the stable redirect key, and the engine always emits
+        // the position leg before the direction leg (r683).  Size-2 only:
+        // the size-1 z leg wants a constant, not an array.
+        let key = 0x8000_0000 | (ureg(unicorn, RegisterARM::LR) & 0x7fff_ffff);
+        redirect_negative_attrib(key, 1.0).unwrap_or(index)
     } else {
         index
     };
@@ -4543,6 +4568,33 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
                     .filter(|(_, count)| *count > 0)
                     .collect();
                 let drew = gpu_void_clear(move || unsafe {
+                    // r711: color safety net.  The combined pass pushes the
+                    // road RGBA through `glVertexAttrib4fv` onto `a_color`;
+                    // if that never arrived (or was black/transparent), draw
+                    // a bright stroke so the real geometry becomes visible.
+                    let mut program = 0i32;
+                    gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut program);
+                    let cname = std::ffi::CString::new("a_color").unwrap();
+                    let loc = if program > 0 {
+                        gl::GetAttribLocation(program as u32, cname.as_ptr())
+                    } else {
+                        -1
+                    };
+                    let tracked = LAST_MAP_ATTRIB4.lock().ok().and_then(|g| *g);
+                    if loc >= 0
+                        && tracked.map_or(true, |(_, c)| {
+                            c[3] < 0.02 || c[0] + c[1] + c[2] < 0.02
+                        })
+                    {
+                        gl::DisableVertexAttribArray(loc as u32);
+                        gl::VertexAttrib4f(loc as u32, 0.85, 0.55, 0.10, 1.0);
+                        static FORCE_LOGS: AtomicU32 = AtomicU32::new(0);
+                        if FORCE_LOGS.fetch_add(1, Ordering::Relaxed) < 3 {
+                            log::info!(
+                                "GPU: map multi-draw forced road color (tracked={tracked:?})"
+                            );
+                        }
+                    }
                     probe_map_draw_vertices(mode as u32, 0, ranges.iter().map(|(_, c)| *c).sum());
                     for (first, count) in ranges {
                         gl::DrawArrays(mode as u32, first, count);
@@ -4938,6 +4990,15 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
             let index = ureg(unicorn, RegisterARM::R0);
             let values_ptr = ureg(unicorn, RegisterARM::R1);
             let values = read_f32_array(unicorn, values_ptr, 4);
+            // r711: remember the last engine-supplied constant attribute for
+            // the map target (the combined pass pushes the road RGBA through
+            // this call, index 1 = `a_color`); the multi-draw arm falls back
+            // to a visible stroke color when it never arrived or is empty.
+            if current_gpu_target() == GpuTarget::Map && index < 8 && values.len() == 4 {
+                if let Ok(mut last) = LAST_MAP_ATTRIB4.lock() {
+                    *last = Some((index, [values[0], values[1], values[2], values[3]]));
+                }
+            }
             gpu_void_clear(move || unsafe {
                 let ptr = if values.is_empty() {
                     std::ptr::null()
