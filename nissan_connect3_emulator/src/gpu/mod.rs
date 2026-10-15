@@ -73,23 +73,35 @@ struct GpuCommand {
 /// only), binding 526 VBOs but reaching no `glDraw*`.
 const SYNTH_VERT_SHADER: &str = "attribute vec4 a_position;
 attribute vec4 a_color;
+uniform mat4 u_matViewProj;
 uniform mat4 u_matModelView;
+uniform mat4 u_m4MetersModelViewWOTransVec;
+uniform mat4 u_matNormal;
+uniform mat4 u_m4ProjMat;
 uniform mat4 u_m4ProjMatStreets;
 varying vec4 v_color;
+varying vec4 v_keep;
 void main() {
-    // Mirror the engine's own upload contract: `DTMStreet::Draw` writes the
-    // model-view into `u_matModelView` (slot+8) itself, and the per-frame
-    // uniform loop case 6 writes `rl_tclRenderLayer3D::m_aflStreetProjMatrix`
-    // into `u_m4ProjMatStreets` (slot+0x18).  Both uniforms are genuinely
-    // used here so nothing is DCE-d and the engine resolves real locations.
+    // Mirror the engine's own upload contract.  The per-frame uniform loop
+    // in `vUpdateShaderUniforms` walks the program's location table from
+    // index 1 and BREAKS at the first -1, so every matrix name up to
+    // `u_m4ProjMatStreets` (index 6) must resolve to a real location or the
+    // streets projection (case 6, rl_tclRenderLayer3D::m_aflStreetProjMatrix,
+    // diag(65536/w, 65536/h): TS units -> NDC) is never uploaded.  All seven
+    // matrices are therefore genuinely consumed: the four observers feed
+    // `v_keep`, which the fragment shader adds after clamping to +/-1e-38
+    // (a visually zero delta the optimizer cannot fold away).
     gl_Position = u_m4ProjMatStreets * (u_matModelView * a_position);
     v_color = a_color;
+    v_keep = clamp(u_matViewProj[0] + u_m4MetersModelViewWOTransVec[0]
+        + u_matNormal[0] + u_m4ProjMat[0], -1e-38, 1e-38);
 }
 ";
 const SYNTH_FRAG_SHADER: &str = "precision mediump float;
 varying vec4 v_color;
+varying vec4 v_keep;
 void main() {
-    gl_FragColor = v_color;
+    gl_FragColor = v_color + v_keep;
 }
 ";
 
@@ -2865,6 +2877,19 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         }
     }
     let mut samples: Vec<[f32; 4]> = Vec::new();
+    // The road program transform is `u_m4ProjMatStreets * (u_matModelView *
+    // pos)`.  If the engine never uploaded a streets projection (its loop has
+    // no case for a dead `u_matViewProj` and case 6 may stay gated), fall back
+    // to the same viewport ortho the synthesized shader would apply, so the
+    // probe clips model the pixels that would actually be rasterized.
+    if matrices.1.is_none() {
+        let mut fallback = [0f32; 16];
+        fallback[0] = 2.0 / viewport[2].max(1) as f32;
+        fallback[5] = 2.0 / viewport[3].max(1) as f32;
+        fallback[10] = 1.0;
+        fallback[15] = 1.0;
+        matrices.1 = Some(fallback);
+    }
     let binding = states[0].4.max(0) as u32;
     if binding != 0 {
         let components = (states[0].1.max(1) as usize).min(4);
