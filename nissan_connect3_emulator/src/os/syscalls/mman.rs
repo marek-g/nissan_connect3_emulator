@@ -292,6 +292,9 @@ fn mmapx(
 
         if (perms & Prot::EXEC) != Prot::NONE {
             mmu_arc.lock().unwrap().update_library_hooks(unicorn);
+            // Library registrars queued svc trap sites (they cannot allocate
+            // caves under the MMU mutex); patch them now that it is free.
+            crate::os::code_stub::flush_trap_sites(unicorn);
         }
     }
 

@@ -9763,8 +9763,6 @@ thread_local! {
 // comes from the module-wide PROCMAP_RT_BASE set at registration.
 static PROCMAP_RT_BASE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static OBS_VPCS_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static PROCMAP_OBS_CAVES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-const OBS_CAVES_SIZE: u32 = 0x40;
 
 /// Patch the two deferred observer sites. Called from the syscall/intr-hook
 /// context (which never holds the MMU mutex) because the cave allocation takes
@@ -9801,65 +9799,28 @@ pub fn install_pending_observers(unicorn: &mut Unicorn<'_, Context>) {
     if base_address == 0 {
         return;
     }
-    let Some(caves) = ensure_observer_caves(unicorn) else {
-        return;
-    };
-    let vfin_ok = crate::os::code_stub::add_code_observer(
+    // r746: the sites are plain trap sites now; `flush_trap_sites` (run right
+    // after this by the scheduler) allocates the caves and patches. Both
+    // always trap (vfin runs first per pass), so the give-up fallback can no
+    // longer be detected here - it only matters if the flush warns about a
+    // non-relocatable instruction, which it handles itself with a legacy hook.
+    crate::os::code_stub::trap_site(
         unicorn,
-        "procmapengine",
         base_address + (0x0055_adf0u32 - ORIGINAL_BASE),
+        crate::os::code_stub::TrapMode::Arm,
         "vFinishCombinedDrawing@observer",
-        caves,
-        vfin_entry_observer,
+        move |uc| vfin_entry_observer(uc),
     );
-    let vpcs_ok = crate::os::code_stub::add_code_observer(
+    crate::os::code_stub::trap_site(
         unicorn,
-        "procmapengine",
         base_address + (0x0040_9250u32 - ORIGINAL_BASE),
+        crate::os::code_stub::TrapMode::Arm,
         "vDrawCombinedStreets@observer",
-        caves + 0x10,
-        vpcs_entry_observer,
+        move |uc| vpcs_entry_observer(uc),
     );
-    if vfin_ok && vpcs_ok {
-        PROCMAP_OBS_TRIES.store(OBS_TRIES_DONE, Ordering::Relaxed);
-        log::info!("PROCMAPENGINE: street observers live (attempt {tries}), page-range hooks not needed");
-    } else if tries >= OBS_TRIES_MAX {
-        PROCMAP_OBS_TRIES.store(OBS_TRIES_DONE, Ordering::Relaxed);
-        log::error!(
-            "PROCMAPENGINE: observer install gave up after {tries} attempts, registering page fallbacks"
-        );
-        if !vfin_ok {
-            register_vfin_page_fallback(unicorn, base_address);
-        }
-        if !vpcs_ok {
-            register_vpcs_page_fallback(unicorn, base_address);
-        }
-    }
+    PROCMAP_OBS_TRIES.store(OBS_TRIES_DONE, Ordering::Relaxed);
 }
 
-fn ensure_observer_caves(unicorn: &mut Unicorn<'_, Context>) -> Option<u32> {
-    let current = PROCMAP_OBS_CAVES.load(Ordering::Relaxed);
-    if current != 0 {
-        return Some(current);
-    }
-    let mmu_arc = {
-        let data = unicorn.get_data();
-        data.mmu.clone()
-    };
-    let addr = mmu_arc.lock().unwrap().heap_alloc(
-        unicorn,
-        OBS_CAVES_SIZE,
-        Prot::READ | Prot::WRITE | Prot::EXEC,
-        "[procmap-observe-caves]",
-    );
-    if addr == 0 || unicorn.mem_write(addr as u64, &[0u8; OBS_CAVES_SIZE as usize]).is_err() {
-        log::warn!("PROCMAPENGINE: failed to allocate observer caves");
-        return None;
-    }
-    PROCMAP_OBS_CAVES.store(addr, Ordering::Relaxed);
-    log::info!("PROCMAPENGINE: observer caves at {addr:#x}");
-    Some(addr)
-}
 
 fn vfin_entry_observer(uc: &mut Unicorn<'_, Context>) -> u32 {
     let base_address = PROCMAP_RT_BASE.load(Ordering::Relaxed);

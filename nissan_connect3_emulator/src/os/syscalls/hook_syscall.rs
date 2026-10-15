@@ -68,6 +68,27 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         return;
     }
 
+    // r746: a trapped site (instruction replaced by `svc #0`, see
+    // `code_stub::trap_site`). The handler behaves exactly like the old
+    // per-address Unicorn code hook: no callee-saved restore behind its back,
+    // register/memory writes take effect as-is. Resume priority: explicit
+    // non-zero return value, then a PC the handler wrote itself, then the
+    // code cave that replays the replaced instruction and branches back.
+    if let Some((key, mut cb, cave)) = crate::os::code_stub::take_site(pc) {
+        let ret = cb.call(unicorn);
+        let after = unicorn.reg_read(RegisterARM::PC).unwrap() as u32;
+        let newpc = if ret != 0 {
+            ret
+        } else if after != pc {
+            after
+        } else {
+            cave
+        };
+        unicorn.reg_write(RegisterARM::PC, newpc as u64).unwrap();
+        crate::os::code_stub::put_site(key, cb, cave);
+        return;
+    }
+
     // Statically linked navigation processes (PROCNAV) reach the LX monitor
     // through generated shims instead of a shared library:
     //

@@ -313,6 +313,7 @@ pub fn run_process_loop(
     // mutex is free, and the guest has not executed a single instruction yet.
     // The call self-gates to the process it belongs to.
     crate::libs::procmapengine::install_pending_observers(unicorn);
+    crate::os::code_stub::flush_trap_sites(unicorn);
 
     let mut last_park_report: Option<String> = None;
     let mut passes: u64 = 0;
