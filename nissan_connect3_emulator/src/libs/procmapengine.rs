@@ -9237,6 +9237,10 @@ fn read_cstring(unicorn: &mut Unicorn<'_, Context>, address: u32) -> String {
 /// translation vector for bank `n` at `arena + 0x1800 + n * 12`.
 static TL_VEC_VALID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// r723: set once the `vFinishCombinedDrawing` entry stamp owned
+/// `poTransPos3D`; the street pass then ignores the per-bank stash.
+static VF_VEC_OWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn ensure_tl_arena(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     static TL_ARENA: AtomicU32 = AtomicU32::new(0);
     let cached = TL_ARENA.load(Ordering::Relaxed);
@@ -9740,6 +9744,42 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     let value = read_u32_or_invalid(uc, addr);
                     let _ = uc.mem_write(addr as u64, &value.wrapping_add(1).to_le_bytes());
                 }
+                // r723: this entry IS the street pass - `r0` is the DTM
+                // street element whose DAPI buffer (`this+0xc`) carries the
+                // map-centre translation (r713: dapi 0x1044248 -> (-4490.6,
+                // 0, -1253.3), matching the render layer's own pan
+                // t=(-4272, -952, +1250)).  Stamp `poTransPos3D` here, once
+                // per pass, exactly like the real unit's per-element
+                // `Street::Draw` write at 0x40fbf8: the per-bank stash from
+                // `emulate_add_tl_params` could not keep the street vector,
+                // because the (dead-simple) route/overlay elements arm
+                // through the same bank and stashed theirs last (r721/r722:
+                // every drawn pass still used (1200, 0, -3030)).
+                let vf_this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let vf_mcp = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let vf_bank = read_u8_or_invalid(uc, vf_mcp.wrapping_add(5));
+                let vf_dapi = read_u32_or_invalid(uc, vf_this.wrapping_add(0xc));
+                let vf_trans = vf_dapi.wrapping_add(0x8c + u32::from(vf_bank) * 12);
+                if vf_dapi >= 0x1000 && uc.mem_read(vf_trans as u64, &mut [0u8; 12]).is_ok() {
+                    let pp_addr = base_address.wrapping_add(0x0073_c31cu32 - ORIGINAL_BASE);
+                    if uc.mem_write(pp_addr as u64, &vf_trans.to_le_bytes()).is_ok() {
+                        VF_VEC_OWNED.store(true, Ordering::Relaxed);
+                        static VF_LOGS: AtomicU32 = AtomicU32::new(0);
+                        if VF_LOGS.fetch_add(1, Ordering::Relaxed) < 6 {
+                            let x = f32::from_bits(read_u32_or_invalid(uc, vf_trans));
+                            let y = f32::from_bits(read_u32_or_invalid(uc, vf_trans.wrapping_add(4)));
+                            let z = f32::from_bits(read_u32_or_invalid(uc, vf_trans.wrapping_add(8)));
+                            log::info!(
+                                "PROCMAPENGINE street-coord probe t={}ms poTransPos3D := vfin this={:#x} dapi {:#x}+{:#x} -> ({x:.1}, {y:.1}, {z:.1}) n={}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                vf_this,
+                                vf_dapi,
+                                0x8c + u32::from(vf_bank) * 12,
+                                VF_LOGS.load(Ordering::Relaxed)
+                            );
+                        }
+                    }
+                }
             } else if original == 0x0055_ae30u32 || original == 0x0055_ae54u32 {
                 // r708: `vDrawCombinedStreets` return sites (both vpcs calls
                 // in `vFinishCombinedDrawing`, r705 entry-probe lr).  r707's
@@ -10102,7 +10142,8 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                 // element's genuine SD-backed translation.
                 let entry_mcp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let entry_bank = ((read_u32_or_invalid(uc, entry_mcp.wrapping_add(4)) >> 8) & 0xff) as u32;
-                let stashed = entry_bank < 48
+                let stashed = !VF_VEC_OWNED.load(Ordering::Relaxed)
+                    && entry_bank < 48
                     && TL_VEC_VALID.load(Ordering::Relaxed) & (1u64 << entry_bank) != 0;
                 let arena = ensure_tl_arena(uc);
                 if stashed && arena != 0 {
