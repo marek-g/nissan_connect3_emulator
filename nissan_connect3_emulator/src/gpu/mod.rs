@@ -1432,6 +1432,7 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
         }
         GpuTarget::Map => unsafe {
             gl::BindFramebuffer(gl::FRAMEBUFFER, backend.map_framebuffer);
+            let mut fresh = vec![0u8; MAP_SURFACE_SIZE];
             gl::ReadPixels(
                 0,
                 0,
@@ -1439,8 +1440,37 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
                 MAP_SURFACE_HEIGHT as i32,
                 gl::RGBA,
                 gl::UNSIGNED_BYTE,
-                backend.map_pixels.as_mut_ptr() as *mut _,
+                fresh.as_mut_ptr() as *mut _,
             );
+            // r730: the engine re-runs the street multi-draw only when its
+            // data updates; later repaints just clear the FBO and read back
+            // as a single flat colour (r729/r730 window dumps: one road
+            // frame published, then every composite saw flat/transparent
+            // pixels and the window lost the roads).  The real unit's map
+            // layer is fully redrawn every frame and its LCD always shows
+            // the latest drawn map, so keep the most recent content-bearing
+            // readback for compositing and let flat repaints pass through
+            // as no-ops.
+            let flat = {
+                let mut reference = 0u32;
+                let mut seen_reference = false;
+                let mut flat = true;
+                for chunk in fresh.chunks_exact(4).skip(701).step_by(997) {
+                    let value =
+                        u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    if !seen_reference {
+                        reference = value;
+                        seen_reference = true;
+                    } else if value != reference {
+                        flat = false;
+                        break;
+                    }
+                }
+                flat
+            };
+            if !flat {
+                backend.map_pixels.copy_from_slice(&fresh);
+            }
             publish_map_surface_pixels(&backend.map_pixels);
         },
     }
