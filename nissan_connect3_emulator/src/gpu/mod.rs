@@ -113,6 +113,10 @@ const MAP_SURFACE_HANDLE: u32 = 0x5f4d4150;
 
 static MAP_SURFACE_DIRTY: AtomicBool = AtomicBool::new(false);
 static MAP_SURFACE_BYTES: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Newest matrix per uniform location uploaded by the map engine, used by
+/// the draw-time clip-coordinate probe.
+static LAST_UPLOADED_MATRICES: std::sync::LazyLock<Mutex<HashMap<i32, [f32; 16]>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // Display-engine state of the map layer, as requested by the HMI through the
 // svg layer API (see `libs::prochmi`'s layer control hooks): `*_ENABLED` is
@@ -448,20 +452,20 @@ fn publish_map_surface_pixels(pixels: &[u8]) {
         // the screen orientation.  Used to tell an empty engine FBO readback
         // apart from pixels lost later in the HMI compositing chain.
         if let Ok(dir) = std::env::var("EMU_MAP_DUMP_DIR") {
-            let mut out = format!(
+            let mut out: Vec<u8> = Vec::with_capacity(32 + MAP_SURFACE_WIDTH * MAP_SURFACE_HEIGHT * 3);
+            out.extend_from_slice(format!(
                 "P6\n{} {}\n255\n",
                 MAP_SURFACE_WIDTH, MAP_SURFACE_HEIGHT
-            );
-            out.reserve(MAP_SURFACE_WIDTH * MAP_SURFACE_HEIGHT * 3);
+            ).as_bytes());
             for row in pixels
                 .chunks(MAP_SURFACE_WIDTH * 4)
                 .rev()
                 .take(MAP_SURFACE_HEIGHT)
             {
                 for px in row.chunks(4) {
-                    out.push(px[0] as char);
-                    out.push(px[1] as char);
-                    out.push(px[2] as char);
+                    out.push(px[0]);
+                    out.push(px[1]);
+                    out.push(px[2]);
                 }
             }
             let path = format!("{}/map_pub_{:04}.ppm", dir, n);
@@ -2706,6 +2710,19 @@ fn route_uniform_matrix(unicorn: &mut Unicorn<'_, Context>, components: usize) -
         }
     }
     let values = read_f32_array(unicorn, values_ptr, (count.max(0) as usize).saturating_mul(components));
+    if current_gpu_target() == GpuTarget::Map && loc >= 0 && components >= 16 && count >= 1 {
+        // Keep the newest matrix per uniform location so the draw-time probe
+        // can compute the clip coordinates the synth shader will produce
+        // (r666: draws accepted with zero GL errors but the FBO readback stays
+        // uniform background - suspects are out-of-range clip coords).
+        if let Ok(mut matrices) = LAST_UPLOADED_MATRICES.lock() {
+            let mut matrix = [0f32; 16];
+            for (slot, value) in values.iter().take(16).enumerate() {
+                matrix[slot] = *value;
+            }
+            matrices.insert(loc, matrix);
+        }
+    }
     gpu_void_clear(move || unsafe {
         let ptr = if values.is_empty() {
             std::ptr::null()
@@ -2719,6 +2736,148 @@ fn route_uniform_matrix(unicorn: &mut Unicorn<'_, Context>, components: usize) -
         }
     });
     0
+}
+
+/// Diagnostic for the r666 road draws: reads the live host vertex attribute
+/// state and the vertex bytes from the scratch VBO (client arrays were copied
+/// there), applies the latest matrices uploaded to `u_matModelView` (loc 0)
+/// and `u_matViewProj` (loc 1) exactly as the synth shader does, and logs the
+/// resulting clip-space vertices.  Tells whether the draws land outside the
+/// clip volume (rasteriser drops them silently, no GL error).
+unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
+    static PROBES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if PROBES.fetch_add(1, Ordering::Relaxed) >= 4 {
+        return;
+    }
+    let mut viewport = [0i32; 4];
+    gl::GetIntegerv(gl::VIEWPORT, viewport.as_mut_ptr());
+    let mut program = 0i32;
+    gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut program);
+    let mut states = [(0i32, 0i32, 0i32, 0i32, 0i32); 2];
+    for (index, state) in states.iter_mut().enumerate() {
+        let index = index as u32;
+        gl::GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_ENABLED, &mut state.0);
+        gl::GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_SIZE, &mut state.1);
+        gl::GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_TYPE, &mut state.2);
+        gl::GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_STRIDE, &mut state.3);
+        gl::GetVertexAttribiv(index, gl::VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &mut state.4);
+    }
+    // The synth program is small; resolve its two matrix uniforms by name so
+    // the probe applies them in the shader's order regardless of the
+    // locations the driver assigned.
+    let mut matrices = (None, None);
+    if program != 0 {
+        let mut uniform_count = 0i32;
+        gl::GetIntegerv(gl::ACTIVE_UNIFORMS, &mut uniform_count);
+        for index in 0..uniform_count.max(0).min(16) {
+            let mut name = [0u8; 64];
+            let mut length = 0i32;
+            let mut size = 0i32;
+            let mut kind = 0u32;
+            gl::GetActiveUniform(
+                program,
+                index as u32,
+                name.len() as i32,
+                &mut length,
+                &mut size,
+                &mut kind,
+                name.as_mut_ptr() as *mut std::ffi::c_char,
+            );
+            let name = String::from_utf8_lossy(
+                &name[..length.max(0).min(63) as usize],
+            )
+            .into_owned();
+            let c_name = std::ffi::CString::new(name.clone()).unwrap_or_default();
+            let loc = gl::GetUniformLocation(program, c_name.as_ptr());
+            if loc < 0 {
+                continue;
+            }
+            let stored = LAST_UPLOADED_MATRICES
+                .lock()
+                .ok()
+                .and_then(|matrices| matrices.get(&(loc as i32)).copied());
+            if name == "u_matModelView" {
+                matrices.0 = stored;
+            } else if name == "u_m4OrthoProjMat" {
+                matrices.1 = stored;
+            }
+        }
+    }
+    let mut samples: Vec<[f32; 4]> = Vec::new();
+    let binding = states[0].4.max(0) as u32;
+    if binding != 0 {
+        let components = (states[0].1.max(1) as usize).min(4);
+        let stride = if states[0].3 > 0 {
+            states[0].3 as usize
+        } else {
+            components * 2
+        };
+        let want = 4usize.min(count.max(0) as usize);
+        let raw_len = (first.max(0) as usize)
+            .saturating_add(want as usize)
+            .saturating_mul(stride)
+            + 8;
+        let mut raw = vec![0u8; raw_len.min(1 << 20)];
+        let mut previous = 0i32;
+        gl::GetIntegerv(gl::ARRAY_BUFFER_BINDING, &mut previous);
+        gl::BindBuffer(gl::ARRAY_BUFFER, binding);
+        gl::GetBufferSubData(
+            gl::ARRAY_BUFFER,
+            0,
+            raw.len() as isize,
+            raw.as_mut_ptr() as *mut _,
+        );
+        gl::BindBuffer(gl::ARRAY_BUFFER, previous as u32);
+        for vertex in 0..want {
+            let base = (first.max(0) as usize + vertex) * stride;
+            let word = |offset: usize| -> i16 {
+                let lo = *raw.get(base + offset).unwrap_or(&0) as u16;
+                let hi = *raw.get(base + offset + 1).unwrap_or(&0) as u16;
+                (lo | (hi << 8)) as i16
+            };
+            let mut pos = [0f32; 4];
+            pos[0] = word(0) as f32;
+            if components > 1 {
+                pos[1] = word(2) as f32;
+            }
+            if components > 2 {
+                pos[2] = word(4) as f32;
+            }
+            pos[3] = 1.0;
+            let apply = |input: [f32; 4], matrix: &[f32; 16]| -> [f32; 4] {
+                let mut out = [0f32; 4];
+                for (row, value) in out.iter_mut().enumerate() {
+                    *value = (0..4).map(|column| matrix[column * 4 + row] * input[column]).sum();
+                }
+                out
+            };
+            let mut clip = pos;
+            if let Some(model_view) = matrices.0 {
+                clip = apply(clip, &model_view);
+            }
+            if let Some(view_proj) = matrices.1 {
+                clip = apply(clip, &view_proj);
+            }
+            samples.push(clip);
+        }
+    }
+    log::info!(
+        "GPU: map draw probe mode={} first={} count={} viewport={:?} program={} attrib0=(en={} size={} type={:#x} stride={} vbo={}) attrib1=(en={} size={} type={:#x} stride={} vbo={}) mv={} vp={} clips=[{}]",
+        mode,
+        first,
+        count,
+        viewport,
+        program,
+        states[0].0, states[0].1, states[0].2, states[0].3, states[0].4,
+        states[1].0, states[1].1, states[1].2, states[1].3, states[1].4,
+        matrices.0.is_some(),
+        matrices.1.is_some(),
+        samples
+            .iter()
+            .map(|clip| format!("({:.1},{:.1},{:.1},{:.1})", clip[0], clip[1], clip[2], clip[3]))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
 }
 
 fn route_active_uniform(unicorn: &mut Unicorn<'_, Context>) -> u32 {
@@ -3129,6 +3288,7 @@ fn gl_backend_api(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32>
                 // sourced GL_SHORT attributes, and a silently rejected draw
                 // would otherwise look like "rendered but invisible".
                 gpu_void_clear(move || unsafe {
+                    probe_map_draw_vertices(mode, first, count);
                     gl::DrawArrays(mode, first, count);
                     let mut errors = [0u32; 4];
                     let mut n = 0usize;
