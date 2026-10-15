@@ -6720,6 +6720,42 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 })
                 .unwrap();
         }
+        // r733b: the DTM draw-layer feeders (same slot/vpcs pipeline the
+        // working street pass uses - we only emulate the street element's
+        // vAddTLParams there).  One per element family: MapElm base,
+        // DTMStreet, Landuse_Line, Polygons (0x3f80e4 sits right before
+        // map_tclMapElm_Polygons' ctor).  If the landuse/polygon versions
+        // run, polygon elements DO reach the DTM layers and only the draw
+        // arming is missing; if none run, the element-build step upstream
+        // is dead.
+        for (add_addr, add_name) in [
+            (0x003c_0074u32, "AddToDTMDrawLayers/base"),
+            (0x003c_5fc8u32, "AddToDTMDrawLayers/43"),
+            (0x003e_ba50u32, "AddToDTMDrawLayers/DTMStreet"),
+            (0x003e_fb28u32, "AddToDTMDrawLayers/Landuse"),
+            (0x003f_80e4u32, "AddToDTMDrawLayers/Polygons"),
+            (0x0042_a8ecu32, "UpdateDrawLayerListsForDTM"),
+        ] {
+            let feed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let addr = base_address + (add_addr - ORIGINAL_BASE);
+            unicorn
+                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                    let count = feed.fetch_add(1, Ordering::Relaxed);
+                    if count >= 8 || count % 512 != 0 {
+                        return;
+                    }
+                    log::info!(
+                        "PROCMAPENGINE render trace {} entry r0={:#x} r1={:#x} r2={:#x} r3={:#x} n={}",
+                        add_name,
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                        uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                        uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+                        uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
+                        count
+                    );
+                })
+                .unwrap();
+        }
         // `DetermineMapObjects` only inserts MOs into the DTM grid when the
         // per-view cell array (scene+0x30+view*4, `*count` there) is non-zero;
         // those arrays are fed by the raw data blocks created from the
