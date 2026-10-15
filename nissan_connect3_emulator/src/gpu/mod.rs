@@ -3075,7 +3075,58 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
             }
         }
         gl::BindBuffer(gl::ARRAY_BUFFER, previous as u32);
-        for &vertex in &vertices {
+        // r714: the synth shader consumes `extruded = a_VertexXY +
+        // a_v2DirVecs`, so the clip model must read the direction leg too -
+        // sampling only the extrusion vectors gave misleading `vis` (r713:
+        // all samples y=0 while the pixels sat in the top-right corner).
+        let mut dir_values: Vec<[f32; 2]> = Vec::new();
+        let dir_binding = states.get(2).map(|state| state.4.max(0) as u32).unwrap_or(0);
+        if dir_binding != 0 {
+            let dir_stride = states
+                .get(2)
+                .map(|state| if state.3 > 0 { state.3 as usize } else { 4 })
+                .unwrap_or(8);
+            let dir_offset = attrib_pointers.get(2).copied().unwrap_or(0).max(0) as usize;
+            let mut draw = vec![0u8; ((first.max(0) as usize + spread + 1) * dir_stride + 8).min(1 << 20)];
+            gl::BindBuffer(gl::ARRAY_BUFFER, dir_binding);
+            {
+                let data = gl::MapBufferRange(
+                    gl::ARRAY_BUFFER,
+                    dir_offset as isize,
+                    draw.len() as isize,
+                    gl::MAP_READ_BIT,
+                );
+                if !data.is_null() {
+                    std::ptr::copy_nonoverlapping(data as *const u8, draw.as_mut_ptr(), draw.len());
+                    gl::UnmapBuffer(gl::ARRAY_BUFFER);
+                }
+            }
+            gl::BindBuffer(gl::ARRAY_BUFFER, previous as u32);
+            let dir_float = states.get(2).map(|state| state.2 as u32 == gl::FLOAT).unwrap_or(true);
+            dir_values = vertices
+                .iter()
+                .map(|&vertex| {
+                    let base = vertex * dir_stride;
+                    let dword = |offset: usize| -> f32 {
+                        if dir_float {
+                            let b: [u8; 4] = [
+                                *draw.get(base + offset).unwrap_or(&0),
+                                *draw.get(base + offset + 1).unwrap_or(&0),
+                                *draw.get(base + offset + 2).unwrap_or(&0),
+                                *draw.get(base + offset + 3).unwrap_or(&0),
+                            ];
+                            f32::from_le_bytes(b)
+                        } else {
+                            let lo = *draw.get(base + offset).unwrap_or(&0) as u16;
+                            let hi = *draw.get(base + offset + 1).unwrap_or(&0) as u16;
+                            (lo | (hi << 8)) as i16 as f32
+                        }
+                    };
+                    [dword(0), dword(if dir_float { 4 } else { 2 })]
+                })
+                .collect();
+        }
+        for (sample_index, &vertex) in vertices.iter().enumerate() {
             let base = vertex * stride;
             // 0x1406 is GL_FLOAT (GL_SHORT is 0x1402) - the engine feeds
             // packed float2 strips, so decode by the reported attribute type.
@@ -3104,6 +3155,10 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
                 pos[2] = word(if is_float { 8 } else { 4 });
             }
             pos[3] = 1.0;
+            if let Some(dir) = dir_values.get(sample_index) {
+                pos[0] += dir[0];
+                pos[1] += dir[1];
+            }
             let apply = |input: [f32; 4], matrix: &[f32; 16]| -> [f32; 4] {
                 let mut out = [0f32; 4];
                 for (row, value) in out.iter_mut().enumerate() {
@@ -3186,7 +3241,17 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
         matrix_catalog.join(" "),
         samples
             .iter()
-            .map(|clip| format!("({:.1},{:.1},{:.1},{:.1})", clip[0], clip[1], clip[2], clip[3]))
+            .map(|clip| {
+                let (sx, sy) = if clip[3].abs() > 1e-6 {
+                    (clip[0] / clip[3], clip[1] / clip[3])
+                } else {
+                    (f32::NAN, f32::NAN)
+                };
+                format!(
+                    "({:.1},{:.1},{:.1},{:.1}|{sx:.2},{sy:.2})",
+                    clip[0], clip[1], clip[2], clip[3]
+                )
+            })
             .collect::<Vec<_>>()
             .join(" "),
     );
