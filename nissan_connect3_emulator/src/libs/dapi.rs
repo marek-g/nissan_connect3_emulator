@@ -10,8 +10,9 @@ fn hook_entry(
     name: &'static str,
 ) {
     let address = base_address + (original_address - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:14", move |uc: &mut Unicorn<'_, Context>| {
+            let addr = address as u64;
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
@@ -25,8 +26,9 @@ fn hook_entry(
                 r1,
                 lr
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 fn hook_result(
@@ -36,8 +38,9 @@ fn hook_result(
     name: &'static str,
 ) {
     let address = base_address + (original_address - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:40", move |uc: &mut Unicorn<'_, Context>| {
+            let addr = address as u64;
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             log::warn!(
                 "DAPI {} [{}] {} result addr={:#x} r0={:#x}",
@@ -47,8 +50,9 @@ fn hook_result(
                 addr,
                 r0
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 #[allow(dead_code)]
@@ -60,27 +64,30 @@ fn hook_force_return(
     value: u32,
 ) {
     let address = base_address + (original_address - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+    // Trap-site flavor: the dispatcher treats a non-zero handler return as the
+    // new PC, which reproduces the old `PC = LR` function skip exactly (and
+    // unlike a legacy hook it cannot be lost to the narrow-hook translation
+    // quirk when neighbouring sites on the same page carry svc patches).
+    crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:70", move |uc: &mut Unicorn<'_, Context>| {
             let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
             uc.reg_write(RegisterARM::R0, value as u64).unwrap();
-            uc.reg_write(RegisterARM::PC, lr as u64).unwrap();
             log::warn!(
                 "DAPI {} [{}] {} stubbed addr={:#x} -> {:#x}",
                 uc.get_data().elf_path,
                 uc.get_data().inner.thread_id(),
                 name,
-                addr,
+                address,
                 value
             );
-        })
-        .unwrap();
+            lr
+        });
 }
 
 fn hook_power_dispatch_state(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let address = base_address + (0x00b4_2098 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:83", move |uc: &mut Unicorn<'_, Context>| {
+            let addr = address as u64;
             let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
             let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
             let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
@@ -108,8 +115,9 @@ fn hook_power_dispatch_state(unicorn: &mut Unicorn<'_, Context>, base_address: u
                 r8,
                 r7
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 /// Documented exception to the "never patch the Bosch applications" rule, for
@@ -132,8 +140,9 @@ fn hook_power_dispatch_state(unicorn: &mut Unicorn<'_, Context>, base_address: u
 /// stay untouched. Disable with `EMU_PATCH_DAPI_ADMIN_LOCK=0`.
 fn hook_clear_admin_lock_branch(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let address = base_address + (0x00b4_0420 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:136", move |uc: &mut Unicorn<'_, Context>| {
+            let addr = address as u64;
             let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
             let mut buf = [0u8; 4];
             let mut word = |offset: u32| {
@@ -163,14 +172,16 @@ fn hook_clear_admin_lock_branch(unicorn: &mut Unicorn<'_, Context>, base_address
                     state
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 fn hook_power_ack_call(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let address = base_address + (0x00b4_23b0 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:173", move |uc: &mut Unicorn<'_, Context>| {
+            let addr = address as u64;
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let mut buf = [0u8; 4];
@@ -195,8 +206,9 @@ fn hook_power_ack_call(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                 vtable,
                 target
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 pub fn dapiapp_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
@@ -315,11 +327,12 @@ fn hook_device_manager_flow(unicorn: &mut Unicorn<'_, Context>, base_address: u3
         (0x008b_4c40, "DeviceTableWorker::bRegPRMNotifications"),
     ] {
         let address = base_address + (address - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:319", move |uc: &mut Unicorn<'_, Context>| {
+                let addr = address as u64;
                 let count = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count >= 800 {
-                    return;
+                    return 0;
                 }
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -334,8 +347,9 @@ fn hook_device_manager_flow(unicorn: &mut Unicorn<'_, Context>, base_address: u3
                     r1,
                     r2,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // bRegPRMNotifications media-status ioctl: at 0x8b4d7c r5 holds the fd
@@ -377,8 +391,9 @@ fn hook_device_manager_flow(unicorn: &mut Unicorn<'_, Context>, base_address: u3
         (0x008b_50c0, "bRegPRM empty-path path (0x218)"),
     ] {
         let address = base_address + (address - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:381", move |uc: &mut Unicorn<'_, Context>| {
+                let addr = address as u64;
                 let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 log::warn!(
@@ -390,8 +405,9 @@ fn hook_device_manager_flow(unicorn: &mut Unicorn<'_, Context>, base_address: u3
                     r5,
                     r0,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
@@ -409,11 +425,12 @@ fn hook_service_status_handler(unicorn: &mut Unicorn<'_, Context>, base_address:
         (0x00b3_a4c8, "status-consumer second-branch"),
     ] {
         let address = base_address + (address - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:413", move |uc: &mut Unicorn<'_, Context>| {
+                let addr = address as u64;
                 let count = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count >= 4000 {
-                    return;
+                    return 0;
                 }
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -432,8 +449,9 @@ fn hook_service_status_handler(unicorn: &mut Unicorn<'_, Context>, base_address:
                     r8,
                     r10,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
@@ -452,8 +470,9 @@ fn hook_device_manager_init(unicorn: &mut Unicorn<'_, Context>, base_address: u3
     ] {
         let address = base_address + (address - ORIGINAL_BASE);
         let notify_at = address;
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:456", move |uc: &mut Unicorn<'_, Context>| {
+                let addr = address as u64;
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
@@ -488,8 +507,9 @@ fn hook_device_manager_init(unicorn: &mut Unicorn<'_, Context>, base_address: u3
                         &PRM_INFO_SENT,
                     );
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
@@ -517,11 +537,11 @@ fn hook_service_state_setter(unicorn: &mut Unicorn<'_, Context>, base_address: u
     static SET_COUNT: AtomicU32 = AtomicU32::new(0);
 
     let address = base_address + (0x00b4_6228 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:521", move |uc: &mut Unicorn<'_, Context>| {
             let count = SET_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 300 {
-                return;
+                return 0;
             }
             let read = |reg| uc.reg_read(reg).unwrap_or(0) as u32;
             // Watch for the internal svc-0x26 entry going ACTIVE (state 0).
@@ -548,8 +568,9 @@ fn hook_service_state_setter(unicorn: &mut Unicorn<'_, Context>, base_address: u
                 read(RegisterARM::R1) & 0xff,
                 read(RegisterARM::LR),
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 /// Traces DAPIAPP's ServiceRegister handler: the service-conf lookup result
@@ -561,12 +582,12 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     for (off, tag) in [(0x00b4_3a70u32, "conf-result"), (0x00b4_3ad0u32, "assign-result")] {
         let address = base_address + (off - ORIGINAL_BASE);
         let tag: &'static str = tag;
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:565", move |uc: &mut Unicorn<'_, Context>| {
                 static HOOK_COUNT: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
                 if HOOK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
-                    return;
+                    return 0;
                 }
                 let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
                 log::warn!(
@@ -577,8 +598,9 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     read(RegisterARM::R10),
                     read(RegisterARM::R11),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // Service-data success path: after the registry scan + state gate passes,
@@ -587,12 +609,12 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     // fall-through at 0xb43518 (dispatch skipped).
     {
         let dispatch = base_address + (0x00b4_3578u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(dispatch as u64, dispatch as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, dispatch, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:591", move |uc: &mut Unicorn<'_, Context>| {
                 static D_COUNT: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
                 if D_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
-                    return;
+                    return 0;
                 }
                 let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
                 let r0 = read(RegisterARM::R0);
@@ -612,19 +634,20 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     target,
                     read(RegisterARM::LR),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         // The dispatch decision itself: `cmp r9,#0xfffe` at 0xb434e0 picks
         // between the generic service handler (vtable+0x20) and the
         // app-info/no-op fall-through.
         let decide = base_address + (0x00b4_34d4u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(decide as u64, decide as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, decide, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:623", move |uc: &mut Unicorn<'_, Context>| {
                 static P_COUNT: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
                 if P_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
-                    return;
+                    return 0;
                 }
                 let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
                 log::warn!(
@@ -633,16 +656,17 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     read(RegisterARM::R9),
                     read(RegisterARM::R10),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         let skip = base_address + (0x00b4_3518u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(skip as u64, skip as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, skip, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:641", move |uc: &mut Unicorn<'_, Context>| {
                 static S_COUNT: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
                 if S_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
-                    return;
+                    return 0;
                 }
                 let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
                 log::warn!(
@@ -651,19 +675,20 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     read(RegisterARM::R10),
                     read(RegisterARM::R4),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         // `dap_tclCommunicationContext::vSendToTask`: a request whose target
         // task index is 0 or whose connection-table entry is missing is
         // dropped with status 0x213 and the client never gets an answer.
         let send = base_address + (0x00b5_1ca8u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(send as u64, send as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, send, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:662", move |uc: &mut Unicorn<'_, Context>| {
                 static T_COUNT: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
                 if T_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 4000 {
-                    return;
+                    return 0;
                 }
                 let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
                 let jobpp = read(RegisterARM::R4);
@@ -679,7 +704,7 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                 // Job type 4 is the CCA map-data service (svc 0x26); the rest
                 // is startup noise that would flood the log.
                 if job_type != 4 {
-                    return;
+                    return 0;
                 }
                 log::warn!(
                     "DAPI vSendToTask jobtype={} thread-idx={} task={:#x} job={:#x}",
@@ -688,16 +713,17 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     read(RegisterARM::R0),
                     job,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         let drop = base_address + (0x00b5_1cc8u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(drop as u64, drop as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, drop, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:696", move |uc: &mut Unicorn<'_, Context>| {
                 static X_COUNT: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
                 if X_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
-                    return;
+                    return 0;
                 }
                 let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
                 log::warn!(
@@ -706,8 +732,9 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     read(RegisterARM::R4),
                     read(RegisterARM::LR),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         // `dap_tclJob::u16AddAction` -> `dap_tclActionList::bSetBlock`: an
         // external CCA request is turned into a job here; when the action
@@ -717,12 +744,12 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
         // `dap_map_tclWorker::vReportError(code, file, line, func)`: every
         // failure of the CCA map-data worker ends here.
         let report = base_address + (0x0084_4e78u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(report as u64, report as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, report, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:721", move |uc: &mut Unicorn<'_, Context>| {
                 static R_COUNT: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
                 if R_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
-                    return;
+                    return 0;
                 }
                 let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
                 // vReportError(this, code, text, line, func): the text/func
@@ -753,19 +780,20 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     text(read(RegisterARM::R4)),
                     read(RegisterARM::LR),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         // `dap_tclAbstractWorker::u16SendResponse(comm, message, size, ...)`:
         // logs the map worker sending its answer so the send can be put next to
         // the error answer seen by the client.
         let send_response = base_address + (0x00b6_3388u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(send_response as u64, send_response as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, send_response, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:764", move |uc: &mut Unicorn<'_, Context>| {
                 static S_COUNT: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
                 if S_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 20 {
-                    return;
+                    return 0;
                 }
                 let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
                 log::warn!(
@@ -776,39 +804,41 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     read(RegisterARM::R3),
                     read(RegisterARM::LR),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         // `amt_tclServiceDataError::vSetErrorData(u16)`: every CCA error answer
         // carries its code through here, so logging the code and the caller
         // shows which layer decided to answer a request with an error.
         let set_error = base_address + (0x0081_98ecu32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(set_error as u64, set_error as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, set_error, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:787", move |uc: &mut Unicorn<'_, Context>| {
                 static E_COUNT: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
                 if E_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 30 {
-                    return;
+                    return 0;
                 }
                 log::warn!(
                     "DAPI ServiceDataError code={:#x} lr={:#x}",
                     (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32) & 0xffff,
                     uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         // `dap_map_tclWorker::enProcessJob` epilogue: `r8` is the out-parameter
         // holding the result code (0xffff means success) and `r0` the return
         // value. Logging both shows what the map worker decided even when it
         // does not report an error through `vReportError`.
         let job_result = base_address + (0x0084_ba90u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(job_result as u64, job_result as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, job_result, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:807", move |uc: &mut Unicorn<'_, Context>| {
                 static J_COUNT: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
                 if J_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 40 {
-                    return;
+                    return 0;
                 }
                 let r8 = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
                 let mut buf = [0u8; 2];
@@ -822,17 +852,18 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32,
                     uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         // `ActionList::bSetBlock` entry logging is installed below.
         let setblock = base_address + (0x00b6_b610u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(setblock as u64, setblock as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, setblock, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:831", move |uc: &mut Unicorn<'_, Context>| {
                 static A_COUNT: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
                 if A_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 60 {
-                    return;
+                    return 0;
                 }
                 let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
                 let this = read(RegisterARM::R0);
@@ -855,8 +886,9 @@ fn hook_registry_guard(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     blocks,
                     read(RegisterARM::LR),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
@@ -883,11 +915,11 @@ fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     ] {
         let address = base_address + (off - ORIGINAL_BASE);
         let tag: &'static str = tag;
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:887", move |uc: &mut Unicorn<'_, Context>| {
                 static COUNT: AtomicU32 = AtomicU32::new(0);
                 if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
-                    return;
+                    return 0;
                 }
                 let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
                 let word = |addr: u32| -> u32 {
@@ -916,8 +948,9 @@ fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                     word(request_job + 0x12) & 0xffff,
                     read(RegisterARM::LR) & !1,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // `dap_tclJob::poCreateErrorResult(request, code)`: the generic factory that
@@ -926,11 +959,11 @@ fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     // one). Its caller is the layer that decided to fail the request, which is
     // what the LR names here.
     let create_error = base_address + (0x00b5_5d00u32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(create_error as u64, create_error as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, create_error, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:930", move |uc: &mut Unicorn<'_, Context>| {
             static COUNT: AtomicU32 = AtomicU32::new(0);
             if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
-                return;
+                return 0;
             }
             let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
             let mut buf = [0u8; 4];
@@ -951,16 +984,17 @@ fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                 read(RegisterARM::R1) & 0xffff,
                 read(RegisterARM::LR) & !1,
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // The translated code that actually reaches the client, plus its setter.
     let init_error = base_address + (0x00b5_4878u32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(init_error as u64, init_error as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, init_error, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:960", move |uc: &mut Unicorn<'_, Context>| {
             static COUNT: AtomicU32 = AtomicU32::new(0);
             if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
-                return;
+                return 0;
             }
             let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
             let mut buf = [0u8; 4];
@@ -976,18 +1010,19 @@ fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                 read(RegisterARM::R2) & 0xffff,
                 read(RegisterARM::LR) & !1,
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // `dap_map_tclWorker::u16SendUniqueIdList(state)`: the map worker's answer
     // path for a GetBlockIDs request. Whether it runs at all separates "DAPI
     // never got to the block-id lookup" from "the lookup produced nothing".
     let unique_ids = base_address + (0x0084_a2f8u32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(unique_ids as u64, unique_ids as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, unique_ids, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:987", move |uc: &mut Unicorn<'_, Context>| {
             static COUNT: AtomicU32 = AtomicU32::new(0);
             if COUNT.fetch_add(1, Ordering::Relaxed) >= 40 {
-                return;
+                return 0;
             }
             let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
             let mut buf = [0u8; 4];
@@ -1003,8 +1038,9 @@ fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                 job,
                 read(RegisterARM::LR) & !1,
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // Step-by-step inside `u16SendUniqueIdList`. These are mid-function sites in
     // already-translated code, and unicorn 2.x only emits the per-instruction
@@ -1022,20 +1058,28 @@ fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     let page_hi = page_lo + 0xfff;
     let stash = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let stashed_msg = std::sync::Arc::clone(&stash);
-    unicorn
-        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+    
+{
+            // r746: page hook expanded to per-arm svc#0 trap sites.
+            for __arm in [0x0084_a310u32, 0x0084_a344u32, 0x0084_a3d4u32, 0x0084_a424u32, 0x0084_a434u32, 0x0084_a4ccu32, 0x0084_a4e4u32, 0x0084_a4fcu32, 0x0084_a514u32, 0x0084_a524u32, 0x0084_a5a8u32, 0x0084_a5dcu32, 0x0084_a63cu32, 0x0084_a7c0u32, 0x0084_a8ccu32, 0x0084_a908u32] {
+                let base_address = base_address.clone();
+                let stash = stash.clone();
+                let stashed_msg = stashed_msg.clone();
+                let __arm: u32 = __arm;
+                let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:1060", move |uc: &mut Unicorn<'_, Context>| {
             use std::sync::atomic::Ordering as Ord;
             static HITS: std::sync::OnceLock<
                 std::sync::Mutex<std::collections::HashMap<u32, u32>>,
             > = std::sync::OnceLock::new();
-            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+            let pc = __site_pc;
             let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
             if original == 0x0084_a310 {
                 stashed_msg.store(
                     uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
                     Ord::Relaxed,
                 );
-                return;
+                return 0;
             }
             let label = match original {
                 0x0084_a344 => "after bGetDapFiMsgFromAction (1=deserialized)",
@@ -1053,18 +1097,18 @@ fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                 0x0084_a7c0 => "after u16SendResponse (answer sent)",
                 0x0084_a8cc => "after u16ProcessLoadRegProfOutlines (RNW outlines)",
                 0x0084_a908 => "after u16ProcessLoadRsRegProfOutlines (RS outlines)",
-                _ => return,
+                _ => return 0,
             };
             let seen = {
                 let mut counts = HITS.get_or_init(Default::default).lock().unwrap();
                 if counts.len() > 40 {
-                    return;
+                    return 0;
                 }
                 *counts.entry(original).or_insert(0) += 1;
                 *counts.get(&original).unwrap()
             };
             if seen > 8 {
-                return;
+                return 0;
             }
             let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             if original == 0x0084_a344 {
@@ -1086,7 +1130,7 @@ fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                     msg,
                     words,
                 );
-                return;
+                return 0;
             }
             let worker = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
             let mut rnw = [0u8; 4];
@@ -1109,8 +1153,11 @@ fn hook_error_job_origin(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                 rnwfi_ref,
                 rsfi_ref,
             );
-        })
-        .unwrap();
+        
+                    0
+                });
+            }
+        }
     }
 }
 
@@ -1124,13 +1171,19 @@ fn hook_fastmap_worker_steps(unicorn: &mut Unicorn<'_, Context>, base_address: u
     for page in [0x0084_9000u32, 0x0084_b000u32] {
         let page_lo = base_address + (page - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x0084_b350u32, 0x0084_b40cu32, 0x0084_b46cu32, 0x0084_b4bcu32, 0x0084_98f8u32, 0x0084_9a2cu32, 0x0084_9a9cu32, 0x0084_9af0u32] {
+                    let base_address = base_address.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:1162", move |uc: &mut Unicorn<'_, Context>| {
                 use std::sync::atomic::Ordering as Ord;
                 static HITS: std::sync::OnceLock<
                     std::sync::Mutex<std::collections::HashMap<u32, u32>>,
                 > = std::sync::OnceLock::new();
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 let label = match original {
                     // u16ProcessOpenChannel
@@ -1143,18 +1196,18 @@ fn hook_fastmap_worker_steps(unicorn: &mut Unicorn<'_, Context>, base_address: u
                     0x0084_9a2c => "LoadBlocks: after rfoGetChannelController/bHandleIsValid (0=invalid handle)",
                     0x0084_9a9c => "LoadBlocks: after rfoGetChannel-ish (0=fail branch)",
                     0x0084_9af0 => "LoadBlocks: after enSetAccessMode (2=write buffer ok)",
-                    _ => return,
+                    _ => return 0,
                 };
                 let seen = {
                     let mut counts = HITS.get_or_init(Default::default).lock().unwrap();
                     if counts.len() > 40 {
-                        return;
+                        return 0;
                     }
                     *counts.entry(original).or_insert(0) += 1;
                     *counts.get(&original).unwrap()
                 };
                 if seen > 6 {
-                    return;
+                    return 0;
                 }
                 let regs = [
                     RegisterARM::R0,
@@ -1173,8 +1226,11 @@ fn hook_fastmap_worker_steps(unicorn: &mut Unicorn<'_, Context>, base_address: u
                     regs,
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
 }
 
@@ -1224,12 +1280,13 @@ fn hook_service_data_scan(unicorn: &mut Unicorn<'_, Context>, base_address: u32)
     ] {
         // (register-id wildcard patch is installed separately below)
         let address = base_address + (address - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:1228", move |uc: &mut Unicorn<'_, Context>| {
+                let addr = address as u64;
                 let counter = if is_scan { &SCAN_COUNT } else { &CMP_COUNT };
                 let count = counter.fetch_add(1, Ordering::Relaxed);
                 if count >= 600 {
-                    return;
+                    return 0;
                 }
                 let read = |reg| uc.reg_read(reg).unwrap_or(0) as u32;
                 let r0 = read(RegisterARM::R0);
@@ -1447,8 +1504,9 @@ fn hook_service_data_scan(unicorn: &mut Unicorn<'_, Context>, base_address: u32)
                         node = nx;
                     }
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // `ail_vAddRegistryEntryFromMessage` (0xb43b80) is reached from a handler
@@ -1461,12 +1519,12 @@ fn hook_service_data_scan(unicorn: &mut Unicorn<'_, Context>, base_address: u32)
         (0x00b4_3b80, "ail_vAddRegistryEntryFromMessage"),
     ] {
         let entry = base_address + (address - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(entry as u64, entry as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, entry, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:1465", move |uc: &mut Unicorn<'_, Context>| {
                 static ADDER_COUNT: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
                 if ADDER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 60 {
-                    return;
+                    return 0;
                 }
                 let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
                 let r0 = read(RegisterARM::R0);
@@ -1509,8 +1567,9 @@ fn hook_service_data_scan(unicorn: &mut Unicorn<'_, Context>, base_address: u32)
                     k3,
                     lr,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
 }
@@ -1529,8 +1588,9 @@ fn hook_service_registration(unicorn: &mut Unicorn<'_, Context>, base_address: u
         (0x00b5_2d3c, "dap_tclCommunicationContext::u16RegisterService"),
     ] {
         let address = base_address + (address - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:1533", move |uc: &mut Unicorn<'_, Context>| {
+                let addr = address as u64;
                 let count = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 60 {
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -1551,8 +1611,9 @@ fn hook_service_registration(unicorn: &mut Unicorn<'_, Context>, base_address: u
                         lr
                     );
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
@@ -1575,11 +1636,12 @@ fn hook_service_register_handler(unicorn: &mut Unicorn<'_, Context>, base_addres
     ] {
         let address = base_address + (address - ORIGINAL_BASE);
         let inject_at = address;
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:1579", move |uc: &mut Unicorn<'_, Context>| {
+                let addr = address as u64;
                 let count = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count >= 40 {
-                    return;
+                    return 0;
                 }
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let r9 = uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32;
@@ -1599,8 +1661,9 @@ fn hook_service_register_handler(unicorn: &mut Unicorn<'_, Context>, base_addres
                     lr
                 );
                 let _ = inject_at;
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
@@ -1617,8 +1680,9 @@ fn hook_service_data_errors(unicorn: &mut Unicorn<'_, Context>, base_address: u3
         (0x00b4_33f4, "ServiceDataError id=0xb temp-unavailable"),
     ] {
         let address = base_address + (address - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:1621", move |uc: &mut Unicorn<'_, Context>| {
+                let addr = address as u64;
                 let count = TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 20 {
                     let service_data = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -1645,8 +1709,9 @@ fn hook_service_data_errors(unicorn: &mut Unicorn<'_, Context>, base_address: u3
                         dump
                     );
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 fn read_u32_at(unicorn: &mut Unicorn<'_, Context>, address: u32) -> u32 {
@@ -1670,12 +1735,12 @@ fn hook_srvctrl_worker_lookup(unicorn: &mut Unicorn<'_, Context>, base_address: 
     use std::sync::atomic::{AtomicU32, Ordering};
     const PO_GET_WORKER: u32 = 0x00b6_2680 - ORIGINAL_BASE;
     let address = base_address + PO_GET_WORKER;
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:1674", move |uc: &mut Unicorn<'_, Context>| {
             static HITS: AtomicU32 = AtomicU32::new(0);
             let hits = HITS.fetch_add(1, Ordering::Relaxed);
             if hits >= 48 {
-                return;
+                return 0;
             }
             let srvctrl = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let job_slot = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -1720,8 +1785,9 @@ fn hook_srvctrl_worker_lookup(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 read_u32_at(uc, job + 0x0a) & 0xffff,
                 uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // `vProcessJob` calls the *assigned* worker's vtable+0x08 right after
     // `poGetWorker` returns (the bl is at 0x82af9c, so the result is in r0 one
@@ -1732,17 +1798,23 @@ fn hook_srvctrl_worker_lookup(unicorn: &mut Unicorn<'_, Context>, base_address: 
     if crate::libs::procmapengine::render_trace_enabled() {
     let page_lo = base_address + 0x0082_a000u32 - ORIGINAL_BASE;
     let page_hi = page_lo + 0xfff;
-    unicorn
-        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-            static ASSIGNED: AtomicU32 = AtomicU32::new(0);
+    
+{
+            // r746: page hook expanded to per-arm svc#0 trap sites.
             const AFTER_PO_GET_WORKER: u32 = 0x0082_afa0;
-            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+            for __arm in [AFTER_PO_GET_WORKER] {
+                let base_address = base_address.clone();
+                let __arm: u32 = __arm;
+                let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:1780", move |uc: &mut Unicorn<'_, Context>| {
+            static ASSIGNED: AtomicU32 = AtomicU32::new(0);
+            let pc = __site_pc;
             if pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE) != AFTER_PO_GET_WORKER {
-                return;
+                return 0;
             }
             let hits = ASSIGNED.fetch_add(1, Ordering::Relaxed);
             if hits >= 12 {
-                return;
+                return 0;
             }
             let worker = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let vtable = read_u32_at(uc, worker);
@@ -1758,8 +1830,11 @@ fn hook_srvctrl_worker_lookup(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 vtable,
                 slots,
             );
-        })
-        .unwrap();
+        
+                    0
+                });
+            }
+        }
     }
 }
 
@@ -1780,21 +1855,27 @@ fn hook_rs_region_outlines_gate(unicorn: &mut Unicorn<'_, Context>, base_address
     // address, because a narrow mid-TB hook can register `Ok` and never be called.
     let page_lo = base_address + 0x0086_9000u32 - ORIGINAL_BASE;
     let page_hi = page_lo + 0xfff;
-    unicorn
-        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-            let offset = (uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32)
+    
+{
+            // r746: page hook expanded to per-arm svc#0 trap sites.
+            for __arm in [0x0086_9ab4u32, 0x0086_9f90u32] {
+                let base_address = base_address.clone();
+                let __arm: u32 = __arm;
+                let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:1828", move |uc: &mut Unicorn<'_, Context>| {
+            let offset = (__site_pc)
                 .wrapping_sub(base_address)
                 .wrapping_add(ORIGINAL_BASE);
             if offset == 0x0086_9ab4 {
                 WORKER.store(uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32, Ordering::Relaxed);
-                return;
+                return 0;
             }
             if offset != 0x0086_9f90 {
-                return;
+                return 0;
             }
             let hits = HITS.fetch_add(1, Ordering::Relaxed);
             if hits >= 6 {
-                return;
+                return 0;
             }
             let worker = WORKER.load(Ordering::Relaxed);
             let context = read_u32_at(uc, worker + 0x14);
@@ -1828,8 +1909,11 @@ fn hook_rs_region_outlines_gate(unicorn: &mut Unicorn<'_, Context>, base_address
                 text(uc, name_b),
                 stack,
             );
-        })
-        .unwrap();
+        
+                    0
+                });
+            }
+        }
 }
 
 /// `rs_tclManager::u16InterpretBroadcast` (0x858880) is how the regionselection component
@@ -1843,12 +1927,12 @@ fn hook_rs_broadcasts(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     use std::sync::atomic::{AtomicU32, Ordering};
     const INTERPRET_BROADCAST: u32 = 0x0085_8880 - ORIGINAL_BASE;
     let address = base_address + INTERPRET_BROADCAST;
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:1847", move |uc: &mut Unicorn<'_, Context>| {
             static HITS: AtomicU32 = AtomicU32::new(0);
             let hits = HITS.fetch_add(1, Ordering::Relaxed);
             if hits >= 16 {
-                return;
+                return 0;
             }
             let job = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             log::warn!(
@@ -1862,8 +1946,9 @@ fn hook_rs_broadcasts(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                 read_u32_at(uc, job + 0x15) & 0xff,
                 uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 /// `rs_tclManager::u16InterpretMediaInfoMsg` (0x8580fc) only registers a medium when the
@@ -1879,9 +1964,15 @@ fn hook_rs_media_info(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     static AFTER_HITS: AtomicU32 = AtomicU32::new(0);
     let page_lo = base_address + 0x0085_8000u32 - ORIGINAL_BASE;
     let page_hi = page_lo + 0xfff;
-    unicorn
-        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-            let offset = (uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32)
+    
+{
+            // r746: page hook expanded to per-arm svc#0 trap sites.
+            for __arm in [0x0085_80fcu32, 0x0085_8b0cu32] {
+                let base_address = base_address.clone();
+                let __arm: u32 = __arm;
+                let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:1928", move |uc: &mut Unicorn<'_, Context>| {
+            let offset = (__site_pc)
                 .wrapping_sub(base_address)
                 .wrapping_add(ORIGINAL_BASE);
             let text = |uc: &mut Unicorn<'_, Context>, name: u32| -> String {
@@ -1898,7 +1989,7 @@ fn hook_rs_media_info(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
             if offset == 0x0085_80fc {
                 let hits = ENTRY_HITS.fetch_add(1, Ordering::Relaxed);
                 if hits >= 8 {
-                    return;
+                    return 0;
                 }
                 let manager = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let context = manager + 0x54;
@@ -1974,14 +2065,14 @@ fn hook_rs_media_info(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     media_b,
                     text(uc, name_b),
                 );
-                return;
+                return 0;
             }
             if offset != 0x0085_8b0c {
-                return;
+                return 0;
             }
             let hits = AFTER_HITS.fetch_add(1, Ordering::Relaxed);
             if hits >= 8 {
-                return;
+                return 0;
             }
             // r0 carries the error the interpreter left behind in `*param_2`'s place;
             // the manager is the object that `poAssignWorker` worked on (r7 there).
@@ -2003,8 +2094,11 @@ fn hook_rs_media_info(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                 media_b,
                 text(uc, name_b),
             );
-        })
-        .unwrap();
+        
+                    0
+                });
+            }
+        }
 }
 
 /// `dap_tclMediaInfoCtrl` is nothing but a deserialized `dap_devmanfi_tclMsgMediaInfoStatus`
@@ -2018,12 +2112,12 @@ fn hook_media_info_vector(unicorn: &mut Unicorn<'_, Context>, base_address: u32)
     use std::sync::atomic::{AtomicU32, Ordering};
     const NAV_ACCESSABLE: u32 = 0x008c_4bb8 - ORIGINAL_BASE;
     let address = base_address + NAV_ACCESSABLE;
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:2022", move |uc: &mut Unicorn<'_, Context>| {
             static HITS: AtomicU32 = AtomicU32::new(0);
             let hits = HITS.fetch_add(1, Ordering::Relaxed);
             if hits >= 4 {
-                return;
+                return 0;
             }
             let ctrl = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let asked = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -2088,8 +2182,9 @@ fn hook_media_info_vector(unicorn: &mut Unicorn<'_, Context>, base_address: u32)
                 words,
                 ascii,
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 /// `dap_tclDapiApp::vEvalDeviceConfig` (0x822630) is what transfers the
@@ -2109,8 +2204,8 @@ fn hook_dapi_device_config(unicorn: &mut Unicorn<'_, Context>, base_address: u32
     for (offset, _) in [(EVAL, "eval"), (ADD_DEVICE, "add")] {
         let address = base_address + offset;
         let which = if offset == EVAL { 0u8 } else { 1u8 };
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:2113", move |uc: &mut Unicorn<'_, Context>| {
                 let text = |uc: &mut Unicorn<'_, Context>, at: u32| -> String {
                     if at == 0 || at == 0xffff_ffff {
                         return "<null>".to_string();
@@ -2125,7 +2220,7 @@ fn hook_dapi_device_config(unicorn: &mut Unicorn<'_, Context>, base_address: u32
                 if which == 0 {
                     let hits = EVAL_HITS.fetch_add(1, Ordering::Relaxed);
                     if hits >= 12 {
-                        return;
+                        return 0;
                     }
                     let app = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                     let config = app + 0x7c;
@@ -2183,11 +2278,11 @@ fn hook_dapi_device_config(unicorn: &mut Unicorn<'_, Context>, base_address: u32
                             });
                         }
                     }
-                    return;
+                    return 0;
                 }
                 let hits = ADD_HITS.fetch_add(1, Ordering::Relaxed);
                 if hits >= 12 {
-                    return;
+                    return 0;
                 }
                 let name = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let prm = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
@@ -2213,8 +2308,9 @@ fn hook_dapi_device_config(unicorn: &mut Unicorn<'_, Context>, base_address: u32
                     from_config_field,
                     online_field,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
@@ -2232,17 +2328,23 @@ fn hook_dapi_file_lookup(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     static MISSES: AtomicU32 = AtomicU32::new(0);
     let page_lo = base_address + 0x008a_c000u32 - ORIGINAL_BASE;
     let page_hi = page_lo + 0xfff;
-    unicorn
-        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-            let offset = (uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32)
+    
+{
+            // r746: page hook expanded to per-arm svc#0 trap sites.
+            for __arm in [0x008a_c4a4u32] {
+                let base_address = base_address.clone();
+                let __arm: u32 = __arm;
+                let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:2283", move |uc: &mut Unicorn<'_, Context>| {
+            let offset = (__site_pc)
                 .wrapping_sub(base_address)
                 .wrapping_add(ORIGINAL_BASE);
             if offset != 0x008a_c4a4 {
-                return;
+                return 0;
             }
             let hits = HITS.fetch_add(1, Ordering::Relaxed);
             if hits >= 400 {
-                return;
+                return 0;
             }
             let path_ptr = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
             let files = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
@@ -2267,11 +2369,11 @@ fn hook_dapi_file_lookup(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                 count,
             );
             if index != 0xffff_ffff {
-                return;
+                return 0;
             }
             let misses = MISSES.fetch_add(1, Ordering::Relaxed);
             if misses >= 8 || base == 0 || base == 0xffff_ffff {
-                return;
+                return 0;
             }
             // Descriptor layout is only partly known; the registered path is the longest
             // printable run inside the 0x7c-byte record, so extract it that way.
@@ -2299,6 +2401,9 @@ fn hook_dapi_file_lookup(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                 .collect::<Vec<_>>()
                 .join(", ");
             log::warn!("DAPI filemgmt table ({} entries): {}", count, names);
-        })
-        .unwrap();
+        
+                    0
+                });
+            }
+        }
 }
