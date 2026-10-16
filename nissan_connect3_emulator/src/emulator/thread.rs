@@ -212,6 +212,13 @@ pub struct GuestThread {
     pub id: u32,
     pub status: ThreadStatus,
 
+    /// µITRON-style task threads fabricated by the RTOS layer (`spawn_guest_thread`,
+    /// `spawn_system_tasks`).  Their bodies have no `main`-like runtime below them:
+    /// when the task body unwinds (PROCNAV's pump `0x5e8d98` answers its unknown
+    /// message id and falls through) it walks into a null continuation and the
+    /// kernel-equivalent kill is the *designed* teardown, not a crash - report it
+    /// as such instead of an ERROR (golden era printed the same walk as an ERROR).
+    pub rtos_task: bool,
     /// saved CPU state (None while Running)
     pub cpu_context: Option<CpuContext>,
     /// PC to start from when switching in (valid when not Running)

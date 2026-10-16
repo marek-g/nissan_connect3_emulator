@@ -1863,7 +1863,18 @@ fn spawn_guest_thread(unicorn: &mut Unicorn<'_, Context>, entry: u32, arg: u32, 
         .reg_write(RegisterARM::R0 as i32, arg as u64)
         .unwrap();
     unicorn.reg_write(RegisterARM::R13 as i32, sp as u64).unwrap();
-    unicorn.reg_write(RegisterARM::R14 as i32, 0).unwrap();
+    // r754: task bodies that *return* (the PROCNAV state pump `0x5e8d98` is
+    // just `vMsgHandler`, which falls through once its context word is not a
+    // known message id) used to branch to LR=0: the scheduler reported
+    // `ERROR cannot resume at pc=0x0` and SIGSEGV-terminated the task every
+    // boot.  The real µITRON kernel gives a task body a return point that
+    // tears the task down, and this emulator already has the equivalent:
+    // the kernel-trap `exit` stub (same one glibc-style mq-notify threads
+    // return through).  LR = stub turns the task's plain `return` into a
+    // normal, quiet thread exit instead of a null-page illtrap.
+    unicorn
+        .reg_write(RegisterARM::R14 as i32, MQ_NOTIFY_EXIT_STUB as u64)
+        .unwrap();
     // SCD task bodies are coroutines that return through `bx r3` into their
     // re-run continuation; with r3 = 0 the first completion branch jumped to
     // the null page and the scheduler terminated the thread (Exited(139)).
@@ -1887,6 +1898,7 @@ fn spawn_guest_thread(unicorn: &mut Unicorn<'_, Context>, entry: u32, arg: u32, 
         let tid = data.inner.next_thread_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         data.threads.lock().unwrap().push(GuestThread {
             id: tid,
+            rtos_task: true,
             status: ThreadStatus::Runnable,
             cpu_context: Some(child_context),
             pc: start,
@@ -3088,6 +3100,7 @@ fn spawn_system_tasks(unicorn: &mut Unicorn<'_, Context>) {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         unicorn.get_data().threads.lock().unwrap().push(GuestThread {
             id: tid,
+            rtos_task: true,
             status: ThreadStatus::Runnable,
             cpu_context: Some(task_context),
             pc: MESSAGE_PUMP,

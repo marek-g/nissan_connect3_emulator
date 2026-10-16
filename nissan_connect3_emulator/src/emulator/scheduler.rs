@@ -58,6 +58,7 @@ pub fn setup_process(
         let cpu_context = unicorn.context_init().map_err(map_uc_error)?;
         data.threads.lock().unwrap().push(GuestThread {
             id: main_id,
+            rtos_task: false,
             status: ThreadStatus::Runnable,
             cpu_context: Some(cpu_context),
             pc: interp_entry_point,
@@ -125,13 +126,31 @@ fn run_quantum(
     // returns immediately (begin == until), which would livelock this loop forever.
     // Linux would deliver SIGSEGV here, so terminate with the same default action.
     if pc < 0x1000 {
-        log::error!(
-            "[{}] cannot resume at pc={:#x} (lr={:#x} sp={:#x}), terminating",
-            next_id,
-            pc,
-            unicorn.reg_read(RegisterARM::R14).unwrap_or(0),
-            unicorn.reg_read(RegisterARM::R13).unwrap_or(0)
-        );
+        let rtos_task = unicorn
+            .get_data()
+            .threads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|t| t.id == next_id && t.rtos_task);
+        if rtos_task {
+            // Fabricated RTOS task whose body unwound into its null teardown
+            // continuation (see `GuestThread::rtos_task`): the real kernel
+            // illtraps this task the same way; it is not an emulator error.
+            log::info!(
+                "[{}] rtos task unwound to its null teardown continuation (pc={:#x}), killed like the real kernel would",
+                next_id,
+                pc
+            );
+        } else {
+            log::error!(
+                "[{}] cannot resume at pc={:#x} (lr={:#x} sp={:#x}), terminating",
+                next_id,
+                pc,
+                unicorn.reg_read(RegisterARM::R14).unwrap_or(0),
+                unicorn.reg_read(RegisterARM::R13).unwrap_or(0)
+            );
+        }
         let data = unicorn.get_data();
         if let Some(thread) = data
             .threads

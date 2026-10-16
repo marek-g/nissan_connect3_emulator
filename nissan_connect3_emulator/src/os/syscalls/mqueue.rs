@@ -235,6 +235,7 @@ fn spawn_notify_thread(unicorn: &mut Unicorn<'_, Context>, function: u32, sigval
         let threads = unicorn.get_data().threads.clone();
         threads.lock().unwrap().push(GuestThread {
             id: tid,
+            rtos_task: false,
             status: ThreadStatus::Runnable,
             cpu_context: Some(child_context),
             pc: function,
