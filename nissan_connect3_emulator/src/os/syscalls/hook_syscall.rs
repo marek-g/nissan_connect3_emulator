@@ -16,6 +16,10 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
     // happens here instead (this context never holds that mutex). The call is
     // a relaxed atomic swap in the common (nothing pending) case.
     crate::libs::procmapengine::install_pending_observers(unicorn);
+    // Handlers and syscall emulation may register further trap sites while
+    // the MMU mutex is free; patch them immediately so the guest reaches
+    // them already trapped (e.g. return-address taps armed from a handler).
+    crate::os::code_stub::flush_trap_sites(unicorn);
 
     // Guest C code expects ARM callee-saved registers to survive OSAL stubs and
     // Linux syscalls. Some host stub/syscall paths use R4-R10 as scratch space, so
@@ -34,6 +38,20 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
         map.get(&pc.wrapping_sub(4)).copied()
     };
     if let Some(stub) = stub {
+        // An `add_code_stub` and a `trap_site` may legitimately coexist at one
+        // address (older code registered both an observer hook and a stub
+        // there; Unicorn ran the hook callback *and* the svc->stub, hook
+        // first). The svc is shared, so run the site callback here in the
+        // same order before the stub handler; the trap's own instruction was
+        // already replaced by the shared svc in both worlds.
+        let co_site = crate::os::code_stub::take_site(pc);
+        if let Some((_key, mut cob, _cave, cname)) = co_site {
+            crate::os::code_stub::note_site(cname, pc.wrapping_sub(4));
+            crate::os::code_stub::site_handler_enter();
+            let _ = cob.call(unicorn);
+            crate::os::code_stub::site_handler_leave();
+            crate::os::code_stub::put_site(_key, cob, _cave, cname);
+        }
         let tid = unicorn.get_data().thread_id();
         log::trace!(
             "{:#x}: [{}] [{} HOOK] {}() [IN]",
@@ -74,8 +92,15 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
     // register/memory writes take effect as-is. Resume priority: explicit
     // non-zero return value, then a PC the handler wrote itself, then the
     // code cave that replays the replaced instruction and branches back.
-    if let Some((key, mut cb, cave)) = crate::os::code_stub::take_site(pc) {
+    if let Some((key, mut cb, cave, name)) = crate::os::code_stub::take_site(pc) {
+        crate::os::code_stub::note_site(name, key);
+        log::debug!(
+            "site hit {name} @ {key:#x} thread [{}]",
+            unicorn.get_data().inner.thread_id()
+        );
+        crate::os::code_stub::site_handler_enter();
         let ret = cb.call(unicorn);
+        crate::os::code_stub::site_handler_leave();
         let after = unicorn.reg_read(RegisterARM::PC).unwrap() as u32;
         let newpc = if ret != 0 {
             ret
@@ -85,8 +110,37 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
             cave
         };
         unicorn.reg_write(RegisterARM::PC, newpc as u64).unwrap();
-        crate::os::code_stub::put_site(key, cb, cave);
+        log::debug!("site resume {name} @ {key:#x} -> {newpc:#x}");
+        crate::os::code_stub::put_site(key, cb, cave, name);
         return;
+    }
+    // Re-entrant hit: guest code run by a running site handler re-executed a
+    // (busy) trapped site. Replay the original instruction through the cave;
+    // never let this svc reach syscall emulation.
+    if crate::os::code_stub::in_site_handler() {
+        if let Some(cave) = crate::os::code_stub::site_cave(pc) {
+            unicorn.reg_write(RegisterARM::PC, cave as u64).unwrap();
+            return;
+        }
+    }
+    // Debug/safety: an `svc #0` whose address is a registered trap site but
+    // that matches no live SITES entry is a lost trap (double-patch, stub
+    // collision, ...) - replay its instruction through the recorded cave
+    // instead of silently emulating a bogus syscall #0 from it.
+    if int_no == 0 {
+        for key in [pc.wrapping_sub(4), pc.wrapping_sub(2)] {
+            if crate::os::code_stub::site_registered(key) {
+                log::error!(
+                    "orphan trap svc at {key:#x} thread [{}] (site entry lost)",
+                    unicorn.get_data().inner.thread_id()
+                );
+                let cave = crate::os::code_stub::site_registered_cave(key);
+                if cave != 0 {
+                    unicorn.reg_write(RegisterARM::PC, cave as u64).unwrap();
+                    return;
+                }
+            }
+        }
     }
 
     // Statically linked navigation processes (PROCNAV) reach the LX monitor

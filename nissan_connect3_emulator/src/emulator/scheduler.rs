@@ -279,6 +279,10 @@ fn run_quantum(
             next_id,
             res.as_ref().err()
         );
+        if let Some((site, site_addr)) = crate::os::code_stub::last_site() {
+            log::error!("last trapped site before fault: {site} at {site_addr:#x}");
+            crate::os::code_stub::dump_site_ring();
+        }
         dump_context(unicorn);
     }
 

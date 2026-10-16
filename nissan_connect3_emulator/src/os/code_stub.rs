@@ -347,6 +347,12 @@ fn probe_true_mode(unicorn: &Unicorn<'_, Context>, site: u32, stamped: TrapMode)
     if unicorn.mem_read(site as u64, &mut code).is_err() {
         return stamped;
     }
+    // An all-zero window means the page is mapped but not written yet (or is
+    // genuinely zero padding): every mode "decodes" zeros, so probing would
+    // be meaningless - the caller's zero-word retry handles that case.
+    if code.iter().all(|b| *b == 0) {
+        return stamped;
+    }
     let decodes = |mode: ArchMode| -> bool {
         let Ok(cs) = Capstone::new()
             .arm()
@@ -541,28 +547,6 @@ pub fn flush_trap_sites(unicorn: &mut Unicorn<'_, Context>) {
         a
     };
     let mut arena = arena_start;
-    // Debug: watch the arena page so guest writes into a live cave (which the
-    // earlier 0x16-into-literal corruption looked exactly like) are logged.
-    {
-        let res = unicorn.add_mem_hook(
-            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
-            (arena_start & !0xfff) as u64,
-            (((arena_start + count * 16) | 0xfff) + 1) as u64 - 1,
-            move |uc, _t, address, size, value| {
-                log::error!(
-                    "ARENA WRITE: {:#x} size {:#x} value {:#x} thread [{}]",
-                    address,
-                    size,
-                    value,
-                    uc.get_data().inner.thread_id()
-                );
-                true
-            },
-        );
-        if let Err(e) = res {
-            log::warn!("arena watch failed: {e:?}");
-        }
-    }
     let mut trapped = 0usize;
     let mut new_retry: Vec<(PendingSite, u32)> = Vec::new();
     for (idx, p) in pending.into_iter().enumerate() {
