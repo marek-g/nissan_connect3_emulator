@@ -686,6 +686,20 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool 
                     "monitor: thread [{self_id}] task {} for thread [{tid}] at {block:#x} answered",
                     if service == TSE_TASK_DELETE { "delete" } else { "terminate" }
                 );
+                // r752: `ter_tsk(0)` (`tid == 0` in the request block) terminates the
+                // *calling* task - the PROCNAV stdin/command loop at 0x5ea41c ends its
+                // service cycle with exactly that call. The real monitor kills the task
+                // at the svc; it never runs anything after the call. Answering the svc
+                // instead let the guest walk its epilogue and die on a `pop {r0,pc}`
+                // reading one word past the 16 KiB monitor stack top, which printed a
+                // READ_UNMAPPED + full register/MMU/disasm dump at every boot
+                // (0x5ea468, thread [20], present since the golden era). Exit at the
+                // svc now: same exit code 1 and the same parked `exited(1)` line as
+                // before, minus the fault noise.
+                if service == TSE_TASK_TERMINATE && tid == 0 {
+                    crate::emulator::thread::exit_current_thread(unicorn, 1);
+                    return true;
+                }
                 if tid != 0 && tid != self_id {
                     let mut threads = unicorn.get_data().threads.lock().unwrap();
                     if let Some(target) = threads.iter_mut().find(|t| t.id == tid) {
