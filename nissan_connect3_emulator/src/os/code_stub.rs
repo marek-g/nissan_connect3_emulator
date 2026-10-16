@@ -179,7 +179,7 @@ use std::collections::HashMap;
 /// Instruction set at a trap site (no mapping symbols exist in these ELFs,
 /// so each converting file states it; procnav + the monitor shims are Thumb,
 /// everything else is ARM).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrapMode {
     Arm,
     Thumb,
@@ -327,6 +327,53 @@ enum CaveFail {
     Structural,
 }
 
+/// Detect the *true* instruction mode at `site` and auto-correct a wrong
+/// registration stamp.  The converter stamps whole files (ARM or Thumb), but
+/// binaries contain interworking islands and linker thunks in the other
+/// mode: an ARM `svc #0` word patched onto Thumb code decodes there as
+/// `movs r0,r0` plus an undefined 32-bit word, and a Thumb16 `svc` spliced
+/// into ARM code corrupts the instruction pair - both keep running (silently
+/// wrong) instead of faulting.  The probe decodes the site in both modes and
+/// flips the stamp only when the stamped mode cannot decode *any* valid
+/// instruction while the other mode can.  Genuinely ambiguous words (an ARM
+/// `STMDB sp!,{..}` push also being a legal Thumb32 encoding) keep the
+/// stamp, which is what every shipped site has been verified against.
+fn probe_true_mode(unicorn: &Unicorn<'_, Context>, site: u32, stamped: TrapMode) -> TrapMode {
+    use capstone::arch::arm::ArchMode;
+    use capstone::prelude::*;
+    use capstone::{Capstone, Endian};
+
+    let mut code = [0u8; 8];
+    if unicorn.mem_read(site as u64, &mut code).is_err() {
+        return stamped;
+    }
+    let decodes = |mode: ArchMode| -> bool {
+        let Ok(cs) = Capstone::new()
+            .arm()
+            .mode(mode)
+            .endian(Endian::Little)
+            .build()
+        else {
+            return false;
+        };
+        cs.disasm_all(&code, site as u64)
+            .map(|insns| insns.iter().next().is_some())
+            .unwrap_or(false)
+    };
+    let (arm_ok, thumb_ok) = (decodes(ArchMode::Arm), decodes(ArchMode::Thumb));
+    let true_mode = match (arm_ok, thumb_ok) {
+        (true, _) => TrapMode::Arm,
+        (false, true) => TrapMode::Thumb,
+        (false, false) => return stamped,
+    };
+    if true_mode != stamped {
+        log::warn!(
+            "trap: site {site:#x} stamp {stamped:?} is really {true_mode:?} (auto-correcting)"
+        );
+    }
+    true_mode
+}
+
 fn build_cave(
     unicorn: &mut Unicorn<'_, Context>,
     arena: &mut u32,
@@ -343,7 +390,8 @@ fn build_cave(
     let mut bytes = [0u8; 16];
     let resume;
     let mut patch: &[u8] = &[];
-    match p.mode {
+    let mode = probe_true_mode(unicorn, site, p.mode);
+    match mode {
         TrapMode::Arm => {
             let mut w = [0u8; 4];
             if unicorn.mem_read(site as u64, &mut w).is_err() {
@@ -451,7 +499,7 @@ fn build_cave(
             unicorn.get_data().inner.thread_id()
         );
     }
-    match p.mode {
+    match mode {
         TrapMode::Arm => Ok(cave),
         TrapMode::Thumb => Ok(cave | 1),
     }
