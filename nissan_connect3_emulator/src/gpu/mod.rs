@@ -1517,6 +1517,36 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
                 backend.map_pixels.copy_from_slice(&fresh);
             }
             publish_map_surface_pixels(&backend.map_pixels);
+            // TEMP r750: classify what the pinned published map pixels hold
+            // at publish time (the map_pub PPM files proved orange).
+            {
+                static PUB_TEL: AtomicU32 = AtomicU32::new(0);
+                let tel = PUB_TEL.fetch_add(1, Ordering::Relaxed);
+                if tel % 3 == 0 {
+                    let (mut orange, mut bg, mut other) = (0u32, 0u32, 0u32);
+                    for px in backend.map_pixels.chunks_exact(4) {
+                        let (r, g, b) = (px[0], px[1], px[2]);
+                        if r.abs_diff(217) < 24 && g.abs_diff(140) < 24 && b < 60 {
+                            orange += 1;
+                        } else if r.abs_diff(204) < 8
+                            && g.abs_diff(206) < 8
+                            && b.abs_diff(217) < 8
+                        {
+                            bg += 1;
+                        } else {
+                            other += 1;
+                        }
+                    }
+                    log::info!(
+                        "GPU: TEMP publish tel n={} flat={} pinned orange={} bg={} other={}",
+                        tel,
+                        flat,
+                        orange,
+                        bg,
+                        other
+                    );
+                }
+            }
             // r750: DPU-style rescan. The guest HMI compositor can freeze
             // (its AIL tick threads park at t~56 s while the map engine
             // keeps publishing frames); on the unit the LCD still shows the
@@ -1634,6 +1664,47 @@ fn composite_hmi_over_map(backend: &mut Backend) {
                 "GPU: HMI layer has {} transparent pixels but no map layer is enabled (window {:#x})",
                 transparent_count,
                 MAP_LAYER_SIGNATURE.load(Ordering::Relaxed)
+            );
+        }
+    }
+    // TEMP r750: the window keeps showing a flat background even though the
+    // pinned map content provably carries road pixels - classify every
+    // composited pixel by source so the loss point is pinned down.
+    {
+        static COMP_TEL: AtomicU32 = AtomicU32::new(0);
+        let tel = COMP_TEL.fetch_add(1, Ordering::Relaxed);
+        if tel % 10 == 0 {
+            let mut orange = 0u32;
+            let mut bg = 0u32;
+            let mut dark = 0u32;
+            let mut black = 0u32;
+            let mut other = 0u32;
+            for px in backend.hmi_pixels.chunks_exact(4) {
+                let (r, g, b) = (px[0], px[1], px[2]);
+                if r.abs_diff(217) < 24 && g.abs_diff(140) < 24 && b < 60 {
+                    orange += 1;
+                } else if r.abs_diff(204) < 8 && g.abs_diff(206) < 8 && b.abs_diff(217) < 8 {
+                    bg += 1;
+                } else if (r | g | b) < 8 {
+                    black += 1;
+                } else if r < 64 && g < 64 && b < 64 {
+                    dark += 1;
+                } else {
+                    other += 1;
+                }
+            }
+            log::info!(
+                "GPU: TEMP composite tel n={} orange={} bg={} dark={} black={} other={} alpha(opaque={} trans={} mixed={} outside={})",
+                tel,
+                orange,
+                bg,
+                dark,
+                black,
+                other,
+                opaque_count,
+                transparent_count,
+                mixed_count,
+                outside_count
             );
         }
     }
