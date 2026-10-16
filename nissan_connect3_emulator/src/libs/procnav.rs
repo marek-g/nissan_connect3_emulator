@@ -767,7 +767,7 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         let sd_hot = sd_hot.clone();
         let built_ptr = built_ptr.clone();
         let ail_count = ail_count.clone();
-        let result = unicorn.add_code_hook(address, address + size, move |uc, addr, _| {
+        crate::os::code_stub::trap_site(unicorn, address as u32, crate::os::code_stub::TrapMode::Thumb, "libs/procnav.rs:770", move |uc: &mut Unicorn<'_, Context>| {
             let tid = uc.get_data().inner.thread_id();
             if name == "power-repost" || (name.starts_with("probe-") && name != "probe-less-u16") {
                 let (counter, limit) = if name.starts_with("probe-new-") {
@@ -802,7 +802,7 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     (&repost_count, 600)
                 };
                 if counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= limit {
-                    return; // dispatch retries and startup allocations flood the log
+                    return 0; // dispatch retries and startup allocations flood the log
                 }
             }
             match name {
@@ -1437,11 +1437,9 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 }
                 _ => {}
             }
+            0
         });
-        match result {
-            Ok(_) => log::info!("PROCNAV: observation hook '{name}' at {address:#x}"),
-            Err(error) => log::warn!("PROCNAV: cannot hook {name} at {address:#x}: {error}"),
-        }
+        log::info!("PROCNAV: observation trap '{name}' at {address:#x}");
     }
 
     // Page-granular watchers replacing the narrow hooks that unicorn 2.1.5

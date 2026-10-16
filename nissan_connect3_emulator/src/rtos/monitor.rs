@@ -1790,16 +1790,20 @@ fn guest_task_loop_stub(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     // trace every first call and re-run through the stub (cheap: only task
     // threads pass through here, and only on log level debug)
     for (label, off) in [("first", 0u32), ("re-run", 0xa)] {
-        let base = addr;
         let tag = label.to_string();
-        unicorn
-            .add_code_hook((base + off) as u64, (base + off + 2) as u64, move |uc, _, _| {
+        crate::os::code_stub::trap_site(
+            unicorn,
+            addr + off,
+            crate::os::code_stub::TrapMode::Thumb,
+            "rtos/monitor.rs:1796",
+            move |uc: &mut Unicorn<'_, Context>| {
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
                 let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0);
                 let tid = uc.get_data().thread_id();
                 log::debug!("monitor: task-stub {tag}[{tid}] r0={r0:#010x} r4={r4:#010x}");
-            })
-            .ok();
+                0
+            },
+        );
     }
     let data = unicorn.get_data();
     data.inner.set_task_loop_stub(addr);
