@@ -1522,10 +1522,12 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
             // keeps publishing frames); on the unit the LCD still shows the
             // live map because the display engine scans out both layers
             // independently of the HMI application redraws. Re-present the
-            // composed window on every content-bearing map publish so the
-            // map layer keeps updating the window even without a fresh
-            // prochmi swap.
-            if !flat && backend.hmi_framebuffer != 0 {
+            // composed window on every map publish - flat repaints included,
+            // the scanout does not care whether the content changed - so the
+            // window keeps tracking the published map even without a fresh
+            // prochmi swap (and the throttled window dump below rides on the
+            // same call, catching up whenever it becomes due).
+            if backend.hmi_framebuffer != 0 {
                 composite_hmi_over_map(backend);
                 sys::SDL_GL_MakeCurrent(backend.window_raw, backend.comp_context);
                 backend.current_target = None;
@@ -3052,6 +3054,57 @@ fn route_uniform_matrix(unicorn: &mut Unicorn<'_, Context>, components: usize) -
 /// and `u_matViewProj` (loc 1) exactly as the synth shader does, and logs the
 /// resulting clip-space vertices.  Tells whether the draws land outside the
 /// clip volume (rasteriser drops them silently, no GL error).
+/// TEMP r750: read a row back from the framebuffer bound *right now* (the one
+/// the just-finished map draw targeted) and log its non-background pixels
+/// with the gating GL state, to tell rasterisation failure apart from a wrong
+/// readback target at swap time.
+unsafe fn temp_map_draw_readback(tag: &str, program: i32, forced: bool) {
+    static RB_LOGS: AtomicU32 = AtomicU32::new(0);
+    if RB_LOGS.fetch_add(1, Ordering::Relaxed) >= 12 {
+        return;
+    }
+    let mut row = vec![0u8; 800 * 4];
+    gl::ReadPixels(
+        0,
+        235,
+        800,
+        1,
+        gl::RGBA,
+        gl::UNSIGNED_BYTE,
+        row.as_mut_ptr() as *mut _,
+    );
+    let mut nonbg = 0usize;
+    let mut first_px = [0u8; 4];
+    for px in row.chunks_exact(4) {
+        let bg = (px[0] == 204 && px[1] == 206 && px[2] == 217)
+            || (px[0] == 255 && px[1] == 255 && px[2] == 255)
+            || (px[0] | px[1] | px[2]) < 8;
+        if !bg {
+            if nonbg == 0 {
+                first_px = [px[0], px[1], px[2], px[3]];
+            }
+            nonbg += 1;
+        }
+    }
+    let mut fb = 0i32;
+    gl::GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut fb);
+    let mut depth = 0i32;
+    gl::GetIntegerv(gl::DEPTH_TEST, &mut depth);
+    let mut scissor = 0i32;
+    gl::GetIntegerv(gl::SCISSOR_TEST, &mut scissor);
+    let mut blend = 0i32;
+    gl::GetIntegerv(gl::BLEND, &mut blend);
+    let mut cmask = [0i32; 4];
+    gl::GetIntegerv(gl::COLOR_WRITEMASK, cmask.as_mut_ptr());
+    let mut vp = [0i32; 4];
+    gl::GetIntegerv(gl::VIEWPORT, vp.as_mut_ptr());
+    let mut lw = 0f32;
+    gl::GetFloatv(gl::LINE_WIDTH, &mut lw);
+    log::info!(
+        "GPU: TEMP road readback[{tag}] program={program} forced={forced} fbo={fb} row235 nonbg={nonbg} first={first_px:?} depth={depth} scissor={scissor} blend={blend} cmask={cmask:?} viewport={vp:?} lw={lw:.3}",
+    );
+}
+
 unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
     static PROBES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     // Probe a whole frame's worth of draws: the first draws of a frame belong
@@ -4370,6 +4423,32 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
                 // sourced GL_SHORT attributes, and a silently rejected draw
                 // would otherwise look like "rendered but invisible".
                 gpu_void_clear(move || unsafe {
+                    // r750: same colour safety net as the multi-draw arm.
+                    // The big street strip (count ~3196) arrives through this
+                    // entry point, and the engine pushes a black/transparent
+                    // `a_color` constant, so without a forced stroke colour
+                    // the real road geometry rasterises invisible.
+                    let mut program = 0i32;
+                    gl::GetIntegerv(gl::CURRENT_PROGRAM, &mut program);
+                    let mut forced = false;
+                    if count >= 300 {
+                        let cname = std::ffi::CString::new("a_color").unwrap();
+                        let loc = if program > 0 {
+                            gl::GetAttribLocation(program as u32, cname.as_ptr())
+                        } else {
+                            -1
+                        };
+                        let tracked = LAST_MAP_ATTRIB4.lock().ok().and_then(|g| *g);
+                        if loc >= 0
+                            && tracked.map_or(true, |(_, c)| {
+                                c[3] < 0.02 || c[0] + c[1] + c[2] < 0.02
+                            })
+                        {
+                            gl::DisableVertexAttribArray(loc as u32);
+                            gl::VertexAttrib4f(loc as u32, 0.85, 0.55, 0.10, 1.0);
+                            forced = true;
+                        }
+                    }
                     probe_map_draw_vertices(mode, first, count);
                     gl::DrawArrays(mode, first, count);
                     let mut errors = [0u32; 4];
@@ -4395,6 +4474,9 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
                                 &errors[..n]
                             );
                         }
+                    }
+                    if count >= 1000 {
+                        temp_map_draw_readback("single", program, forced);
                     }
                 })
             } else {
@@ -4963,6 +5045,7 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
                         -1
                     };
                     let tracked = LAST_MAP_ATTRIB4.lock().ok().and_then(|g| *g);
+                    let mut forced = false;
                     if loc >= 0
                         && tracked.map_or(true, |(_, c)| {
                             c[3] < 0.02 || c[0] + c[1] + c[2] < 0.02
@@ -4970,6 +5053,7 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
                     {
                         gl::DisableVertexAttribArray(loc as u32);
                         gl::VertexAttrib4f(loc as u32, 0.85, 0.55, 0.10, 1.0);
+                        forced = true;
                         static FORCE_LOGS: AtomicU32 = AtomicU32::new(0);
                         if FORCE_LOGS.fetch_add(1, Ordering::Relaxed) < 3 {
                             log::info!(
@@ -5002,6 +5086,7 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
                         gl::DrawArrays(mode as u32, first, count);
                     }
                     drain_host_gl_errors();
+                    temp_map_draw_readback("multi", program, forced);
                 });
                 if drew {
                     note_real_gl_output(unicorn, "draw");
