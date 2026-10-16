@@ -287,3 +287,22 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
   answered - it marks shutdown.
 - **Verified:** fix27/fix28: no `terminated` line in a 340 s run, prochmi
   swaps 1971 in 140 s (fix24: 659 in 340 s), roads and window dumps intact.
+
+## PROCNAV thread [77]: SXM/AGW service-discovery thread exits with code 1 and faults unwinding (open)
+
+- **Seen:** run fix52 (150 s, first run long enough): after
+  `registry query .../PROCESS/PROCSXM/FC_SXM/SERVICES/AGW"\"SERVICEID = 0x98`
+  PROCNAV thread [77] logs `thread exited with code 1` and then
+  `0x35952a: [77] Execution error: Some(READ_UNMAPPED)` (LR 0x34e4e9,
+  FP 0, R2 = 0xfba0f168 poison-ish).  One occurrence per run.
+- **Not caused by the r755 CCA-directory work:** the responder answers only
+  src 0x0109 registrations and procmap/DAPI keep their bespoke paths; no new
+  message reaches PROCNAV.  300 s golden-era runs (fix34) show no such exit -
+  the SXM branch is schedule/time dependent and only became reachable with
+  the changed timing.  Guest-side bug faithfully surfaced (its exit-unwind
+  reads an unmapped pointer), unrelated to navigation/map.
+- **Impact:** satellite-radio service discovery gives up; navigation path
+  unaffected; thread park list shows [77] gone afterwards, no storms.
+- **TODO:** when revisiting PROCNAV fidelity, trace the 0x35952a unwind (it
+  follows `vHandle...SXM` startup failing without an AGW service) and either
+  provide an AGW/SXM directory entry or document the crash as benign.

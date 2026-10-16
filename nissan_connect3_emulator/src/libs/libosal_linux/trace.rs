@@ -89,7 +89,7 @@ pub fn v_write_to_err_mem(unicorn: &mut Unicorn<'_, Context>) -> u32 {
             log::warn!(
                 "[{}] err raw @{arg2:#x}: {:02x?}",
                 unicorn.get_data().inner.thread_id(),
-                &raw[..32]
+                &raw[..64]
             );
         } else {
             log::warn!("{}", text);

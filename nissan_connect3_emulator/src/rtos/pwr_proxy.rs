@@ -278,6 +278,19 @@ pub fn take_pending_for(app_id: u16) -> Option<PendingPowerMessage> {
     state.take_next(app_id)
 }
 
+/// Whether the proxy has already handed this application its NORMAL
+/// `PWR_STATE_CHANGE_REQ` (the message whose processing moves the AIL admin
+/// state to RUNNING).  The CCA directory uses this to time its replies:
+/// class-0x50 answers are dropped by the client's dispatch below RUNNING.
+pub fn app_state_change_delivered(app_id: u16) -> bool {
+    let state = global().lock().unwrap();
+    state
+        .apps
+        .get(&app_id)
+        .map(|r| r.state_change_delivered)
+        .unwrap_or(false)
+}
+
 /// `mbx_<N>` where `<N>` is a decimal application id. Everything else
 /// (`mbx_0`, terminal queues, IOSC queues) is ignored.
 pub fn parse_mbx_app_id(name: &str) -> Option<u16> {

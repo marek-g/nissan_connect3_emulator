@@ -374,6 +374,56 @@ crate::os::code_stub::trap_site(unicorn, (base_address + MESSAGE_DELETE), crate:
 suppress_synthetic_message_delete(uc, addr as u32, base_address);
             0
         });
+
+    // r755-diag: OSAL_vAssertFunction(expr, file, line).  The d02 errmem
+    // storms report only the record; this names the assert text, its source
+    // file/line and the first return addresses still on the stack, so a
+    // failing OSAL operation is identifiable without symbol hunting.
+    const ASSERT: u32 = 0x4850_4d48 - 0x484d_8000;
+    crate::os::code_stub::trap_site(unicorn, (base_address + ASSERT), crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/message.rs:assert", move |uc: &mut Unicorn<'_, Context>| {
+            static SEEN: std::sync::LazyLock<
+                std::sync::Mutex<std::collections::HashSet<(u32, u32, u32)>>,
+            > = std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let fresh = SEEN
+                .lock()
+                .map(|mut s| s.insert((r0, r1, r2)) && s.len() <= 24)
+                .unwrap_or(false);
+            if fresh {
+                let expr = crate::emulator::utils::read_string(uc, r0);
+                let file = crate::emulator::utils::read_string(uc, r1);
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                let mut chain: Vec<u32> = Vec::new();
+                if sp > 0x1000 && sp < 0xf000_0000 {
+                    for i in 0..128u32 {
+                        let mut w = [0u8; 4];
+                        if uc.mem_read((sp + i * 4) as u64, &mut w).is_err() {
+                            break;
+                        }
+                        let w = u32::from_le_bytes(w);
+                        if (w >= 0x484d_8000 && w < 0x4855_e414)
+                            || (w >= 0x8000 && w < 0x0300_0000 && w & 3 == 0)
+                        {
+                            if !chain.contains(&w) {
+                                chain.push(w);
+                                if chain.len() >= 10 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                log::warn!(
+                    "[LIBOSAL-ASSERT] {} [{}] expr={expr:?} file={file:?} line={r2} lr={lr:#x} chain={chain:?}",
+                    uc.get_data().elf_path,
+                    uc.get_data().inner.thread_id(),
+                );
+            }
+            0
+        });
 }
 
 fn handle_queue_api(
@@ -1732,6 +1782,7 @@ fn pwr_proxy_service_handle(
         }
         "OSAL_s32MessageQueuePost" => {
             observe_pwr_proxy_post(unicorn, name, r1, r2);
+            observe_cca_directory(unicorn, name, r1, r2);
             false
         }
         _ => false,
@@ -1873,6 +1924,238 @@ fn observe_pwr_proxy_post(
     {
         pwr_proxy::observe_power_post(sender_app_id, power_type, data1, data2);
     }
+}
+
+/// r755: CCA directory (LPM) emulation.  `ApplicationInfoRegister` (wire
+/// class 0x49, `amt_tclApplicationInfoRegister`, ServerAppID @body+0x14) is
+/// every client's request for the LPM to track interest in a server
+/// application; the unit's LPM answers with `ApplicationInfoStatus` (class
+/// 0x50, ServerAppID @+0x14, ServerAppState byte @+0x16) on the client's own
+/// queue, where `ail_bHandleMsgAppInfoMessage` feeds the server-application
+/// list that gates prochmi's whole hmicca registration chain.  Nothing here
+/// consumed `mbx_0`, so the registrations posted at HMI init were the only
+/// CCA traffic that ever left the HMI - and none ever came back.
+///
+/// Scope is milestone 1: answer the HMI (0x0109) only.  The answer must not
+/// arrive before the client's AIL admin state reaches RUNNING (dispatch
+/// drops class 0x50 below state 3), so replies are cached and flushed when
+/// the PWR proxy hands out the NORMAL `PWR_STATE_CHANGE_REQ` - the message
+/// whose processing promotes that state - or live once the promotion is
+/// known to have happened.  Replies must also not create the recipient's
+/// host queue before its owner did (guest `mq_create` is O_EXCL, r755): the
+/// flush path refuses to create and re-caches instead.
+static DIR_REPLY_CACHE: std::sync::LazyLock<std::sync::Mutex<Vec<Vec<u8>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
+
+/// Deliver every cached ApplicationInfoStatus to the HMI queue (which its
+/// owner must already exist in the host table).  Re-caches on failure.
+fn dir_reply_flush(unicorn: &mut Unicorn<'_, Context>) {
+    let bodies = match DIR_REPLY_CACHE.lock() {
+        Ok(mut c) => std::mem::take(&mut *c),
+        Err(_) => return,
+    };
+    if bodies.is_empty() {
+        return;
+    }
+    let mut kept: Vec<Vec<u8>> = Vec::new();
+    let mut posted = 0usize;
+    for body in bodies {
+        let mut blob = Vec::with_capacity(8 + body.len());
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&body);
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
+        match state.mq.queue_id_for_name("mbx_265") {
+            Some(q) => {
+                state.mq.grow_msgsize(q, blob.len() as i64);
+                if OsalQueueService::guest_post(&mut state.mq, "mbx_265", blob, 0) {
+                    posted += 1;
+                    state.notify_waiters();
+                }
+            }
+            None => kept.push(body),
+        }
+    }
+    if !kept.is_empty() {
+        if let Ok(mut c) = DIR_REPLY_CACHE.lock() {
+            c.append(&mut kept);
+        }
+    }
+    log::info!("[LIBOSAL-MBX] cca directory: flushed ApplicationInfoStatus replies to mbx_265: {posted}");
+}
+
+/// Parse one `mbx_0` post; when it is an HMI `ApplicationInfoRegister`,
+/// build and spool/queue the LPM's ApplicationInfoStatus answer.
+fn observe_cca_directory(    unicorn: &mut Unicorn<'_, Context>,
+    name: &str,
+    msg_ptr: u32,
+    msg_len: u32,
+) {
+    if name != pwr_proxy::LPM_IN_QUEUE || msg_ptr == 0 || msg_ptr > 0xf000_0000 || msg_len < 8 {
+        return;
+    }
+    let Some(data) = read_guest_buffer(unicorn, msg_ptr, 8) else {
+        return;
+    };
+    if u32::from_le_bytes([data[0], data[1], data[2], data[3]]) != 1 {
+        return;
+    }
+    let content = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    if content == 0 || content > 0xf000_0000 {
+        return;
+    }
+    let Some(body) = read_guest_buffer(unicorn, content, 0x18) else {
+        return;
+    };
+    if body[0xb] != 0x49 {
+        return;
+    }
+    let src = u16::from_le_bytes([body[0], body[1]]);
+    if src != 0x0109 {
+        return;
+    }
+    let server_app = u16::from_le_bytes([body[0x14], body[0x15]]);
+    // The LPM's answer.  Layout mirrors the register body (same base
+    // message header); the fields `ail_bHandleMsgAppInfoMessage` reads are
+    // ServerAppID @+0x14 and ServerAppState @+0x16.  State 1 is the value
+    // `bRegisterAsync`'s scan matches on (`state == '\x01'`) and the state
+    // the LPM reports for a live server application.
+    static MSG_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x2000);
+    let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed);
+    let mut reply = vec![0u8; 0x18];
+    reply[0..2].copy_from_slice(&0u16.to_le_bytes()); // src: the LPM (app 0)
+    reply[2..4].copy_from_slice(&src.to_le_bytes()); // dst: the HMI
+    reply[4..8].copy_from_slice(&(0x18u32).to_le_bytes());
+    reply[8..10].copy_from_slice(&2u16.to_le_bytes()); // opcode
+    reply[0xb] = 0x50; // wire class: ApplicationInfoStatus
+    reply[0x10..0x14].copy_from_slice(&(msg_id as u32).to_le_bytes());
+    reply[0x14..0x16].copy_from_slice(&server_app.to_le_bytes());
+    reply[0x16] = 1; // ServerAppState: RUNNING
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
+    let fresh = SEEN
+        .lock()
+        .map(|mut s| s.insert(server_app) && s.len() <= 48)
+        .unwrap_or(false);
+    if fresh {
+        log::info!(
+            "[LIBOSAL-MBX] cca directory: ApplicationInfoRegister(svc {server_app:#x}) from HMI -> answering ApplicationInfoStatus(state 1)"
+        );
+    }
+    if pwr_proxy::app_state_change_delivered(src) {
+        // Client is (or is about to be) at admin state 3: deliver live.
+        let mut blob = Vec::with_capacity(8 + reply.len());
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&(reply.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&reply);
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
+        let deliver = match state.mq.queue_id_for_name("mbx_265") {
+            Some(q) => {
+                state.mq.grow_msgsize(q, blob.len() as i64);
+                let ok = OsalQueueService::guest_post(&mut state.mq, "mbx_265", blob, 0);
+                if ok {
+                    state.notify_waiters();
+                }
+                ok
+            }
+            None => false,
+        };
+        if deliver {
+            return;
+        }
+    }
+    if let Ok(mut c) = DIR_REPLY_CACHE.lock() {
+        if c.len() < 64 {
+            c.push(reply);
+        }
+    }
+}
+
+/// r755: CCA service-server emulation for the HMI's service registrations.
+/// Once the `ApplicationInfoStatus` answer above makes
+/// `vOnServerApplicationStatus` AVAILABLE, the HMI's `bRegisterAsyncExecute`
+/// posts a ServiceRegister (class 0x41) to the *server application's* queue
+/// (service 0x0024 opened `mbx_36` at HMI init).  The providers of the GUI's
+/// service ids are Triton-executive-side apps with no Linux-side presence
+/// here, so those registrations would go unanswered forever.  Answer as a
+/// live unit's directory/server does: a RegisterConf (class 0x43, result
+/// accepted @+0x18) immediately followed by a ServiceStatus (class 0x44,
+/// state ACTIVE @+0x18) on the client queue.
+/// `ail_bHandleMsgServiceRegisterConf` turns the conf into an
+/// `ail_tclServiceReference` and `ail_bHandleMsgServiceStatus` then has a
+/// matching reference to dispatch `vOnServiceState` through - the event the
+/// HMI popup/map page react to.  The regid (u16 @+0x16) stays 0xffff:
+/// `stamp_registration_id` assigns one per (queue, service) and keeps the
+/// conf and status consistent.
+///
+/// Milestone-1 scope: only HMI (0x0109) registrations on server-app queues;
+/// other clients keep their existing bespoke answers.  Timing gate is the
+/// same as the directory's: both classes need admin state RUNNING, so the
+/// spool rides `DIR_REPLY_CACHE` until the pump reaches a bridged Wait
+/// after promotion.
+fn cca_server_answer_register(
+    unicorn: &mut Unicorn<'_, Context>,
+    server_app: u16,
+    client: u16,
+    service: u16,
+) {
+    static MSG_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x3000);
+    let mut answers: Vec<Vec<u8>> = Vec::with_capacity(2);
+    for class in [0x43u8, 0x44] {
+        let mut body = vec![0u8; 0x20];
+        body[0..2].copy_from_slice(&server_app.to_le_bytes());
+        body[2..4].copy_from_slice(&client.to_le_bytes());
+        body[4..8].copy_from_slice(&(0x20u32).to_le_bytes());
+        body[8..10].copy_from_slice(&2u16.to_le_bytes());
+        body[0xb] = class;
+        let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed) as u32;
+        body[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
+        body[0x14..0x16].copy_from_slice(&service.to_le_bytes());
+        body[0x16..0x18].copy_from_slice(&0xffffu16.to_le_bytes());
+        if class == 0x43 {
+            body[0x18] = 1; // conf result: accepted
+        } // else ServiceStatus: state byte 0 = ACTIVE (fastmap precedent)
+        stamp_registration_id("mbx_265", &mut body);
+        answers.push(body);
+    }
+    let mut kept: Vec<Vec<u8>> = Vec::new();
+    let mut posted = 0usize;
+    for body in answers {
+        let mut blob = Vec::with_capacity(8 + body.len());
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&body);
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
+        let delivered = match state.mq.queue_id_for_name("mbx_265") {
+            Some(q) if pwr_proxy::app_state_change_delivered(client) => {
+                state.mq.grow_msgsize(q, blob.len() as i64);
+                let ok = OsalQueueService::guest_post(&mut state.mq, "mbx_265", blob, 0);
+                if ok {
+                    state.notify_waiters();
+                }
+                ok
+            }
+            _ => false,
+        };
+        if delivered {
+            posted += 1;
+        } else {
+            kept.push(body);
+        }
+    }
+    if !kept.is_empty() {
+        if let Ok(mut c) = DIR_REPLY_CACHE.lock() {
+            for body in kept {
+                if c.len() < 96 {
+                    c.push(body);
+                }
+            }
+        }
+    }
+    log::info!(
+        "[LIBOSAL-MBX] cca server {server_app:#06x}: answered ServiceRegister(svc {service:#06x}) from {client:#06x} with RegisterConf+ServiceStatus (live {posted}, spooled {})",
+        2 - posted,
+    );
 }
 
 fn bridge_guest_osal_queue(
@@ -2109,6 +2392,63 @@ fn bridge_dyn_mbx_queue(
 ///
 /// Snapshot blob layout stored in the host queue:
 /// `[u32 type_flag(1), u32 content_len, content bytes...]`.
+/// Cache of hub (`mbx_0`) broadcasts destined for a recipient queue its
+/// owner has not created yet (r755 fan-out).  Only the latest body per
+/// (queue, src, class) is kept - the directory delivers current state, not
+/// every historical re-broadcast.
+static HUB_FANOUT_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(&'static str, u16, u8), Vec<u8>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
+
+/// Recipient queue whose cache has already been drained.  The cache holds
+/// last-state only, so one drain is enough; later broadcasts are posted
+/// live by the POST path.
+static HUB_FANOUT_FLUSHED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<&'static str>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
+
+/// Deliver the cached hub broadcasts once the recipient is alive on its own
+/// queue (first bridged Wait).  Must not run before the guest created the
+/// queue: guest `mq_create` is O_EXCL and an EEXIST there aborts the HMI
+/// boot (assert `osalmqueue.cpp:1181`, err 0xd02).
+fn hub_fanout_flush(unicorn: &mut Unicorn<'_, Context>, queue: &str) {
+    if queue != "mbx_265" {
+        return;
+    }
+    let queue: &'static str = "mbx_265";
+    let fresh = HUB_FANOUT_FLUSHED
+        .lock()
+        .map(|mut s| s.insert(queue))
+        .unwrap_or(false);
+    if !fresh {
+        return;
+    }
+    let bodies: Vec<Vec<u8>> = HUB_FANOUT_CACHE
+        .lock()
+        .map(|c| {
+            c.iter()
+                .filter(|((q, _, _), _)| *q == queue)
+                .map(|(_, v)| v.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut posted = 0usize;
+    for body in bodies {
+        let mut blob = Vec::with_capacity(8 + body.len());
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&body);
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
+        let q = OsalQueueService::ensure_queue(&mut state.mq, queue);
+        state.mq.grow_msgsize(q, blob.len() as i64);
+        if OsalQueueService::guest_post(&mut state.mq, queue, blob, 0) {
+            posted += 1;
+            state.notify_waiters();
+        }
+    }
+    log::info!("[LIBOSAL-MBX] hub fanout flush -> {queue}: {posted} bodies");
+}
+
 fn bridge_mbx_queue(
     unicorn: &mut Unicorn<'_, Context>,
     api_name: &str,
@@ -2161,8 +2501,105 @@ fn bridge_mbx_queue(
             // its own id - fails the receiver's registration match and is re-posted. Give
             // each (client queue, service) pair an id when its conf arrives and stamp that
             // id into every provider message delivered to the same pair afterwards.
+            // r755: hub emulation, step 1.  On the unit the TE-side CCA hub
+            // consumes mbx_0 (every app's `dst 0x0000` broadcast) and
+            // re-delivers each body to every subscriber's own mbx_<appid>.
+            // r755 analysis showed the class-0x40/0x49 traffic prochmi posts
+            // is its own CCA power chatter (dispatch class 0x40 == power
+            // message), and that path is already emulated by the PWR proxy,
+            // so the fan-out stays off by default.  Kept behind
+            // EMU_HUB_FANOUT=1 for experiments.
+            if std::env::var_os("EMU_HUB_FANOUT").is_some()
+                && name == "mbx_0"
+                && body.len() >= 0x10
+                && u16::from_le_bytes([body[2], body[3]]) == 0
+                && matches!(body[0xb], 0x40 | 0x49)
+                && u16::from_le_bytes([body[0], body[1]]) != 0x0109
+            {
+                let mut clone = body.clone();
+                clone[2..4].copy_from_slice(&0x0109u16.to_le_bytes());
+                let delivered = {
+                    let mut state = unicorn.get_data().namespace.lock().unwrap();
+                    match state.mq.queue_id_for_name("mbx_265") {
+                        Some(q) => {
+                            let mut blob = Vec::with_capacity(8 + clone.len());
+                            blob.extend_from_slice(&1u32.to_le_bytes());
+                            blob.extend_from_slice(&(clone.len() as u32).to_le_bytes());
+                            blob.extend_from_slice(&clone);
+                            state.mq.grow_msgsize(q, blob.len() as i64);
+                            let ok =
+                                OsalQueueService::guest_post(&mut state.mq, "mbx_265", blob, 0);
+                            if ok {
+                                state.notify_waiters();
+                            }
+                            ok
+                        }
+                        None => {
+                            let src = u16::from_le_bytes([body[0], body[1]]);
+                            if let Ok(mut c) = HUB_FANOUT_CACHE.lock() {
+                                c.insert(("mbx_265", src, body[0xb]), clone);
+                            }
+                            false
+                        }
+                    }
+                };
+                static FANOUT_LOG: AtomicU32 = AtomicU32::new(0);
+                if FANOUT_LOG.fetch_add(1, Ordering::Relaxed) < 24 {
+                    log::info!(
+                        "[LIBOSAL-MBX] hub fanout mbx_0->mbx_265 src={:#06x} class={:#04x} live={delivered}",
+                        u16::from_le_bytes([body[0], body[1]]),
+                        body[0xb],
+                    );
+                }
+            }
             stamp_registration_id(name, &mut body);
+            // r755: CCA service-server emulation for HMI (0x0109)
+            // ServiceRegisters landing on server-app queues no Linux-side
+            // process hosts (e.g. service 0x0024's mbx_36).  See
+            // `cca_server_answer_register`.
+            if body.len() >= 0x18 && body[0xb] == 0x41 {
+                let client = u16::from_le_bytes([body[0], body[1]]);
+                if client == 0x0109 && name != "mbx_265" && name != "mbx_0" {
+                    if let Some(dec) = name.strip_prefix("mbx_") {
+                        if let Ok(server) = dec.parse::<u32>() {
+                            if (1..=0xffff).contains(&server) {
+                                cca_server_answer_register(
+                                    unicorn,
+                                    server as u16,
+                                    client,
+                                    u16::from_le_bytes([body[0x14], body[0x15]]),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             trace_dapi_map_service_data(name, &body);
+            // r755-diag: every mbx_0 post body once per (src, class), so the
+            // HMI's AIL traffic shape (svc 0x27 subscribe?) becomes visible.
+            if name == "mbx_0" {
+                static SEEN0: std::sync::LazyLock<
+                    std::sync::Mutex<std::collections::HashSet<(u16, u8)>>,
+                > = std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
+                if body.len() >= 0x14 {
+                    let src = u16::from_le_bytes([body[0], body[1]]);
+                    let fresh = SEEN0
+                        .lock()
+                        .map(|mut s| s.insert((src, body[0xb])))
+                        .unwrap_or(false);
+                    if fresh {
+                        log::info!(
+                            "[LIBOSAL-MBX] mbx_0 body src={src:#06x} class={:#04x}: {}",
+                            body[0xb],
+                            body.iter()
+                                .take(0x28)
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                        );
+                    }
+                }
+            }
             stamp_unique_id_for_receiver(name, &mut body);
             // The stamped RegisterConf (class 0x43) on the engine's mailbox
             // proves the (engine, svc 0x26) registration pair carries its
@@ -2187,7 +2624,7 @@ fn bridge_mbx_queue(
                 );
             }
             if body.len() >= 0x18
-                && u16::from_le_bytes([body[0], body[1]]) == 0x0400
+                && matches!(u16::from_le_bytes([body[0], body[1]]), 0x0400 | 0x0109)
                 && matches!(body[0xb], 0x41 | 0x42 | 0x44 | 0x45)
             {
                 if matches!(body[0xb], 0x42 | 0x45) {
@@ -2210,7 +2647,8 @@ fn bridge_mbx_queue(
                     );
                 }
                 log::info!(
-                    "[LIBOSAL-MBX] from-procmap q={} dst={:#06x} class={:#04x} svc={:#06x} regid={:#06x} sub12={:#06x} sub14={:#06x}",
+                    "[LIBOSAL-MBX] from-{:#06x} q={} dst={:#06x} class={:#04x} svc={:#06x} regid={:#06x} sub12={:#06x} sub14={:#06x}",
+                    u16::from_le_bytes([body[0], body[1]]),
                     name,
                     u16::from_le_bytes([body[2], body[3]]),
                     body[0xb],
@@ -2262,6 +2700,17 @@ fn bridge_mbx_queue(
             let prio_ptr = prio_or_prio_ptr;
             if buf == 0 || buf > 0xf000_0000 || buf_len < 8 {
                 return false;
+            }
+            // r755: the recipient is alive on this queue now - deliver the
+            // hub broadcasts that arrived before it created the queue.
+            hub_fanout_flush(unicorn, name);
+            // r755: and the CCA directory answers that spooled while the HMI
+            // was still below AIL admin state RUNNING.  Reaching a bridged
+            // Wait on the pump thread implies every previously injected power
+            // message (incl. the NORMAL PWR_STATE_CHANGE_REQ) has already
+            // been dispatched, so a class-0x50 delivered now is not dropped.
+            if name == "mbx_265" && pwr_proxy::app_state_change_delivered(0x0109) {
+                dir_reply_flush(unicorn);
             }
             // Keep one consumer per queue active at a time so a handler cannot
             // overtake the message that was posted before it (see MBX_IN_SERVICE).

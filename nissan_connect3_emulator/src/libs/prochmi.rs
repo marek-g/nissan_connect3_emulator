@@ -265,6 +265,11 @@ static HSI_POWER_STATE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static HMI_NAV_HANDLER: AtomicU32 = AtomicU32::new(0);
 static HMI_NAV_HANDLER_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// Startup GUI internal events driving the HMI lock state machine
+/// (LOCKED -> CHECKING -> ON).  r755: firing 0xcb SYSTEM_ALLOW_USER_ACTION
+/// after these was tried and changes nothing - the "Starting navigation."
+/// popup is not user-action gated; the hide path goes through the HSI
+/// MsgBoxSystem component (see docs/issues/correctness.md).
 const GUI_INTERNAL_EVENT_COUNT: u32 = 3;
 const GUI_INTERNAL_EVENTS: [u32; 3] = [0x8d, 0x8e, 0x8f];
 
@@ -296,7 +301,10 @@ fn gui_event_name_trace_allowed() -> bool {
     if std::env::var_os("EMU_PROCHMI_GUI_EVENT_TRACE").is_none() {
         return false;
     }
-    GUI_EVENT_NAME_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < NAV_STATE_TRACE_LIMIT
+    // r755: the registry lookup runs for every fired/dispatched event, so
+    // the shared 128-call cap hid most of the Lua event name registry.  The
+    // log line itself is deduplicated by id, so a wide cap stays quiet.
+    LUA_CALL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 6000
 }
 
 fn gui_fire_event_trace_allowed() -> bool {
@@ -678,6 +686,9 @@ crate::os::code_stub::trap_site(unicorn, check_msgbox, crate::os::code_stub::Tra
                     "PROCHMI: injected startup animation status before GUI message box poll"
                 );
             }
+            // r755-diag: (removed vtable peek: singleton was null at first
+            // tick; the live dispatch is traced at the parseMessage sites
+            // themselves instead.)
             // Stages >=10 mutate registers via guest calls; they must not run
             // from this hook because the stub return re-enters bCheckMsgBox's
             // own code hook. They run from the DisplayManager::update hook
@@ -688,6 +699,44 @@ crate::os::code_stub::trap_site(unicorn, check_msgbox, crate::os::code_stub::Tra
         
             0
         });
+
+    // r755-diag: both message-box dispatchers (GUI + System variants) log
+    // every queue message they consume, so the "Starting navigation." popup
+    // create opcode becomes visible and the matching hide opcode can be
+    // fabricated through the same GUI_UTIL_Queue the LayerSync announcements
+    // already ride.  parseMessage(this, opcode): slot = 0x4*(opcode+1).
+    for (offset, label) in [
+        (0x0236_880cu32, "GUI_MessageBoxGUI::parseMessage"),
+        (0x0236_9210u32, "GUI_MessageBoxSystem::parseMessage"),
+    ] {
+        let address = base_address + (offset - ORIGINAL_BASE);
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:msgbox-parse", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = HITS.fetch_add(1, Ordering::Relaxed);
+            if n >= 48 {
+                return 0;
+            }
+            let obj = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let opcode = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let vt = read_u32(uc, obj);
+            let slot = if vt != 0 && (1..=7).contains(&opcode) {
+                read_u32(uc, vt + (opcode + 1) * 4)
+            } else {
+                0
+            };
+            log::info!(
+                "PROCHMI msgbox-parse {label} t={}ms thread=[{}] n={} obj={:#x} opcode={} vt={:#x} handler={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                n,
+                obj,
+                opcode,
+                vt,
+                slot,
+            );
+            0
+        });
+    }
 
     for offset in [
         GUI_UTIL_QUEUE_READER_C1,
@@ -736,11 +785,12 @@ crate::os::code_stub::trap_site(unicorn, msg_on_message, crate::os::code_stub::T
             0
         });
 
-    // Which services the HMI is told about: the map page can only hide its
-    // "Starting navigation." popup once the MapService receiver for PROCNAV's
-    // navigation service (0x0027) reports ready, and that readiness comes from
-    // `vOnServiceAvailable`.  Logging both it and the receiver creation shows
-    // whether the notification never arrives or arrives and is refused.
+    // Which services the HMI is told about.  NOTE (r755): symtab proved both
+    // offsets are MISATTRIBUTED - 0x023a9d28 lives inside
+    // `HSA_System_TestMode__blBTDevConnectedServices` and 0x023a9890 inside
+    // `..._ulwGetUsbDeviceSrvStatus`, so these traps watch Bluetooth/USB test
+    // getters, not the nav receiver, and correctly see zero hits.  Kept as
+    // cheap canaries; the real path is re-derived from the popup string below.
     for (offset, label) in [
         (GUI_NAV_V_ON_SERVICE_AVAILABLE, "vOnServiceAvailable"),
         (GUI_NAV_V_SET_PROPERTIES, "GUI_State::vSetProperties"),
@@ -775,6 +825,279 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                 0
             });
     }
+
+    // r755: find the popup's presenter and hider from the string itself.
+    // "Starting navigation." sits at VA 0x025186fc (file offset 0x25106fc in
+    // the LOAD segment based at 0x8000) and IS presented during boot, so a
+    // MEM_READ hook over the string reports every pc that touches it - the
+    // first hits are the presenter, any later distinct pc is the hider or a
+    // re-paint.  The page is cold, so the hook is cheap; still env-gated so
+    // bare runs install nothing new.
+    if std::env::var_os("EMU_PROCHMI_POPUP_TRACE").is_some() {
+        use unicorn_engine::unicorn_const::HookType;
+        // "Starting navigation." VA 0x025186fc (file 0x25106fc),
+        // "STARTING NAVIGATION" VA 0x02452d6c (file 0x244ad6c) - both + 0x8000.
+        for (lo, hi, tag) in [
+            (0x0251_86f0u64, 0x0251_8720u64, "Starting navigation."),
+            (0x0245_2d50u64, 0x0245_2d90u64, "STARTING NAVIGATION"),
+        ] {
+            let _tag = tag;
+            let res = unicorn.add_mem_hook(
+                HookType::MEM_READ,
+                lo,
+                hi,
+                move |_uc, _t, address, size, _value| {
+                    static SEEN: std::sync::LazyLock<
+                        std::sync::Mutex<std::collections::HashMap<(u32, u64), u32>>,
+                    > = std::sync::LazyLock::new(|| {
+                        std::sync::Mutex::new(std::collections::HashMap::new())
+                    });
+                    static TEL: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let pc = _uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                    let elf = _uc.get_data().elf_path.clone();
+                    let tid = _uc.get_data().inner.thread_id();
+                    let count = {
+                        let mut s = match SEEN.lock() {
+                            Ok(s) => s,
+                            Err(_) => return true,
+                        };
+                        if s.len() > 4096 {
+                            return true;
+                        }
+                        let e = s.entry((pc, address)).or_insert(0);
+                        *e += 1;
+                        *e
+                    };
+                    // New (pc, addr): always. Repeats: log the 20th and then
+                    // every 256th, so a steady-state re-paint is visible
+                    // without flooding and the popup-hide pass is not missed.
+                    let tel = TEL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if count > 1 && count != 20 && count % 256 != 20 {
+                        return true;
+                    }
+                    let sp = _uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    let mut chain: Vec<u32> = Vec::new();
+                    if sp > 0x1000 && sp < 0xf000_0000 {
+                        for i in 0..192u32 {
+                            let w = read_u32(_uc, sp + i * 4);
+                            if (w >= 0x8000 && w < 0x0286_5294)
+                                || (w >= 0x47d0_0000 && w < 0x4860_0000)
+                            {
+                                if !chain.contains(&w) {
+                                    chain.push(w);
+                                    if chain.len() >= 12 {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    log::warn!(
+                        "PROCHMI popup-string READ({tag}) {} [{}] addr={:#x} size={} n={} tel={tel} pc={:#x} chain={:?}",
+                        elf,
+                        tid,
+                        address,
+                        size,
+                        count,
+                        pc,
+                        chain.iter().map(|w| format!("{w:#x}")).collect::<Vec<_>>(),
+                    );
+                    true
+                },
+            );
+            log::warn!("PROCHMI popup-string read-hook({tag}) installed: {}", res.is_ok());
+        }
+    }
+
+    // r755: real service-state pipeline (symtab-verified, unlike the old
+    // misattributed GUI_NAV_* canaries).  prochmi's HMI-CCA framework is the
+    // same `ail_tclInternalDispatch`/`hmicca_tclApp` family procmapengine
+    // uses.  These observers answer one question per hit: does the nav
+    // (svc 0x0027) receiver registration / status path ever run at all, and
+    // with what arguments.
+    for (offset, label) in [
+        (0x00fc_9348 - ORIGINAL_BASE, "hmicca_tclApp::bRegisterForService"),
+        (0x00fc_80c8 - ORIGINAL_BASE, "hmicca_tclApp::vOnServiceState"),
+        (0x00fe_01b0 - ORIGINAL_BASE, "ail_bHandleMsgServiceStatus"),
+        (0x00fe_03c0 - ORIGINAL_BASE, "ail_bHandleMsgServiceRegisterConf"),
+        (0x00fe_08b0 - ORIGINAL_BASE, "ail_bHandleMsgServiceRegister"),
+        (0x00fd_ef38 - ORIGINAL_BASE, "ail_vOnServerApplicationStatus"),
+        (0x00fe_8a94 - ORIGINAL_BASE, "ail_bIpcMessageWait"),
+        (0x00fe_27cc - ORIGINAL_BASE, "ail_bDispatchCCAMessages"),
+        (0x00fd_f8d8 - ORIGINAL_BASE, "ail_bHandleMsgAppInfoMessage"),
+        (0x00fd_2950 - ORIGINAL_BASE, "ail_bServerApplicationListAvailable"),
+        (0x00fd_4d88 - ORIGINAL_BASE, "ail_Restricted::bInitInstance"),
+        (0x00fd_3f9c - ORIGINAL_BASE, "ail_Restricted::vDeinitInstance"),
+        (0x00fd_7a88 - ORIGINAL_BASE, "ail_OneThreadAppInterface::bRegisterAsync"),
+        (0x00fd_6730 - ORIGINAL_BASE, "ail::bSendCCASrvSupplierMsg"),
+        (0x00fd_60b0 - ORIGINAL_BASE, "ail::bSendAppInfoMsg"),
+        (0x00fe_4338 - ORIGINAL_BASE, "ail_bTakeListAccess"),
+    ] {
+        let address = base_address + offset;
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:ail-svc", move |uc: &mut Unicorn<'_, Context>| {
+                static HITS: std::sync::LazyLock<
+                    std::sync::Mutex<std::collections::HashMap<&'static str, u32>>,
+                > = std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
+                let n = {
+                    let mut m = match HITS.lock() {
+                        Ok(m) => m,
+                        Err(_) => return 0,
+                    };
+                    let e = m.entry(label).or_insert(0);
+                    *e += 1;
+                    *e
+                };
+                if n > 32 {
+                    return 0;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                // For the AppInfo dispatch (r0 = ail_tclInternalDispatch*)
+                // dump the server-application list behind *r0+0x4c: decides
+                // whether the registration gate fails for having no list at
+                // all.  List nodes: {+0x10 u16 instance, +0x12 u16 appid,
+                // +0x14 u8 state} (from bRegisterAsync's iterator walk).
+                let mut extra = String::new();
+                if label.ends_with("vOnServerApplicationStatus") {
+                    let dispatch = read_u32(uc, r0);
+                    let list_head = if dispatch != 0 {
+                        read_u32(uc, dispatch + 0x4c)
+                    } else {
+                        0
+                    };
+                    let mut items: Vec<String> = Vec::new();
+                    if list_head != 0 && list_head < 0xf000_0000 {
+                        let mut node = read_u32(uc, list_head + 4);
+                        for _ in 0..8 {
+                            if node == 0 || node > 0xf000_0000 {
+                                break;
+                            }
+                            let inst = read_u16(uc, node + 0x10);
+                            let app = read_u16(uc, node + 0x12);
+                            let st = read_u8(uc, node + 0x14);
+                            items.push(format!("{{inst:{inst:#x} app:{app:#x} state:{st}}}"));
+                            node = read_u32(uc, node + 4);
+                        }
+                    }
+                    extra = format!(" list_head={list_head:#x} items={items:?}");
+                }
+                if label.ends_with("ail_bServerApplicationListAvailable") {
+                    // Gate: *(this+0x4c) != 0 - the same fwl_List that
+                    // bRegisterAsync walks as this[0x13] (int* -> byte 0x4c).
+                    // Nodes: next=[head+4], payload at oItem(); dump node words
+                    // raw to locate {inst, appid, state}.
+                    let list_obj = read_u32(uc, r0 + 0x4c);
+                    let mut items: Vec<String> = Vec::new();
+                    if list_obj != 0 && list_obj < 0xf000_0000 {
+                        let mut node = read_u32(uc, list_obj + 4);
+                        for _ in 0..6 {
+                            if node == 0 || node > 0xf000_0000 || node == list_obj {
+                                break;
+                            }
+                            let w0 = read_u32(uc, node + 8);
+                            let w1 = read_u32(uc, node + 0xc);
+                            let w2 = read_u32(uc, node + 0x10);
+                            let w3 = read_u32(uc, node + 0x14);
+                            items.push(format!("{{+8:{w0:#x} +c:{w1:#x} +10:{w2:#x} +14:{w3:#x}}}"));
+                            node = read_u32(uc, node + 4);
+                        }
+                    }
+                    extra = format!(" list={list_obj:#x} nodes={items:?}");
+                }
+                if label.ends_with("bRegisterAsync") {
+                    // (this, param_2..param_4 in r1..r3, param_5/param_6 on the
+                    // stack): param_6 == 0xffff selects the srv-supplier path,
+                    // otherwise the app-info path.
+                    let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    let p5 = if sp > 0x1000 && sp < 0xf000_0000 { read_u32(uc, sp) } else { 0 };
+                    let p6 = if sp > 0x1000 && sp < 0xf000_0000 { read_u32(uc, sp + 4) } else { 0 };
+                    extra = format!(" p5={p5:#x} p6={p6:#x}");
+                }
+                if label.ends_with("bDispatchCCAMessages") && r1 > 0x1000 && r1 < 0xf000_0000 {
+                    // (dispatch, msg-ref*, size, flags): the amt wrapper reads
+                    // its wire fields from the referenced content ([r1+4]).
+                    // Dump the first body bytes to see what the pump received.
+                    let content = read_u32(uc, r1 + 4);
+                    let mut bytes: Vec<String> = Vec::new();
+                    if content > 0x1000 && content < 0xf000_0000 {
+                        for i in 0..5u32 {
+                            let mut w = [0u8; 4];
+                            if uc.mem_read((content + i * 4) as u64, &mut w).is_err() {
+                                break;
+                            }
+                            bytes.push(format!("{:08x}", u32::from_le_bytes(w)));
+                        }
+                    }
+                    extra = format!(" content={content:#x} body={bytes:?}");
+                }
+                log::info!(
+                    "PROCHMI ail-svc {label} t={}ms thread=[{}] n={n} r0={:#x} r1={:#x} r2={:#x} r3={:#x} lr={:#x}{}{}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    r0,
+                    r1,
+                    r2,
+                    r3,
+                    lr,
+                    extra,
+                    if label.ends_with("bRegisterForService") && n <= 3 {
+                        // hmicca_tclApp::bRegisterForService forwards to
+                        // vtable+0x58: name the real implementation once, and
+                        // peek the client object behind it.
+                        let vt = read_u32(uc, r0);
+                        let impl58 = if vt != 0 { read_u32(uc, vt + 0x58) } else { 0 };
+                        format!(" vt={vt:#x} vtable58={impl58:#x}")
+                    } else {
+                        String::new()
+                    },
+                );
+            
+                0
+            });
+    }
+
+    // r755: `hmicca_tclApp::vOnServiceState` forwards the event through
+    // clHMIMngr: `piVar1 = *(mngr_ifc + 8); (*piVar1->vtable[0x18])(piVar1,
+    // svc, serverApp, version, state, subid)`.  At 0xfc8180 (right before
+    // `ldr pc, [ip, #0x18]`) r0 is the receiving object, R10 the state byte
+    // and R9 the sub-id; resolve the dispatch target so the nav (0x27)
+    // event's real GUI consumer gets a name.
+    let nav_state_dispatch = base_address + (0x00fc_8180u32 - ORIGINAL_BASE);
+    crate::os::code_stub::trap_site(unicorn, nav_state_dispatch, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:nav-state-dispatch", move |uc: &mut Unicorn<'_, Context>| {
+        static HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = HITS.fetch_add(1, Ordering::Relaxed);
+        if n >= 40 {
+            return 0;
+        }
+        let obj = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+        let svc = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+        let server = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+        let version = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+        let subid = uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32;
+        let state = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
+        let vt = read_u32(uc, obj);
+        let target = if vt != 0 { read_u32(uc, vt + 0x18) } else { 0 };
+        log::info!(
+            "PROCHMI nav-state-dispatch t={}ms thread=[{}] n={} obj={:#x} svc={:#x} server={:#x} version={:#x} state={} subid={:#x} vt={:#x} target={:#x}",
+            crate::libs::dapi::emu_t0_elapsed_ms(),
+            uc.get_data().inner.thread_id(),
+            n,
+            obj,
+            svc,
+            server,
+            version,
+            state,
+            subid,
+            vt,
+            target,
+        );
+        0
+    });
 
     let hmi_perform_new_app_state = base_address + CL_HMI_MNGR_PERFORM_NEW_APP_STATE;
     
@@ -893,6 +1216,16 @@ crate::os::code_stub::trap_site(unicorn, gui_msg_event_name, crate::os::code_stu
             };
             let name_ptr = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let name = read_cstr(uc, name_ptr, 160);
+            {
+                use std::sync::Mutex;
+                static SEEN: std::sync::LazyLock<Mutex<std::collections::HashSet<u16>>> =
+                    std::sync::LazyLock::new(|| Mutex::new(Default::default()));
+                if let Ok(mut s) = SEEN.lock() {
+                    if !s.insert(event as u16) {
+                        return 0;
+                    }
+                }
+            }
             log::info!(
                 "PROCHMI: GUI_Messaging event id={:#x} name={} name_ptr={:#x}",
                 event,
