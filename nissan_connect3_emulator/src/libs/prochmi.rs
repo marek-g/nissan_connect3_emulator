@@ -418,21 +418,19 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         SVG_CREATE_LAYER_CONTEXT,
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:422", move |uc: &mut Unicorn<'_, Context>| {
                 let result = if offset == SVG_INIT_RESOURCE {
                     0
                 } else {
                     svg_fake_handle(uc)
                 };
-                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0);
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
                 if !SVG_BYPASS_LOGGED.swap(true, Ordering::Relaxed) {
                     log::info!("PROCHMI: bypassing SVG resource functions");
                 }
                 uc.reg_write(RegisterARM::R0, result as u64).unwrap();
-                uc.reg_write(RegisterARM::PC, lr).unwrap();
-            })
-            .unwrap();
+                lr
+            });
     }
 
     install_svg_map_surface_hooks(unicorn, base_address);
@@ -460,11 +458,12 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         (GUI_TOUCH_START, "GUI_TouchAdapter_vStart"),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |_, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:464", move |_: &mut Unicorn<'_, Context>| {
                 log::info!("PROCHMI: hit {}", name);
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     for (offset, store) in [
@@ -474,8 +473,8 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         (CL_GUI_WIDGET_C2, "gui_widget"),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:478", move |uc: &mut Unicorn<'_, Context>| {
                 let ptr = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 if ptr != 0 {
                     if store == "hmi_mngr" {
@@ -485,8 +484,9 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     }
                     log::debug!("PROCHMI: recorded {} object {:#x}", store, ptr);
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     for (offset, label) in [
@@ -501,8 +501,8 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:505", move |uc: &mut Unicorn<'_, Context>| {
                 let handler = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let force = matches!(
                     label,
@@ -512,8 +512,9 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         | "clHmiNavServerHandler vHandleOnRequestCreateRenderView"
                 );
                 log_hmi_nav_handler_state(uc, handler, label, force || nav_trace_enabled());
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     for (offset, label) in [
@@ -535,8 +536,8 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:539", move |uc: &mut Unicorn<'_, Context>| {
                 let render_view = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let sink = if offset == ENAVI_RENDER_VIEW_REGISTER_SINK {
                     uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32
@@ -560,13 +561,14 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         width
                     );
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     let lua_do_file = base_address + GUI_LUA_DOFILE;
-    unicorn
-        .add_code_hook(lua_do_file as u64, lua_do_file as u64, |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, lua_do_file, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:569", move |uc: &mut Unicorn<'_, Context>| {
             let lua = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let path = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let path_str = read_cstr(uc, path, 128);
@@ -577,14 +579,15 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 lua_state,
                 path_str
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     let lua_prepare_call = base_address + GUI_LUA_PREPARE_CALL;
-    unicorn
-        .add_code_hook(lua_prepare_call as u64, lua_prepare_call as u64, |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, lua_prepare_call, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:585", move |uc: &mut Unicorn<'_, Context>| {
             if !lua_call_trace_allowed() {
-                return;
+                return 0;
             }
             let module = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let function = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
@@ -595,8 +598,9 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 module_name,
                 function_name
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     let gui_mainloop = base_address + CL_GUI_MAINLOOP;
     unicorn
@@ -649,8 +653,9 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         .unwrap();
 
     let check_msgbox = base_address + CL_GUI_CHECK_MSGBOX;
-    unicorn
-        .add_code_hook(check_msgbox as u64, check_msgbox as u64, |uc, address, _| {
+    
+crate::os::code_stub::trap_site(unicorn, check_msgbox, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:653", move |uc: &mut Unicorn<'_, Context>| {
+            let address = check_msgbox as u64;
             let msgbox_ticks = LSYNC_MSGBOX_TICKS.fetch_add(1, Ordering::Relaxed);
             if msgbox_ticks % 2000 == 1 {
                 log::info!("PROCHMI: bCheckMsgBox tick {}", msgbox_ticks);
@@ -671,8 +676,9 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
             if LSYNC_MAP_STAGE.load(Ordering::Relaxed) < 10 {
                 post_lsync_map_announcement(uc, address as u32);
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     for offset in [
         GUI_UTIL_QUEUE_READER_C1,
@@ -680,10 +686,10 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         GUI_UTIL_QUEUE_READER_BEGIN,
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:684", move |uc: &mut Unicorn<'_, Context>| {
                 if GUI_UTIL_MSGBOX_QUEUE.load(Ordering::Relaxed) != 0 {
-                    return;
+                    return 0;
                 }
                 let reader = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let mut queue = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -699,13 +705,14 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     GUI_UTIL_MSGBOX_QUEUE.store(queue, Ordering::Relaxed);
                     log::info!("PROCHMI: captured GUI_UTIL message box queue={:#x}", queue);
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     let msg_on_message = base_address + GUI_MSG_ON_MESSAGE;
-    unicorn
-        .add_code_hook(msg_on_message as u64, msg_on_message as u64, |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, msg_on_message, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:708", move |uc: &mut Unicorn<'_, Context>| {
             let messaging = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             if messaging != 0 {
                 GUI_MESSAGING_POINTER.store(messaging, Ordering::Relaxed);
@@ -716,8 +723,9 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
             {
                 post_gui_internal_events(uc);
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     // Which services the HMI is told about: the map page can only hide its
     // "Starting navigation." popup once the MapService receiver for PROCNAV's
@@ -729,8 +737,8 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         (GUI_NAV_V_SET_PROPERTIES, "GUI_State::vSetProperties"),
     ] {
         let address = base_address + offset;
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:733", move |uc: &mut Unicorn<'_, Context>| {
                 static HITS: [std::sync::atomic::AtomicU32; 2] = [
                     std::sync::atomic::AtomicU32::new(0),
                     std::sync::atomic::AtomicU32::new(0),
@@ -738,7 +746,7 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 let index = if offset == GUI_NAV_V_SET_PROPERTIES { 1 } else { 0 };
                 let hits = HITS[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if hits >= 24 {
-                    return;
+                    return 0;
                 }
                 let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -754,18 +762,16 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     if content != 0 { read_u8(uc, content + 0x1a) } else { 0xff },
                     uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     let hmi_perform_new_app_state = base_address + CL_HMI_MNGR_PERFORM_NEW_APP_STATE;
-    unicorn
-        .add_code_hook(
-            hmi_perform_new_app_state as u64,
-            hmi_perform_new_app_state as u64,
-            |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, hmi_perform_new_app_state, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:763", move |uc: &mut Unicorn<'_, Context>| {
                 if !hmi_app_state_trace_allowed() {
-                    return;
+                    return 0;
                 }
                 let obj = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let caller = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
@@ -786,15 +792,15 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     pending,
                     caller
                 );
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let hsi_send_system_event = base_address + HSI_CM_BASE_SEND_SYSTEM_EVENT;
-    unicorn
-        .add_code_hook(hsi_send_system_event as u64, hsi_send_system_event as u64, |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, hsi_send_system_event, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:795", move |uc: &mut Unicorn<'_, Context>| {
             if !hsi_cm_event_trace_allowed() {
-                return;
+                return 0;
             }
             let obj = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let event = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -811,17 +817,15 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 event_engine,
                 caller
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     let cm_startup_update_status = base_address + CL_HSI_CM_STARTUP_UPDATE_STATUS;
-    unicorn
-        .add_code_hook(
-            cm_startup_update_status as u64,
-            cm_startup_update_status as u64,
-            |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, cm_startup_update_status, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:819", move |uc: &mut Unicorn<'_, Context>| {
                 if !hsi_cm_event_trace_allowed() {
-                    return;
+                    return 0;
                 }
                 let obj = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let caller = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
@@ -837,18 +841,15 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     status,
                     caller
                 );
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let cm_startup_check_status = base_address + CL_HSI_CM_STARTUP_CHECK_STATUS;
-    unicorn
-        .add_code_hook(
-            cm_startup_check_status as u64,
-            cm_startup_check_status as u64,
-            |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, cm_startup_check_status, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:846", move |uc: &mut Unicorn<'_, Context>| {
                 if !hsi_cm_event_trace_allowed() {
-                    return;
+                    return 0;
                 }
                 let obj = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let service_id = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -865,15 +866,15 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     end,
                     caller
                 );
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let gui_msg_event_name = base_address + GUI_MSG_EVENT_NAME_RETURN;
-    unicorn
-        .add_code_hook(gui_msg_event_name as u64, gui_msg_event_name as u64, |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, gui_msg_event_name, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:874", move |uc: &mut Unicorn<'_, Context>| {
             if !gui_event_name_trace_allowed() {
-                return;
+                return 0;
             }
             let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
             let event = if sp != 0 {
@@ -889,17 +890,15 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 name,
                 name_ptr
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     let gui_fire_internal_event = base_address + GUI_MSG_FIRE_INTERNAL_EVENT;
-    unicorn
-        .add_code_hook(
-            gui_fire_internal_event as u64,
-            gui_fire_internal_event as u64,
-            |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, gui_fire_internal_event, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:897", move |uc: &mut Unicorn<'_, Context>| {
                 if !gui_fire_event_trace_allowed() {
-                    return;
+                    return 0;
                 }
                 let receiver = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -922,21 +921,18 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     m4,
                     m8
                 );
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let hsi_factory_post_assign = base_address + HSI_FACTORY_CREATE_POST_ASSIGN;
-    unicorn
-        .add_code_hook(
-            hsi_factory_post_assign as u64,
-            hsi_factory_post_assign as u64,
-            |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, hsi_factory_post_assign, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:931", move |uc: &mut Unicorn<'_, Context>| {
                 let object = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
                 let component_id = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
                 let factory = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
                 if component_id != HSI_CM_STARTUP_ID || object == 0 {
-                    return;
+                    return 0;
                 }
 
                 HSI_CM_STARTUP_COMPONENT.store(object, Ordering::Relaxed);
@@ -961,15 +957,15 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         HSI_POWER_STATE_PENDING.load(Ordering::Relaxed)
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let state_on_message = base_address + GUI_STATEMACHINE_ON_MESSAGE;
-    unicorn
-        .add_code_hook(state_on_message as u64, state_on_message as u64, |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, state_on_message, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:970", move |uc: &mut Unicorn<'_, Context>| {
             if !nav_trace_enabled() {
-                return;
+                return 0;
             }
             let sm = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -985,7 +981,7 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 0
             };
             if state_id != SYSDLG_NAV_STARTING_UP_STATE {
-                return;
+                return 0;
             }
             let event = if message != 0 {
                 read_u16(uc, message + GUI_MESSAGE_EVENT_ID)
@@ -1010,17 +1006,15 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     m10
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     let state_perform_transition = base_address + GUI_STATEMACHINE_PERFORM_TRANSITION;
-    unicorn
-        .add_code_hook(
-            state_perform_transition as u64,
-            state_perform_transition as u64,
-            |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, state_perform_transition, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:1018", move |uc: &mut Unicorn<'_, Context>| {
                 if !nav_trace_enabled() {
-                    return;
+                    return 0;
                 }
                 let sm = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let leaf = if sm != 0 {
@@ -1035,7 +1029,7 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 };
                 let transition = read_u32(uc, sm + GUI_STATE_SM_PENDING_TRANSITION);
                 if transition == 0 {
-                    return;
+                    return 0;
                 }
                 let event = read_u16(uc, transition + GUI_TRANSITION_EVENT_ID);
                 let source = read_u16(uc, transition + GUI_TRANSITION_SOURCE_STATE);
@@ -1054,15 +1048,15 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         kind
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let state_do_transition = base_address + GUI_STATEMACHINE_DO_TRANSITION;
-    unicorn
-        .add_code_hook(state_do_transition as u64, state_do_transition as u64, |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, state_do_transition, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:1063", move |uc: &mut Unicorn<'_, Context>| {
             if !nav_trace_enabled() {
-                return;
+                return 0;
             }
             let sm = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let transition = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
@@ -1077,7 +1071,7 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 0
             };
             if state_id != SYSDLG_NAV_STARTING_UP_STATE && transition != SYSDLG_NAV_STARTING_UP_TRANSITION {
-                return;
+                return 0;
             }
             if nav_trace_allowed() {
                 log::info!(
@@ -1087,15 +1081,13 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     transition
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     let state_add_transition = base_address + GUI_STATE_ADD_TRANSITION;
-    unicorn
-        .add_code_hook(
-            state_add_transition as u64,
-            state_add_transition as u64,
-            |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:1095", move |uc: &mut Unicorn<'_, Context>| {
                 let state = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let transition = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
                 let state_id = if state != 0 {
@@ -1132,17 +1124,17 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         }
                     }
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     for (offset, store) in [
         (CL_HMI_MNGR_B_EXECUTE, "hmi_mngr"),
         (CL_GUI_WIDGET_B_EXECUTE, "gui_widget"),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:1145", move |uc: &mut Unicorn<'_, Context>| {
                 let ptr = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 if ptr != 0 {
                     if store == "hmi_mngr" {
@@ -1155,18 +1147,20 @@ pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 if store == "hmi_mngr" {
                     force_hmi_gui_state(uc);
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     let hmi_main_entry = base_address + HMI_MAIN_ENTRY;
-    unicorn
-        .add_code_hook(hmi_main_entry as u64, hmi_main_entry as u64, |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, hmi_main_entry, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:1164", move |uc: &mut Unicorn<'_, Context>| {
             let tid = uc.get_data().thread_id();
             HMI_MAIN_THREAD_ID.store(tid, Ordering::Relaxed);
             log::info!("PROCHMI: recorded HMI_MAIN thread id {}", tid);
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 pub fn should_force_hmi_event(unicorn: &Unicorn<'_, Context>, requested_mask: u32) -> bool {
@@ -1814,8 +1808,7 @@ fn install_svg_map_surface_hooks(unicorn: &mut Unicorn<'_, Context>, base_addres
         (SVG_WAIT_LAYER_VSYNC, "wait_vsync"),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:1810", move |uc: &mut Unicorn<'_, Context>| {
                 let result = match kind {
                     "layer_by_name" | "layer_status" => SVG_MAP_LAYER_HANDLE,
                     "surface_status" => SVG_MAP_SURFACE_HANDLE,
@@ -1859,10 +1852,9 @@ fn install_svg_map_surface_hooks(unicorn: &mut Unicorn<'_, Context>, base_addres
                     log::info!("PROCHMI: bypassing SVG layer-sync resource functions");
                 }
                 uc.reg_write(RegisterARM::R0, result as u64).unwrap();
-                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0);
-                uc.reg_write(RegisterARM::PC, lr).unwrap();
-            })
-            .unwrap();
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                lr
+            });
     }
 }
 
@@ -1885,8 +1877,7 @@ fn install_svg_layer_control_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
         (SVG_DISABLE_LAYER_SETTINGS, "disable_settings"),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:1880", move |uc: &mut Unicorn<'_, Context>| {
                 let handle = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
@@ -1927,10 +1918,9 @@ fn install_svg_layer_control_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                 // The layer functions return void on this ABI; callers only
                 // look at svgGetLayerError(), which the status hooks keep at 0.
                 uc.reg_write(RegisterARM::R0, 0).unwrap();
-                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0);
-                uc.reg_write(RegisterARM::PC, lr).unwrap();
-            })
-            .unwrap();
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                lr
+            });
     }
 }
 
@@ -1949,29 +1939,28 @@ fn publish_svg_map_layer_window() {
 
 fn force_ea_manager_background(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let addr = base_address + GUI_DM_EA_MANAGER_GET_BACKGROUND;
-    unicorn
-        .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+    crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:1942", move |uc: &mut Unicorn<'_, Context>| {
             let ea = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let layer_copy = ea + 0x130;
             let texture = read_u32(uc, layer_copy);
-            if texture != 0 {
-                let count = GL_LAYER_COPY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-                if count < 40 {
-                    log::info!(
-                        "PROCHMI: forced EA background count={} ea={:#x} layer_copy={:#x} texture={:#x}",
-                        count,
-                        ea,
-                        layer_copy,
-                        texture
-                    );
-                }
-                HMI_MAINLOOP_TRACE_ARMED.store(true, Ordering::Relaxed);
-                uc.reg_write(RegisterARM::R0, layer_copy as u64).unwrap();
-                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0);
-                uc.reg_write(RegisterARM::PC, lr).unwrap();
+            if texture == 0 {
+                return 0;
             }
-        })
-        .unwrap();
+            let count = GL_LAYER_COPY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if count < 40 {
+                log::info!(
+                    "PROCHMI: forced EA background count={} ea={:#x} layer_copy={:#x} texture={:#x}",
+                    count,
+                    ea,
+                    layer_copy,
+                    texture
+                );
+            }
+            HMI_MAINLOOP_TRACE_ARMED.store(true, Ordering::Relaxed);
+            uc.reg_write(RegisterARM::R0, layer_copy as u64).unwrap();
+            let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+            lr
+        });
 }
 
 
@@ -1980,13 +1969,11 @@ fn force_ea_manager_background(unicorn: &mut Unicorn<'_, Context>, base_address:
 
 fn force_display_manager_dirty(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let addr = base_address + GUI_DM_DISPLAY_MANAGER_IS_DIRTY;
-    unicorn
-        .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+    crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:1971", move |uc: &mut Unicorn<'_, Context>| {
             uc.reg_write(RegisterARM::R0, 1).unwrap();
-            let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0);
-            uc.reg_write(RegisterARM::PC, lr).unwrap();
-        })
-        .unwrap();
+            let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+            lr
+        });
 }
 
 
