@@ -1517,6 +1517,24 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
                 backend.map_pixels.copy_from_slice(&fresh);
             }
             publish_map_surface_pixels(&backend.map_pixels);
+            // r750: DPU-style rescan. The guest HMI compositor can freeze
+            // (its AIL tick threads park at t~56 s while the map engine
+            // keeps publishing frames); on the unit the LCD still shows the
+            // live map because the display engine scans out both layers
+            // independently of the HMI application redraws. Re-present the
+            // composed window on every content-bearing map publish so the
+            // map layer keeps updating the window even without a fresh
+            // prochmi swap.
+            if !flat && backend.hmi_framebuffer != 0 {
+                composite_hmi_over_map(backend);
+                sys::SDL_GL_MakeCurrent(backend.window_raw, backend.comp_context);
+                backend.current_target = None;
+                blit_hmi_pixels_to_window(backend);
+                dump_window_pixels(backend);
+                let _ = backend.window.gl_swap_window();
+                sys::SDL_GL_MakeCurrent(backend.window_raw, backend.map_context);
+                backend.current_target = Some(GpuTarget::Map);
+            }
         },
     }
     unsafe {
@@ -3061,6 +3079,15 @@ unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
             return;
         }
         (100, LARGE_PROBES.fetch_add(1, Ordering::Relaxed))
+    } else if road_geometry_uploaded() {
+        // r750: with the trap-world engine the road pass arrives as batches
+        // of small strips (multi-draw count ~8), so the general 40-probe
+        // budget - all spent before t<2 s - never observes them. Once the
+        // street upload has happened, spend a second budget of 80 probes on
+        // small strips too; that is exactly the t>60 s window we need to see
+        // the clip positions of.
+        static AFTER_UPLOAD_SMALL: AtomicU32 = AtomicU32::new(0);
+        (80, AFTER_UPLOAD_SMALL.fetch_add(1, Ordering::Relaxed))
     } else {
         (40, PROBES.fetch_add(1, Ordering::Relaxed))
     };
