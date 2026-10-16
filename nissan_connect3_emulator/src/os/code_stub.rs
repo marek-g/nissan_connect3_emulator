@@ -314,11 +314,24 @@ fn thumb32_relocatable(word: u32) -> bool {
 /// Allocate a per-site code cave and build the trampoline for one pending
 /// site. Returns the cave resume address, or 0 when the site cannot be
 /// relocated (caller falls back to a legacy hook).
+/// Why `build_cave` did not patch a site.
+enum CaveFail {
+    /// The word may not be the final instruction yet (the loader has mapped
+    /// the page but not written it) - retry on a later flush.
+    Retry,
+    /// The word is a real instruction but structurally unrelocatable (branch,
+    /// `BX`, `MRS`/`MSR`, PC operand, `SVC`...). Retrying is pointless; go to
+    /// the narrow-hook fallback *immediately*, because leaving the site
+    /// unhooked for 64 flushes runs the guest function completely bare
+    /// during that window (the golden-era hooks were live from load).
+    Structural,
+}
+
 fn build_cave(
     unicorn: &mut Unicorn<'_, Context>,
     arena: &mut u32,
     p: &PendingSite,
-) -> u32 {
+) -> Result<u32, CaveFail> {
     let site = p.site;
     // Cave layouts (16 bytes, 4-byte aligned, all Thumb entries are reached
     // with the |1 Thumb bit).  Thumb16 has NO `ldr pc,[pc,#imm]` (Rt=15 is not
@@ -334,15 +347,19 @@ fn build_cave(
         TrapMode::Arm => {
             let mut w = [0u8; 4];
             if unicorn.mem_read(site as u64, &mut w).is_err() {
-                return 0;
+                return Err(CaveFail::Retry);
             }
             let word = u32::from_le_bytes(w);
             if !arm_instruction_relocatable(word) {
                 log::debug!(
-                    "trap {}: ARM word {word:#010x} not relocatable (will retry)",
+                    "trap {}: ARM word {word:#010x} not relocatable",
                     p.name
                 );
-                return 0;
+                return Err(if word == 0 {
+                    CaveFail::Retry // unwritten page: retry after the loader
+                } else {
+                    CaveFail::Structural
+                });
             }
             resume = site.wrapping_add(4);
             let words = [word, 0xe59ff000u32, 0, resume];
@@ -354,22 +371,23 @@ fn build_cave(
         TrapMode::Thumb => {
             let mut h = [0u8; 2];
             if unicorn.mem_read(site as u64, &mut h).is_err() {
-                return 0;
+                return Err(CaveFail::Retry);
             }
             let h0 = u16::from_le_bytes(h);
             let wide = (h0 >> 11) >= 0b11101;
             if wide {
                 let mut w = [0u8; 4];
                 if unicorn.mem_read(site as u64, &mut w).is_err() {
-                    return 0;
+                    return Err(CaveFail::Retry);
                 }
                 let word = u32::from_le_bytes(w);
                 if !thumb32_relocatable(word) {
-                    log::debug!(
-                        "trap {}: Thumb word {word:#08x} not relocatable (will retry)",
-                        p.name
-                    );
-                    return 0;
+                    log::debug!("trap {}: Thumb word {word:#08x} not relocatable", p.name);
+                    return Err(if word == 0 {
+                        CaveFail::Retry
+                    } else {
+                        CaveFail::Structural
+                    });
                 }
                 resume = site.wrapping_add(4);
                 bytes[0..4].copy_from_slice(&word.to_le_bytes());
@@ -379,11 +397,12 @@ fn build_cave(
                 patch = &[0x00, 0xf0, 0x00, 0xf8];
             } else {
                 if !thumb16_relocatable(h0) {
-                    log::debug!(
-                        "trap {}: Thumb half {h0:#06x} not relocatable (will retry)",
-                        p.name
-                    );
-                    return 0;
+                    log::debug!("trap {}: Thumb half {h0:#06x} not relocatable", p.name);
+                    return Err(if h0 == 0 {
+                        CaveFail::Retry
+                    } else {
+                        CaveFail::Structural
+                    });
                 }
                 // Only 2 bytes are clobbered; instruction at site+2 stays in
                 // place, so the cave runs the single replaced halfword and
@@ -400,11 +419,11 @@ fn build_cave(
     let cave = *arena;
     *arena += 16;
     if unicorn.mem_write(cave as u64, &bytes).is_err() {
-        return 0;
+        return Err(CaveFail::Retry);
     }
     if unicorn.mem_write(site as u64, patch).is_err() {
         log::warn!("trap {}: svc patch at {site:#x} failed", p.name);
-        return 0;
+        return Err(CaveFail::Retry);
     }
     // The patched page may already have translated blocks (the site itself was
     // not executed yet, but QEMU translates whole runs of instructions, and a
@@ -433,8 +452,8 @@ fn build_cave(
         );
     }
     match p.mode {
-        TrapMode::Arm => cave,
-        TrapMode::Thumb => cave | 1,
+        TrapMode::Arm => Ok(cave),
+        TrapMode::Thumb => Ok(cave | 1),
     }
 }
 
@@ -508,12 +527,20 @@ pub fn flush_trap_sites(unicorn: &mut Unicorn<'_, Context>) {
         };
         let disabled = trap_disabled(p.name);
         let duplicate = SITES.with(|s| s.borrow().contains_key(&p.site));
+        let mut structural_reject = false;
         let cave = if !disabled
             && !duplicate
             && arena_start != 0
             && arena + 16 <= arena_start + count * 16
         {
-            build_cave(unicorn, &mut arena, &p)
+            match build_cave(unicorn, &mut arena, &p) {
+                Ok(cave) => cave,
+                Err(CaveFail::Structural) => {
+                    structural_reject = true;
+                    0
+                }
+                Err(CaveFail::Retry) => 0,
+            }
         } else {
             0
         };
@@ -528,20 +555,25 @@ pub fn flush_trap_sites(unicorn: &mut Unicorn<'_, Context>) {
             // one handler, so chain this extra registration as a legacy hook
             // (it still fires alongside the svc trap that owns the instruction).
             log::warn!("trap {}: duplicate site at {:#x}, legacy hook", p.name, p.site);
-        } else if !disabled && attempts < RETRY_LIMIT {
-            // The site word was not a relocatable instruction. Most often the
-            // loader has mapped the page but not written its contents yet
-            // (segments arrive in several mmaps); retry on the next flush
-            // instead of permanently losing the trap to the narrow-hook
-            // translation quirk.
+        } else if !disabled && attempts < RETRY_LIMIT && !structural_reject {
+            // The site word may not be final yet (the loader has mapped the
+            // page but not written its contents - segments arrive in several
+            // mmaps); retry on the next flush. A *structural* rejection goes
+            // straight to the legacy hook: an unhooked window would run the
+            // guest function bare, and the golden-era hooks were live from
+            // load.
             new_retry.push((p, attempts + 1));
             continue;
         } else if !disabled {
             log::warn!(
-                "trap {}: site {:#x} not relocatable after {} flushes, legacy hook (in {} [{}])",
+                "trap {}: site {:#x} -> legacy hook ({}, in {} [{}])",
                 p.name,
                 p.site,
-                RETRY_LIMIT,
+                if structural_reject {
+                    "instruction not relocatable".to_string()
+                } else {
+                    format!("not relocatable after {RETRY_LIMIT} flushes")
+                },
                 unicorn.get_data().elf_path,
                 unicorn.get_data().inner.thread_id()
             );
