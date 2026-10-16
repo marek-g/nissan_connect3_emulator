@@ -1455,7 +1455,7 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
                 if hmi_capture_prefix().is_some() {
                     capture_raw_hmi_before_composite(backend);
                 }
-                composite_hmi_over_map(backend);
+                composite_hmi_over_map(backend, true);
                 // Present on the private compositor context so guests never
                 // see our program/texture/attrib state.
                 unsafe {
@@ -1558,7 +1558,15 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
             // prochmi swap (and the throttled window dump below rides on the
             // same call, catching up whenever it becomes due).
             if backend.hmi_framebuffer != 0 {
-                composite_hmi_over_map(backend);
+                // r750: do NOT re-read the HMI FBO from here - this runs on
+                // the map publishing thread with the MAP context current,
+                // and `hmi_framebuffer` is an id from prochmi's context, so
+                // binding it here resolves to the map's own FBO (id 1) and
+                // the map layer would masquerade as the HMI layer.  Reuse
+                // the `hmi_pixels` cached by the last real HMI swap: on the
+                // unit a frozen HMI layer keeps showing its last painted
+                // frame while the map layer underneath stays live.
+                composite_hmi_over_map(backend, false);
                 sys::SDL_GL_MakeCurrent(backend.window_raw, backend.comp_context);
                 backend.current_target = None;
                 blit_hmi_pixels_to_window(backend);
@@ -1579,21 +1587,37 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
 // prochmi's HMI layer is blended on top using its own per-pixel alpha only.
 // Fully transparent HMI pixels let the map through, partial alpha blends,
 // opaque pixels (including intentionally black widgets) occlude the map.
-fn composite_hmi_over_map(backend: &mut Backend) {
-    unsafe {
-        let mut previous = 0i32;
-        gl::GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut previous);
-        gl::BindFramebuffer(gl::FRAMEBUFFER, backend.hmi_framebuffer);
-        gl::ReadPixels(
-            0,
-            0,
-            MAP_SURFACE_WIDTH as i32,
-            MAP_SURFACE_HEIGHT as i32,
-            gl::RGBA,
-            gl::UNSIGNED_BYTE,
-            backend.hmi_pixels.as_mut_ptr() as *mut _,
-        );
-        gl::BindFramebuffer(gl::FRAMEBUFFER, previous as u32);
+fn composite_hmi_over_map(backend: &mut Backend, reload_hmi: bool) {
+    // r750: the raw (pre-blend) HMI layer as of the last real HMI swap.  The
+    // map-publish re-present cannot re-read the HMI FBO (foreign-context id)
+    // and must not reuse the post-blend `hmi_pixels`, so the pristine layer
+    // pixels are cached here on every swap that can read them.
+    static HMI_RAW_CACHE: std::sync::LazyLock<Mutex<Vec<u8>>> =
+        std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+    if reload_hmi {
+        unsafe {
+            let mut previous = 0i32;
+            gl::GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut previous);
+            gl::BindFramebuffer(gl::FRAMEBUFFER, backend.hmi_framebuffer);
+            gl::ReadPixels(
+                0,
+                0,
+                MAP_SURFACE_WIDTH as i32,
+                MAP_SURFACE_HEIGHT as i32,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                backend.hmi_pixels.as_mut_ptr() as *mut _,
+            );
+            gl::BindFramebuffer(gl::FRAMEBUFFER, previous as u32);
+        }
+        if let Ok(mut cache) = HMI_RAW_CACHE.lock() {
+            cache.clear();
+            cache.extend_from_slice(&backend.hmi_pixels);
+        }
+    } else if let Ok(cache) = HMI_RAW_CACHE.lock() {
+        if cache.len() == backend.hmi_pixels.len() && !cache.is_empty() {
+            backend.hmi_pixels.copy_from_slice(&cache);
+        }
     }
     if backend.map_pixels.len() != backend.hmi_pixels.len() {
         return;
