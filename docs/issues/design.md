@@ -2995,3 +2995,42 @@ xp-watch *and* fallback - with different semantics), and the SWI rejection in
 `arm_instruction_relocatable` was bit-rotted (`(w >> 24) & 0xf0 == 0xf0`
 never matches) so old `add_code_stub` sites could be hijacked by the
 converter - a svc word saved as its own "original" instruction.
+
+## r748b (2026-10-16): structural rejects fall back at once; roads are back (RESOLVED)
+
+`build_cave` conflated "word not final yet" with "word is a real instruction
+that cannot live in a cave".  Both burned the whole 64-flush budget as a
+*bare, unhooked* site, and during that window the guest function runs with
+none of its emulator semantics - exactly the failure above.  It now returns
+`CaveFail::{Retry, Structural}` and a structural reject goes to the narrow
+hook on the *first* flush, so it is live from load like the golden-era hook.
+With that, the full trap world booted the engine (OPEN(mbx_1024) x3, PWR
+0x0400, Tim-CB threads, the same tolerated 8-assert background as golden) but
+still drew nothing: `multi-draw`/`street-coord probe` were zero while
+`RCMapObjectsUpdate::Execute` matched golden exactly.
+
+Per-event timeline diff against golden localised it to `t=136.8s`: golden ran
+`RCSetCameraParameters` -> `enqueued pure render job` -> `DetermineMapObjects`
+(leg 0x4328b4) -> street `AddElement`s; the trap world executed the camera job
+and then nothing.  `enqueued pure render job` was 6:0 golden:trap, i.e. the
+two-stage pure-render kick never got past stage 1, and the reason was a
+*converter artifact*, not a handler: the capture-site loop passed the already
+offset constant `CREATE_RC_JOB_RENDER_RESULT` (= `0x4c5b20 - ORIGINAL_BASE`)
+into the template, which subtracts `ORIGINAL_BASE` a second time.  The svc
+landed at `0x4bdb20`, 0x8000 below the factory's real
+`ldmia sp!,{r4,pc}` return, so the job pointer was never captured,
+`MAP_RENDER_KICK_CAPTURING` stayed true forever and every later kick returned
+early.  Same class, two more sites: `0x138`/`0x1a8`/`0x2c` were lifted out of
+comments (`"after MO vcall+0x138"`, `"stored+0x2c"`) and registered as fetch
+addresses near zero.  And the DOM-leg block registered only 2 of the 6 arms its
+own handler matches, which is why legs `0x4328b4`/`0x43186c` looked dead when
+they were only unobserved - do not read a missing probe line as missing code.
+Audit rule taken from this: for every `for __arm in [...]` block, the arms must
+be raw VAs *and* must equal the handler's guard set; the three discrepancies
+above are the full list.  Result: roads in the trap world at t=140s (golden
+t=141s), `multi-draw` 10, street `AddElement` 16, no engine exit.
+
+Diagnostics that made this readable (kept): site ring + `last_site()` printed
+on a quantum fault, `site hit`/`site resume` debug lines, and the raw assert
+dump.  Dropped: the `[trap-site-caves]` arena write-watch and the temporary
+`mbx` stat/mq_open logs and the message-queue-create wrapper trace.
