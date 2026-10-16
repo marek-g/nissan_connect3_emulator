@@ -2874,3 +2874,124 @@ mutex free, guest not yet executing - one attempt, always succeeds; the
 fallback (registers the extracted `register_vfin/vpcs_page_fallback` page hooks
 in the right VM, r743 behavior). Trace mode registers the fallbacks
 unconditionally as the diagnostic legs.
+
+## r747: trap-site conversion regression - `B`/`BL` accepted by the relocatability decoder
+
+After converting the per-address `add_code_hook` sites of procmapengine (183),
+dapi (40), prochmi (23) and libosal (22) to `svc #0` trap sites, every full run
+crashed the DAPI process: thread exited with code 1, then
+`0x47dc8400 WRITE_PROT` (libc string fn writing to DAPI's R-X text).  Bisecting
+with `EMU_TRAPS_DISABLE` (now worth keeping as a regression tool) isolated the
+culprit to `libs/dapi.rs` sites; `last trapped site before fault` instrumentation
+(`code_stub::note_site` + scheduler print) showed the flow dying right after the
+`bInitThread` entry log.
+
+Root cause #1 (`arm_instruction_relocatable`): the B/BL rejection tested
+`(word >> 26) == 0b0101`, which only matches branches with `cond == 0`.  Real
+ARM branches are `0xEA......`/`0xEB......` (`word >> 26 == 0b111010`), so every
+`b`/`bl` at a site address was accepted as relocatable, and its cave *replayed
+the branch relative to the cave address* - a jump into arena garbage.  The
+`hook_entry` sites sit on interworking thunks (`b #real_fn`), e.g. vStartApp
+0x8137e0 = `b #0x813988`, so the vStartApp body was skipped entirely and it
+called `bInitThread` with `r0 = 0` (vs `r0 = 0xf60a80` normally), diverging DAPI
+startup into a libc string call writing to a read-only global.  Fix: reject
+bits[27:25] == 0b101 (B/BL, any cond) and SWI.
+
+Root cause #2 (`build_cave`, Thumb layouts): the cave return was written as
+`0x4801`, believed to be `ldr pc,[pc,#4]` - but **Thumb16 has no PC-relative
+load of PC** (Rt=15 is not encodable in LDR-literal T1).  `0x4801` is
+`ldr r1,[pc,#4]`: the cave loaded the resume word into *r1* and then executed
+the pad halfword (`movs r0,r0`) and the resume literal's own halves as code
+(`ble` + `lsls r3,...`).  Whether the guest survived depended on the flags at
+that moment - procnav threads wandered into heap pages (`0x90001000
+FETCH_PROT`, `0x8ffffda6 FETCH_UNMAPPED`) with the resume value as a data
+argument, and called `exit(1)` on their way out.  Fix: `ldr r1,[pc,#4]` +
+`bx r1` (BX honours the |1 mode bit), plus rejection of any replayed
+instruction that writes r1 (`ldr r1,...`, PUSH lists with r1, ...) so the
+loaded resume cannot clobber a live result.  ARM caves (`ldr pc,[pc,#0]`) were
+always correct - r746a only ever trapped ARM sites, which is why the bug slept
+until the procnav/monitor Thumb sites were converted.
+
+Same run also gained three dispatcher hardening bits:
+
+* `ctl_remove_cache(site page)` after every svc patch - host-side `mem_write`
+  never invalidates translated blocks, so patching a page whose block run was
+  already translated would leave a dead site (no svc ever fetched).
+* orphan-svc guard: an `svc #0` at a registered site address with no live
+  `SITES` entry replays its cave instead of emulating a bogus syscall #0.
+* stub+site coexistence: when an `add_code_stub` and a `trap_site` share an
+  address, the site callback now runs (before the stub handler) from the stub
+  branch, matching the old world where Unicorn ran the code hook *and* the
+  svc->stub.
+
+## r748 (2026-10-16): retry-flush for late-loaded pages + PC-redirect hooks as trap sites
+
+Roads vanished in every trap-world run (multi-draw never fired) while HEAD
+(r746 infra, only 2 trapped sites) still rendered at t=141 s.  Bisecting the
+trap-world milestone chain against `run_headchk.log` (HEAD, roads OK) narrowed
+the gap to the map render pass: `RCMapObjectsUpdate::Execute` 19 -> 0,
+`MOUpd copy-active` (which sets `MAP_MO_COPY_DONE`, the pure-render-kick
+gate) 1 -> 0, `forced renderer execute` 3 -> 0, and the `vOnNewMessage`
+monitor spam 150 -> 1105 (the r655 request-machine restart storm).  Two
+independent mechanism bugs produced that:
+
+* **Flush-time stale words.**  The loader maps a segment's pages before
+  writing all of their contents (`get_libraries_and_base_addresses` already
+  reports the library at its first mmap), so the first flush read garbage
+  words at the not-yet-written sites and *permanently* degraded them to
+  legacy Unicorn hooks - which then sit in pages whose neighbours carry svc
+  patches and are exactly the class of narrow hooks that the
+  `HOOK_EXISTS_BOUNDED` translation quirk silences.  Site
+  `libs/procmapengine.rs:1122` (the RC-job factory return tap, real word
+  `pop {r4,pc}`) read `0x006a0178` and was lost this way.  Fix: a rejected
+  site is retried on every later flush (`RETRY_SITES`, limit 64) and only
+  degrades to the legacy hook after the limit; the per-attempt decoder
+  warning moved to `debug!` to keep flushes quiet.
+* **The retry itself indexed the batch wrong** (fresh sites first vs.
+  attempt counts assumed first): every retry got `attempts = 0`, so retries
+  never aged out, never converted, and each flush allocated a fresh cave
+  arena it never used - the run log is a `code traps: 0/47` storm and the
+  pump sites stayed unhooked forever (worse than no retry at all).  Fixed
+  by offsetting `retry_counts` by the fresh-site count.
+
+The other regression class was functional hooks that *skip guest code* by
+writing `PC` from inside the hook (wait-skip pumps, forced renderer-execute,
+`force_ail_ipc_post_success`, `suppress_duplicate_procmap_start_conf`,
+DAPI `hook_force_return`, five prochmi SVG/EA/DM bypasses).  The converter
+correctly refused to trap them (a handler may not `reg_write(PC)` under the
+old svc contract), leaving them as legacy hooks - dead by the same quirk
+once their page gained trapped neighbours, freezing the renderer thread's
+job-wait pump.  The svc dispatcher already treats a non-zero handler return
+as "PC = this value", so all twelve bodies were converted: they return the
+address instead of writing PC (early-outs return 0 = run the replaced
+instruction in the cave, exactly the old hook returning without touching
+PC).
+
+Fallback delivery took two iterations.  The retry budget makes a fallback
+register *late* (after 64 flushes), by which time its page is hot and already
+translated, and Unicorn's bounded-range check is not retro-emitted - the
+narrow `begin..end` hooks registered `Ok` but dispatched zero times (same
+false-negative class as the r372 probes).  The first fix - one *page-range*
+hook per 4 KiB page dispatching on the fetch address (the `xp-watch` pattern)
+plus `ctl_remove_cache` - did make handlers fire, but page hooks fire
+*mid-TB*: the replaced instruction and the rest of the TB still execute and
+clobber whatever the handler did.  For pure observers that is harmless, but
+stub-body handlers (`return_to_caller`-style: fake the return value, jump to
+LR) silently executed the real function body anyway.  That was the whole
+procmap failure chain: `s32CheckForIOSCQueue` (0x48509744) is a mid-function
+word `add_code_observer` rejects, so it ran as a broken fallback; the guest
+then fell into the real `OSAL_s32MessageQueueCreate` body instead of the
+stub's non-IOSC return, tripped its `ALWAYS` assert (libosal line 1181) from
+`scd_bCreateQueue`, the engine took its error path (`MapEngineControl::Exit`,
+`/proc/self/maps` diagnostics from procbaselx), and no render thread ever
+started.  The assert path now dumps the raw error string (libosal
+`v_write_to_err_mem`), which is how this was found.  Fallbacks are back to
+the golden-era *narrow* hook, but with the previously-missing
+`ctl_remove_cache(page)` right after registering, so re-translation emits the
+bounded check and instruction-boundary semantics (skip + PC redirect) hold.
+Two related fixes shipped with it: `EMU_TRAPS_DISABLE` files now skip the
+fallback registration entirely (procnav sites were being double-dispatched -
+xp-watch *and* fallback - with different semantics), and the SWI rejection in
+`arm_instruction_relocatable` was bit-rotted (`(w >> 24) & 0xf0 == 0xf0`
+never matches) so old `add_code_stub` sites could be hijacked by the
+converter - a svc word saved as its own "original" instruction.

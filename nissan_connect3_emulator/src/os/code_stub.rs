@@ -69,12 +69,11 @@ fn arm_instruction_relocatable(word: u32) -> bool {
     if rd == 15 || rn == 15 || rm == 15 {
         return false; // PC appears as operand or base
     }
-    if (word >> 25) & 0b101 == 0b101 && (word >> 25) & 0b100 == 0 {
-        // B/BL immediate class: cond 0101 ll - reject any 25:24 == 01 with
-        // the L bit forms; branches specifically are (word>>26)==0b0101.
+    if (word >> 25) & 0b111 == 0b101 {
+        return false; // B / BL (any condition: bits 27:25 == 101)
     }
-    if (word >> 26) == 0b0101 {
-        return false; // B/BL
+    if (word >> 24) & 0x0f == 0x0f {
+        return false; // SWI / SVC (bits 27:24 all set - also rejects svc-patched stub sites)
     }
     if word & 0x0ffffff0 == 0x012fff10 || word & 0x0fffffff == 0x012fff30 {
         return false; // BX / BLX register
@@ -211,7 +210,18 @@ struct PendingSite {
 
 thread_local! {
     static PENDING_SITES: RefCell<Vec<PendingSite>> = const { RefCell::new(Vec::new()) };
-    static SITES: RefCell<HashMap<u32, (Box<dyn SiteCb>, u32)>> = RefCell::new(HashMap::new());
+    static SITES: RefCell<HashMap<u32, (Box<dyn SiteCb>, u32, &'static str)>> = RefCell::new(HashMap::new());
+    /// Legacy-fallback handlers keyed by their exact site address.  Each
+    /// fallback rides a narrow (`begin == end`) Unicorn code hook at the site
+    /// - the golden-era mechanism whose instruction-boundary semantics the
+    /// handlers assume (skip + PC redirect).  Because fallbacks register late
+    /// (after the retry budget) the page is usually already translated
+    /// without the bounded check, so `flush_trap_sites` calls
+    /// `ctl_remove_cache` on the page right after registering, forcing
+    /// re-translation with `HOOK_EXISTS_BOUNDED` emitted (see r748 notes in
+    /// docs/issues/design.md - a page-range hook cannot substitute: it fires
+    /// mid-TB and the guest then executes the replaced instruction anyway).
+    static FALLBACKS: RefCell<HashMap<u32, Box<dyn SiteCb>>> = RefCell::new(HashMap::new());
 }
 
 /// Queue an observe-and-continue trap at a single instruction address (see
@@ -244,6 +254,27 @@ pub fn trap_site<F>(
 /// cannot observe the PC; everything else (branches, literals, `BX`,
 /// 0x46xx/0x47xx high-register moves, conditionals) falls back to a hook.
 fn thumb16_relocatable(h: u16) -> bool {
+    // The T1 cave returns through `ldr r1,[pc,#4]` + `bx r1`, so the replayed
+    // instruction must not write r1 (the loaded resume would clobber its
+    // result).  r1-writing forms per allow-listed class (Rd fields below):
+    let writes_r1 = match h {
+        // PUSH {..}: bit1 = r1 in the list
+        0xb400..=0xb5ff => h & 0x2 != 0,
+        // ADD/SUB SP,#imm: Rd = bits 10:8 (SP for 0xa8xx? those are ADD Rd,SP - real Rd field)
+        0xa800..=0xa8ff => (h >> 8) & 7 == 1,
+        0xb000..=0xb0ff => false, // ADD/SUB SP,SP,#imm
+        // LSL/LSR/ASR/MOV/ADD/SUB/CMP imm & 3-register forms: Rd = bits 10:8
+        0x0000..=0x27ff => (h >> 8) & 7 == 1,
+        // ALU hi-op / MUL / REV / CMP-CMN-TST-NOT-NEG reg: Rn/Rd = bits 5:3
+        0x4200..=0x45ff => (h >> 3) & 7 == 1,
+        // STR/LDR half,word,byte immediate: Rt = bits 2:0 (reject loads AND
+        // stores naming r1: cheap and conservative)
+        r @ (0x5000..=0x7fff | 0x8800..=0x8bff | 0x6800..=0x6bff) => r & 7 == 1,
+        _ => true,
+    };
+    if writes_r1 {
+        return false;
+    }
     match h {
         // PUSH {r0-r7[,lr]} / STMDB SP!
         0xb400..=0xb5ff => true,
@@ -268,9 +299,10 @@ fn thumb16_relocatable(h: u16) -> bool {
 fn thumb32_relocatable(word: u32) -> bool {
     let h0 = (word & 0xffff) as u16;
     let h1 = (word >> 16) as u16;
-    // STMDB.W / PUSH.W with writeback, base SP, list without PC
+    // STMDB.W / PUSH.W with writeback, base SP, list without PC.  The T2 cave
+    // also returns via `ldr r1` + `bx r1`, so a list containing r1 is rejected.
     if h0 == 0xe92d {
-        return h1 & 0x8000 == 0;
+        return h1 & 0x8002 == 0;
     }
     // SUB sp, sp, #imm8 (T3): 11110 00000 10 Sn1101 1101 imm8
     if h0 & 0xfbdf == 0xf1ad && h1 & 0xf000 == 0xd000 {
@@ -289,11 +321,12 @@ fn build_cave(
 ) -> u32 {
     let site = p.site;
     // Cave layouts (16 bytes, 4-byte aligned, all Thumb entries are reached
-    // with the |1 Thumb bit; `ldr pc,[pc,#imm]` gives mode-independent
-    // arbitrary-range resume):
+    // with the |1 Thumb bit).  Thumb16 has NO `ldr pc,[pc,#imm]` (Rt=15 is not
+    // encodable), so the return is `ldr r1,[pc,#4]` + `bx r1` (BX honours the
+    // |1 mode bit); the replayed instruction must not depend on r1:
     //  ARM:      [word][ldr pc,[pc,#0] @+4][pad @+8][resume @+0xc]
-    //  Thumb T1: [h16 @+0][ldr pc,[pc,#4] @+2][pad @+4][resume @+8]
-    //  Thumb T2: [word32 @+0][ldr pc,[pc,#4] @+4][pad][resume @+0xc]
+    //  Thumb T1: [h16 @+0][ldr r1 @+2][bx r1 @+4][pad @+6][resume|1 @+8]
+    //  Thumb T2: [word32 @+0][ldr r1 @+4][bx r1 @+6][pad @+8][resume|1 @+0xc]
     let mut bytes = [0u8; 16];
     let resume;
     let mut patch: &[u8] = &[];
@@ -305,8 +338,8 @@ fn build_cave(
             }
             let word = u32::from_le_bytes(w);
             if !arm_instruction_relocatable(word) {
-                log::warn!(
-                    "trap {}: ARM word {word:#010x} not relocatable, legacy hook",
+                log::debug!(
+                    "trap {}: ARM word {word:#010x} not relocatable (will retry)",
                     p.name
                 );
                 return 0;
@@ -332,21 +365,22 @@ fn build_cave(
                 }
                 let word = u32::from_le_bytes(w);
                 if !thumb32_relocatable(word) {
-                    log::warn!(
-                        "trap {}: Thumb word {word:#08x} not relocatable, legacy hook",
+                    log::debug!(
+                        "trap {}: Thumb word {word:#08x} not relocatable (will retry)",
                         p.name
                     );
                     return 0;
                 }
                 resume = site.wrapping_add(4);
                 bytes[0..4].copy_from_slice(&word.to_le_bytes());
-                bytes[4..6].copy_from_slice(&0x4801u16.to_le_bytes()); // ldr pc,[pc,#4]
+                bytes[4..6].copy_from_slice(&0x4801u16.to_le_bytes()); // ldr r1,[pc,#4]
+                bytes[6..8].copy_from_slice(&0x4708u16.to_le_bytes()); // bx  r1
                 bytes[12..16].copy_from_slice(&(resume | 1).to_le_bytes());
                 patch = &[0x00, 0xf0, 0x00, 0xf8];
             } else {
                 if !thumb16_relocatable(h0) {
-                    log::warn!(
-                        "trap {}: Thumb half {h0:#06x} not relocatable, legacy hook",
+                    log::debug!(
+                        "trap {}: Thumb half {h0:#06x} not relocatable (will retry)",
                         p.name
                     );
                     return 0;
@@ -356,7 +390,8 @@ fn build_cave(
                 // returns to site+2.
                 resume = site.wrapping_add(2);
                 bytes[0..2].copy_from_slice(&h0.to_le_bytes());
-                bytes[2..4].copy_from_slice(&0x4801u16.to_le_bytes()); // ldr pc,[pc,#4] @+2 -> literal @+8
+                bytes[2..4].copy_from_slice(&0x4801u16.to_le_bytes()); // ldr r1,[pc,#4] @+2 -> literal @+8
+                bytes[4..6].copy_from_slice(&0x4708u16.to_le_bytes()); // bx  r1 (honours the |1 mode bit)
                 bytes[8..12].copy_from_slice(&(resume | 1).to_le_bytes());
                 patch = &SVC16;
             }
@@ -371,6 +406,32 @@ fn build_cave(
         log::warn!("trap {}: svc patch at {site:#x} failed", p.name);
         return 0;
     }
+    // The patched page may already have translated blocks (the site itself was
+    // not executed yet, but QEMU translates whole runs of instructions, and a
+    // block covering the site can exist as part of a block whose earlier part
+    // ran - or a guest demand-paged page load may have rewritten our svc, in
+    // which case re-patching here is exactly what keeps the trap alive).
+    // Drop the page's translations so the *next* fetch re-reads the patched
+    // bytes; host-side mem_write alone never invalidates them.
+    if unicorn
+        .ctl_remove_cache((site & !0xfff) as u64, ((site & !0xfff) + 0x1000) as u64)
+        .is_err()
+    {
+        log::warn!("trap {}: TB invalidate at {site:#x} failed", p.name);
+    }
+    // Confirm the patch really landed (a readback that differs means the page
+    // was remapped/reloaded over us).
+    {
+        let mut back = [0u8; 4];
+        let _ = unicorn.mem_read(site as u64, &mut back);
+        log::debug!(
+            "trap {}: patched {site:#x} readback {:02x?} (want {:02x?}) thread [{}]",
+            p.name,
+            back,
+            patch,
+            unicorn.get_data().inner.thread_id()
+        );
+    }
     match p.mode {
         TrapMode::Arm => cave,
         TrapMode::Thumb => cave | 1,
@@ -378,12 +439,21 @@ fn build_cave(
 }
 
 /// Patch all queued trap sites. Must run with the MMU mutex FREE (it calls
-/// `heap_alloc`) and before the guest reaches the sites. Fallback sites get a
-/// legacy single-address Unicorn code hook with the same handler.
+/// `heap_alloc`) and before the guest reaches the sites. A site whose word is
+/// not yet the real instruction (the loader may map a segment's pages before
+/// writing all of their contents) is retried on the next flush; only after
+/// `RETRY_LIMIT` flushes - by which time the guest has surely loaded and even
+/// run the page - does it degrade to a legacy Unicorn code hook.
 pub fn flush_trap_sites(unicorn: &mut Unicorn<'_, Context>) {
-    let pending = PENDING_SITES.with(|q| std::mem::take(&mut *q.borrow_mut()));
-    if pending.is_empty() {
+    let mut pending = PENDING_SITES.with(|q| std::mem::take(&mut *q.borrow_mut()));
+    let retry: Vec<(PendingSite, u32)> = RETRY_SITES.with(|q| std::mem::take(&mut *q.borrow_mut()));
+    if pending.is_empty() && retry.is_empty() {
         return;
+    }
+    let retry_counts: Vec<u32> = retry.iter().map(|(_, n)| *n).collect();
+    let fresh_count = pending.len();
+    for (p, _) in retry {
+        pending.push(p);
     }
     let count = pending.len() as u32;
     let arena_start = {
@@ -404,48 +474,246 @@ pub fn flush_trap_sites(unicorn: &mut Unicorn<'_, Context>) {
         a
     };
     let mut arena = arena_start;
+    // Debug: watch the arena page so guest writes into a live cave (which the
+    // earlier 0x16-into-literal corruption looked exactly like) are logged.
+    {
+        let res = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            (arena_start & !0xfff) as u64,
+            (((arena_start + count * 16) | 0xfff) + 1) as u64 - 1,
+            move |uc, _t, address, size, value| {
+                log::error!(
+                    "ARENA WRITE: {:#x} size {:#x} value {:#x} thread [{}]",
+                    address,
+                    size,
+                    value,
+                    uc.get_data().inner.thread_id()
+                );
+                true
+            },
+        );
+        if let Err(e) = res {
+            log::warn!("arena watch failed: {e:?}");
+        }
+    }
     let mut trapped = 0usize;
-    for p in pending {
-        let cave = if arena_start != 0 && arena + 16 <= arena_start + count * 16 {
+    let mut new_retry: Vec<(PendingSite, u32)> = Vec::new();
+    for (idx, p) in pending.into_iter().enumerate() {
+        // Retries were appended behind the fresh sites; their attempt count
+        // lives in `retry_counts` (same order as the trailing items).
+        let attempts = if idx >= fresh_count {
+            retry_counts[idx - fresh_count]
+        } else {
+            0
+        };
+        let disabled = trap_disabled(p.name);
+        let duplicate = SITES.with(|s| s.borrow().contains_key(&p.site));
+        let cave = if !disabled
+            && !duplicate
+            && arena_start != 0
+            && arena + 16 <= arena_start + count * 16
+        {
             build_cave(unicorn, &mut arena, &p)
         } else {
             0
         };
         if cave != 0 {
-            SITES.with(|s| s.borrow_mut().insert(p.site, (p.cb, cave)));
+            ALL_SITES.with(|s| s.borrow_mut().insert(p.site, cave));
+            SITES.with(|s| s.borrow_mut().insert(p.site, (p.cb, cave, p.name)));
             trapped += 1;
-        } else {
-            // Legacy fallback: identical handler through a Unicorn hook.
-            let mut cb = p.cb;
-            let _ = unicorn.add_code_hook(
-                p.site as u64,
-                p.site as u64,
-                move |uc, _a, _b| {
-                    cb.call(uc);
-                },
+            continue;
+        }
+        if duplicate {
+            // unicorn would run BOTH legacy callbacks; a trap could only carry
+            // one handler, so chain this extra registration as a legacy hook
+            // (it still fires alongside the svc trap that owns the instruction).
+            log::warn!("trap {}: duplicate site at {:#x}, legacy hook", p.name, p.site);
+        } else if !disabled && attempts < RETRY_LIMIT {
+            // The site word was not a relocatable instruction. Most often the
+            // loader has mapped the page but not written its contents yet
+            // (segments arrive in several mmaps); retry on the next flush
+            // instead of permanently losing the trap to the narrow-hook
+            // translation quirk.
+            new_retry.push((p, attempts + 1));
+            continue;
+        } else if !disabled {
+            log::warn!(
+                "trap {}: site {:#x} not relocatable after {} flushes, legacy hook (in {} [{}])",
+                p.name,
+                p.site,
+                RETRY_LIMIT,
+                unicorn.get_data().elf_path,
+                unicorn.get_data().inner.thread_id()
             );
         }
+        if disabled {
+            // EMU_TRAPS_DISABLE names the pure-legacy files (procnav probes,
+            // rtos stub traces): their addresses are owned by the xp-watch
+            // page hooks / stub registrar, so installing a fallback here too
+            // would double-dispatch every hit with different semantics.
+            continue;
+        }
+        // Legacy fallback: the golden-era narrow (begin == end) Unicorn hook
+        // at the exact site address. Narrow hooks fire *at the instruction
+        // boundary*, so the handler's PC writes and skip semantics survive
+        // (a page-range hook fires mid-TB: the replaced instruction and the
+        // rest of the TB still execute and clobber the handler's redirect -
+        // that silently ran stub function bodies whose trap rejected the
+        // prologue, e.g. OSAL_s32MessageQueueCreate asserting on procmap
+        // boot). They die only when the page was already translated without
+        // the bounded-hook check, so drop the page's TBs right after
+        // registering to force re-translation with the check emitted.
+        FALLBACKS.with(|m| m.borrow_mut().insert(p.site, p.cb));
+        log::info!("trap {}: fallback hook installed at {:#x}", p.name, p.site);
+        let res = unicorn.add_code_hook(p.site as u64, p.site as u64, move |uc, a, _| {
+            let a = a as u32;
+            let cb = FALLBACKS.with(|m| m.borrow_mut().remove(&a));
+            if let Some(mut cb) = cb {
+                let ret = cb.call(uc);
+                FALLBACKS.with(|m| m.borrow_mut().insert(a, cb));
+                if ret != 0 {
+                    let _ = uc.reg_write(unicorn_engine::RegisterARM::PC, ret as u64);
+                }
+            }
+        });
+        if res.is_err() {
+            log::warn!("trap {}: fallback hook install failed at {:#x}", p.name, p.site);
+        }
+        let page = p.site & !0xfff;
+        let _ = unicorn.ctl_remove_cache(page as u64, page as u64 + 0x1000);
     }
+    RETRY_SITES.with(|q| *q.borrow_mut() = new_retry);
     log::info!(
-        "code traps: {trapped}/{count} sites trapped via svc #0 (caves at {arena_start:#x})"
+        "code traps: {}/{} sites trapped via svc #0 (caves at {:#x}) in {} [{}]",
+        trapped,
+        count,
+        arena_start,
+        unicorn.get_data().elf_path,
+        unicorn.get_data().inner.thread_id()
     );
+}
+
+thread_local! {
+    /// Sites rejected by `build_cave` (word not yet a real instruction
+    /// because the loader has not finished writing the page), kept pending
+    /// conversion until a later flush sees a sane word. See flush_trap_sites.
+    static RETRY_SITES: RefCell<Vec<(PendingSite, u32)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Number of flush passes a rejected site waits before it degrades to a
+/// legacy Unicorn hook.
+const RETRY_LIMIT: u32 = 64;
+
+thread_local! {
+    /// Registry of every successfully patched site address -> its cave. Kept
+    /// for the lifetime of the VM even while the site is temporarily taken by
+    /// the dispatcher; lets the interrupt hook recognise (and safely replay)
+    /// its own `svc #0` whose SITES entry went missing.
+    static ALL_SITES: RefCell<HashMap<u32, u32>> = RefCell::new(HashMap::new());
+}
+
+pub fn site_registered(addr: u32) -> bool {
+    ALL_SITES.with(|s| s.borrow().contains_key(&addr))
+}
+
+pub fn site_registered_cave(addr: u32) -> u32 {
+    ALL_SITES.with(|s| *s.borrow().get(&addr).unwrap_or(&0))
 }
 
 /// Dispatcher support: take (remove) the site whose instruction was just
 /// replaced by the svc that fired, keyed on the post-svc PC.
-pub fn take_site(post_pc: u32) -> Option<(u32, Box<dyn SiteCb>, u32)> {
+pub fn take_site(post_pc: u32) -> Option<(u32, Box<dyn SiteCb>, u32, &'static str)> {
     for key_pc in [post_pc.wrapping_sub(4), post_pc.wrapping_sub(2)] {
-        let hit = SITES.with(|s| s.borrow_mut().remove(&key_pc).map(|(cb, cave)| (key_pc, cb, cave)));
-        if let Some((key, cb, cave)) = hit {
-            return Some((key, cb, cave));
+        let hit = SITES
+            .with(|s| s.borrow_mut().remove(&key_pc).map(|(cb, cave, name)| (key_pc, cb, cave, name)));
+        if let Some((key, cb, cave, name)) = hit {
+            return Some((key, cb, cave, name));
         }
     }
     None
 }
 
+/// A site is busy while its handler runs (`take_site` removed it). If guest
+/// code executed *by the handler* (`call_guest_function`) re-executes that
+/// exact site, the trap must NOT run the handler again nor fall through to
+/// syscall emulation: the instruction must simply replay. Returns the cave
+/// for such a re-entrant hit.
+pub fn site_cave(post_pc: u32) -> Option<u32> {
+    for key_pc in [post_pc.wrapping_sub(4), post_pc.wrapping_sub(2)] {
+        let hit = SITES.with(|s| s.borrow().get(&key_pc).map(|(_, cave, _)| *cave));
+        if hit.is_some() {
+            return hit;
+        }
+    }
+    None
+}
+
+thread_local! {
+    /// Nesting depth of site-handler execution on this VM thread.
+    static IN_SITE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+pub fn in_site_handler() -> bool {
+    IN_SITE.with(|d| d.get() > 0)
+}
+
+thread_local! {
+    /// Debug aid: the name of the last site handler executed on this VM
+    /// thread, reported by the scheduler when a guest execution fault hits.
+    static LAST_SITE: std::cell::RefCell<Option<(&'static str, u32)>> = const { std::cell::RefCell::new(None) };
+}
+
+pub fn note_site(name: &'static str, addr: u32) {
+    LAST_SITE.with(|s| *s.borrow_mut() = Some((name, addr)));
+    SITE_RING.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.len() >= 48 {
+            r.remove(0);
+        }
+        r.push_back((name, addr));
+    });
+}
+
+pub fn last_site() -> Option<(&'static str, u32)> {
+    LAST_SITE.with(|s| *s.borrow())
+}
+
+thread_local! {
+    /// Debug aid: the last ~48 site hits on this VM thread, dumped with the
+    /// scheduler's fault context so the exact trapped path is visible.
+    static SITE_RING: std::cell::RefCell<std::collections::VecDeque<(&'static str, u32)>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+pub fn dump_site_ring() {
+    SITE_RING.with(|r| {
+        let r = r.borrow();
+        for (n, a) in r.iter() {
+            log::error!("site ring: {n} @ {a:#x}");
+        }
+    });
+}
+
+pub fn site_handler_enter() {
+    IN_SITE.with(|d| d.set(d.get() + 1));
+}
+
+pub fn site_handler_leave() {
+    IN_SITE.with(|d| d.set(d.get() - 1));
+}
+
+/// Kill-switch for bisecting regressions: `EMU_TRAPS_DISABLE=<name prefix>`
+/// (comma separated) makes matching `trap_site` registrations fall back to a
+/// legacy Unicorn code hook instead of the svc trampoline.
+fn trap_disabled(name: &str) -> bool {
+    std::env::var("EMU_TRAPS_DISABLE").map_or(false, |v| {
+        v.split(',').any(|p| !p.is_empty() && name.starts_with(p))
+    })
+}
+
 /// Dispatcher support: put the site back after its handler ran.
-pub fn put_site(key: u32, cb: Box<dyn SiteCb>, cave: u32) {
-    SITES.with(|s| s.borrow_mut().insert(key, (cb, cave)));
+pub fn put_site(key: u32, cb: Box<dyn SiteCb>, cave: u32, name: &'static str) {
+    SITES.with(|s| s.borrow_mut().insert(key, (cb, cave, name)));
 }
 
 /// Number of live trapped sites (diagnostics/tests).

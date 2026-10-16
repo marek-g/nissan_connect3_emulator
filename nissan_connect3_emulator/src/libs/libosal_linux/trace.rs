@@ -81,7 +81,19 @@ pub fn v_write_to_err_mem(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     );
     if arg2 != 0 {
         let text = read_string(unicorn, arg2);
-        log::warn!("{}", text);
+        if text.is_empty() {
+            // The engine's error text did not read back; dump the raw bytes
+            // so the failing operation is still identifiable.
+            let mut raw = [0u8; 64];
+            let _ = unicorn.mem_read(arg2 as u64, &mut raw);
+            log::warn!(
+                "[{}] err raw @{arg2:#x}: {:02x?}",
+                unicorn.get_data().inner.thread_id(),
+                &raw[..32]
+            );
+        } else {
+            log::warn!("{}", text);
+        }
     }
     0u32
 }
