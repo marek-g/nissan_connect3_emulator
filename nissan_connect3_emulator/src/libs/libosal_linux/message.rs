@@ -330,25 +330,21 @@ pub fn hook_message_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     const MESSAGE_CREATE: u32 = 0x48513cc0 - 0x484d8000;
     const MESSAGE_DELETE: u32 = 0x48513850 - 0x484d8000;
 
-    unicorn
-        .add_code_hook(
-            (base_address + QUEUE_OPEN) as u64,
-            (base_address + QUEUE_OPEN) as u64,
-            move |uc, addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, (base_address + QUEUE_OPEN), crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/message.rs:334", move |uc: &mut Unicorn<'_, Context>| {
+            let addr = (base_address + QUEUE_OPEN) as u64;
                 fallback_open_to_create(uc, addr as u32, base_address, QUEUE_CREATE);
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
-    unicorn
-        .add_code_hook(
-            (base_address + CHECK_FOR_IOS_QUEUE) as u64,
-            (base_address + CHECK_FOR_IOS_QUEUE) as u64,
-            move |uc, addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, (base_address + CHECK_FOR_IOS_QUEUE), crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/message.rs:344", move |uc: &mut Unicorn<'_, Context>| {
+            let addr = (base_address + CHECK_FOR_IOS_QUEUE) as u64;
                 force_non_iosc_queue(uc, addr as u32, base_address);
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     for (offset, name) in [
         (QUEUE_WAIT, "OSAL_s32MessageQueueWait"),
@@ -357,30 +353,27 @@ pub fn hook_message_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
         (QUEUE_PRIORITY_WAIT, "OSAL_s32MessageQueuePriorityWait"),
         (GET_FROM_MQ, "u32GetFromMessageQueue"),
     ] {
-        unicorn
-            .add_code_hook(
-                (base_address + offset) as u64,
-                (base_address + offset) as u64,
-                move |uc, addr, _| handle_queue_api(uc, addr as u32, base_address, name),
-            )
-            .unwrap();
+        
+crate::os::code_stub::trap_site(unicorn, (base_address + offset), crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/message.rs:361", move |uc: &mut Unicorn<'_, Context>| {
+                let addr = (base_address + offset) as u64;
+handle_queue_api(uc, addr as u32, base_address, name);
+                0
+            });
     }
 
-    unicorn
-        .add_code_hook(
-            (base_address + MESSAGE_CREATE) as u64,
-            (base_address + MESSAGE_CREATE) as u64,
-            move |uc, addr, _| emulate_message_create(uc, addr as u32, base_address),
-        )
-        .unwrap();
+    
+crate::os::code_stub::trap_site(unicorn, (base_address + MESSAGE_CREATE), crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/message.rs:370", move |uc: &mut Unicorn<'_, Context>| {
+            let addr = (base_address + MESSAGE_CREATE) as u64;
+emulate_message_create(uc, addr as u32, base_address);
+            0
+        });
 
-    unicorn
-        .add_code_hook(
-            (base_address + MESSAGE_DELETE) as u64,
-            (base_address + MESSAGE_DELETE) as u64,
-            move |uc, addr, _| suppress_synthetic_message_delete(uc, addr as u32, base_address),
-        )
-        .unwrap();
+    
+crate::os::code_stub::trap_site(unicorn, (base_address + MESSAGE_DELETE), crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/message.rs:378", move |uc: &mut Unicorn<'_, Context>| {
+            let addr = (base_address + MESSAGE_DELETE) as u64;
+suppress_synthetic_message_delete(uc, addr as u32, base_address);
+            0
+        });
 }
 
 fn handle_queue_api(

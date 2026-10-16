@@ -94,8 +94,9 @@ fn hook_prm_notify_trace(
     name: &'static str,
 ) {
     let address = base_address + (libosal_address - 0x484d_8000);
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/mod.rs:98", move |uc: &mut Unicorn<'_, Context>| {
+            let addr = address as u64;
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
@@ -111,8 +112,9 @@ fn hook_prm_notify_trace(
                 r3,
                 addr
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 fn hook_sd_trace(
@@ -122,8 +124,9 @@ fn hook_sd_trace(
     name: &'static str,
 ) {
     let address = base_address + (libosal_address - 0x484d_8000);
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/mod.rs:126", move |uc: &mut Unicorn<'_, Context>| {
+            let addr = address as u64;
             log::warn!(
                 "libosal {} [{}] {} entry addr={:#x} r0={:#x} lr={:#x}",
                 uc.get_data().elf_path,
@@ -133,8 +136,9 @@ fn hook_sd_trace(
                 uc.reg_read(RegisterARM::R0).unwrap_or(0),
                 uc.reg_read(RegisterARM::LR).unwrap_or(0)
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 fn hook_prm_register_trace(
@@ -144,8 +148,8 @@ fn hook_prm_register_trace(
     name: &'static str,
 ) {
     let address = base_address + (libosal_address - 0x484d_8000);
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/mod.rs:148", move |uc: &mut Unicorn<'_, Context>| {
             let client = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let path_ptr = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let mask = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
@@ -168,8 +172,9 @@ fn hook_prm_register_trace(
                 status,
                 two_parameter
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 fn hook_prm_io_trace(
@@ -179,8 +184,8 @@ fn hook_prm_io_trace(
     name: &'static str,
 ) {
     let address = base_address + (libosal_address - 0x484d_8000);
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/mod.rs:183", move |uc: &mut Unicorn<'_, Context>| {
             let fd = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let command = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let data = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
@@ -218,8 +223,9 @@ fn hook_prm_io_trace(
                     data
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 fn hook_prm_delivery_trace(
@@ -230,8 +236,8 @@ fn hook_prm_delivery_trace(
 ) {
     let address = base_address + (libosal_address - 0x484d_8000);
     let table_global = base_address + (0x90ad_a928 - 0x484d_8000);
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/mod.rs:234", move |uc: &mut Unicorn<'_, Context>| {
             let target_process = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let thread = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let data = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
@@ -264,8 +270,9 @@ fn hook_prm_delivery_trace(
                 table,
                 extra
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
@@ -288,13 +295,13 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     // elapsed values look fresh - so record what the guest clock really returns.
     {
         let address = base_address + (0x4851_9b3c - 0x484d_8000);
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/mod.rs:292", move |uc: &mut Unicorn<'_, Context>| {
                 static HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 use std::sync::atomic::Ordering;
                 let hits = HITS.fetch_add(1, Ordering::Relaxed);
                 if hits >= 12 {
-                    return;
+                    return 0;
                 }
                 let elapsed = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
@@ -307,13 +314,15 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     host_ms,
                     lr,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
     hook_core_code(unicorn, base_address);
     hook_io_code(unicorn, base_address);
     hook_registry_code(unicorn, base_address);
     hook_message_code(unicorn, base_address);
+
     hook_process_code(unicorn, base_address);
     hook_event_code(unicorn, base_address);
     hook_prm_code(unicorn, base_address);
@@ -338,9 +347,9 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
 
     const FORCE_DNL_SD_CARD: u32 = 0x4850_1710 - 0x484d_8000;
     let force_dnl_sd_card = base_address + FORCE_DNL_SD_CARD;
-    unicorn
-        .add_code_hook(force_dnl_sd_card as u64, force_dnl_sd_card as u64, {
-            |uc, addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, force_dnl_sd_card, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/mod.rs:342", move |uc: &mut Unicorn<'_, Context>| {
+            let addr = force_dnl_sd_card as u64;
                 let handle = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
                 let mut table_bytes = [0u8; 4];
                 let table = if uc.mem_read(handle as u64, &mut table_bytes).is_ok() {
@@ -395,17 +404,15 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         handle
                     );
                 }
-            }
-        })
-        .unwrap();
+            
+            0
+        });
 
     const FORCE_DNL_SD_ACTIVATE_BRANCH: u32 = 0x4850_1718 - 0x484d_8000;
     let force_dnl_sd_activate_branch = base_address + FORCE_DNL_SD_ACTIVATE_BRANCH;
-    unicorn
-        .add_code_hook(
-            force_dnl_sd_activate_branch as u64,
-            force_dnl_sd_activate_branch as u64,
-            |uc, addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, force_dnl_sd_activate_branch, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/mod.rs:405", move |uc: &mut Unicorn<'_, Context>| {
+            let addr = force_dnl_sd_activate_branch as u64;
                 let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
                 if r2 != 0 {
                     let _ = uc.reg_write(RegisterARM::R2, 0);
@@ -417,9 +424,9 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                         r2
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     hook_prm_notify_trace(
         unicorn,

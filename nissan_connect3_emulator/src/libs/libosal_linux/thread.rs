@@ -11,13 +11,12 @@ pub fn hook_thread_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
         (THREAD_CREATE, "OSAL_ThreadCreate"),
         (THREAD_ACTIVATE, "OSAL_s32ThreadActivate"),
     ] {
-        unicorn
-            .add_code_hook(
-                (base_address + offset) as u64,
-                (base_address + offset) as u64,
-                move |uc, addr, _| log_thread_call(uc, addr as u32, base_address, name),
-            )
-            .unwrap();
+        
+crate::os::code_stub::trap_site(unicorn, (base_address + offset), crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/thread.rs:15", move |uc: &mut Unicorn<'_, Context>| {
+                let addr = (base_address + offset) as u64;
+log_thread_call(uc, addr as u32, base_address, name);
+                0
+            });
     }
 
     if std::env::var_os("EMU_OSAL_TRACE_THREADS").is_some_and(|v| !v.is_empty() && v != "0") {
@@ -39,8 +38,8 @@ pub fn hook_thread_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
             ),
         ] {
             let addr = base_address + offset;
-            unicorn
-                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/thread.rs:43", move |uc: &mut Unicorn<'_, Context>| {
                     let r10 = if log_r10 {
                         uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32
                     } else {
@@ -53,8 +52,9 @@ pub fn hook_thread_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                         reason,
                         r10
                     );
-                })
-                .unwrap();
+                
+                    0
+                });
         }
     }
 }
@@ -89,8 +89,9 @@ fn hook_ail_entry(unicorn: &mut Unicorn<'_, Context>, entry: u32) {
         return;
     }
 
-    unicorn
-        .add_code_hook(entry as u64, entry as u64, |uc, addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, entry, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/thread.rs:93", move |uc: &mut Unicorn<'_, Context>| {
+            let addr = entry as u64;
             let obj = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let vtable = read_u32(uc, obj);
             let app_entry = read_u32(uc, vtable + 0x10);
@@ -103,8 +104,9 @@ fn hook_ail_entry(unicorn: &mut Unicorn<'_, Context>, entry: u32) {
                 vtable,
                 app_entry
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 fn read_u32(unicorn: &Unicorn<'_, Context>, addr: u32) -> u32 {

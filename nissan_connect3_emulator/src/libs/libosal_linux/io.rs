@@ -19,18 +19,18 @@ pub fn hook_io_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     // opening /dev/cryptcard misses.
     let lookup = base_address + (0x484f_12b4u32 - 0x484d_8000);
     let table = base_address + (0x4856_7b58u32 - 0x484d_8000);
-    unicorn
-        .add_code_hook(lookup as u64, lookup as u64, move |uc, _addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, lookup, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/io.rs:23", move |uc: &mut Unicorn<'_, Context>| {
             use std::sync::atomic::{AtomicU32, Ordering};
             static DUMPS: AtomicU32 = AtomicU32::new(0);
             let path = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let len = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let query = crate::emulator::utils::read_string(uc, path);
             if !query.starts_with("/dev/crypt") {
-                return;
+                return 0;
             }
             if DUMPS.fetch_add(1, Ordering::Relaxed) >= 30 {
-                return;
+                return 0;
             }
             let mut names: Vec<String> = Vec::new();
             for slot in 0..0x77u32 {
@@ -54,23 +54,25 @@ pub fn hook_io_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                 len,
                 names.join(", ")
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     hook_osal_ioopen_internals(unicorn, base_address);
 
     // prm_vInit builds the PRM device table (incl. cryptcard/cryptnav status
     // bytes) and spawns PRM_RECOGNITION. Log which processes run it.
     let prm_init = base_address + (0x484f_ff00u32 - 0x484d_8000);
-    unicorn
-        .add_code_hook(prm_init as u64, prm_init as u64, |uc, _addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, prm_init, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/io.rs:66", move |uc: &mut Unicorn<'_, Context>| {
             log::warn!(
                 "LIBOSAL {} [{}] prm_vInit enter",
                 uc.get_data().elf_path,
                 uc.get_data().inner.thread_id()
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 /// Read the OSAL shared-memory base pointer the way OSAL_IOOpen does:
@@ -111,8 +113,8 @@ fn hook_osal_ioopen_internals(unicorn: &mut Unicorn<'_, Context>, base_address: 
     let error_path = base_address + (0x484f_1a4cu32 - 0x484d_8000);
 
     // r6 = dispatcher entry (or 0). Only report crypt* devices to stay quiet.
-    unicorn
-        .add_code_hook(post_lookup as u64, post_lookup as u64, |uc, _addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, post_lookup, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/io.rs:115", move |uc: &mut Unicorn<'_, Context>| {
             let entry = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
             let name = {
                 let mut buf = [0u8; 4];
@@ -123,7 +125,7 @@ fn hook_osal_ioopen_internals(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 }
             };
             if !name.starts_with("/dev/crypt") {
-                return;
+                return 0;
             }
             let open_fn = {
                 let mut buf = [0u8; 4];
@@ -160,16 +162,17 @@ fn hook_osal_ioopen_internals(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 st[1],
                 st[2]
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // r0 = open handler return; r6 = dispatcher entry still live (callee-saved).
-    unicorn
-        .add_code_hook(post_open as u64, post_open as u64, move |uc, _addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, post_open, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/io.rs:168", move |uc: &mut Unicorn<'_, Context>| {
             let entry = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
             let name = dispatcher_name(uc, entry);
             if !name.starts_with("/dev/crypt") {
-                return;
+                return 0;
             }
             let ret = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let mut buf = [0u8; 4];
@@ -230,16 +233,17 @@ fn hook_osal_ioopen_internals(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 u32::from_le_bytes(w30dc8),
                 b30dd4[0],
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // r4 = final OSAL error code on the trace/error path.
-    unicorn
-        .add_code_hook(error_path as u64, error_path as u64, move |uc, _addr, _| {
+    
+crate::os::code_stub::trap_site(unicorn, error_path, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/io.rs:238", move |uc: &mut Unicorn<'_, Context>| {
             let entry = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
             let name = dispatcher_name(uc, entry);
             if !name.starts_with("/dev/crypt") {
-                return;
+                return 0;
             }
             let err = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
             log::warn!(
@@ -249,8 +253,9 @@ fn hook_osal_ioopen_internals(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 name,
                 err
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 #[allow(dead_code)] // kept for re-enabling during performance work

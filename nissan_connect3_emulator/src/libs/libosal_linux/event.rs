@@ -36,13 +36,12 @@ pub fn hook_event_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
         (EVENT_OPEN, "OSAL_s32EventOpen"),
         (EVENT_CREATE, "OSAL_s32EventCreate"),
     ] {
-        unicorn
-            .add_code_hook(
-                (base_address + offset) as u64,
-                (base_address + offset) as u64,
-                move |uc, addr, _| handle_event_call(uc, addr as u32, base_address, name),
-            )
-            .unwrap();
+        
+crate::os::code_stub::trap_site(unicorn, (base_address + offset), crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/event.rs:40", move |uc: &mut Unicorn<'_, Context>| {
+                let addr = (base_address + offset) as u64;
+handle_event_call(uc, addr as u32, base_address, name);
+                0
+            });
     }
 }
 
