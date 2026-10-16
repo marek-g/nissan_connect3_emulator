@@ -542,8 +542,8 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     // bump in `force_map_power_cca_mode` this gets us a working
     // PWR_APP_INITIALIZED without touching any guest code paths.
     let cca_dispatch_addr = base_address + CCA_DISPATCH;
-    unicorn
-        .add_code_hook(cca_dispatch_addr as u64, cca_dispatch_addr as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, cca_dispatch_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:546", move |uc: &mut Unicorn<'_, Context>| {
             let queue = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
             // One-shot: the early CCA-startup repair seeds the body-thread
             // wait / entry-thread forward target (app+0x78) with the entry
@@ -601,7 +601,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                         count + 1
                     );
                 }
-                return;
+                return 0;
             }
 
             // Keep-on-entry-thread suppression is only wanted for the
@@ -624,11 +624,11 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
             // to MQB_1024 and starved exactly that (r404/r409: one claim,
             // then all forwards stranded).
             if matches!(msg_class, 0x42..=0x45) {
-                return;
+                return 0;
             }
 
             if uc.reg_write(RegisterARM::R2, u32::MAX as u64).is_err() {
-                return;
+                return 0;
             }
 
             let count = CCA_BODY_FORWARD_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
@@ -638,8 +638,9 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     queue
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     // r743: pure-observation page probes (r63x CCA/message-pool/render-job
     // traces) - gated; the stall that once suggested a pacing dependency was
@@ -659,15 +660,25 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         let post_hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let page_lo = base_address + (0x0066_c000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x0066_cb20u32, 0x0066_c93cu32, 0x0066_cfa8u32, 0x0066_cfccu32] {
+                    let base_address = base_address.clone();
+                    let drop_hits = drop_hits.clone();
+                    let examine_hits = examine_hits.clone();
+                    let gate_hits = gate_hits.clone();
+                    let post_hits = post_hits.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:664", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 let r10 = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
                 if original == 0x0066_cb20u32 {
                     let count = gate_hits.fetch_add(1, Ordering::Relaxed);
                     if count >= 40 {
-                        return;
+                        return 0;
                     }
                     let thisx = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
                     let app = read_u32_or_invalid(uc, thisx);
@@ -684,7 +695,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                 } else if original == 0x0066_c93cu32 {
                     let count = drop_hits.fetch_add(1, Ordering::Relaxed);
                     if count >= 24 {
-                        return;
+                        return 0;
                     }
                     let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
                     log::info!(
@@ -704,7 +715,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     // layer as `post MQB_1024`).
                     let count = examine_hits.fetch_add(1, Ordering::Relaxed);
                     if count >= 40 {
-                        return;
+                        return 0;
                     }
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                     let msg = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
@@ -727,7 +738,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     // message gets rejected through vtable+0x74 (0x66cff8).
                     let count = post_hits.fetch_add(1, Ordering::Relaxed);
                     if count >= 40 {
-                        return;
+                        return 0;
                     }
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                     let msg = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
@@ -743,8 +754,11 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                         count
                     );
                 }
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
 
     // r643: `ail_bExamineInfluenceToAdministration` case-2 consumed every
@@ -761,9 +775,17 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         let vset_hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let page_lo = base_address + (0x0066_e000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x0066_e3d0u32, 0x0066_e43cu32] {
+                    let base_address = base_address.clone();
+                    let bisect_hits = bisect_hits.clone();
+                    let vset_hits = vset_hits.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:766", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 if original == 0x0066_e3d0u32 {
                     let refx = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -772,11 +794,11 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     // second; only the svc-0x26 (DAPI fastmap) probes carry
                     // information.
                     if a1 != 0x0026 {
-                        return;
+                        return 0;
                     }
                     let count = bisect_hits.fetch_add(1, Ordering::Relaxed);
                     if count >= 120 {
-                        return;
+                        return 0;
                     }
                     let mut refbuf = [0u8; 12];
                     let ref_ok = uc.mem_read(refx as u64, &mut refbuf).is_ok();
@@ -815,7 +837,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                 } else if original == 0x0066_e43cu32 {
                     let count = vset_hits.fetch_add(1, Ordering::Relaxed);
                     if count >= 24 {
-                        return;
+                        return 0;
                     }
                     let refx = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                     let state = (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32) & 0xff;
@@ -828,8 +850,11 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                         count
                     );
                 }
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
 
     // r646: `GetLeftBlocks` only fills the RCMOUPD job's MO list when the
@@ -844,16 +869,24 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         let glo = base_address + (0x0051_5eecu32 - ORIGINAL_BASE);
         let page_lo = base_address + (0x0051_5000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [glo] {
+                    let base_address = base_address.clone();
+                    let glo = glo.clone();
+                    let probes = probes.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:849", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 if original != glo {
-                    return;
+                    return 0;
                 }
                 let count = probes.fetch_add(1, Ordering::Relaxed);
                 if count >= 300 {
-                    return;
+                    return 0;
                 }
                 let uid = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let cache = read_u32_or_invalid(
@@ -878,8 +911,11 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     first_uid,
                     count
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
 
     // r647: the raw-data cache only gets entries through
@@ -893,16 +929,24 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         let glo = base_address + (0x0050_d1a0u32 - ORIGINAL_BASE);
         let page_lo = base_address + (0x0050_d000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [glo] {
+                    let base_address = base_address.clone();
+                    let glo = glo.clone();
+                    let probes = probes.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:898", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 if original != glo {
-                    return;
+                    return 0;
                 }
                 let count = probes.fetch_add(1, Ordering::Relaxed);
                 if count >= 100 {
-                    return;
+                    return 0;
                 }
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -920,27 +964,39 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     lr,
                     count
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
         let probes2 = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let t_create = base_address + (0x0051_66dcu32 - ORIGINAL_BASE);
         let t_add = base_address + (0x0051_64e0u32 - ORIGINAL_BASE);
         let page_lo = base_address + (0x0051_6000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [t_create, t_add] {
+                    let base_address = base_address.clone();
+                    let probes2 = probes2.clone();
+                    let t_add = t_add.clone();
+                    let t_create = t_create.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:932", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 let which = if original == t_create {
                     "Create"
                 } else if original == t_add {
                     "Add"
                 } else {
-                    return;
+                    return 0;
                 };
                 let count = probes2.fetch_add(1, Ordering::Relaxed);
                 if count >= 100 {
-                    return;
+                    return 0;
                 }
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
@@ -954,8 +1010,11 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     lr,
                     count
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
 
     // r649: `GetLeftBlocks` sets the RCMOUPD job's `last mo of lod` byte via
@@ -975,20 +1034,31 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         let t_c3 = base_address + (0x0050_6264u32 - ORIGINAL_BASE);
         let page_lo = base_address + (0x0050_6000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [t_leg, t_store, t_c2, t_c3] {
+                    let base_address = base_address.clone();
+                    let leg = leg.clone();
+                    let t_c2 = t_c2.clone();
+                    let t_c3 = t_c3.clone();
+                    let t_leg = t_leg.clone();
+                    let t_store = t_store.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:980", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 let name = match original {
                     a if a == t_leg => "gbi-leg",
                     a if a == t_store => "gbi-store50",
                     a if a == t_c2 => "gbi-create-a",
                     a if a == t_c3 => "gbi-create-b",
-                    _ => return,
+                    _ => return 0,
                 };
                 let count = leg.fetch_add(1, Ordering::Relaxed);
                 if count >= 300 {
-                    return;
+                    return 0;
                 }
                 let req = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
                 let job = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
@@ -1013,22 +1083,33 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     g8,
                     count
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
         let linked = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let t_linked = base_address + (0x0051_3a6cu32 - ORIGINAL_BASE);
         let page_lo = base_address + (0x0051_3000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [t_linked] {
+                    let base_address = base_address.clone();
+                    let linked = linked.clone();
+                    let t_linked = t_linked.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:1024", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 if original != t_linked {
-                    return;
+                    return 0;
                 }
                 let count = linked.fetch_add(1, Ordering::Relaxed);
                 if count >= 300 {
-                    return;
+                    return 0;
                 }
                 let block = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let out = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -1042,8 +1123,11 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     out,
                     count
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
 
     // r650: the linked-MO hits of r649 come from legs *before* the +0x50
@@ -1117,20 +1201,26 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     {
         let page_lo = base_address + (0x004c_5000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x004c_5b20u32] {
+                    let base_address = base_address.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:1122", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 if original != CREATE_RC_JOB_RENDER_RESULT + ORIGINAL_BASE {
-                    return;
+                    return 0;
                 }
                 if !MAP_RENDER_KICK_CAPTURING.swap(false, Ordering::Relaxed) {
-                    return;
+                    return 0;
                 }
                 let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 if job == 0 || job == u32::MAX {
                     log::warn!("PROCMAPENGINE: pure render kick factory returned no job");
-                    return;
+                    return 0;
                 }
                 // `map_tclJobRCRenderPixmapView::Execute` looks the view up
                 // through the byte at job+0x1c; the factory does not fill it
@@ -1146,7 +1236,7 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     .is_err()
                 {
                     log::warn!("PROCMAPENGINE: failed to stamp view id on pure render job {:#x}", job);
-                    return;
+                    return 0;
                 }
                 MAP_RENDER_KICK_JOB.store(job, Ordering::Relaxed);
                 MAP_RENDER_KICK_ENQUEUE_PENDING.store(true, Ordering::Relaxed);
@@ -1160,8 +1250,11 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                         count
                     );
                 }
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
 
     // r743: pure-observation page probes (r63x CCA/message-pool/render-job
@@ -1178,9 +1271,16 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         let ex_legs = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let page_lo = base_address + (0x004d_6000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x004d_6234u32, 0x004d_6248u32, 0x004d_6500u32, 0x004d_62ccu32, 0x004d_6218u32] {
+                    let base_address = base_address.clone();
+                    let ex_legs = ex_legs.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:1183", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 let name = match original {
                     0x004d_6234u32 => "getview1",
@@ -1188,11 +1288,11 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     0x004d_6500u32 => "draw-leg",
                     0x004d_62ccu32 => "phaseB",
                     0x004d_6218u32 => "bad-mapstate",
-                    _ => return,
+                    _ => return 0,
                 };
                 let count = ex_legs.fetch_add(1, Ordering::Relaxed);
                 if count >= 60 {
-                    return;
+                    return 0;
                 }
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let f50 = if r0 == 0 || r0 == u32::MAX {
@@ -1208,8 +1308,11 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     f50,
                     count,
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
 
     // r659: DTMStreet::Draw gates the whole GL leg on the shader program
@@ -1221,16 +1324,23 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         let sh_checks = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let page_lo = base_address + (0x0055_b000u32 - ORIGINAL_BASE);
         let page_hi = base_address + (0x0055_bfffu32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x0055_b364u32] {
+                    let base_address = base_address.clone();
+                    let sh_checks = sh_checks.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:1226", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 if original != 0x0055_b364u32 {
-                    return;
+                    return 0;
                 }
                 let count = sh_checks.fetch_add(1, Ordering::Relaxed);
                 if count >= 40 {
-                    return;
+                    return 0;
                 }
                 let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
                 let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
@@ -1262,8 +1372,11 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     read_u8_or_invalid(uc, r6.wrapping_add(5)),
                     count,
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
     }  // render_trace_enabled
 
@@ -1292,52 +1405,47 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
         .is_none_or(|value| value.is_empty() || value == "0");
     let force_start_after_init = std::env::var_os("EMU_PROCMAPENGINE_FORCE_START_AFTER_INIT")
         .is_some_and(|value| !value.is_empty() && value != "0");
-    unicorn
-        .add_code_hook(repair_addr as u64, repair_addr as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, repair_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:1296", move |uc: &mut Unicorn<'_, Context>| {
             if uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 != 0 {
                 repair_map_ipc_wait_param(uc);
                 if force_start_after_init {
                     start_map_engine_after_init(uc, repair_addr);
                 }
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     add_street_coord_buffer_probe_hooks(unicorn, base_address);
 
     add_natural_map_engine_start_hooks(unicorn, base_address);
 
     let handler_hook_addr = base_address + PORTCONTROL_HANDLER_RESULT;
-    unicorn
-        .add_code_hook(
-            handler_hook_addr as u64,
-            handler_hook_addr as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, handler_hook_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:1312", move |uc: &mut Unicorn<'_, Context>| {
                 if uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 != 0 {
                     trigger_pending_map_render(uc, handler_hook_addr, false);
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     if activate_after_init {
         let render_hook_addr = base_address + RENDER_CONTROL_QUEUE_STATE;
-        unicorn
-            .add_code_hook(
-                render_hook_addr as u64,
-                render_hook_addr as u64,
-                move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, render_hook_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:1326", move |uc: &mut Unicorn<'_, Context>| {
                     if !MAP_VIEW_READY.load(Ordering::Relaxed) {
-                        return;
+                        return 0;
                     }
 
                     let tick = MAP_RENDER_LOOP_TRIGGER_TICK.fetch_add(1, Ordering::Relaxed) + 1;
                     if tick == 1 || tick % MAP_RENDER_TRIGGER_INTERVAL == 0 {
                         trigger_pending_map_render(uc, render_hook_addr, tick != 1);
                     }
-                },
-            )
-            .unwrap();
+                
+                0
+            });
         add_render_thread_trace_hooks(unicorn, base_address);
         add_render_job_queue_wait_skip_hook(unicorn, base_address);
         add_forced_renderer_execute_hook(unicorn, base_address);
@@ -1368,12 +1476,12 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
     let hook_addr = base_address + AIL_VSTART_APP_ENTRY;
     let state_function = base_address + APP_NEW_STATE;
 
-    unicorn
-        .add_code_hook(hook_addr as u64, hook_addr as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, hook_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:1372", move |uc: &mut Unicorn<'_, Context>| {
             let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             if this == 0 {
                 log::warn!("PROCMAPENGINE: vStartAppEntry called with null app object");
-                return;
+                return 0;
             }
 
             if force_early_active && !APP_STATE_STARTED.swap(true, Ordering::Relaxed) {
@@ -1391,8 +1499,9 @@ pub fn procmapengine_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_add
                     APP_STATE_STARTED.store(false, Ordering::Relaxed);
                 }
             }
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 fn add_init_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
@@ -1407,11 +1516,11 @@ fn add_init_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
         ("map-engine-vtable-result", INIT_MAP_ENGINE_VTABLE_RESULT),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:1411", move |uc: &mut Unicorn<'_, Context>| {
                 let count = INIT_MAP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count >= 20 {
-                    return;
+                    return 0;
                 }
 
                 let regs = [
@@ -1437,8 +1546,9 @@ fn add_init_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     regs[5],
                     regs[6]
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
@@ -1459,11 +1569,11 @@ fn add_port_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address
         ("map_tclTraceTools::TraceMsgToErrmem", MAP_TRACE_ERRMEM, 3u8),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:1463", move |uc: &mut Unicorn<'_, Context>| {
                 let count = PORTCONTROL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count >= 80 {
-                    return;
+                    return 0;
                 }
 
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -1510,8 +1620,9 @@ fn add_port_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address
                         handler_name
                     ),
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
@@ -1570,11 +1681,11 @@ fn add_map_engine_init_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
         ("map_tclDynamicElementManager::Init", 0x0051_e5a0),
     ] {
         let addr = base_address + (original_addr - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:1574", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_INIT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count >= 200 {
-                    return;
+                    return 0;
                 }
 
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -1586,8 +1697,9 @@ fn add_map_engine_init_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                     r0,
                     r1
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
@@ -2009,11 +2121,8 @@ fn trigger_pending_map_render(
 
 fn add_render_thread_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let render_mainloop = base_address + RENDER_CONTROL_MAINLOOP_ENTRY;
-    unicorn
-        .add_code_hook(
-            render_mainloop as u64,
-            render_mainloop as u64,
-            move |_, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, render_mainloop, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2013", move |_: &mut Unicorn<'_, Context>| {
                 let count = RENDER_CONTROL_MAINLOOP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 10 {
                     log::info!(
@@ -2021,16 +2130,13 @@ fn add_render_thread_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addres
                         count + 1
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let map_mainloop = base_address + MAP_VIEW_MAINLOOP_ENTRY;
-    unicorn
-        .add_code_hook(
-            map_mainloop as u64,
-            map_mainloop as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, map_mainloop, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2030", move |uc: &mut Unicorn<'_, Context>| {
                 let view = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let count = MAP_VIEW_MAINLOOP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 10 {
@@ -2040,9 +2146,9 @@ fn add_render_thread_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addres
                         count + 1
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     for (offset, return_offset, name) in [
         (RENDER_CONTROL_WAIT_CALL, RENDER_CONTROL_WAIT_RETURN, "render control"),
@@ -2050,14 +2156,10 @@ fn add_render_thread_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addres
     ] {
         let call_addr = base_address + offset;
         let return_addr = base_address + return_offset;
-        unicorn
-            .add_code_hook(
-                call_addr as u64,
-                call_addr as u64,
-                move |uc, _, _| {
+        crate::os::code_stub::trap_site(unicorn, call_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2159", move |uc: &mut Unicorn<'_, Context>| {
                     let tick = MAP_JOB_WAIT_SKIP_TICK.fetch_add(1, Ordering::Relaxed) + 1;
                     if tick > 100 && tick % MAP_RENDER_TRIGGER_INTERVAL != 1 {
-                        return;
+                        return 0;
                     }
 
                     let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
@@ -2085,10 +2187,18 @@ fn add_render_thread_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addres
                         // one rect long enough to advance.
                         triggered = trigger_pending_map_render(uc, return_pc, false);
                     }
-                    if !triggered {
+                    // A redirect when nothing was triggered: R0 = 0 and the
+                    // dispatcher sets PC to our return value (old code wrote
+                    // `PC = return_addr` from the hook).  When `triggered`,
+                    // `trigger_pending_map_render` already steered PC through
+                    // a guest call, so returning 0 keeps that (the dispatcher
+                    // preserves a handler-written PC).
+                    let redirect = if !triggered {
                         uc.reg_write(RegisterARM::R0, 0).unwrap_or_default();
-                        uc.reg_write(RegisterARM::PC, return_addr as u64).unwrap_or_default();
-                    }
+                        return_addr
+                    } else {
+                        0
+                    };
 
                     let trace_count = MAP_JOB_WAIT_SKIP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                     if trace_count < 50 {
@@ -2100,9 +2210,8 @@ fn add_render_thread_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addres
                             triggered
                         );
                     }
-                },
-            )
-            .unwrap();
+                    redirect
+                });
     }
 }
 
@@ -2111,55 +2220,55 @@ fn add_render_job_queue_wait_skip_hook(unicorn: &mut Unicorn<'_, Context>, base_
     let rc_return = base_address + RENDER_JOB_QUEUE_WAIT_RC_RETURN;
     let view_return = base_address + MAP_VIEW_JOB_QUEUE_WAIT_RETURN;
 
-    unicorn
-        .add_code_hook(entry as u64, entry as u64, move |uc, _, _| {
-            let queue = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
-            if queue == 0 || queue == u32::MAX {
-                return;
-            }
+    crate::os::code_stub::trap_site(unicorn, entry, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2224", move |uc: &mut Unicorn<'_, Context>| {
+        let queue = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+        if queue == 0 || queue == u32::MAX {
+            return 0;
+        }
 
-            let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
-            let (name, tick) = if lr == rc_return {
-                (
-                    "render control",
-                    RENDER_JOB_WAIT_SKIP_TICK.fetch_add(1, Ordering::Relaxed) + 1,
-                )
-            } else if lr == view_return {
-                (
-                    "map view",
-                    MAP_VIEW_JOB_WAIT_SKIP_TICK.fetch_add(1, Ordering::Relaxed) + 1,
-                )
-            } else {
-                return;
-            };
+        let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+        let (name, tick) = if lr == rc_return {
+            (
+                "render control",
+                RENDER_JOB_WAIT_SKIP_TICK.fetch_add(1, Ordering::Relaxed) + 1,
+            )
+        } else if lr == view_return {
+            (
+                "map view",
+                MAP_VIEW_JOB_WAIT_SKIP_TICK.fetch_add(1, Ordering::Relaxed) + 1,
+            )
+        } else {
+            return 0;
+        };
 
-            if tick > 1 && tick % MAP_RENDER_TRIGGER_INTERVAL != 1 {
-                return;
-            }
+        if tick > 1 && tick % MAP_RENDER_TRIGGER_INTERVAL != 1 {
+            return 0;
+        }
 
-            let queue_state = read_u32_or_invalid(uc, queue);
-            uc.reg_write(RegisterARM::R0, queue_state as u64).unwrap_or_default();
-            uc.reg_write(RegisterARM::PC, lr as u64).unwrap_or_default();
+        let queue_state = read_u32_or_invalid(uc, queue);
+        uc.reg_write(RegisterARM::R0, queue_state as u64).unwrap_or_default();
 
-            let trace_count = RENDER_JOB_WAIT_SKIP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if trace_count < 50 {
-                log::info!(
-                    "PROCMAPENGINE: skipped {} enabled semaphore wait tick={} queue={:#x} state={:#x} return={:#x}",
-                    name,
-                    tick,
-                    queue,
-                    queue_state,
-                    lr
-                );
-            }
-        })
-        .unwrap();
+        let trace_count = RENDER_JOB_WAIT_SKIP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if trace_count < 50 {
+            log::info!(
+                "PROCMAPENGINE: skipped {} enabled semaphore wait tick={} queue={:#x} state={:#x} return={:#x}",
+                name,
+                tick,
+                queue,
+                queue_state,
+                lr
+            );
+        }
+        // Skip the rest of the wait function: the dispatcher turns a non-zero
+        // handler return into the new PC (old hook wrote `PC = lr` directly).
+        lr
+    });
 }
 
 fn add_natural_map_engine_start_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let call_addr = base_address + AIL_START_MAP_ENGINE_CALL;
-    unicorn
-        .add_code_hook(call_addr as u64, call_addr as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, call_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2162", move |uc: &mut Unicorn<'_, Context>| {
             let control_state = read_u32_or_invalid(uc, base_address + MAP_ENGINE_CONTROL_STATE);
             let count = NATURAL_MAP_START_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 10 {
@@ -2184,12 +2293,13 @@ fn add_natural_map_engine_start_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             } else if control_state == 2 {
                 initialize_map_data_medium(uc, base_address);
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     let result_addr = base_address + AIL_START_MAP_ENGINE_RESULT;
-    unicorn
-        .add_code_hook(result_addr as u64, result_addr as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, result_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2192", move |uc: &mut Unicorn<'_, Context>| {
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let control_state = read_u32_or_invalid(uc, base_address + MAP_ENGINE_CONTROL_STATE);
             let count = NATURAL_MAP_START_RESULT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -2207,16 +2317,15 @@ fn add_natural_map_engine_start_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     control_state
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let branch_addr = base_address + MAP_RENDERER_SKIP_BRANCH;
     let body_addr = base_address + MAP_RENDERER_EXECUTE_BODY;
-    unicorn
-        .add_code_hook(branch_addr as u64, branch_addr as u64, move |uc, _, _| {
-            uc.reg_write(RegisterARM::PC, body_addr as u64).unwrap_or_default();
+    crate::os::code_stub::trap_site(unicorn, branch_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2221", move |_uc: &mut Unicorn<'_, Context>| {
             let count = MAP_RENDERER_FORCE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 20 {
                 log::info!(
@@ -2225,15 +2334,13 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
                     body_addr
                 );
             }
-        })
-        .unwrap();
+            // Jump straight to the execute body (old hook wrote PC directly).
+            body_addr
+        });
 
     let execute_entry = base_address + MAP_RENDERER_EXECUTE_ENTRY;
-    unicorn
-        .add_code_hook(
-            execute_entry as u64,
-            execute_entry as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, execute_entry, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2233", move |uc: &mut Unicorn<'_, Context>| {
                 let renderer = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let surface = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
                 let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
@@ -2252,16 +2359,13 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
                         count + 1
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let element_list_add = base_address + MAP_ELEMENT_LIST_ADD;
-    unicorn
-        .add_code_hook(
-            element_list_add as u64,
-            element_list_add as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, element_list_add, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2261", move |uc: &mut Unicorn<'_, Context>| {
                 let list = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let element = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let list_count = read_u32_or_invalid(uc, list + 10) & 0xffff;
@@ -2280,16 +2384,13 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
                         count + 1
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let draw_layer_add = base_address + MAP_DRAW_LAYER_LISTS_ADD_ELEMENT;
-    unicorn
-        .add_code_hook(
-            draw_layer_add as u64,
-            draw_layer_add as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, draw_layer_add, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2289", move |uc: &mut Unicorn<'_, Context>| {
                 let draw_layers = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let element = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let layer = (uc.reg_read(RegisterARM::R2).unwrap_or(0) & 0xff) as u32;
@@ -2316,16 +2417,13 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
                         count + 1
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let draw_list_entry = base_address + MAP_RENDERER_DRAW_LIST_ENTRY;
-    unicorn
-        .add_code_hook(
-            draw_list_entry as u64,
-            draw_list_entry as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, draw_list_entry, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2325", move |uc: &mut Unicorn<'_, Context>| {
                 let renderer = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let list = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let surface = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
@@ -2359,9 +2457,9 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
                         count + 1
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let draw_list_blit_target = base_address + MAP_RENDERER_DRAW_LIST_TARGET_3C;
     for (offset, slot, kind) in [
@@ -2370,8 +2468,8 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
     ] {
         let vcall_addr = base_address + offset;
         let draw_list_blit_target = draw_list_blit_target;
-        unicorn
-            .add_code_hook(vcall_addr as u64, vcall_addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, vcall_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2374", move |uc: &mut Unicorn<'_, Context>| {
                 let object = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let vtable = uc.reg_read(RegisterARM::R12).unwrap_or(0) as u32;
                 let target = read_u32_or_invalid(uc, vtable + slot);
@@ -2401,8 +2499,9 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
                         gpu::request_draw_list(uc, element_count as i32);
                     }
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     let blit_entry = base_address + MAP_DRAW_BLIT_ICON_ENTRY;
@@ -2411,8 +2510,8 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
     let blit_global_end = base_address + MAP_DRAW_BLIT_ICON_GLOBAL_END;
     let blit_null_return = base_address + MAP_DRAW_BLIT_ICON_NULL_RETURN;
     let mut fake_blit_context = 0u32;
-    unicorn
-        .add_code_hook(blit_entry as u64, blit_entry as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, blit_entry, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2415", move |uc: &mut Unicorn<'_, Context>| {
             let mut context_global = read_u32_or_invalid(uc, blit_global);
             let mut context = if context_global == 0 || context_global == u32::MAX {
                 0
@@ -2480,8 +2579,9 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
                     count + 1
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
     for (name, offset) in [
         ("return", MAP_DRAW_BLIT_ICON_NULL_RETURN),
         ("branch1", MAP_DRAW_BLIT_ICON_BRANCH_1),
@@ -2490,8 +2590,8 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
         ("branch4", MAP_DRAW_BLIT_ICON_BRANCH_4),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2494", move |uc: &mut Unicorn<'_, Context>| {
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
                 let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
@@ -2531,15 +2631,16 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
                         count + 1
                     );
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     let _ = blit_null_return;
 
     let flip_entry = base_address + SURFACE_FLIP_ENTRY;
-    unicorn
-        .add_code_hook(flip_entry as u64, flip_entry as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, flip_entry, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2542", move |uc: &mut Unicorn<'_, Context>| {
             let surface = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let count = SURFACE_FLIP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 20 {
@@ -2549,14 +2650,15 @@ fn add_forced_renderer_execute_hook(unicorn: &mut Unicorn<'_, Context>, base_add
                     count + 1
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let entry = base_address + MAP_JOB_QUEUE_ADD_ELEMENT_ENTRY;
-    unicorn
-        .add_code_hook(entry as u64, entry as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, entry, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2559", move |uc: &mut Unicorn<'_, Context>| {
             let thread = uc.get_data().inner.thread_id();
             let queue = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let element = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -2582,19 +2684,21 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                     count + 1
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     let pre_post = base_address + MAP_JOB_QUEUE_ADD_ELEMENT_PRE_POST;
-    unicorn
-        .add_code_hook(pre_post as u64, pre_post as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, pre_post, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2590", move |uc: &mut Unicorn<'_, Context>| {
             save_map_job_callee_regs(uc);
-        })
-        .unwrap();
+        
+            0
+        });
 
     let after_post = base_address + MAP_JOB_QUEUE_ADD_ELEMENT_AFTER_POST;
-    unicorn
-        .add_code_hook(after_post as u64, after_post as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, after_post, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2597", move |uc: &mut Unicorn<'_, Context>| {
             let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
             restore_map_job_callee_regs(uc, sp);
             let thread = uc.get_data().inner.thread_id();
@@ -2620,24 +2724,26 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                     count + 1
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     for offset in [MAP_JOB_QUEUE_ADD_ELEMENT_RETURN, MAP_JOB_QUEUE_ADD_ELEMENT_RETURN_ALT] {
         let return_addr = base_address + offset;
-        unicorn
-            .add_code_hook(return_addr as u64, return_addr as u64, move |_, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, return_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2629", move |_: &mut Unicorn<'_, Context>| {
                 clear_map_job_saved_callee_regs();
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     let b_post_ipc = base_address + (0x0066_0ea0u32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(b_post_ipc as u64, b_post_ipc as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, b_post_ipc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2637", move |uc: &mut Unicorn<'_, Context>| {
             let count = AIL_B_POST_IPC_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 24 && count % 20_000 != 0 {
-                return;
+                return 0;
             }
             let thread = uc.get_data().inner.thread_id();
             let svc = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
@@ -2653,15 +2759,16 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                 thread,
                 count + 1
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     let ipc_post_trace = base_address + AIL_POST_IPC_MESSAGE;
-    unicorn
-        .add_code_hook(ipc_post_trace as u64, ipc_post_trace as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, ipc_post_trace, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2661", move |uc: &mut Unicorn<'_, Context>| {
             let count = AIL_IPC_POST_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 24 && count % 20_000 != 0 {
-                return;
+                return 0;
             }
             let thread = uc.get_data().inner.thread_id();
             let appid = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -2689,8 +2796,9 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                 thread,
                 count + 1
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // posfi NavPositionStatus consumption chain (observer probes): the
     // dispatcher hands svc 0x1e / fn 0x10 / op 6 messages to vHandleNavPosition,
@@ -2698,11 +2806,11 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
     // data request window.  Log each stage plus the parsed-object shape so a
     // fabricated provider message can be validated end to end.
     let vhandle_nav_position = base_address + NAVI_HANDLER_VHANDLE_NAV_POSITION;
-    unicorn
-        .add_code_hook(vhandle_nav_position as u64, vhandle_nav_position as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, vhandle_nav_position, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2702", move |uc: &mut Unicorn<'_, Context>| {
             let count = NAV_POSITION_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 12 {
-                return;
+                return 0;
             }
             let thread = uc.get_data().inner.thread_id();
             let handler = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -2731,12 +2839,13 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                     read_u32_or_invalid(uc, handler + 0x7c)
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     let handle_service_data = base_address + AIL_HANDLE_MSG_SERVICE_DATA;
-    unicorn
-        .add_code_hook(handle_service_data as u64, handle_service_data as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, handle_service_data, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2739", move |uc: &mut Unicorn<'_, Context>| {
             // Watchdog: the engine's live registrations can detach the
             // fabricated posfi reference from the server-ref list; re-link
             // it before this message's claim walk runs (r429).
@@ -2752,7 +2861,7 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
             }
             let count = HANDLE_SERVICE_DATA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 400 {
-                return;
+                return 0;
             }
             let thread = uc.get_data().inner.thread_id();
             let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -2840,19 +2949,20 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                 thread,
                 count + 1
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // map_tclPortControl_Platform::vOnNewMessage: the client dispatch tail of
     // the claim path.  Logs the lookup key (message u16 at content+0x00) and
     // enumerates the client-handler map at platform+0xa0 so the correct key
     // for the posfi handler can be identified.
     let von_new_message = base_address + PORTCONTROL_VON_NEW_MESSAGE;
-    unicorn
-        .add_code_hook(von_new_message as u64, von_new_message as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, von_new_message, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2852", move |uc: &mut Unicorn<'_, Context>| {
             let count = VON_NEW_MESSAGE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 12 {
-                return;
+                return 0;
             }
             let thread = uc.get_data().inner.thread_id();
             let platform = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -2902,19 +3012,20 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                     }
                 }
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     // ail_tclServiceReference::bIsDataSet - the claim walk's predicate (the
     // server-ref loop calls it with (svc, sub-id, reg-id, +0x0e) and 0xffff
     // wildcards).  Log every call's tuple, the entry's stored fields and the
     // caller LR so a non-match can be pinned to the mismatching slot.
     let ref_is_dataset = base_address + AIL_REF_IS_DATASET_FN;
-    unicorn
-        .add_code_hook(ref_is_dataset as u64, ref_is_dataset as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, ref_is_dataset, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2914", move |uc: &mut Unicorn<'_, Context>| {
             let count = REF_WALK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 200 {
-                return;
+                return 0;
             }
             let thread = uc.get_data().inner.thread_id();
             let entry = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -2936,18 +3047,19 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                 (read_u32_or_invalid(uc, entry + 4) >> 16) & 0xff,
                 count + 1
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // ail_tclServiceReference ctor: shows what a register-confirmation actually
     // handed the engine for each service reference (the +8 unique id is the
     // slot later matched against every ServiceData message's unique id).
     let ref_ctor = base_address + AIL_REF_CTOR_FN;
-    unicorn
-        .add_code_hook(ref_ctor as u64, ref_ctor as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, ref_ctor, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2947", move |uc: &mut Unicorn<'_, Context>| {
             let count = REF_CTOR_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 40 {
-                return;
+                return 0;
             }
             let thread = uc.get_data().inner.thread_id();
             let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -2961,14 +3073,15 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                 "PROCMAPENGINE: service-reference ctor this={this:#x} app={app:#x} service={service:#x} regid={regid:#x} unique={unique:#x} lr={lr:#x} thread=[{thread}] trace={}",
                 count + 1
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
-    let vprocess_nav_pos = base_address + NAV_HANDLER_VPROCESS_NAV_POS;    unicorn
-        .add_code_hook(vprocess_nav_pos as u64, vprocess_nav_pos as u64, move |uc, _, _| {
+    let vprocess_nav_pos = base_address + NAV_HANDLER_VPROCESS_NAV_POS;    
+crate::os::code_stub::trap_site(unicorn, vprocess_nav_pos, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2968", move |uc: &mut Unicorn<'_, Context>| {
             let count = NAV_PROCESS_POS_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 2 {
-                return;
+                return 0;
             }
             let thread = uc.get_data().inner.thread_id();
             let handler = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -2991,15 +3104,13 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                 thread,
                 count + 1
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     let update_map_data_request = base_address + MAP_DATA_MANAGER_UPDATE_REQUEST;
-    unicorn
-        .add_code_hook(
-            update_map_data_request as u64,
-            update_map_data_request as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, update_map_data_request, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2999", move |uc: &mut Unicorn<'_, Context>| {
                 let count =
                     MAP_DATA_UPDATE_REQUEST_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 // r431: the posfi window call (r0=4) stayed invisible
@@ -3008,7 +3119,7 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                 // every other priority.
                 let r0_now = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 if count >= 200 || (r0_now == 5 && count >= 8) {
-                    return;
+                    return 0;
                 }
                 let thread = uc.get_data().inner.thread_id();
                 let mut args = Vec::new();
@@ -3031,29 +3142,27 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                     thread,
                     count + 1
                 );
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     // Cache the PortControl platform object for the Navi registration kick.
     let platform_ctor = base_address + PORTCONTROL_PLATFORM_CTOR;
-    unicorn
-        .add_code_hook(platform_ctor as u64, platform_ctor as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, platform_ctor, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3041", move |uc: &mut Unicorn<'_, Context>| {
             let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             PORTCONTROL_PLATFORM.store(this, Ordering::Relaxed);
             log::info!("PROCMAPENGINE: map_tclPortControl_Platform constructed at {:#x}", this);
-        })
-        .unwrap();
+        
+            0
+        });
 
     let on_server_app_status = base_address + AIL_ON_SERVER_APP_STATUS;
-    unicorn
-        .add_code_hook(
-            on_server_app_status as u64,
-            on_server_app_status as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, on_server_app_status, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3050", move |uc: &mut Unicorn<'_, Context>| {
                 let count = AIL_SERVER_APP_STATUS_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count >= 24 && count % 50_000 != 0 {
-                    return;
+                    return 0;
                 }
                 let thread = uc.get_data().inner.thread_id();
                 let svc = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
@@ -3067,13 +3176,13 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                     thread,
                     count + 1
                 );
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let pre_crash = base_address + MAP_JOB_QUEUE_ADD_ELEMENT_PRE_CRASH;
-    unicorn
-        .add_code_hook(pre_crash as u64, pre_crash as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, pre_crash, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3076", move |uc: &mut Unicorn<'_, Context>| {
             let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
             restore_map_job_callee_regs(uc, sp);
             let thread = uc.get_data().inner.thread_id();
@@ -3122,26 +3231,26 @@ fn add_map_job_queue_add_element_trace_hooks(unicorn: &mut Unicorn<'_, Context>,
                     count + 1
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 fn add_job_queue_wait_skip_hook(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
-    unicorn
-        .add_code_hook(OSAL_THREAD_WAIT as u64, OSAL_THREAD_WAIT as u64, move |uc, _, _| {
+    crate::os::code_stub::trap_site(unicorn, OSAL_THREAD_WAIT, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3240", move |uc: &mut Unicorn<'_, Context>| {
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             if r0 != 1 {
-                return;
+                return 0;
             }
 
             let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
             if lr < base_address || lr >= base_address + 0x70_0000 {
-                return;
+                return 0;
             }
 
             let tick = MAP_OSAL_WAIT_SKIP_TICK.fetch_add(1, Ordering::Relaxed) + 1;
             if tick > 100 && tick % MAP_RENDER_TRIGGER_INTERVAL != 1 {
-                return;
+                return 0;
             }
 
             let mut triggered = false;
@@ -3151,10 +3260,12 @@ fn add_job_queue_wait_skip_hook(unicorn: &mut Unicorn<'_, Context>, base_address
                 // (request-state-machine reset storm).
                 triggered = trigger_pending_map_render(uc, lr, false);
             }
-            if !triggered {
+            let redirect = if !triggered {
                 uc.reg_write(RegisterARM::R0, 0).unwrap_or_default();
-                uc.reg_write(RegisterARM::PC, lr as u64).unwrap_or_default();
-            }
+                lr
+            } else {
+                0
+            };
 
             let trace_count = MAP_OSAL_WAIT_SKIP_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if trace_count < 50 {
@@ -3165,8 +3276,8 @@ fn add_job_queue_wait_skip_hook(unicorn: &mut Unicorn<'_, Context>, base_address
                     triggered
                 );
             }
-        })
-        .unwrap();
+            redirect
+        });
 }
 
 /// Trace the FastMap channel path, the gate that stands between the 34 block
@@ -3203,11 +3314,11 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
     // service state fan-in; `this + 4` is the u16 service id, `this + 0xe` the
     // stored state.
     let site = base_address + (0x0059_0390u32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3207", move |uc: &mut Unicorn<'_, Context>| {
             static COUNT: AtomicU32 = AtomicU32::new(0);
             if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
-                return;
+                return 0;
             }
             let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let svc = read_u16_or_invalid(uc, this + 4);
@@ -3225,18 +3336,19 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                 read_u8_or_invalid(uc, this + 0xe),
                 (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32) & 0xff,
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // `map_tclMapDataManager::OnUpdateServiceStateDAPIFastmap(uchar)`: opens a
     // channel per configured FastMap slot when it runs with state 1.
     let site = base_address + (0x0051_2400u32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3235", move |uc: &mut Unicorn<'_, Context>| {
             static COUNT: AtomicU32 = AtomicU32::new(0);
             let n = COUNT.fetch_add(1, Ordering::Relaxed);
             if n >= 20 {
-                return;
+                return 0;
             }
             log::info!(
                 "PROCMAPENGINE fastmap trace OnUpdateServiceStateDAPIFastmap t={}ms thread=[{}] state={:#x} dataset={:#x} validated={:#x} fastmap_avail={:#x} channels={:#x} stop_loading={:#x} info[0,10,20]={:#x},{:#x},{:#x} lr={:#x}",
@@ -3255,17 +3367,18 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                     .wrapping_sub(base_address)
                     .wrapping_add(ORIGINAL_BASE),
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // `map_tclMapDataManager::HandleMapDataRequest(uchar)`: the gate itself.
     let site = base_address + (0x0051_2108u32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3264", move |uc: &mut Unicorn<'_, Context>| {
             static COUNT: AtomicU32 = AtomicU32::new(0);
             let n = COUNT.fetch_add(1, Ordering::Relaxed);
             if n >= 20 {
-                return;
+                return 0;
             }
             log::info!(
                 "PROCMAPENGINE fastmap trace HandleMapDataRequest t={}ms thread=[{}] arg={:#x} dataset={:#x} validated={:#x} fastmap_avail={:#x} channels={:#x} stop_loading={:#x} lr={:#x}",
@@ -3281,16 +3394,17 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                     .wrapping_sub(base_address)
                     .wrapping_add(ORIGINAL_BASE),
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // `map_tclPortControl::MapData_OpenFastMapChannel(u16, map_rFastMapChannelInfo&)`.
     let site = base_address + (0x0053_a298u32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3290", move |uc: &mut Unicorn<'_, Context>| {
             static COUNT: AtomicU32 = AtomicU32::new(0);
             if COUNT.fetch_add(1, Ordering::Relaxed) >= 20 {
-                return;
+                return 0;
             }
             let channel = (uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32) & 0xffff;
             let info = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -3305,18 +3419,19 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                     .collect::<Vec<_>>()
                     .join(","),
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // `PortControl_CCAClientHandler_DAPI::OpenFastMapChannel(u16, info&)`:
     // refuses with 0xffab2a while the client service handler
     // (`this + 0x24`) says `bIsServiceAvailable == 0`, so log its state.
     let site = base_address + (0x0053_d500u32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3316", move |uc: &mut Unicorn<'_, Context>| {
             static COUNT: AtomicU32 = AtomicU32::new(0);
             if COUNT.fetch_add(1, Ordering::Relaxed) >= 20 {
-                return;
+                return 0;
             }
             let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let handler = read_u32_or_invalid(uc, this + 0x24);
@@ -3341,19 +3456,20 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                 channel,
                 shm,
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // ---- property registration / service state fan-out (fastmap availability) ----
     // `PortControl_CCAClientHandlerBase::vOnServiceState(svc, reg, ...)`: logs
     // every arrival, whether a client handler matched or it traced "Unhandled
     // service state change".
     let site = base_address + (0x0059_2604u32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3353", move |uc: &mut Unicorn<'_, Context>| {
             static COUNT: AtomicU32 = AtomicU32::new(0);
             if COUNT.fetch_add(1, Ordering::Relaxed) >= 40 {
-                return;
+                return 0;
             }
             let words = (0..5u32)
                 .map(|i| {
@@ -3371,17 +3487,18 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                     .wrapping_sub(base_address)
                     .wrapping_add(ORIGINAL_BASE),
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // AIL-side availability fan-out `vServiceAvailabilityChanged` (0x66434c):
     // reads the registry state; the only path that tells PortControl.
     let site = base_address + (0x0066_434cu32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3381", move |uc: &mut Unicorn<'_, Context>| {
             static COUNT: AtomicU32 = AtomicU32::new(0);
             if COUNT.fetch_add(1, Ordering::Relaxed) >= 40 {
-                return;
+                return 0;
             }
             let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             log::info!(
@@ -3394,8 +3511,9 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                     .wrapping_sub(base_address)
                     .wrapping_add(ORIGINAL_BASE),
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // Property subscription state machine: `vUpRegOrGet` (0x593580) sends the
     // UpReg/Get pair, `CheckSubscriptionState` (0x593218) and
@@ -3410,11 +3528,11 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
         (0x0059_31e0u32, "vServiceStateChanged(base)"),
     ] {
         let site = base_address + (va - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3414", move |uc: &mut Unicorn<'_, Context>| {
                 static COUNT: AtomicU32 = AtomicU32::new(0);
                 if COUNT.fetch_add(1, Ordering::Relaxed) >= 100 {
-                    return;
+                    return 0;
                 }
                 let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let arg1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -3446,8 +3564,9 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                     fn_id,
                     opcode,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // `ail_tclServiceReference::bIsDataSet(svc, server_app, reg_id)` is called
@@ -3457,11 +3576,11 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
     // every candidate (stored fields + lookup tuple) so a near-miss - e.g. an
     // AIL-self-assigned register-id vs our conf id - shows up.
     let site = base_address + (0x0066_e394u32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3461", move |uc: &mut Unicorn<'_, Context>| {
             static COUNT: AtomicU32 = AtomicU32::new(0);
             if COUNT.fetch_add(1, Ordering::Relaxed) >= 400 {
-                return;
+                return 0;
             }
             let reference = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let want = [RegisterARM::R1, RegisterARM::R2, RegisterARM::R3]
@@ -3485,8 +3604,9 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                     .wrapping_sub(base_address)
                     .wrapping_add(ORIGINAL_BASE),
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // Instruction tracer over the AIL administration module, armed per
     // admin-type-2 arrival by the `ExamineInfluenceToAdministration` probe
@@ -3603,11 +3723,11 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
 
     // `map_tclJobMDMHandleGetBlockIDs::Execute` entry.
     let execute = base_address + (0x004b_4028u32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(execute as u64, execute as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, execute, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3607", move |uc: &mut Unicorn<'_, Context>| {
             let count = ANSWER_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 60 {
-                return;
+                return 0;
             }
             let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             // The answer's block-id array (`fi_tclVisitorMessage::s32GetData` in
@@ -3644,17 +3764,18 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 uid0,
                 uid1,
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // Result of `GetDAPIRequestingMapDataRequest`: `r0` is the request (0 means
     // the answer is dropped).
     let resolved = base_address + (0x004b_403cu32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(resolved as u64, resolved as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, resolved, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3654", move |uc: &mut Unicorn<'_, Context>| {
             static COUNT: AtomicU32 = AtomicU32::new(0);
             if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
-                return;
+                return 0;
             }
             let request = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             log::info!(
@@ -3668,16 +3789,17 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 read_u32_or_invalid(uc, request + 0x1f8),
                 read_u8_or_invalid(uc, request + 0x1fc),
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // The drop path itself.
     let dropped = base_address + (0x004b_4a98u32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(dropped as u64, dropped as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, dropped, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3677", move |uc: &mut Unicorn<'_, Context>| {
             static COUNT: AtomicU32 = AtomicU32::new(0);
             if COUNT.fetch_add(1, Ordering::Relaxed) >= 60 {
-                return;
+                return 0;
             }
             let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
             let this = read_u32_or_invalid(uc, sp + 0x44);
@@ -3688,8 +3810,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 read_u16_or_invalid(uc, this + 0x1e),
                 read_u32_or_invalid(uc, this + 0xc),
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // Every write to the MDM ref counter (`request + 0x200`, the u16
     // `mdm_sMapDataRequest::u16MDMRefCounter`) of the statically allocated
@@ -3741,11 +3864,11 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
     ] {
         let address = base_address + (off - ORIGINAL_BASE);
         let name: &'static str = name;
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3745", move |uc: &mut Unicorn<'_, Context>| {
                 static COUNT: AtomicU32 = AtomicU32::new(0);
                 if COUNT.fetch_add(1, Ordering::Relaxed) >= 40 {
-                    return;
+                    return 0;
                 }
                 log::warn!(
                     "PROCMAPENGINE map-data trace {} t={}ms thread=[{}] this={:#x} r1={:#x} lr={:#x}",
@@ -3756,8 +3879,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
                     (uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // The car-position channel: `vHandleExtrapolatedPositions` (client map entry
@@ -3769,11 +3893,11 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
     // (`sd2-GENJ_EU_I.A v2`) dataset on the card, so no real block can ever be
     // drawn. Log the deserialization result and the fields the RC job got.
     let extrap_deserialized = base_address + (0x0054_9bf4u32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(extrap_deserialized as u64, extrap_deserialized as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, extrap_deserialized, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3773", move |uc: &mut Unicorn<'_, Context>| {
             static COUNT: AtomicU32 = AtomicU32::new(0);
             if COUNT.fetch_add(1, Ordering::Relaxed) >= 12 {
-                return;
+                return 0;
             }
             let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let job = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
@@ -3825,8 +3949,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     element,
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     // Does the CCP really move? `map_tclJobRCHandleExtrapolatedPositions::Execute`
     // fills the CCA's interpolation array (`BeginUpdate` at 0x54d1b0 hands back the
@@ -3836,11 +3961,11 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
     // filled) and dump the instance plus the array it now publishes.
     let cca_filled = base_address + (0x004d_173cu32 - ORIGINAL_BASE);
     let cca_instance_global = base_address + (0x0078_f668u32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(cca_filled as u64, cca_filled as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, cca_filled, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3840", move |uc: &mut Unicorn<'_, Context>| {
             static COUNT: AtomicU32 = AtomicU32::new(0);
             if COUNT.fetch_add(1, Ordering::Relaxed) >= 8 {
-                return;
+                return 0;
             }
             let cca = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
             let start = read_u32_or_invalid(uc, cca);
@@ -3867,8 +3992,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 entries,
                 read_u8_or_invalid(uc, cca_instance_global),
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // `map_tclJobRCContinuousScrolling::Execute` (0x4c9898) - the job that turns
     // on "continuous scrolling", i.e. the map view following the CCP - refuses to
@@ -3909,8 +4035,8 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
     // language... Log which method the HMI actually calls, so a missing
     // follow-the-car command is distinguishable from one the engine refused.
     let renfi = base_address + (0x003a_359cu32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(renfi as u64, renfi as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, renfi, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3913", move |uc: &mut Unicorn<'_, Context>| {
             static SEEN: std::sync::OnceLock<std::sync::Mutex<Vec<[u32; 3]>>> =
                 std::sync::OnceLock::new();
             let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -3935,7 +4061,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 }
             };
             if !is_new {
-                return;
+                return 0;
             }
             log::info!(
                 "PROCMAPENGINE map-data trace RenFI method t={}ms thread=[{}] svc={:#x} fn={:#x} opcode={:#x} message={:#x} lr={:#x}",
@@ -3947,8 +4073,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 message,
                 (uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1,
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     // `map_tclMapEngineControl`'s lifecycle state (`ms_eMapEngineState`, 0x7907ac) is what
     // decides whether a RenFI camera job survives: `RndFI_AddJobToQueue` (0x53ad90) hands
@@ -3974,11 +4101,11 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
             let addr = base_address + (offset - ORIGINAL_BASE);
             let state = state_at;
             let label: &'static str = label;
-            unicorn
-                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3978", move |uc: &mut Unicorn<'_, Context>| {
                     let hits = HITS.fetch_add(1, Ordering::Relaxed);
                     if hits >= 40 {
-                        return;
+                        return 0;
                     }
                     let state_value = read_u32_or_invalid(uc, state);
                     log::info!(
@@ -3990,8 +4117,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                             .wrapping_sub(base_address)
                             .wrapping_add(ORIGINAL_BASE),
                     );
-                })
-                .unwrap();
+                
+                    0
+                });
         }
     }
 
@@ -4012,11 +4140,11 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
 
         static ADD_LOGS: AtomicU32 = AtomicU32::new(0);
         let add = base_address + (0x003a_79b8u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(add as u64, add as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, add, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4016", move |uc: &mut Unicorn<'_, Context>| {
                 let logs = ADD_LOGS.fetch_add(1, Ordering::Relaxed);
                 if logs >= 1500 {
-                    return;
+                    return 0;
                 }
                 let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 // One call site floods the render control queue with a per-frame job;
@@ -4027,7 +4155,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     .wrapping_sub(base_address)
                     .wrapping_add(ORIGINAL_BASE);
                 if caller == 0x004c_7270 && logs >= 3 {
-                    return;
+                    return 0;
                 }
                 let queue = read_u32_or_invalid(uc, rc_queue_global);
                 // `map_tclJobQueue::AddElement` (0x4a4284) does not link the element: it
@@ -4069,14 +4197,15 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                         .wrapping_sub(base_address)
                         .wrapping_add(ORIGINAL_BASE),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         static POLL_LOGS: AtomicU32 = AtomicU32::new(0);
         static POLL_LAST: AtomicU32 = AtomicU32::new(0xffff_ffff);
         let poll = base_address + (0x004a_52e0u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(poll as u64, poll as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, poll, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4079", move |uc: &mut Unicorn<'_, Context>| {
                 let logs = POLL_LOGS.fetch_add(1, Ordering::Relaxed);
                 let queue = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let state = read_u32_or_invalid(uc, queue);
@@ -4085,7 +4214,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 // tight rotation, so a flat log cap hides everything that matters later.
                 let signature = queue.rotate_left(4) ^ (state << 12) ^ count;
                 if POLL_LAST.swap(signature, Ordering::Relaxed) == signature && logs >= 40 {
-                    return;
+                    return 0;
                 }
                 log::info!(
                     "PROCMAPENGINE map-data trace render queue poll PeekElement t={}ms thread=[{}] queue={:#x} state={:#x} count={:#x} logs={}",
@@ -4096,16 +4225,17 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     count,
                     logs + 1,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         static GATE_LOGS: AtomicU32 = AtomicU32::new(0);
         let gate = base_address + (0x004c_5c50u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(gate as u64, gate as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, gate, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4105", move |uc: &mut Unicorn<'_, Context>| {
                 let logs = GATE_LOGS.fetch_add(1, Ordering::Relaxed);
                 if logs >= 3000 {
-                    return;
+                    return 0;
                 }
                 let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let instance = read_u32_or_invalid(uc, instance_global);
@@ -4128,16 +4258,17 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                         .wrapping_sub(base_address)
                         .wrapping_add(ORIGINAL_BASE),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         static TAKE_LOGS: AtomicU32 = AtomicU32::new(0);
         let take = base_address + (0x004a_3d7cu32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(take as u64, take as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, take, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4137", move |uc: &mut Unicorn<'_, Context>| {
                 let logs = TAKE_LOGS.fetch_add(1, Ordering::Relaxed);
                 if logs >= 3000 {
-                    return;
+                    return 0;
                 }
                 let element = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 // `GetPeekedElement` (0x4a3d7c) hands the element back only while the
@@ -4156,20 +4287,21 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     read_u32_or_invalid(uc, queue.wrapping_add(8)),
                     read_u32_or_invalid(uc, queue.wrapping_add(0x10)),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         static REMOVED_LOGS: AtomicU32 = AtomicU32::new(0);
         let removed = base_address + (0x004a_3be4u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(removed as u64, removed as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, removed, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4165", move |uc: &mut Unicorn<'_, Context>| {
                 let element = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let vptr = read_u32_or_invalid(uc, element);
                 let logs = REMOVED_LOGS.fetch_add(1, Ordering::Relaxed);
                 // `map_tclJobRCSetCameraParameters`' vtable; other job classes are only
                 // reported a handful of times so the trace stays readable.
                 if vptr != 0x006a_cb18 && logs >= 20 {
-                    return;
+                    return 0;
                 }
                 // `RemoveElementFromIJQ` is the last statement of the success branch of
                 // `GetPeekedElement`, so reaching it proves the element was handed back to
@@ -4182,8 +4314,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     element,
                     vptr,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         // 0x3a8df8 is the instruction right after `GetPeekedElement` returns in
         // `RenderControlMainLoop` and 0x3a8e00 the one that loads the vtable before
@@ -4191,14 +4324,20 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
         // hook dispatching on the fetched address (see docs/issues/design.md).
         {
             let page = base_address + (0x003a_8000u32 - ORIGINAL_BASE);
-            unicorn
-                .add_code_hook(page as u64, (page + 0xfff) as u64, move |uc, _, _| {
+            
+{
+                    // r746: page hook expanded to per-arm svc#0 trap sites.
+                    for __arm in [0x003a_8df8u32, 0x003a_8e00u32] {
+                        let base_address = base_address.clone();
+                        let __arm: u32 = __arm;
+                        let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                        crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4213", move |uc: &mut Unicorn<'_, Context>| {
                     static DISPATCH_LOGS: AtomicU32 = AtomicU32::new(0);
-                    let offset = (uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32)
+                    let offset = (__site_pc)
                         .wrapping_sub(base_address)
                         .wrapping_add(ORIGINAL_BASE);
                     if offset != 0x003a_8df8 && offset != 0x003a_8e00 {
-                        return;
+                        return 0;
                     }
                     let element = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                     let (vptr, execute) = if element == 0 {
@@ -4209,7 +4348,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     };
                     let logs = DISPATCH_LOGS.fetch_add(1, Ordering::Relaxed);
                     if vptr != 0x006a_cb18 && logs >= 20 {
-                        return;
+                        return 0;
                     }
                     log::info!(
                         "PROCMAPENGINE map-data trace render loop dispatch {offset:#x} t={}ms thread=[{}] element={:#x} vptr={:#x} execute={:#x}",
@@ -4219,8 +4358,11 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                         vptr,
                         execute,
                     );
-                })
-                .unwrap();
+                
+                            0
+                        });
+                    }
+                }
         }
 
         // `map_tclRenderControl::SetCameraParameters` has exactly two exits: 0x3a75f4
@@ -4233,11 +4375,11 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
         ] {
             static EXIT_LOGS: AtomicU32 = AtomicU32::new(0);
             let site = base_address + offset;
-            unicorn
-                .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+            
+crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4237", move |uc: &mut Unicorn<'_, Context>| {
                     let logs = EXIT_LOGS.fetch_add(1, Ordering::Relaxed);
                     if logs >= 400 {
-                        return;
+                        return 0;
                     }
                     let view_id = (uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32) & 0xff;
                     log::info!(
@@ -4258,8 +4400,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                             (uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32).wrapping_add(0x1c),
                         ),
                     );
-                })
-                .unwrap();
+                
+                    0
+                });
         }
 
         // The engine's DAPI `GetBlockIDs` requests stop being sent after the second one:
@@ -4271,12 +4414,12 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
         // 4 nor 0xd, 17 for state 2).  Log header, list and verdict.
         {
             let site = base_address + (0x0066_dd00u32 - ORIGINAL_BASE);
-            unicorn
-                .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+            
+crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4275", move |uc: &mut Unicorn<'_, Context>| {
                     static ENTRY_LOGS: AtomicU32 = AtomicU32::new(0);
                     let logs = ENTRY_LOGS.fetch_add(1, Ordering::Relaxed);
                     if logs >= 300 {
-                        return;
+                        return 0;
                     }
                     let msg = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
                     let list = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
@@ -4355,8 +4498,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                             );
                         }
                     }
-                })
-                .unwrap();
+                
+                    0
+                });
         }
         for (offset, label) in [
             (0x0066_de18u32 - ORIGINAL_BASE, "client mail check verdict"),
@@ -4365,11 +4509,11 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
         ] {
             static VERDICT_LOGS: AtomicU32 = AtomicU32::new(0);
             let site = base_address + offset;
-            unicorn
-                .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+            
+crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4369", move |uc: &mut Unicorn<'_, Context>| {
                     let logs = VERDICT_LOGS.fetch_add(1, Ordering::Relaxed);
                     if logs >= 300 {
-                        return;
+                        return 0;
                     }
                     let stack = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
                     log::info!(
@@ -4382,8 +4526,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                         read_u32_or_invalid(uc, stack.wrapping_add(0x10)),
                         read_u32_or_invalid(uc, stack.wrapping_add(0xc)),
                     );
-                })
-                .unwrap();
+                
+                    0
+                });
         }
 
         // `ail_enCheckClientMailValidity` only lets a request (opcode 2) through while the
@@ -4401,11 +4546,11 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
         ] {
             static STATE_LOGS: AtomicU32 = AtomicU32::new(0);
             let site = base_address + offset;
-            unicorn
-                .add_code_hook(site as u64, site as u64, move |uc, _, _| {
+            
+crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4405", move |uc: &mut Unicorn<'_, Context>| {
                     let logs = STATE_LOGS.fetch_add(1, Ordering::Relaxed);
                     if logs >= 600 {
-                        return;
+                        return 0;
                     }
                     let reference = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                     let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -4485,8 +4630,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                             .wrapping_sub(base_address)
                             .wrapping_add(ORIGINAL_BASE),
                     );
-                })
-                .unwrap();
+                
+                    0
+                });
         }
 
         // The narrow hooks on `ail_tclServiceReference`'s constructor (0x66e2ec, leaves the
@@ -4497,10 +4643,16 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
         // other places that rewrite a reference's service / register / sub id.
         {
             let page = base_address + (0x0066_e000u32 - ORIGINAL_BASE);
-            unicorn
-                .add_code_hook(page as u64, (page + 0xfff) as u64, move |uc, _, _| {
+            
+{
+                    // r746: page hook expanded to per-arm svc#0 trap sites.
+                    for __arm in [0x0066_e2ecu32, 0x0066_e43cu32, 0x0066_e4b4u32, 0x0066_e504u32, 0x0066_e444u32, 0x0066_e3d0u32] {
+                        let base_address = base_address.clone();
+                        let __arm: u32 = __arm;
+                        let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                        crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4523", move |uc: &mut Unicorn<'_, Context>| {
                     static REF_LOGS: AtomicU32 = AtomicU32::new(0);
-                    let offset = (uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32)
+                    let offset = (__site_pc)
                         .wrapping_sub(base_address)
                         .wrapping_add(ORIGINAL_BASE);
                     let label = match offset {
@@ -4512,11 +4664,11 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                         // so a zero count here means the page hook itself never dispatches
                         0x0066_e444 => "service reference state read (liveness)",
                         0x0066_e3d0 => "service reference match test (liveness)",
-                        _ => return,
+                        _ => return 0,
                     };
                     let logs = REF_LOGS.fetch_add(1, Ordering::Relaxed);
                     if logs >= 400 {
-                        return;
+                        return 0;
                     }
                     let reference = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                     log::info!(
@@ -4539,17 +4691,20 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                             .wrapping_sub(base_address)
                             .wrapping_add(ORIGINAL_BASE),
                     );
-                })
-                .unwrap();
+                
+                            0
+                        });
+                    }
+                }
         }
 
         static EXEC_LOGS: AtomicU32 = AtomicU32::new(0);
         let exec = base_address + (0x004d_74c4u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(exec as u64, exec as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, exec, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4549", move |uc: &mut Unicorn<'_, Context>| {
                 let logs = EXEC_LOGS.fetch_add(1, Ordering::Relaxed);
                 if logs >= 200 {
-                    return;
+                    return 0;
                 }
                 let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 // `map_tclJobRCSetCameraParameters` keeps the camera parameter block it
@@ -4567,17 +4722,18 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     read_u32_or_invalid(uc, job.wrapping_add(0x24)),
                     logs + 1,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         static SET_LOGS: AtomicU32 = AtomicU32::new(0);
         let set = base_address + (0x003a_7594u32 - ORIGINAL_BASE);
         let views_global = base_address + (0x0071_5550u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(set as u64, set as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, set, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4577", move |uc: &mut Unicorn<'_, Context>| {
                 let logs = SET_LOGS.fetch_add(1, Ordering::Relaxed);
                 if logs >= 600 {
-                    return;
+                    return 0;
                 }
                 let view_id = (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32) & 0xff;
                 let params = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
@@ -4630,8 +4786,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                         .wrapping_sub(base_address)
                         .wrapping_add(ORIGINAL_BASE),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // recognised SetCameraParameters method (0x5a) is dropped: 0x3a3244 is right after
@@ -4641,10 +4798,16 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
     // as a page range dispatching on the fetched address (see docs/issues/design.md).
     {
         let page = base_address + (0x003a_3000u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(page as u64, (page + 0xfff) as u64, move |uc, _, _| {
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x003a_344cu32, 0x003a_34d4u32, 0x003a_3244u32, 0x003a_3338u32] {
+                    let base_address = base_address.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4669", move |uc: &mut Unicorn<'_, Context>| {
                 static HITS: AtomicU32 = AtomicU32::new(0);
-                let offset = (uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32)
+                let offset = (__site_pc)
                     .wrapping_sub(base_address)
                     .wrapping_add(ORIGINAL_BASE);
                 // 0x3a344c is right after the `bl map_tclPortControl::RndFI_AddJobToQueue`
@@ -4655,7 +4818,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     static RESULT_LOGS: AtomicU32 = AtomicU32::new(0);
                     let logs = RESULT_LOGS.fetch_add(1, Ordering::Relaxed);
                     if logs >= 40 {
-                        return;
+                        return 0;
                     }
                     log::info!(
                         "PROCMAPENGINE map-data trace RenFI camera add-result {offset:#x} t={}ms thread=[{}] job={:#x} add_result={:#x}",
@@ -4664,14 +4827,14 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                         uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32,
                         uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
                     );
-                    return;
+                    return 0;
                 }
                 if offset != 0x003a_3244 && offset != 0x003a_3338 {
-                    return;
+                    return 0;
                 }
                 let hits = HITS.fetch_add(1, Ordering::Relaxed);
                 if hits >= 24 {
-                    return;
+                    return 0;
                 }
                 let stack = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
                 // `fi_tclVisitorMessage` lives at sp + 0xa4: +0x04 is the message
@@ -4702,15 +4865,18 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     payload,
                     length,
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
         let simple = base_address + (0x004c_5a84u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(simple as u64, simple as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, simple, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4709", move |uc: &mut Unicorn<'_, Context>| {
                 static HITS: AtomicU32 = AtomicU32::new(0);
                 let hits = HITS.fetch_add(1, Ordering::Relaxed);
                 if hits >= 8 {
-                    return;
+                    return 0;
                 }
                 let stack = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
                 log::info!(
@@ -4723,8 +4889,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
                     (0..10u32).map(|i| read_u32_or_invalid(uc, stack + i * 4)).collect::<Vec<_>>(),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // The engine's debug channel commands (`vChannelMgr` 0x3a4888, a switch over a
@@ -4733,12 +4900,12 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
     // explain the camera being re-aimed from inside the map-data-manager loop.
     {
         let addr = base_address + 0x003a_4888u32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4737", move |uc: &mut Unicorn<'_, Context>| {
                 static HITS: AtomicU32 = AtomicU32::new(0);
                 let hits = HITS.fetch_add(1, Ordering::Relaxed);
                 if hits >= 12 {
-                    return;
+                    return 0;
                 }
                 let record = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let words: Vec<u32> =
@@ -4756,8 +4923,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                         .join(" "),
                     uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // Only four places call `MapEngine_TriggerPixmapViewRender`: the debug channel
@@ -4766,8 +4934,8 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
     // which one re-aims the camera at the engine's built-in default position.
     for offset in [0x0053_b7c0u32, 0x0053_b984, 0x0053_bd68, 0x0054_98f8] {
         let addr = base_address + offset - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4770", move |uc: &mut Unicorn<'_, Context>| {
                 // One counter per address: a shared static would let the
                 // once-per-second posfi handler exhaust the budget and hide the
                 // others.
@@ -4785,7 +4953,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 };
                 let hits = HITS[index].fetch_add(1, Ordering::Relaxed);
                 if hits >= 10 {
-                    return;
+                    return 0;
                 }
                 log::info!(
                     "PROCMAPENGINE map-data trace camera-reset candidate {:#x} t={}ms thread=[{}] arg={} lr={:#x}",
@@ -4795,8 +4963,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 & 0xff,
                     uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // Who triggers the pixmap-view render: it is the only remaining caller that
@@ -4806,12 +4975,12 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
     // handler's PC stress-test ladder, so the link register separates them.
     {
         let addr = base_address + 0x0053_b36cu32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4810", move |uc: &mut Unicorn<'_, Context>| {
                 static HITS: AtomicU32 = AtomicU32::new(0);
                 let hits = HITS.fetch_add(1, Ordering::Relaxed);
                 if hits >= 400 {
-                    return;
+                    return 0;
                 }
                 let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
                 let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
@@ -4825,7 +4994,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                         uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 & 0xff,
                         lr,
                     );
-                    return;
+                    return 0;
                 }
                 // The link register points outside the module here, so walk the
                 // stack for return addresses that do live in the engine's text and
@@ -4859,8 +5028,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                         .collect::<Vec<_>>()
                         .join(" "),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // Whoever creates a camera job decides the view's position: the only callers
@@ -4870,14 +5040,14 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
     // the coordinate source behind the power-on camera that never moves.
     {
         let addr = base_address + 0x004c_5ac0u32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4874", move |uc: &mut Unicorn<'_, Context>| {
                 static HITS: AtomicU32 = AtomicU32::new(0);
                 static LRS: AtomicU32 = AtomicU32::new(0);
                 let hits = HITS.fetch_add(1, Ordering::Relaxed);
                 let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
                 if hits >= 24 || LRS.swap(lr, Ordering::Relaxed) == lr {
-                    return;
+                    return 0;
                 }
                 let params = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let words: Vec<u32> =
@@ -4896,8 +5066,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     lr,
 
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // Steps between "AIL accepted the message" and "the RenFI method ran", so a
@@ -4911,8 +5082,8 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
         (0x0052_3eacu32 - ORIGINAL_BASE, "u32SetCameraParameters"),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:4915", move |uc: &mut Unicorn<'_, Context>| {
                 static HITS: [AtomicU32; 3] = [
                     AtomicU32::new(0),
                     AtomicU32::new(0),
@@ -4930,7 +5101,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 // small cap let the routine posfi/dapi traffic hide the one message
                 // that matters here: count all of them and dump only the unusual ones.
                 if hits >= if index == 0 { 6000 } else { 4000 } {
-                    return;
+                    return 0;
                 }
                 if index == 0 {
                     let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -4952,7 +5123,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                                 hits,
                             );
                         }
-                        return;
+                        return 0;
                     }
                     for (label, base) in bases {
                         let words: Vec<u32> =
@@ -4979,7 +5150,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                                 .join(" "),
                         );
                     }
-                    return;
+                    return 0;
                 }
                 if index == 2 {
                     // u32SetCameraParameters(camera_object, parameters): dump what
@@ -5016,7 +5187,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                     static CALLS: AtomicU32 = AtomicU32::new(0);
                     let calls = CALLS.fetch_add(1, Ordering::Relaxed);
                     if calls >= 500 {
-                        return;
+                        return 0;
                     }
                     let _ = signature;
                     log::info!(
@@ -5039,7 +5210,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                             .wrapping_add(ORIGINAL_BASE)
                             & !1,
                     );
-                    return;
+                    return 0;
                 }
                 let message = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let header = read_u32_or_invalid(uc, message + 4);
@@ -5060,8 +5231,9 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                         .wrapping_add(ORIGINAL_BASE)
                         & !1,
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // Every re-arm of a map-data request: `UpdateMapDataRequest(prio, type,
@@ -5073,8 +5245,8 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
     // other's request, and no DAPI answer can be matched any more. Log who arms
     // what, and what the request currently holds.
     let update = base_address + (0x0050_494cu32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(update as u64, update as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, update, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5077", move |uc: &mut Unicorn<'_, Context>| {
             static LAST: std::sync::OnceLock<std::sync::Mutex<[u32; 7]>> =
                 std::sync::OnceLock::new();
             let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
@@ -5103,7 +5275,7 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 changed
             };
             if !changed {
-                return;
+                return 0;
             }
             log::info!(
                 "PROCMAPENGINE map-data trace UpdateMapDataRequest at {:#x}: t={}ms thread=[{}] prio={:#x} type={:#x} scale={:.3} stamp={:#x} rect=[{:#x},{:#x},{:#x},{:#x}] lr={:#x}",
@@ -5120,23 +5292,24 @@ fn add_get_block_ids_answer_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base
                 rect[3],
                 (uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1,
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 fn add_map_view_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let create_result = base_address + RENDER_CONTROL_CREATE_VIEW_RESULT;
-    unicorn
-        .add_code_hook(create_result as u64, create_result as u64, |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, create_result, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5130", move |uc: &mut Unicorn<'_, Context>| {
             if !MAP_VIEW_CREATE_MUTATING.swap(false, Ordering::Relaxed) {
-                return;
+                return 0;
             }
 
             let job = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
             if job == 0 || job == u32::MAX {
                 MAP_VIEW_CREATE_PENDING.store(false, Ordering::Relaxed);
                 log::warn!("PROCMAPENGINE: map view create job factory returned null");
-                return;
+                return 0;
             }
 
             if uc
@@ -5148,23 +5321,24 @@ fn add_map_view_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     "PROCMAPENGINE: failed to set view id on create job {:#x}",
                     job
                 );
-                return;
+                return 0;
             }
 
             MAP_VIEW_CREATE_JOB_ADDRESS.store(job, Ordering::Relaxed);
             MAP_VIEW_CREATE_PENDING.store(false, Ordering::Relaxed);
             MAP_VIEW_CREATE_ENQUEUE_PENDING.store(true, Ordering::Relaxed);
             log::info!("PROCMAPENGINE: created map view {} job {:#x}", MAP_RENDER_VIEW_ID, job);
-        })
-        .unwrap();
+        
+            0
+        });
 
     let get_view_result = base_address + RENDER_CONTROL_GET_VIEW_RESULT;
-    unicorn
-        .add_code_hook(get_view_result as u64, get_view_result as u64, |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, get_view_result, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5163", move |uc: &mut Unicorn<'_, Context>| {
             let view_id = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let view = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             if view_id != MAP_RENDER_VIEW_ID || view == 0 {
-                return;
+                return 0;
             }
 
             let surface_state = read_u32_or_invalid(uc, view + 0xf50);
@@ -5190,22 +5364,23 @@ fn add_map_view_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                             "PROCMAPENGINE: failed to force surface state on view {:#x}",
                             view
                         );
-                        return;
+                        return 0;
                     }
                 }
 
                 MAP_VIEW_READY.store(true, Ordering::Relaxed);
             }
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let queue_global = base_address + MAP_DATA_JOB_QUEUE_GLOBAL;
     let queue_state_addr = base_address + MAP_DATA_MAINLOOP_QUEUE_STATE;
 
-    unicorn
-        .add_code_hook(queue_state_addr as u64, queue_state_addr as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, queue_state_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5208", move |uc: &mut Unicorn<'_, Context>| {
             let queue = read_u32_or_invalid(uc, queue_global);
             let state = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let last = RENDER_LOOP_QUEUE_STATE_LAST.swap(state, Ordering::Relaxed);
@@ -5218,8 +5393,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     state
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     // AddJobToMapDataManagerQueue (0x503414) path probes (r433): the
     // fabricated posfi UpdateMapDataRequest(4,...) job is queued and the
@@ -5235,16 +5411,16 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         const ADDJOB_ADDELEMENT_RET: u32 = 0x0050_34c0 - ORIGINAL_BASE;
         const ADDJOB_DAT_0078F800: u32 = 0x0050_39a4 - ORIGINAL_BASE;
         let addjob_entry = base_address + ADDJOB_QUEUE_ENTRY;
-        unicorn
-            .add_code_hook(addjob_entry as u64, addjob_entry as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addjob_entry, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5239", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_ADDJOB_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 if job >= 0xf000_0000 {
-                    return;
+                    return 0;
                 }
                 let request = read_u32_or_invalid(uc, job + 0x24);
                 if count >= 400 || (request == 5 && count % 50 != 0) {
-                    return;
+                    return 0;
                 }
                 let thread = uc.get_data().inner.thread_id();
                 let backup_got = read_u32_or_invalid(uc, base_address + ADDJOB_DAT_0078F800);
@@ -5254,18 +5430,19 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     read_u32_or_invalid(uc, job + 0x28) & 0xff,
                     read_u32_or_invalid(uc, backup_got),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
         for (name, offset) in [
             ("backup-list", ADDJOB_BACKUP_BRANCH),
             ("early-return0", ADDJOB_EARLY_RETURN),
         ] {
             let addr = base_address + offset;
-            unicorn
-                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5265", move |uc: &mut Unicorn<'_, Context>| {
                     let count = MAP_DATA_ADDJOB_BRANCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                     if count >= 20 {
-                        return;
+                        return 0;
                     }
                     let job = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
                     let request = if job < 0xf000_0000 {
@@ -5276,20 +5453,21 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     log::info!(
                         "PROCMAPENGINE map-data trace AddJob {name} taken at {addr:#x}: job={job:#x} request={request} count={count}"
                     );
-                })
-                .unwrap();
+                
+                    0
+                });
         }
         let addelement_ret = base_address + ADDJOB_ADDELEMENT_RET;
-        unicorn
-            .add_code_hook(addelement_ret as u64, addelement_ret as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addelement_ret, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5284", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_ADDJOB_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 let job = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
                 if job >= 0xf000_0000 {
-                    return;
+                    return 0;
                 }
                 let request = read_u32_or_invalid(uc, job + 0x24);
                 if count >= 400 || (request == 5 && count % 50 != 0) {
-                    return;
+                    return 0;
                 }
                 let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
                 log::info!(
@@ -5298,8 +5476,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     read_u32_or_invalid(uc, sp + 0x1c),
                     read_u32_or_invalid(uc, sp + 0x18),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // CreateMDMJobMapDataRequest::Create (0x4b9d30) allocation outcome
@@ -5315,8 +5494,8 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             ("heap-null", MDMJOB_CREATE_HEAP_NULL),
         ] {
             let addr = base_address + offset;
-            unicorn
-                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5319", move |uc: &mut Unicorn<'_, Context>| {
                     let prio = uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32;
                     let job = if name == "heap-null" {
                         0
@@ -5329,19 +5508,20 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     // Successful prio=5 (default view) creations are the
                     // flood; only failures and other priorities matter.
                     if job != 0 && prio == 5 {
-                        return;
+                        return 0;
                     }
                     let count =
                         MAP_DATA_ADDJOB_BRANCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                     if count >= 40 {
-                        return;
+                        return 0;
                     }
                     let thread = uc.get_data().inner.thread_id();
                     log::info!(
                         "PROCMAPENGINE map-data trace MDMJob Create {name} at {addr:#x}: prio={prio} job={job:#x} thread=[{thread}] count={count}"
                     );
-                })
-                .unwrap();
+                
+                    0
+                });
         }
     }
 
@@ -5363,12 +5543,12 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         const PMDR_PRIO5_PATH: u32 = 0x0050_cf58 - ORIGINAL_BASE;
 
         let pmdr_entry = base_address + PMDR_ENTRY;
-        unicorn
-            .add_code_hook(pmdr_entry as u64, pmdr_entry as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, pmdr_entry, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5367", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_PMDR_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 let prio = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
                 if count >= 800 || (prio == 5 && count % 50 != 0) {
-                    return;
+                    return 0;
                 }
                 let thread = uc.get_data().inner.thread_id();
                 let r10 = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
@@ -5383,8 +5563,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     (r6 as i32).wrapping_sub(r10 as i32),
                     (r8 as i32).wrapping_sub(r11 as i32),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
 
         for (name, offset) in [
             ("invalid-rect-return", PMDR_INVALID_RECT),
@@ -5394,23 +5575,24 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             ("prio5-path", PMDR_PRIO5_PATH),
         ] {
             let addr = base_address + offset;
-            unicorn
-                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5398", move |uc: &mut Unicorn<'_, Context>| {
                     let prio = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
                     // the prio=5 default-view path is known good and floods
                     if prio == 5 {
-                        return;
+                        return 0;
                     }
                     let count = MAP_DATA_PMDR_GATE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                     if count >= 60 {
-                        return;
+                        return 0;
                     }
                     let thread = uc.get_data().inner.thread_id();
                     log::info!(
                         "PROCMAPENGINE map-data trace PerformMapDataRequest {name} at {addr:#x}: prio={prio} thread=[{thread}] count={count}"
                     );
-                })
-                .unwrap();
+                
+                    0
+                });
         }
     }
 
@@ -5421,19 +5603,20 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
     {
         const TRIGGER_HANDLE_MAP_DATA_REQUEST: u32 = 0x0050_4824 - ORIGINAL_BASE;
         let addr = base_address + TRIGGER_HANDLE_MAP_DATA_REQUEST;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5425", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_TRIGGER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 let visible = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 & 0xff;
                 if count >= 400 {
-                    return;
+                    return 0;
                 }
                 let thread = uc.get_data().inner.thread_id();
                 log::info!(
                     "PROCMAPENGINE map-data trace TriggerHandleMapDataRequest at {addr:#x}: visible={visible} thread=[{thread}] count={count}"
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // Which test in `PerformMapDataRequest`'s prio-4 branch sends the car-cursor
@@ -5443,17 +5626,24 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
     {
         let page_begin = base_address + 0x0050_c000u32 - ORIGINAL_BASE;
         let page_end = base_address + 0x0050_d000u32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(page_begin as u64, page_end as u64, move |uc, _, size| {
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x50cd24u32, 0x50cd28u32, 0x50cd2cu32] {
+                    let base_address = base_address.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5488", move |uc: &mut Unicorn<'_, Context>| {
+                let size = 4u32;
                 static HITS: AtomicU32 = AtomicU32::new(0);
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let pc = __site_pc;
                 let offset = pc.wrapping_sub(base_address) + ORIGINAL_BASE;
                 if !matches!(offset, 0x0050_cd24..=0x0050_cd2c) {
-                    return;
+                    return 0;
                 }
                 let hits = HITS.fetch_add(1, Ordering::Relaxed);
                 if hits >= 24 {
-                    return;
+                    return 0;
                 }
                 let carsor = base_address + 0x0079_04e4u32 - ORIGINAL_BASE;
                 let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
@@ -5462,7 +5652,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 // Passes for the camera rectangle reach this code constantly; only the
                 // ones carrying the posfi car box (longitude ~0x0e2xxxxx) matter here.
                 if !words.iter().any(|word| (0xfff0_0000 & word) == 0x0e20_0000) {
-                    return;
+                    return 0;
                 }
                 log::info!(
                     "PROCMAPENGINE map-data trace prio4-branch at {:#x} t={}ms thread=[{}] hits={} r0={:#x} r1={:#x} r4={:#x} r6={:#x} r9={:#x} counters[cam={} block={} carsor={}] f1f4={:#x} list=[{}] stack=[{}] size={}",
@@ -5501,8 +5691,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         .join(" "),
                     size,
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
 
     // IntHandleMapDataRequest (0x5116d4) request selection (r441): the
@@ -5515,11 +5708,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         const INT_HANDLE_GET_HIGHEST_PRIO_RESULT: u32 = 0x0051_16e4 - ORIGINAL_BASE;
         const MAP_DATA_REQ_CARSOR: u32 = 0x0079_04e4 - ORIGINAL_BASE;
         let addr = base_address + INT_HANDLE_GET_HIGHEST_PRIO_RESULT;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5519", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_TRIGGER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count >= 60 {
-                    return;
+                    return 0;
                 }
                 let request = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
@@ -5566,23 +5759,21 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         read_u32_or_invalid(uc, record + 0x6c),
                     );
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     let request_call_addr = base_address + MAP_DATA_JOB_MAP_DATA_REQUEST_CALL;
-    unicorn
-        .add_code_hook(
-            request_call_addr as u64,
-            request_call_addr as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, request_call_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5575", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_REQUEST_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 // Same lesson as the UpdateMapDataRequest probe (r431): the
                 // request=5 default-window flood saturates the budget, so
                 // throttle it and keep every other request id visible.
                 let request = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 if count >= 600 || (request == 5 && count >= 10) {
-                    return;
+                    return 0;
                 }
                 {
                     let priority = (uc.reg_read(RegisterARM::R1).unwrap_or(0) & 0xff) as u32;
@@ -5602,16 +5793,13 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         read_u32_or_invalid(uc, sp + 12)
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let request_result_addr = base_address + MAP_DATA_JOB_MAP_DATA_REQUEST_RESULT;
-    unicorn
-        .add_code_hook(
-            request_result_addr as u64,
-            request_result_addr as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, request_result_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5611", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_REQUEST_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 200 {
                     let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -5621,16 +5809,13 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         result
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let handle_result_addr = base_address + MAP_DATA_JOB_HANDLE_REQUEST_RESULT;
-    unicorn
-        .add_code_hook(
-            handle_result_addr as u64,
-            handle_result_addr as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, handle_result_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5630", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_HANDLE_REQUEST_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 200 {
                     let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -5640,16 +5825,13 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         result
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let dapi_get_block_ids_entry = base_address + MAP_DATA_DAPI_GET_BLOCK_IDS_ENTRY;
-    unicorn
-        .add_code_hook(
-            dapi_get_block_ids_entry as u64,
-            dapi_get_block_ids_entry as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, dapi_get_block_ids_entry, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5649", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 200 {
                     let platform = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -5682,16 +5864,13 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         read_u32_or_invalid(uc, rect + 12)
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let cca_get_block_ids_vcall = base_address + MAP_DATA_CCA_GET_BLOCK_IDS_VCALL;
-    unicorn
-        .add_code_hook(
-            cca_get_block_ids_vcall as u64,
-            cca_get_block_ids_vcall as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, cca_get_block_ids_vcall, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5691", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 200 {
                     let service = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -5709,13 +5888,13 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         target
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
     let send_request_entry = base_address + MAP_DATA_CCA_SEND_REQUEST_ENTRY;
     add_dapi_register_diag_hooks(unicorn, base_address);
-    unicorn
-        .add_code_hook(send_request_entry as u64, send_request_entry as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, send_request_entry, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5718", move |uc: &mut Unicorn<'_, Context>| {
             // The unit's CCA directory (TE side) never answers the register
             // handshake, so the map engine's DAPI client handler stays
             // unregistered and every ServiceData request is rejected with
@@ -5913,15 +6092,13 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     vt10
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     let request_ctor_result = base_address + MAP_DATA_SEND_REQUEST_CONSTRUCTOR_RESULT;
-    unicorn
-        .add_code_hook(
-            request_ctor_result as u64,
-            request_ctor_result as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, request_ctor_result, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5921", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 200 {
                     let message_object = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -5934,13 +6111,13 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         read_u32_or_invalid(uc, message_object + 0x20) & 0xff
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let send_service_vcall = base_address + MAP_DATA_SEND_SERVICE_VCALL;
-    unicorn
-        .add_code_hook(send_service_vcall as u64, send_service_vcall as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, send_service_vcall, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5943", move |uc: &mut Unicorn<'_, Context>| {
             let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 200 {
                 let client = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -5956,11 +6133,12 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     target
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
     let send_service_result = base_address + MAP_DATA_SEND_SERVICE_RESULT;
-    unicorn
-        .add_code_hook(send_service_result as u64, send_service_result as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, send_service_result, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5963", move |uc: &mut Unicorn<'_, Context>| {
             let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 200 {
                 let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -5970,8 +6148,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     result
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     // Who asks for a registration, does the 9 s retry timer fire, and does the
     // conf handling run: procmapengine sends ServiceRegister for svc 0x26 twice
@@ -5982,12 +6161,12 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         (AIL_EN_HANDLE_ASYNC_REGISTER_CONF, "vHandleAsyncRegisterConf"),
     ] {
         let entry = base_address + offset;
-        unicorn
-            .add_code_hook(entry as u64, entry as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, entry, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5986", move |uc: &mut Unicorn<'_, Context>| {
                 static REG_TRACE_COUNT: std::sync::atomic::AtomicU32 =
                     std::sync::atomic::AtomicU32::new(0);
                 if REG_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) >= 40 {
-                    return;
+                    return 0;
                 }
                 let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
                 let this = read(RegisterARM::R0);
@@ -6009,13 +6188,14 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     read_u32_or_invalid(uc, this + 0x70),
                     read_u32_or_invalid(uc, this + 0x74),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     let post_message_entry = base_address + AIL_EN_POST_MESSAGE_ENTRY;
-    unicorn
-        .add_code_hook(post_message_entry as u64, post_message_entry as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, post_message_entry, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6018", move |uc: &mut Unicorn<'_, Context>| {
             let count = AIL_MAIL_VALIDITY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 20 {
                 log::info!(
@@ -6029,12 +6209,13 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     read_u32_or_invalid(uc, uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32 + 0x50)
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     let mail_validity_entry = base_address + AIL_EN_CHECK_CLIENT_MAIL_VALIDITY;
-    unicorn
-        .add_code_hook(mail_validity_entry as u64, mail_validity_entry as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, mail_validity_entry, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6037", move |uc: &mut Unicorn<'_, Context>| {
             let count = AIL_MAIL_VALIDITY_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 20 {
                 let app_id = (uc.reg_read(RegisterARM::R0).unwrap_or(0) & 0xffff) as u32;
@@ -6065,15 +6246,13 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     read_u16_or_invalid(uc, first_node + 14) & 0xff
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     let mail_validity_epilogue = base_address + AIL_EN_CHECK_CLIENT_MAIL_VALIDITY_EPILOGUE;
-    unicorn
-        .add_code_hook(
-            mail_validity_epilogue as u64,
-            mail_validity_epilogue as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, mail_validity_epilogue, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6073", move |uc: &mut Unicorn<'_, Context>| {
                 let count = AIL_MAIL_VALIDITY_RESULT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 20 {
                     log::info!(
@@ -6082,9 +6261,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         uc.reg_read(RegisterARM::R4).unwrap_or(0)
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     for (name, offset) in [
         ("after validity", AIL_EN_POST_MESSAGE_AFTER_VALIDITY),
@@ -6094,8 +6273,8 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         ("delete path", AIL_EN_POST_MESSAGE_DELETE_PATH),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6098", move |uc: &mut Unicorn<'_, Context>| {
                 let count = AIL_POST_MESSAGE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 40 {
                     let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
@@ -6112,16 +6291,14 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         uc.reg_read(RegisterARM::LR).unwrap_or(0),
                     );
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     let cca_get_block_ids_result = base_address + MAP_DATA_CCA_GET_BLOCK_IDS_RESULT;
-    unicorn
-        .add_code_hook(
-            cca_get_block_ids_result as u64,
-            cca_get_block_ids_result as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, cca_get_block_ids_result, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6121", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 200 {
                     let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -6131,9 +6308,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         result
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     for (name, offset) in [
         (
@@ -6149,8 +6326,8 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         ),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6153", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 200 {
                     let service_data = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -6167,8 +6344,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         mdm_ref
                     );
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // Job-queue tail of the LoadBlocks answer path: vHandleLoadBlocks creates
@@ -6183,8 +6361,8 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         let statics = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let queued = std::sync::Arc::clone(&statics);
         let addr = base_address + 0x0053_a094u32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6187", move |uc: &mut Unicorn<'_, Context>| {
                 let count = queued.fetch_add(1, Ordering::Relaxed);
                 if count < 200 {
                     let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -6197,12 +6375,13 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
                     );
                 }
-            })
-            .unwrap();
+            
+                0
+            });
         let executed = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let addr = base_address + 0x004b_5420u32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6205", move |uc: &mut Unicorn<'_, Context>| {
                 let count = executed.fetch_add(1, Ordering::Relaxed);
                 if count < 200 {
                     let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -6218,8 +6397,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
                     );
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // r579: `map_tclJobRCMapObjectsUpdate` (vtable 0x6abe80) reached the render
@@ -6232,11 +6412,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
     {
         let mo_exec = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let addr = base_address + 0x004d_37e0u32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6236", move |uc: &mut Unicorn<'_, Context>| {
                 let count = mo_exec.fetch_add(1, Ordering::Relaxed);
                 if count >= 100 {
-                    return;
+                    return 0;
                 }
                 let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let vec = read_u32_or_invalid(uc, this + 0x54);
@@ -6250,15 +6430,16 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     n,
                     view
                 );
-            })
-            .unwrap();
+            
+                0
+            });
         let tex = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let addr = base_address + 0x0055_6170u32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6258", move |uc: &mut Unicorn<'_, Context>| {
                 let count = tex.fetch_add(1, Ordering::Relaxed);
                 if count >= 60 {
-                    return;
+                    return 0;
                 }
                 let mo = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let fbo = read_u32_or_invalid(uc, base_address + (0x0071_ae94u32 - ORIGINAL_BASE));
@@ -6268,15 +6449,16 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     mo,
                     fbo
                 );
-            })
-            .unwrap();
+            
+                0
+            });
         let scene = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let addr = base_address + 0x0043_57c8u32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6276", move |uc: &mut Unicorn<'_, Context>| {
                 let count = scene.fetch_add(1, Ordering::Relaxed);
                 if count >= 100 {
-                    return;
+                    return 0;
                 }
                 let job = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 log::info!(
@@ -6291,8 +6473,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     read_u32_or_invalid(uc, job + 0x20),
                     read_u32_or_invalid(uc, job + 0x54)
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // r580: procmapengine's GL traffic is shader/state setup plus exactly the
@@ -6308,35 +6491,45 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         let branch = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let page_lo = base_address + (0x004d_3000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x004d_3870u32, 0x004d_3888u32, 0x004d_38a0u32, 0x004d_383cu32] {
+                    let base_address = base_address.clone();
+                    let branch = branch.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6343", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 let label = match original {
                     0x004d_3870 => "after MO vcall+0x138 (1=relevant)",
                     0x004d_3888 => "after MO vcall+0x1a8 (0=skip)",
                     0x004d_38a0 => "GO texture update (bl bCheckForTextureUpdateBasedOnNewMO)",
                     0x004d_383c => "skip-object tail (vcall+0x1ac only)",
-                    _ => return,
+                    _ => return 0,
                 };
                 let count = branch.fetch_add(1, Ordering::Relaxed);
                 if count >= 120 {
-                    return;
+                    return 0;
                 }
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
                 log::info!(
                     "PROCMAPENGINE render trace MO-loop {label} at {original:#x}: r0={r0:#x} mo={r4:#x}"
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
         let texinit = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let addr = base_address + 0x0055_817cu32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6336", move |uc: &mut Unicorn<'_, Context>| {
                 let count = texinit.fetch_add(1, Ordering::Relaxed);
                 if count >= 8 {
-                    return;
+                    return 0;
                 }
                 log::info!(
                     "PROCMAPENGINE render trace DTM_Texture_Helper::bInit_Textures entry at {:#x}: this={:#x} lr={:#x}",
@@ -6344,8 +6537,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
                     uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // r582 (EMU_GPU_TRACE_ALL): procmapengine's complete GL vocabulary is
@@ -6361,16 +6555,23 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         let pre = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let page_lo = base_address + (0x0052_f000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x0052_f184u32] {
+                    let base_address = base_address.clone();
+                    let pre = pre.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6397", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 if original != 0x0052_f184 {
-                    return;
+                    return 0;
                 }
                 let count = pre.fetch_add(1, Ordering::Relaxed);
                 if count >= 60 {
-                    return;
+                    return 0;
                 }
                 let mcp = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
                 let view = read_u32_or_invalid(uc, mcp.wrapping_add(5)) & 0xff;
@@ -6386,8 +6587,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     active,
                     nodes
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
 
     // r583: PreRender sees alstActive.count=0 every frame.  Its list-builder
@@ -6399,11 +6603,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
     {
         let upd = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let addr = base_address + 0x0042_a8ecu32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6403", move |uc: &mut Unicorn<'_, Context>| {
                 let count = upd.fetch_add(1, Ordering::Relaxed);
                 if count >= 40 {
-                    return;
+                    return 0;
                 }
                 let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let mcp = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -6427,8 +6631,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     r2,
                     r3
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // Zero r584 hits on UpdateDrawLayerListsForDTM: PreRender's DAT-gate skips
@@ -6444,11 +6649,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         // r603); its question is answered (only _INIT_8 zeroes it).
         let upd = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let addr = base_address + 0x003b_d940u32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6448", move |uc: &mut Unicorn<'_, Context>| {
                 let count = upd.fetch_add(1, Ordering::Relaxed);
                 if count >= 30 {
-                    return;
+                    return 0;
                 }
                 let mcp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let view = read_u32_or_invalid(uc, mcp.wrapping_add(5)) & 0xff;
@@ -6459,15 +6664,16 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     view,
                     uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
                 );
-            })
-            .unwrap();
+            
+                0
+            });
         let drw = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let addr = base_address + 0x003c_ef80u32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6467", move |uc: &mut Unicorn<'_, Context>| {
                 let count = drw.fetch_add(1, Ordering::Relaxed);
                 if count >= 30 {
-                    return;
+                    return 0;
                 }
                 log::info!(
                     "PROCMAPENGINE render trace DTMTextureDummy::Draw entry at {:#x}: this={:#x} r1={:#x} lr={:#x}",
@@ -6476,8 +6682,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
                     uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // r584/r585: PreRender returns 0 every frame (DTM node lists never
@@ -6493,11 +6700,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
     {
         let exec = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let addr = base_address + 0x0052_d618u32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6497", move |uc: &mut Unicorn<'_, Context>| {
                 let count = exec.fetch_add(1, Ordering::Relaxed);
                 if count >= 40 {
-                    return;
+                    return 0;
                 }
                 let renderer = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let renderer_obj = read_u32_or_invalid(uc, renderer.wrapping_add(0x18));
@@ -6518,15 +6725,16 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     table,
                     count
                 );
-            })
-            .unwrap();
+            
+                0
+            });
         let flip = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let addr = base_address + 0x0055_20d8u32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6526", move |uc: &mut Unicorn<'_, Context>| {
                 let count = flip.fetch_add(1, Ordering::Relaxed);
                 if count >= 40 {
-                    return;
+                    return 0;
                 }
                 log::info!(
                     "PROCMAPENGINE render trace Surface::Flip entry at {:#x}: surface={:#x} count={:#x}",
@@ -6534,12 +6742,13 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
                     count
                 );
-            })
-            .unwrap();
+            
+                0
+            });
         let dl = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let addr = base_address + 0x0052_ccc8u32 - ORIGINAL_BASE;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6542", move |uc: &mut Unicorn<'_, Context>| {
                 // r630b: the flat 120-cap was exhausted within the first
                 // few frames (43 layers per pass), hiding the tail where the
                 // harvest fills lists.  Log only NON-EMPTY lists (plus a
@@ -6557,10 +6766,10 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 let vtbl = if w1 == 0 { 0 } else { read_u32_or_invalid(uc, w1) };
                 let non_empty = cnt != 0;
                 if !non_empty && (count % 4300 != 0 || count >= 47_300) {
-                    return;
+                    return 0;
                 }
                 if non_empty && count >= 100_000 {
-                    return;
+                    return 0;
                 }
                 log::info!(
                     "PROCMAPENGINE render trace DrawList entry at {:#x}: layer={:#x} elem_list={:#x} w0={:#x} w1={:#x} w2={:#x} count={:#x} t={}ms elems={} vtbl={:#x}",
@@ -6575,8 +6784,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     cnt,
                     vtbl
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     // r637: the per-element draw call of the DrawList loop (verified ARM
@@ -6592,12 +6802,19 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         let drawn = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let page_lo = base_address + (0x0052_c000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x0052_cd40u32] {
+                    let base_address = base_address.clone();
+                    let drawn = drawn.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6634", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 if original != 0x0052_cd40u32 {
-                    return;
+                    return 0;
                 }
                 let count = drawn.fetch_add(1, Ordering::Relaxed);
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -6617,7 +6834,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     read_u32_or_invalid(uc, vtbl.wrapping_add(0x38))
                 };
                 if count >= 60 {
-                    return;
+                    return 0;
                 }
                 log::info!(
                     "PROCMAPENGINE render trace MOUpd elem-draw t={}ms this={:#x} vtbl={:#x} a_r1={:#x} a_r2={:#x} a_r3={:#x} idx={} iter={:#x} target={:#x} n={}",
@@ -6632,8 +6849,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     target,
                     count
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
 
     // r587: 43 layers iterate, every per-layer element list is empty
@@ -6647,16 +6867,23 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         let det = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let page_lo = base_address + (0x0052_e000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x0052_e340u32, 0x0052_e870u32] {
+                    let base_address = base_address.clone();
+                    let det = det.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6689", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 if original != 0x0052_e340 && original != 0x0052_e870 {
-                    return;
+                    return 0;
                 }
                 let count = det.fetch_add(1, Ordering::Relaxed);
                 if count >= 20 {
-                    return;
+                    return 0;
                 }
                 let scene = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 log::info!(
@@ -6701,20 +6928,29 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         read_u32_or_invalid(uc, cell_obj.wrapping_add(0xc)),
                     );
                 }
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
         let ins = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         // r741: page dispatch (narrow entry hooks under-count, AGENTS.md).
         let page_lo = base_address + (0x0043_c000u32 - ORIGINAL_BASE);
         let addr = base_address + (0x0043_cad8u32 - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(page_lo as u64, page_lo as u64 + 0xfff, move |uc, _, _| {
-                if uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32 != addr {
-                    return;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                {
+                    let addr = addr.clone();
+                    let ins = ins.clone();
+                    let __site_pc: u32 = addr;
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6749r0", move |uc: &mut Unicorn<'_, Context>| {
+                if __site_pc != addr {
+                    return 0;
                 }
                 let count = ins.fetch_add(1, Ordering::Relaxed);
                 if count >= 40 {
-                    return;
+                    return 0;
                 }
                 log::info!(
                     "PROCMAPENGINE render trace s32InsertMO entry at {:#x}: map_object={:#x} count={:#x}",
@@ -6722,8 +6958,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
                     count
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
         // `DetermineMapObjects` only inserts MOs into the DTM grid when the
         // per-view cell array (scene+0x30+view*4, `*count` there) is non-zero;
         // those arrays are fed by the raw data blocks created from the
@@ -6768,11 +7007,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 .unwrap();
             let add = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let addr = base_address + 0x0051_64e0u32 - ORIGINAL_BASE;
-            unicorn
-                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6772", move |uc: &mut Unicorn<'_, Context>| {
                     let count = add.fetch_add(1, Ordering::Relaxed);
                     if count >= 40 {
-                        return;
+                        return 0;
                     }
                     log::info!(
                         "PROCMAPENGINE render trace AddNewRawDataBlock entry at {:#x}: block={:#x} count={:#x}",
@@ -6780,8 +7019,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
                         count
                     );
-                })
-                .unwrap();
+                
+                    0
+                });
         }
         // r590: raw data blocks ARE created/added (24x), yet the per-view
         // active-MO array stays empty.  `PerformLocalUpdateOfMapObjects`
@@ -6794,11 +7034,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         {
             let plc = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let addr = base_address + 0x0042_c49cu32 - ORIGINAL_BASE;
-            unicorn
-                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6798", move |uc: &mut Unicorn<'_, Context>| {
                     let count = plc.fetch_add(1, Ordering::Relaxed);
                     if count >= 30 {
-                        return;
+                        return 0;
                     }
                     let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                     let view = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xff;
@@ -6829,18 +7069,19 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         job_b,
                         count
                     );
-                })
-                .unwrap();
+                
+                    0
+                });
             // r603: the jobArray A/B/C write-watches were removed (the
             // SetCameraViewPointMOs entry probe shows the slot contents
             // directly) to keep the host section budget down.
             let setp = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let addr = base_address + 0x0043_2b44u32 - ORIGINAL_BASE;
-            unicorn
-                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6840", move |uc: &mut Unicorn<'_, Context>| {
                     let count = setp.fetch_add(1, Ordering::Relaxed);
                     if count >= 40 {
-                        return;
+                        return 0;
                     }
                     let array = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                     let job = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
@@ -6861,8 +7102,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         slot,
                         count
                     );
-                })
-                .unwrap();
+                
+                    0
+                });
             // Else leg 0x435d78 (view>4 || lod>3) - page hook, dispatch on pc.
             // r613: extend the dispatch with the two render-tail gates found
             // in `MapObjectsUpdate` (0x4357c8).  0x435940 (`LAB_00435940`) runs
@@ -6881,17 +7123,17 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             {
                 let fa = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                 let addr = base_address + 0x0042_8eecu32 - ORIGINAL_BASE;
-                unicorn
-                    .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6885", move |uc: &mut Unicorn<'_, Context>| {
                         let job = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                         if job == 0 {
                             // PLU also calls for (view,lod) combos whose slot
                             // is empty; those trivially bail. Not interesting.
-                            return;
+                            return 0;
                         }
                         let count = fa.fetch_add(1, Ordering::Relaxed);
                         if count >= 300 {
-                            return;
+                            return 0;
                         }
                         let rect3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
                         let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
@@ -6921,8 +7163,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                             read_u32_or_invalid(uc, rect4 + 0xc),
                             count
                         );
-                    })
-                    .unwrap();
+                    
+                        0
+                    });
             }
             // r622: three-way visibility into the same function's rect gate:
             // 0x4291b0 = centre rect (param_4) covered, 0x429014 = surround
@@ -6935,19 +7178,26 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 let page_lo = base_address + (0x0042_8000u32 - ORIGINAL_BASE);
                 let page_hi = page_lo + 0x1fff;
                 let gt = gate.clone();
-                unicorn
-                    .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                        let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                
+{
+                        // r746: page hook expanded to per-arm svc#0 trap sites.
+                        for __arm in [0x0042_91b0u32, 0x0042_9014u32, 0x0042_8fd8u32] {
+                            let base_address = base_address.clone();
+                            let gt = gt.clone();
+                            let __arm: u32 = __arm;
+                            let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                            crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6981", move |uc: &mut Unicorn<'_, Context>| {
+                        let pc = __site_pc;
                         let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                         let tag = match original {
                             0x0042_91b0u32 => "fill-gate1",
                             0x0042_9014u32 => "fill-gate23",
                             0x0042_8fd8u32 => "fill-bail",
-                            _ => return,
+                            _ => return 0,
                         };
                         let n = gt.fetch_add(1, Ordering::Relaxed);
                         if n >= 60 {
-                            return;
+                            return 0;
                         }
                         let job = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
                         let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
@@ -6981,8 +7231,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                             read_u32_or_invalid(uc, rect5 + 0xc),
                             n
                         );
-                    })
-                    .unwrap();
+                    
+                                0
+                            });
+                        }
+                    }
             }
             // r623/r626: `GlobalViewRect_2D` builds the per-frame DOM rect
             // as corner offsets (mcp+0x14..+0x20 fixed-point corners times a
@@ -7107,11 +7360,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             {
                 let gr = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                 let addr = base_address + 0x0044_b14cu32 - ORIGINAL_BASE;
-                unicorn
-                    .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:7111", move |uc: &mut Unicorn<'_, Context>| {
                         let count = gr.fetch_add(1, Ordering::Relaxed);
                         if count >= 12 {
-                            return;
+                            return 0;
                         }
                         let rect = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                         let mcp = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -7155,8 +7408,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                             read_u32_or_invalid(uc, mcp + 0x5c),
                             read_u32_or_invalid(uc, mcp + 0x60)
                         );
-                    })
-                    .unwrap();
+                    
+                        0
+                    });
             }
             let lab = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let cp2 = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -7181,15 +7435,29 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             let armed: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u32>>> =
                 std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
             let armed_c = armed.clone();
-            unicorn
-                .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+            
+{
+                    // r746: page hook expanded to per-arm svc#0 trap sites.
+                    for __arm in [0x0043_5d78u32, 0x0043_5db0u32, 0x0043_5940u32, 0x0043_5950u32, 0x0043_595cu32, 0x0043_5974u32, 0x0043_6014u32] {
+                        let armed_c = armed_c.clone();
+                        let base_address = base_address.clone();
+                        let cp2_c = cp2_c.clone();
+                        let els = els.clone();
+                        let g590 = g590.clone();
+                        let g591 = g591.clone();
+                        let g592 = g592.clone();
+                        let lab_c = lab_c.clone();
+                        let __arm: u32 = __arm;
+                        let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                        crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:7228", move |uc: &mut Unicorn<'_, Context>| {
+                let size = 4u32;
+                    let pc = __site_pc;
                     let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                     match original {
                         0x0043_5d78u32 => {
                             let count = els.fetch_add(1, Ordering::Relaxed);
                             if count >= 20 {
-                                return;
+                                return 0;
                             }
                             log::info!(
                                 "PROCMAPENGINE render trace MapObjectsUpdate-else-leg 0x435d78 hit at {:#x} count={:#x}",
@@ -7223,7 +7491,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                             if FC.fetch_add(1, Ordering::Relaxed) >= 80 {
                                                 return true;
                                             }
-                                            let pc = uc2.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                                            let pc = __site_pc;
                                             let lr = uc2.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
                                             log::warn!(
                                                 "PROCMAPENGINE render trace MOUpd flag50 WRITE t={}ms thread=[{}] job={:#x} size={} value={:#x} pc={:#x} lr={:#x}",
@@ -7241,7 +7509,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                 }
                             }
                             if count >= 60 {
-                                return;
+                                return 0;
                             }
                             log::info!(
                                 "PROCMAPENGINE render trace MOUpd combined t={}ms stored={:#x} stored28={:#x} stored50={:#x} newjob={:#x} new28={:#x} new50={:#x} res={:#x} count={:#x}",
@@ -7295,7 +7563,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         0x0043_6014u32 => {
                             let count = cp2_c.fetch_add(1, Ordering::Relaxed);
                             if count >= 150 {
-                                return;
+                                return 0;
                             }
                             let job = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
                             let arr = read_u32_or_invalid(uc, job + 0x54);
@@ -7318,8 +7586,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         }
                         _ => {}
                     }
-                })
-                .unwrap();
+                
+                            0
+                        });
+                    }
+                }
             // r616: `DetermineMapObjects` (0x430f34) calls
             // `PerformLocalUpdateOfMapObjects` at 0x4317b8 - the harvest step
             // that feeds the per-frame element lists - but five branches skip
@@ -7333,9 +7604,16 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 let page_lo = base_address + (0x0043_1000u32 - ORIGINAL_BASE);
                 let page_hi = page_lo + 0x1fff;
                 let sk = domskip.clone();
-                unicorn
-                    .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                        let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                
+{
+                        // r746: page hook expanded to per-arm svc#0 trap sites.
+                        for __arm in [0x0043_1718u32, 0x0043_17bcu32, 0x0043_186cu32, 0x0043_28b4u32, 0x0043_2a44u32, 0x0043_2a50u32] {
+                            let base_address = base_address.clone();
+                            let sk = sk.clone();
+                            let __arm: u32 = __arm;
+                            let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                            crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:7380", move |uc: &mut Unicorn<'_, Context>| {
+                        let pc = __site_pc;
                         let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                         if !matches!(
                             original,
@@ -7346,11 +7624,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                 | 0x0043_2a44u32
                                 | 0x0043_2a50u32
                         ) {
-                            return;
+                            return 0;
                         }
                         let n = sk.fetch_add(1, Ordering::Relaxed);
                         if n >= 200 {
-                            return;
+                            return 0;
                         }
                         let mcp = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
                         let view = read_u8_or_invalid(uc, mcp + 5);
@@ -7378,7 +7656,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                 view,
                                 r0
                             );
-                            return;
+                            return 0;
                         }
                         log::info!(
                             "PROCMAPENGINE render trace DOM-leg t={}ms leg={:#x} mcp={:#x} mcpaa={:#x} view={} n={}",
@@ -7389,8 +7667,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                             view,
                             n
                         );
-                    })
-                    .unwrap();
+                    
+                                0
+                            });
+                        }
+                    }
             }
             // `FillActiveMOArrayFromRCMapObjectsRequest` (which alone fills the
             // per-view active-MO array DetermineMapObjects walks) runs only
@@ -7404,11 +7685,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
             {
                 let cj = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                 let addr = base_address + 0x004c_5bacu32 - ORIGINAL_BASE;
-                unicorn
-                    .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:7408", move |uc: &mut Unicorn<'_, Context>| {
                         let count = cj.fetch_add(1, Ordering::Relaxed);
                         if count >= 60 {
-                            return;
+                            return 0;
                         }
                         let vp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                         let pp = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -7423,15 +7704,16 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                             uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
                             count
                         );
-                    })
-                    .unwrap();
+                    
+                        0
+                    });
                 let glb = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                 let addr = base_address + 0x0050_54f4u32 - ORIGINAL_BASE;
-                unicorn
-                    .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:7431", move |uc: &mut Unicorn<'_, Context>| {
                         let count = glb.fetch_add(1, Ordering::Relaxed);
                         if count >= 30 {
-                            return;
+                            return 0;
                         }
                         let req = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                         let a1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -7448,8 +7730,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                             read_u32_or_invalid(uc, a2),
                             count
                         );
-                    })
-                    .unwrap();
+                    
+                        0
+                    });
                 // The camera-viewpoint request is a static at 0x78fcd4 (its
                 // +0x74 state stays 1 forever -> every RC job is created with
                 // reqstate 1 -> FillActiveMOArrayFromRCMapObjectsRequest never
@@ -7577,17 +7860,24 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     {
                         let lo = page_lo;
                         let cnt = std::sync::Arc::clone(&gbids);
-                        unicorn
-                            .add_code_hook(lo as u64, (page_hi) as u64, move |uc, _, _| {
-                                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                        
+{
+                                // r746: page hook expanded to per-arm svc#0 trap sites.
+                                for __arm in [0x0050_7de0u32] {
+                                    let base_address = base_address.clone();
+                                    let cnt = cnt.clone();
+                                    let __arm: u32 = __arm;
+                                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:7626", move |uc: &mut Unicorn<'_, Context>| {
+                                let pc = __site_pc;
                                 let original =
                                     pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                                 if original != 0x0050_7de0u32 {
-                                    return;
+                                    return 0;
                                 }
                                 let count = cnt.fetch_add(1, Ordering::Relaxed);
                                 if count >= 40 {
-                                    return;
+                                    return 0;
                                 }
                                 let req = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                                 log::info!(
@@ -7629,8 +7919,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                     ccount,
                                     f1f8,
                                 );
-                            })
-                            .unwrap();
+                            
+                                        0
+                                    });
+                                }
+                            }
                     }
                     // Return site (bl at 0x511fd8 -> 0x511fdc) and a one-shot
                     // armed trace of the very first GetBlockIDs body to see
@@ -7639,25 +7932,35 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         let ret = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                         let page_lo = base_address + (0x0051_1000u32 - ORIGINAL_BASE);
                         let page_hi = page_lo + 0xfff;
-                        unicorn
-                            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                        
+{
+                                // r746: page hook expanded to per-arm svc#0 trap sites.
+                                for __arm in [0x0051_1fdcu32] {
+                                    let base_address = base_address.clone();
+                                    let ret = ret.clone();
+                                    let __arm: u32 = __arm;
+                                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:7688", move |uc: &mut Unicorn<'_, Context>| {
+                                let pc = __site_pc;
                                 let original =
                                     pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                                 if original != 0x0051_1fdcu32 {
-                                    return;
+                                    return 0;
                                 }
                                 let count = ret.fetch_add(1, Ordering::Relaxed);
                                 if count >= 40 {
-                                    return;
+                                    return 0;
                                 }
                                 log::info!(
                                     "PROCMAPENGINE render trace MDM::GetBlockIDs return r0={:#x} count={:#x}",
                                     uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
                                     count
                                 );
-                            })
-                            .unwrap();
+                            
+                                        0
+                                    });
+                                }
+                            }
                     }
                     let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let steps = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -7669,11 +7972,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     {
                         let sdm = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                         let addr = base_address + 0x004b_fd08u32 - ORIGINAL_BASE;
-                        unicorn
-                            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+                        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:7673", move |uc: &mut Unicorn<'_, Context>| {
                                 let count = sdm.fetch_add(1, Ordering::Relaxed);
                                 if count >= 40 {
-                                    return;
+                                    return 0;
                                 }
                                 let thisp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                                 log::info!(
@@ -7683,8 +7986,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                     read_u32_or_invalid(uc, thisp + 4),
                                     count
                                 );
-                            })
-                            .unwrap();
+                            
+                                0
+                            });
                     }
                     let page_lo = base_address + (0x0050_7000u32 - ORIGINAL_BASE);
                     let page_hi = page_lo + 0xfff;
@@ -7695,9 +7999,17 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         let steps = std::sync::Arc::clone(&steps);
                         let start = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                         let _start = start;
-                        unicorn
-                            .add_code_hook(lo as u64, hi as u64, move |uc, _, _| {
-                                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                        
+{
+                                // r746: page hook expanded to per-arm svc#0 trap sites.
+                                for __arm in [0x0050_7de0u32] {
+                                    let armed = armed.clone();
+                                    let base_address = base_address.clone();
+                                    let steps = steps.clone();
+                                    let __arm: u32 = __arm;
+                                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:7745", move |uc: &mut Unicorn<'_, Context>| {
+                                let pc = __site_pc;
                                 let original =
                                     pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                                 if original == 0x0050_7de0u32 {
@@ -7705,27 +8017,30 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                     if steps.load(Ordering::Relaxed) == 0 {
                                         armed.store(true, Ordering::Relaxed);
                                     }
-                                    return;
+                                    return 0;
                                 }
                                 if !armed.load(Ordering::Relaxed) {
-                                    return;
+                                    return 0;
                                 }
                                 let n = steps.fetch_add(1, Ordering::Relaxed);
                                 if n >= 700 {
                                     armed.store(false, Ordering::Relaxed);
-                                    return;
+                                    return 0;
                                 }
                                 if original < 0x0050_7de0u32 || original > 0x0050_8490u32 {
                                     armed.store(false, Ordering::Relaxed);
-                                    return;
+                                    return 0;
                                 }
                                 log::info!(
                                     "PROCMAPENGINE gbids-step {:#010x} (left {})",
                                     original,
                                     700 - n
                                 );
-                            })
-                            .unwrap();
+                            
+                                        0
+                                    });
+                                }
+                            }
                     }
                 }
                 // The request static (0x78fcd4) tracks outstanding work at
@@ -7737,17 +8052,24 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     let ihm = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                     let page_lo = base_address + (0x0051_1000u32 - ORIGINAL_BASE);
                     let page_hi = page_lo + 0xfff;
-                    unicorn
-                        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                    
+{
+                            // r746: page hook expanded to per-arm svc#0 trap sites.
+                            for __arm in [0x0051_16d4u32] {
+                                let base_address = base_address.clone();
+                                let ihm = ihm.clone();
+                                let __arm: u32 = __arm;
+                                let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                                crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:7787", move |uc: &mut Unicorn<'_, Context>| {
+                            let pc = __site_pc;
                             let original =
                                 pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                             if original != 0x0051_16d4u32 {
-                                return;
+                                return 0;
                             }
                             let count = ihm.fetch_add(1, Ordering::Relaxed);
                             if count >= 80 {
-                                return;
+                                return 0;
                             }
                             // The camera-viewpoint request is the static at
                             // 0x78fcd4; dump it directly (r0 is a byte arg).
@@ -7763,8 +8085,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                 read_u32_or_invalid(uc, req_static + 0x200),
                                 count
                             );
-                        })
-                        .unwrap();
+                        
+                                    0
+                                });
+                            }
+                        }
                 }
                 // r606: promotion 1->2 requires BOTH LeftToFetch fields back to
                 // -1.  +0x1f4 (visible) completes, but +0x1f8 (synch/elevation)
@@ -7780,15 +8105,24 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     let page_lo = base_address + (0x0051_9000u32 - ORIGINAL_BASE);
                     let page_hi = page_lo + 0xfff;
                     let loaders = base_address + (0x0079_0744u32 - ORIGINAL_BASE);
-                    unicorn
-                        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                    
+{
+                            // r746: page hook expanded to per-arm svc#0 trap sites.
+                            for __arm in [0x0051_9548u32, 0x0051_9578u32, 0x0051_957cu32] {
+                                let base_address = base_address.clone();
+                                let loaders = loaders.clone();
+                                let ret = ret.clone();
+                                let syn = syn.clone();
+                                let __arm: u32 = __arm;
+                                let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                                crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:7830", move |uc: &mut Unicorn<'_, Context>| {
+                            let pc = __site_pc;
                             let original =
                                 pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                             if original == 0x0051_9548u32 {
                                 let count = syn.fetch_add(1, Ordering::Relaxed);
                                 if count >= 12 {
-                                    return;
+                                    return 0;
                                 }
                                 let np = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                                 let node = read_u32_or_invalid(uc, np) & 0xff;
@@ -7806,15 +8140,18 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                             } else if original == 0x0051_9578u32 || original == 0x0051_957cu32 {
                                 let count = ret.fetch_add(1, Ordering::Relaxed);
                                 if count >= 12 {
-                                    return;
+                                    return 0;
                                 }
                                 log::info!(
                                     "PROCMAPENGINE render trace SynchGetBlockIDs return site={original:#x} r0={:#x} count={count}",
                                     uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
                                 );
                             }
-                        })
-                        .unwrap();
+                        
+                                    0
+                                });
+                            }
+                        }
                 }
                 // r608: the request-state zeroing at 0x50ccf0 (inside
                 // PerformMapDataRequest) destroys accepted 34-block rounds
@@ -7833,9 +8170,17 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         let lo = base_address + (page - ORIGINAL_BASE);
                         let armed = std::sync::Arc::clone(&armed);
                         let steps = std::sync::Arc::clone(&steps);
-                        unicorn
-                            .add_code_hook(lo as u64, (lo + 0xfff) as u64, move |uc, _, _| {
-                                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                        
+{
+                                // r746: page hook expanded to per-arm svc#0 trap sites.
+                                for __arm in [0x0050_ccf0u32] {
+                                    let armed = armed.clone();
+                                    let base_address = base_address.clone();
+                                    let steps = steps.clone();
+                                    let __arm: u32 = __arm;
+                                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:7883", move |uc: &mut Unicorn<'_, Context>| {
+                                let pc = __site_pc;
                                 let original =
                                     pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                                 if original == 0x0050_ccf0u32 && steps.load(Ordering::Relaxed) == 0
@@ -7846,15 +8191,15 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                         crate::libs::dapi::emu_t0_elapsed_ms(),
                                         uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
                                     );
-                                    return;
+                                    return 0;
                                 }
                                 if !armed.load(Ordering::Relaxed) {
-                                    return;
+                                    return 0;
                                 }
                                 let n = steps.fetch_add(1, Ordering::Relaxed);
                                 if n >= 400 {
                                     armed.store(false, Ordering::Relaxed);
-                                    return;
+                                    return 0;
                                 }
                                 if original < 0x0050_c000u32 || original > 0x0050_dfffu32 {
                                     armed.store(false, Ordering::Relaxed);
@@ -7863,7 +8208,7 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                         original,
                                         uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32
                                     );
-                                    return;
+                                    return 0;
                                 }
                                 log::info!(
                                     "PROCMAPENGINE reset-step {:#010x} lr={:#x} (left {})",
@@ -7871,8 +8216,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                     uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
                                     400 - n
                                 );
-                            })
-                            .unwrap();
+                            
+                                        0
+                                    });
+                                }
+                            }
                     }
                 }
                 // r606: the request state climbs 0->1 then is reset to 0
@@ -7887,17 +8235,24 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     let upd = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                     let page_lo = base_address + (0x0050_4000u32 - ORIGINAL_BASE);
                     let page_hi = page_lo + 0xfff;
-                    unicorn
-                        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                    
+{
+                            // r746: page hook expanded to per-arm svc#0 trap sites.
+                            for __arm in [0x0050_494cu32] {
+                                let base_address = base_address.clone();
+                                let upd = upd.clone();
+                                let __arm: u32 = __arm;
+                                let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                                crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:7937", move |uc: &mut Unicorn<'_, Context>| {
+                            let pc = __site_pc;
                             let original =
                                 pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                             if original != 0x0050_494cu32 {
-                                return;
+                                return 0;
                             }
                             let count = upd.fetch_add(1, Ordering::Relaxed);
                             if count >= 160 {
-                                return;
+                                return 0;
                             }
                             let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
                             log::info!(
@@ -7914,22 +8269,32 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                 uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
                                 count
                             );
-                        })
-                        .unwrap();
+                        
+                                    0
+                                });
+                            }
+                        }
                     let perf = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
                     let page_lo = base_address + (0x0050_c000u32 - ORIGINAL_BASE);
                     let page_hi = page_lo + 0xfff;
-                    unicorn
-                        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                    
+{
+                            // r746: page hook expanded to per-arm svc#0 trap sites.
+                            for __arm in [0x0050_c93cu32] {
+                                let base_address = base_address.clone();
+                                let perf = perf.clone();
+                                let __arm: u32 = __arm;
+                                let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                                crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:7969", move |uc: &mut Unicorn<'_, Context>| {
+                            let pc = __site_pc;
                             let original =
                                 pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                             if original != 0x0050_c93cu32 {
-                                return;
+                                return 0;
                             }
                             let count = perf.fetch_add(1, Ordering::Relaxed);
                             if count >= 160 {
-                                return;
+                                return 0;
                             }
                             let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
                             log::info!(
@@ -7946,8 +8311,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                                 uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
                                 count
                             );
-                        })
-                        .unwrap();
+                        
+                                    0
+                                });
+                            }
+                        }
                 }
             }
         }
@@ -7965,16 +8333,23 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         let dispatch_watch = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let page_lo = base_address + (0x0059_2000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x0059_2454u32, 0x0059_23e8u32] {
+                    let base_address = base_address.clone();
+                    let dispatch_watch = dispatch_watch.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8015", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 let entry_hit = original == 0x0059_2454;
                 // vOnUnhandledMessage (0x5923e8): reached from the walk's
                 // empty-tree arm (0x5924e8) - the message is deleted here.
                 let unhandled_hit = original == 0x0059_23e8;
                 if !entry_hit && !unhandled_hit {
-                    return;
+                    return 0;
                 }
                 let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let msg = if entry_hit {
@@ -7987,11 +8362,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 let svc = read_u16_or_invalid(uc, inner.wrapping_add(0x14));
                 let fnid = read_u16_or_invalid(uc, inner.wrapping_add(0x18));
                 if svc != 0x26 {
-                    return;
+                    return 0;
                 }
                 let count = dispatch_watch.fetch_add(1, Ordering::Relaxed);
                 if count >= 300 {
-                    return;
+                    return 0;
                 }
                 let opcode = read_u32_or_invalid(uc, inner.wrapping_add(0x1a)) & 0xff;
                 let mdm_ref = read_u16_or_invalid(uc, inner.wrapping_add(0x1c));
@@ -8005,8 +8380,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     opcode,
                     mdm_ref
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
 
     for (name, call_offset, result_offset) in [
@@ -8028,8 +8406,8 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
     ] {
         let call_addr = base_address + call_offset;
         let result_addr = base_address + result_offset;
-        unicorn
-            .add_code_hook(call_addr as u64, call_addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, call_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8032", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 200 {
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -8046,10 +8424,11 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         r3
                     );
                 }
-            })
-            .unwrap();
-        unicorn
-            .add_code_hook(result_addr as u64, result_addr as u64, move |uc, _, _| {
+            
+                0
+            });
+        
+crate::os::code_stub::trap_site(unicorn, result_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8052", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_DAPI_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 200 {
                     let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -8060,8 +8439,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         result
                     );
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     for (name, offset) in [
@@ -8069,8 +8449,8 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         ("wait", MAP_DATA_MAINLOOP_WAIT_GET_ELEMENT_RESULT),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8073", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_MAINLOOP_STATE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 // r438: the request=4 posfi job is delivered to the mainloop's
@@ -8082,10 +8462,10 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                 let job_type_now = read_u32_or_invalid(uc, job + 8);
                 let interesting = job_type_now != 0x45 && job_type_now != 0x83;
                 if !(posfi != 0 && job == posfi) && !interesting && count % 50 != 0 {
-                    return;
+                    return 0;
                 }
                 if job_type_now == 0x45 && count % 50 != 0 && !(posfi != 0 && job == posfi) {
-                    return;
+                    return 0;
                 }
                 let state = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
                 let thread = uc.get_data().inner.thread_id();
@@ -8105,8 +8485,9 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                     read_u32_or_invalid(uc, queue + 4),
                     read_u32_or_invalid(uc, queue + 8),
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     for (name, offset) in [
@@ -8114,8 +8495,8 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
         ("wait", MAP_DATA_MAINLOOP_WAIT_JOB_CAN_EXECUTE),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8118", move |uc: &mut Unicorn<'_, Context>| {
                 let count = MAP_DATA_MAINLOOP_JOB_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 100 {
                     let job = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
@@ -8130,16 +8511,17 @@ fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_a
                         target
                     );
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
 fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let queue_state_addr = base_address + RENDER_CONTROL_QUEUE_STATE;
     let add_job_addr = base_address + RENDER_CONTROL_ADD_JOB;
-    unicorn
-        .add_code_hook(add_job_addr as u64, add_job_addr as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, add_job_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8142", move |uc: &mut Unicorn<'_, Context>| {
             let count = RENDER_CONTROL_ADD_JOB_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 50 {
                 let job = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -8151,8 +8533,9 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
                     vtable
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     for (name, offset) in [
         ("JobRCStartQueue::Execute", RC_JOB_START_QUEUE_EXECUTE),
@@ -8162,8 +8545,8 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
         ("JobRCRenderView::Execute", RC_JOB_RENDER_VIEW_EXECUTE),
     ] {
         let job_addr = base_address + offset;
-        unicorn
-            .add_code_hook(job_addr as u64, job_addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, job_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8166", move |uc: &mut Unicorn<'_, Context>| {
                 let count = RC_JOB_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 100 {
                     let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -8174,8 +8557,9 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
                         this
                     );
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     for (name, offset) in [
@@ -8186,8 +8570,8 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
         ("RenderPixmapView view result", RC_JOB_RENDER_PIXMAP_VIEW_RESULT),
     ] {
         let step_addr = base_address + offset;
-        unicorn
-            .add_code_hook(step_addr as u64, step_addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, step_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8190", move |uc: &mut Unicorn<'_, Context>| {
                 let count = RC_JOB_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 100 {
                     let value = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -8198,16 +8582,14 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
                         value
                     );
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     let create_execute_result = base_address + RC_JOB_CREATE_VIEW_FINAL;
-    unicorn
-        .add_code_hook(
-            create_execute_result as u64,
-            create_execute_result as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, create_execute_result, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8207", move |uc: &mut Unicorn<'_, Context>| {
                 let count = RC_JOB_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 100 {
                     let job = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
@@ -8223,13 +8605,13 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
                         result
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let view_state_addr = base_address + RC_JOB_RENDER_PIXMAP_VIEW_STATE;
-    unicorn
-        .add_code_hook(view_state_addr as u64, view_state_addr as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, view_state_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8232", move |uc: &mut Unicorn<'_, Context>| {
             let count = RC_JOB_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 100 {
                 let state = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
@@ -8241,15 +8623,13 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
                     state
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     let map_view_render_addr = base_address + MAP_VIEW_RENDER_ENTRY;
-    unicorn
-        .add_code_hook(
-            map_view_render_addr as u64,
-            map_view_render_addr as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, map_view_render_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8249", move |uc: &mut Unicorn<'_, Context>| {
                 let count = RC_JOB_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 100 {
                     let view = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -8259,16 +8639,13 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
                         view
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let view_render_thread_addr = base_address + VIEW_RENDER_THREAD_ENTRY;
-    unicorn
-        .add_code_hook(
-            view_render_thread_addr as u64,
-            view_render_thread_addr as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, view_render_thread_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8268", move |uc: &mut Unicorn<'_, Context>| {
                 let count = RC_JOB_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 100 {
                     let renderer = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -8278,13 +8655,13 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
                         renderer
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     let peek_addr = base_address + RENDER_CONTROL_PEEK_RESULT;
-    unicorn
-        .add_code_hook(peek_addr as u64, peek_addr as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, peek_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8287", move |uc: &mut Unicorn<'_, Context>| {
             let count = RENDER_CONTROL_PEEK_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 50 {
                 let queue = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -8294,15 +8671,13 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
                     queue
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     let can_execute_addr = base_address + RENDER_CONTROL_JOB_CAN_EXECUTE_RESULT;
-    unicorn
-        .add_code_hook(
-            can_execute_addr as u64,
-            can_execute_addr as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, can_execute_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8302", move |uc: &mut Unicorn<'_, Context>| {
                 let count = RENDER_CONTROL_JOB_CAN_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 100 {
                     let result = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -8314,17 +8689,17 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
                         result
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
     for (name, offset) in [
         ("GetPeekedElement result", RENDER_CONTROL_JOB_RESULT),
         ("second virtual result", RENDER_CONTROL_SECOND_VIRTUAL_RESULT),
     ] {
         let step_addr = base_address + offset;
-        unicorn
-            .add_code_hook(step_addr as u64, step_addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, step_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8327", move |uc: &mut Unicorn<'_, Context>| {
                 let count = RENDER_CONTROL_JOB_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 100 {
                     let value = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -8335,13 +8710,14 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
                         value
                     );
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     let execute_addr = base_address + RENDER_CONTROL_EXECUTE_RESULT;
-    unicorn
-        .add_code_hook(execute_addr as u64, execute_addr as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, execute_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8344", move |uc: &mut Unicorn<'_, Context>| {
             let count = RENDER_CONTROL_EXECUTE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count < 100 {
                 let job = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
@@ -8353,15 +8729,13 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
                     vtable
                 );
             }
-        })
-        .unwrap();
+        
+            0
+        });
 
     let render_view_addr = base_address + RENDER_CONTROL_RENDER_VIEW;
-    unicorn
-        .add_code_hook(
-            render_view_addr as u64,
-            render_view_addr as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, render_view_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8361", move |uc: &mut Unicorn<'_, Context>| {
                 let count = RENDER_CONTROL_RENDER_VIEW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count < 50 {
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -8371,15 +8745,12 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
                         r0
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 
-    unicorn
-        .add_code_hook(
-            queue_state_addr as u64,
-            queue_state_addr as u64,
-            move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, queue_state_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8379", move |uc: &mut Unicorn<'_, Context>| {
                 let queue = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
                 let state = read_u32_or_invalid(uc, queue);
                 let last = RENDER_LOOP_QUEUE_STATE_LAST.swap(state, Ordering::Relaxed);
@@ -8392,19 +8763,19 @@ fn add_render_control_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addre
                         state
                     );
                 }
-            },
-        )
-        .unwrap();
+            
+            0
+        });
 }
 
 fn add_b_create_window_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     static B_CREATE_WINDOW_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
     let entry_addr = base_address + B_CREATE_WINDOW_ENTRY;
-    unicorn
-        .add_code_hook(entry_addr as u64, entry_addr as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, entry_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8404", move |uc: &mut Unicorn<'_, Context>| {
             let count = B_CREATE_WINDOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 20 {
-                return;
+                return 0;
             }
             let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let settings = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -8419,8 +8790,9 @@ fn add_b_create_window_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                 w,
                 h
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     for (name, offset, store_off) in [
         (
@@ -8440,11 +8812,11 @@ fn add_b_create_window_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
         ),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8444", move |uc: &mut Unicorn<'_, Context>| {
                 let count = B_CREATE_WINDOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count >= 60 {
-                    return;
+                    return 0;
                 }
                 let this = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -8460,16 +8832,17 @@ fn add_b_create_window_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                     h
                 );
                 let _ = store_off;
-            })
-            .unwrap();
+            
+                0
+            });
     }
 
     let layer_result = base_address + B_CREATE_WINDOW_LAYER_TRIPLE_RESULT;
-    unicorn
-        .add_code_hook(layer_result as u64, layer_result as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, layer_result, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8469", move |uc: &mut Unicorn<'_, Context>| {
             let count = B_CREATE_WINDOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 60 {
-                return;
+                return 0;
             }
             let this = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -8483,15 +8856,16 @@ fn add_b_create_window_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                 w,
                 h
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     let egl_window_addr = base_address + B_CREATE_WINDOW_EGL_WINDOW_SURFACE_ENTRY;
-    unicorn
-        .add_code_hook(egl_window_addr as u64, egl_window_addr as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, egl_window_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8491", move |uc: &mut Unicorn<'_, Context>| {
             let count = B_CREATE_WINDOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 40 {
-                return;
+                return 0;
             }
             let this = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
             let display = read_u32_or_invalid(uc, this + 0x4c);
@@ -8508,15 +8882,16 @@ fn add_b_create_window_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                 w,
                 h
             );
-        })
-        .unwrap();
+        
+            0
+        });
 
     let apply_addr = base_address + B_CREATE_WINDOW_APPLY_IN_SYNC_RESULT;
-    unicorn
-        .add_code_hook(apply_addr as u64, apply_addr as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, apply_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8516", move |uc: &mut Unicorn<'_, Context>| {
             let count = B_CREATE_WINDOW_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 40 {
-                return;
+                return 0;
             }
             let this = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
             log::info!(
@@ -8525,8 +8900,9 @@ fn add_b_create_window_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
                 this,
                 read_u32_or_invalid(uc, this + 0x7c)
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 fn add_ail_power_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
@@ -8536,11 +8912,11 @@ fn add_ail_power_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u
         ("bSendCCAPowerMsg result", AIL_SEND_CCA_POWER_MSG_RESULT, 2u8),
     ] {
         let addr = base_address + original_addr;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8540", move |uc: &mut Unicorn<'_, Context>| {
                 let count = AIL_POWER_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count >= 100 {
-                    return;
+                    return 0;
                 }
 
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -8572,18 +8948,19 @@ fn add_ail_power_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u
                         r3
                     ),
                 }
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
 fn add_ail_power_dispatch_state_hook(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let addr = base_address + (0x0066_7a8c - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+    
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8583", move |uc: &mut Unicorn<'_, Context>| {
             let count = AIL_POWER_DISPATCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
             if count >= 200 {
-                return;
+                return 0;
             }
             let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
             let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
@@ -8600,43 +8977,36 @@ fn add_ail_power_dispatch_state_hook(unicorn: &mut Unicorn<'_, Context>, base_ad
                 r6,
                 r4
             );
-        })
-        .unwrap();
+        
+            0
+        });
 }
 
 #[allow(dead_code)]
 fn force_ail_ipc_post_success(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let addr = base_address + AIL_POST_IPC_MESSAGE;
-    unicorn
-        .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+    crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3256", move |uc: &mut Unicorn<'_, Context>| {
             let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
-            if uc.reg_write(RegisterARM::R0, 0x72000_u64).is_err()
-                || uc.reg_write(RegisterARM::PC, lr as u64).is_err()
-            {
-                return;
+            if uc.reg_write(RegisterARM::R0, 0x72000_u64).is_err() {
+                return 0;
             }
             log::info!(
                 "PROCMAPENGINE stubbed bPostIpcMessage at {:#x} -> 0x72000",
                 addr
             );
-        })
-        .unwrap();
+            lr
+        });
 }
 
 fn suppress_duplicate_procmap_start_conf(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     let addr = base_address + (0x0066_7cd8u32 - ORIGINAL_BASE);
     let exit_addr = base_address + (0x0066_7c5cu32 - ORIGINAL_BASE);
-    unicorn
-        .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+    crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3272", move |uc: &mut Unicorn<'_, Context>| {
             let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
             let object = read_u32_or_invalid(uc, r7);
             let state = read_u32_or_invalid(uc, object + APP_STATE_OFFSET);
             if state <= 2 {
-                return;
-            }
-
-            if uc.reg_write(RegisterARM::PC, exit_addr as u64).is_err() {
-                return;
+                return 0;
             }
 
             let count = DUPLICATE_PROCMAP_START_CONF_SUPPRESSED.fetch_add(1, Ordering::Relaxed);
@@ -8647,8 +9017,8 @@ fn suppress_duplicate_procmap_start_conf(unicorn: &mut Unicorn<'_, Context>, bas
                     state
                 );
             }
-        })
-        .unwrap();
+            exit_addr
+        });
 }
 
 fn add_procmap_switch_trace_hook(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
@@ -8658,11 +9028,11 @@ fn add_procmap_switch_trace_hook(unicorn: &mut Unicorn<'_, Context>, base_addres
         ("type3 path", 0x0066_7cd8u32),
     ] {
         let addr = base_address + (offset - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8662", move |uc: &mut Unicorn<'_, Context>| {
                 let count = AIL_POWER_SWITCH_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count >= AIL_POWER_SWITCH_TRACE_LIMIT {
-                    return;
+                    return 0;
                 }
                 let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
                 let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
@@ -8685,8 +9055,9 @@ fn add_procmap_switch_trace_hook(unicorn: &mut Unicorn<'_, Context>, base_addres
                     r5,
                     r6
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
@@ -8696,8 +9067,8 @@ fn add_procmap_type3_state_hook(unicorn: &mut Unicorn<'_, Context>, base_address
         ("after state update", 0x0066_7d18u32),
     ] {
         let addr = base_address + (offset - ORIGINAL_BASE);
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8700", move |uc: &mut Unicorn<'_, Context>| {
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
                 let object = read_u32_or_invalid(uc, r7);
@@ -8710,8 +9081,9 @@ fn add_procmap_type3_state_hook(unicorn: &mut Unicorn<'_, Context>, base_address
                     read_u32_or_invalid(uc, object + APP_STATE_OFFSET),
                     read_u32_or_invalid(uc, object + 0x34)
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
@@ -8721,11 +9093,11 @@ fn add_cca_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
         ("cca-power-handler", CCA_POWER_HANDLER),
     ] {
         let addr = base_address + offset;
-        unicorn
-            .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8725", move |uc: &mut Unicorn<'_, Context>| {
                 let count = CCA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count >= 500 {
-                    return;
+                    return 0;
                 }
 
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -8758,8 +9130,9 @@ fn add_cca_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     message_header[1],
                     message_header[2]
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
@@ -8810,11 +9183,11 @@ fn add_dapi_register_diag_hooks(unicorn: &mut Unicorn<'_, Context>, base_address
     ];
     for (offset, label) in sites {
         let address = base_address + offset;
-        unicorn
-            .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+        
+crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:8814", move |uc: &mut Unicorn<'_, Context>| {
                 let count = DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
                 if count >= 30 {
-                    return;
+                    return 0;
                 }
                 let handler = if label.contains("entry") {
                     uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32
@@ -8863,8 +9236,9 @@ fn add_dapi_register_diag_hooks(unicorn: &mut Unicorn<'_, Context>, base_address
                     r9,
                     lr
                 );
-            })
-            .unwrap();
+            
+                0
+            });
     }
 }
 
@@ -9253,7 +9627,9 @@ fn call_guest_function(
         );
         return false;
     }
-
+    // r748 debug: trap-return diagnosis.  When the emulated call is armed to
+    // capture (CAPTURING) or to enqueue (PENDING), record what the redirect
+    // started with and what the stub eventually restores.
     unicorn
         .reg_write(RegisterARM::R13, new_sp as u64)
         .unwrap_or_default();
@@ -9792,13 +10168,30 @@ pub fn install_pending_observers(unicorn: &mut Unicorn<'_, Context>) {
     }
     let tries = PROCMAP_OBS_TRIES.load(Ordering::Relaxed);
     if tries == OBS_TRIES_IDLE || tries == OBS_TRIES_DONE {
+        if tries == OBS_TRIES_DONE {
+            log::debug!(
+                "obs install: already DONE (elf {})",
+                unicorn.get_data().elf_path
+            );
+        }
         return;
     }
     PROCMAP_OBS_TRIES.fetch_add(1, Ordering::Relaxed);
     let base_address = PROCMAP_RT_BASE.load(Ordering::Relaxed);
     if base_address == 0 {
+        log::debug!(
+            "obs install: base not set yet (elf {}, tries {})",
+            unicorn.get_data().elf_path,
+            tries
+        );
         return;
     }
+    log::info!(
+        "obs install: queueing vfin/vpcs observers in elf {:#x} (elf {}, tries {})",
+        base_address,
+        unicorn.get_data().elf_path,
+        tries
+    );
     // r746: the sites are plain trap sites now; `flush_trap_sites` (run right
     // after this by the scheduler) allocates the caves and patches. Both
     // always trap (vfin runs first per pass), so the give-up fallback can no
@@ -10082,9 +10475,20 @@ fn register_vfin_page_fallback(unicorn: &mut Unicorn<'_, Context>, base_address:
     let skip_hits = Arc::new(AtomicU32::new(0));
     let page_lo = base_address + (0x0055_a000u32 - ORIGINAL_BASE);
     let page_hi = page_lo + 0xfff;
-    unicorn
-        .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-            let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+    
+{
+            // r746: page hook expanded to per-arm svc#0 trap sites.
+            for __arm in [0x0055_adf0u32, 0x0055_ae30u32, 0x0055_ae54u32, 0x0055_ae60u32, 0x0055_af54u32, 0x0055_af58u32, 0x0055_af9cu32] {
+                let base_address = base_address.clone();
+                let entry_hits = entry_hits.clone();
+                let process_calls = process_calls.clone();
+                let process_results = process_results.clone();
+                let skip_hits = skip_hits.clone();
+                let __arm: u32 = __arm;
+                let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:10136", move |uc: &mut Unicorn<'_, Context>| {
+                let size = 4u32;
+            let pc = __site_pc;
             let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
             if original == 0x0055_adf0u32 {
                 // `vFinishCombinedDrawing` entry (r0 = street element,
@@ -10249,7 +10653,7 @@ fn register_vfin_page_fallback(unicorn: &mut Unicorn<'_, Context>, base_address:
                 // vPrepareStreetCoordBuffer entry: r0=this, r1=MCP.
                 let count = entry_hits.fetch_add(1, Ordering::Relaxed);
                 if count >= 24 {
-                    return;
+                    return 0;
                 }
                 let thisx = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let mcp = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -10307,7 +10711,7 @@ fn register_vfin_page_fallback(unicorn: &mut Unicorn<'_, Context>, base_address:
                                 if watch_count.fetch_add(1, Ordering::Relaxed) >= 40 {
                                     return true;
                                 }
-                                let pc = writer.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                                let pc = __site_pc;
                                 log::info!(
                                     "PROCMAPENGINE street-coord watch t={}ms WRITE scb+{:#x}={:#x} size={} pc={:#x}",
                                     crate::libs::dapi::emu_t0_elapsed_ms(),
@@ -10334,7 +10738,7 @@ fn register_vfin_page_fallback(unicorn: &mut Unicorn<'_, Context>, base_address:
                 // path IS reached (container was non-NULL).
                 let count = process_calls.fetch_add(1, Ordering::Relaxed);
                 if count >= 16 {
-                    return;
+                    return 0;
                 }
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
@@ -10349,7 +10753,7 @@ fn register_vfin_page_fallback(unicorn: &mut Unicorn<'_, Context>, base_address:
                 // right after that `bl`: r0 = bProcessData return.
                 let count = process_results.fetch_add(1, Ordering::Relaxed);
                 if count >= 16 {
-                    return;
+                    return 0;
                 }
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 log::info!(
@@ -10362,7 +10766,7 @@ fn register_vfin_page_fallback(unicorn: &mut Unicorn<'_, Context>, base_address:
                 // LAB_0055af9c: the time-slice / DPM / NULL-container skip leg.
                 let count = skip_hits.fetch_add(1, Ordering::Relaxed);
                 if count >= 8 {
-                    return;
+                    return 0;
                 }
                 log::info!(
                     "PROCMAPENGINE street-coord probe t={}ms skipped (timeslice/dpm/null) n={}",
@@ -10370,8 +10774,11 @@ fn register_vfin_page_fallback(unicorn: &mut Unicorn<'_, Context>, base_address:
                     count
                 );
             }
-        })
-        .unwrap();
+        
+                    0
+                });
+            }
+        }
 }
 
 fn register_vpcs_page_fallback(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
@@ -10381,9 +10788,16 @@ fn register_vpcs_page_fallback(unicorn: &mut Unicorn<'_, Context>, base_address:
         let entry_hits = Arc::new(AtomicU32::new(0));
         let page_lo = base_address + (0x0040_9000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x0040_9250u32, 0x0040_92b4u32, 0x0040_9508u32, 0x0040_9514u32, 0x0040_96f0u32, 0x0040_9828u32, 0x0040_9884u32, 0x0040_98b4u32, 0x0040_98ecu32, 0x0040_996cu32, 0x0040_99dcu32, 0x0040_9b1cu32] {
+                    let base_address = base_address.clone();
+                    let entry_hits = entry_hits.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:10435", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 if original != 0x0040_9250u32 {
                     // r707: the arming works (r706: primcount[0]=1, first0 =
@@ -10405,7 +10819,7 @@ fn register_vpcs_page_fallback(unicorn: &mut Unicorn<'_, Context>, base_address:
                         0x0040_996c => ("image-gate", true),
                         0x0040_99dc => ("color-gate", true),
                         0x0040_9b1c => ("mv-compose", false),
-                        _ => return,
+                        _ => return 0,
                     };
                     static SITES: [std::sync::OnceLock<std::sync::Mutex<u64>>; 11] = [
                         std::sync::OnceLock::new(),
@@ -10450,7 +10864,7 @@ fn register_vpcs_page_fallback(unicorn: &mut Unicorn<'_, Context>, base_address:
                             n
                         );
                     }
-                    return;
+                    return 0;
                 }
                 // r698: with DTM enabled and z-resources empty the combined
                 // streets pass jumps to the exit label and never draws.  Clear
@@ -10522,7 +10936,7 @@ fn register_vpcs_page_fallback(unicorn: &mut Unicorn<'_, Context>, base_address:
                 }
                 let count = entry_hits.fetch_add(1, Ordering::Relaxed);
                 if count >= 40 && count % 2048 != 0 {
-                    return;
+                    return 0;
                 }
                 let mcp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let bank = (read_u32_or_invalid(uc, mcp.wrapping_add(4)) >> 8) & 0xff;
@@ -10568,8 +10982,11 @@ fn register_vpcs_page_fallback(unicorn: &mut Unicorn<'_, Context>, base_address:
                     lr,
                     count
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
 }
 fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
@@ -10598,16 +11015,23 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
         let call_hits = Arc::new(AtomicU32::new(0));
         let page_lo = base_address + (0x0044_9000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x0044_9118u32] {
+                    let base_address = base_address.clone();
+                    let call_hits = call_hits.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:10652", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 if original != 0x0044_9118u32 {
-                    return;
+                    return 0;
                 }
                 let count = call_hits.fetch_add(1, Ordering::Relaxed);
                 if count >= 16 {
-                    return;
+                    return 0;
                 }
                 let scb = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let pos_src = read_u32_or_invalid(uc, scb.wrapping_add(0x30));
@@ -10622,8 +11046,11 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     dir_src,
                     count
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
     }
 
@@ -10635,16 +11062,23 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
         let entry_hits = Arc::new(AtomicU32::new(0));
         let page_lo = base_address + (0x0044_6000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x0044_6f9cu32] {
+                    let base_address = base_address.clone();
+                    let entry_hits = entry_hits.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:10689", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 if original != 0x0044_6f9cu32 {
-                    return;
+                    return 0;
                 }
                 let count = entry_hits.fetch_add(1, Ordering::Relaxed);
                 if count >= 16 {
-                    return;
+                    return 0;
                 }
                 let scb = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
@@ -10676,8 +11110,11 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     count
                 );
                 crate::gpu::note_road_geometry_uploaded();
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
     }
 
@@ -10702,16 +11139,23 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
         let entry_hits = Arc::new(AtomicU32::new(0));
         let page_lo = base_address + (0x0040_f000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x0040_f730u32] {
+                    let base_address = base_address.clone();
+                    let entry_hits = entry_hits.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:10756", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 if original != 0x0040_f730u32 {
-                    return;
+                    return 0;
                 }
                 let count = entry_hits.fetch_add(1, Ordering::Relaxed);
                 if count >= 24 && count % 1024 != 0 {
-                    return;
+                    return 0;
                 }
                 let thisx = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let nodes = (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32) & 0xffff;
@@ -10726,8 +11170,11 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     bank,
                     count
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
     }
 
@@ -10740,16 +11187,23 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
         let mode_hits = Arc::new(AtomicU32::new(0));
         let page_lo = base_address + (0x0040_f000u32 - ORIGINAL_BASE);
         let page_hi = page_lo + 0xfff;
-        unicorn
-            .add_code_hook(page_lo as u64, page_hi as u64, move |uc, _, _| {
-                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+        
+{
+                // r746: page hook expanded to per-arm svc#0 trap sites.
+                for __arm in [0x0040_fb18u32] {
+                    let base_address = base_address.clone();
+                    let mode_hits = mode_hits.clone();
+                    let __arm: u32 = __arm;
+                    let __site_pc = base_address.wrapping_add(__arm.wrapping_sub(ORIGINAL_BASE));
+                    crate::os::code_stub::trap_site(unicorn, __site_pc, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:10794", move |uc: &mut Unicorn<'_, Context>| {
+                let pc = __site_pc;
                 let original = pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE);
                 if original != 0x0040_fb18u32 {
-                    return;
+                    return 0;
                 }
                 let count = mode_hits.fetch_add(1, Ordering::Relaxed);
                 if count >= 48 && count % 512 != 0 {
-                    return;
+                    return 0;
                 }
                 let mode = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let mcp = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
@@ -10761,8 +11215,11 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                     bank,
                     count
                 );
-            })
-            .unwrap();
+            
+                        0
+                    });
+                }
+            }
     }
     }
 }
