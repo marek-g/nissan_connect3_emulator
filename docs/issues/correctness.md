@@ -306,3 +306,38 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
 - **TODO:** when revisiting PROCNAV fidelity, trace the 0x35952a unwind (it
   follows `vHandle...SXM` startup failing without an AGW service) and either
   provide an AGW/SXM directory entry or document the crash as benign.
+
+## HMI "Starting navigation." wait-widget: remaining chain to hide it (open)
+
+- **Solved this round (r755/r756):** CCA directory now answers
+  ApplicationInfoRegister (class 0x49 -> ApplicationInfoStatus class 0x50),
+  un-hocking `bRegisterAsync` so real ServiceRegisters (0x41) reach the
+  unhosted server queues; RegisterConf(0x43)+ServiceStatus(0x44) answers
+  drive `hmicca_tclApp::vOnServiceState` for all 32 registrations incl. nav
+  svc 0x27 (server app 0x24); ServiceData(0x45) requests for svc 0x27 are
+  answered (OPTYPE 9) and AIL-forwards them into
+  `hmicca_tclApp::vOnNewMessage` -> `ahl_tclClientPortMngr::enUpdate`.
+- **Still open:** the wait-widget survives all of that.  Facts gathered:
+  - It is a Lua/widget-toolkit drawn widget (`GUI_WTK_FormatTextExt` +
+    `GUI_ContentLanguage` string id 0x25106fc), presented ~t=3.4s; the map
+    page itself (compass, 50 m scale) is already behind it.
+  - `GUI_Messaging` receiver lists (+0x10/+0x14) stay EMPTY in the whole
+    run - GUI event dispatch (vFireInternalEvent/bOnMessage) finds no
+    receivers, so event injection (0xcb ALLOW_USER_ACTION etc.) is a dead
+    end; the popup is not an event subscriber.
+  - `main.lua` is absent even on the unit (golden log: same
+    NoSuchFileOrDirectory); production = the `path=memory` bootstrap, so
+    the hide path is C++ widget-engine code, string referenced via the
+    GUI_ContentLanguage table (no direct xref - find the table index of
+    0x25106fc, then the u32-index constants in code = presenter/hider).
+  - Likely true trigger is FI-level: `clHmiNavServerHandler::
+    vHandleEnaviServerStatus` returns early because the enavi interface
+    field +0x7dc (and +0x814 DAPI, +0x15c nav-server) are 0 - the FI link
+    between DAPI and PROCNAV (TEA_TASK1 msg-manager NULL, see design.md)
+    is the upstream blocker; the svc-0x27 ServiceData payload schema
+    (functions 0x2000/0x2002/0x2208) is what its port data must fill.
+- **Next experiments:** decode the service-data port read side
+  (`ahl_tclServicePort` consumers) to learn what payload Lua/C++ polls;
+  find the ContentLanguage table index for the string and its users; wire
+  the DAPI<->PROCNAV FI link (TEA_TASK1) which is already on the plan for
+  the GPS consumer work.
