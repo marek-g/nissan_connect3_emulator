@@ -60,3 +60,25 @@ Hot-path problems: per-syscall allocations, O(n) lookups, redundant FFI calls, r
 - **Fix:** one reusable scratch read buffer + one dedicated host VBO per distinct
   guest pointer (content-hashed; unchanged geometry skips `BufferData` entirely).
   RSS now flat over multi-minute runs (`GPU: resource telemetry` watchdog).
+
+## RESOLVED: forensic range hooks forced per-instruction dispatch in bare runs
+
+- **Location:** `nissan_connect3_emulator/src/libs/prochmi.rs` (`GUI_MAINLOOP_TRACE_*`),
+  `nissan_connect3_emulator/src/libs/procmapengine.rs` (AIL administration tracer)
+- **Problem:** Two diagnostic fetch-sequence tracers registered unconditionally as
+  bounded `add_code_hook` ranges - 64 KiB over `bGUIMainloop` and 64 KiB over the
+  AIL administration module. A bounded range makes Unicorn emit a per-instruction
+  hook check in every TB intersecting it (AGENTS/r743: the emulator's main hook
+  cost), throttling the GUI thread itself. Measured: after removing the
+  bGUIMainloop tracer, the loop logged 5x more iterations per wall second
+  (fix19: 121 -> fix20: 643 `bGUIMainloop` lines at equal run length).
+- **Fix (r751):** both tracers register only under their trace env flags
+  (`EMU_PROCMAP_TRACE` / `EMU_PROCHMI_NAV_TRACE` / lua trace). All other
+  remaining single-address Unicorn code hooks were migrated to `trap_site`
+  (`bGUIMainloop`, the 14-entry GUI composition observer list, `OSAL_IOOpen`
+  entry, dapi eval return tap, `OSAL_ProcessSpawn`, `CreateNewRawDataBlock`);
+  the two dapi sites whose first instruction is PC-relative (`ADD r12,pc,#0x700`,
+  `BAL`) structurally reject the svc patch and stay narrow fallback hooks by
+  design.  Legacy `add_code_hook` registrations on the normal path: **0**
+  (only `add_mem_hook` watchpoints, the svc intr hook, and rejected-site
+  fallbacks remain).

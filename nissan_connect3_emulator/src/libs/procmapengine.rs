@@ -3612,7 +3612,10 @@ crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::A
     // admin-type-2 arrival by the `ExamineInfluenceToAdministration` probe
     // (see EXAMINE_TRACE_STEPS). Logs the real fetch sequence so the actual
     // ServiceStatus code path is observable despite the Ghidra misdecode.
-    {
+    // r751: pure observation over a 64 KiB range - registers only under
+    // EMU_PROCMAP_TRACE now (bounded hooks force per-instruction dispatch
+    // checks across the whole range; no trap counterpart for a trace).
+    if render_trace_enabled() {
         let lo = (base_address + (0x0066_0000u32 - ORIGINAL_BASE)) as u64;
         let hi = (base_address + (0x0067_0000u32 - ORIGINAL_BASE)) as u64;
         unicorn
@@ -6974,11 +6977,10 @@ crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::A
         {
             let create = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let addr = base_address + 0x0051_66dcu32 - ORIGINAL_BASE;
-            unicorn
-                .add_code_hook(addr as u64, addr as u64, move |uc, _, _| {
+            crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6977", move |uc: &mut Unicorn<'_, Context>| {
                     let count = create.fetch_add(1, Ordering::Relaxed);
                     if count >= 40 {
-                        return;
+                        return 0;
                     }
                     let uid = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                     let kind = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -7003,8 +7005,8 @@ crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::A
                         count,
                         lr
                     );
-                })
-                .unwrap();
+                0
+                });
             let add = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
             let addr = base_address + 0x0051_64e0u32 - ORIGINAL_BASE;
             

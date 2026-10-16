@@ -42,8 +42,7 @@ pub fn hook_process_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     }
 
     let address = base_address + OSAL_PROCESS_SPAWN;
-    unicorn
-        .add_code_hook(address as u64, address as u64, move |uc, _, _| {
+    crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/process.rs:44", move |uc: &mut Unicorn<'_, Context>| {
             let struct_ptr = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             if struct_ptr == 0 {
                 log::warn!("OSAL_ProcessSpawn called with null process info");
@@ -51,7 +50,7 @@ pub fn hook_process_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                     .unwrap_or_default();
                 uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap_or(0))
                     .unwrap_or_default();
-                return;
+                return 0;
             }
 
             let Some(app_name_ptr) = read_u32(uc, struct_ptr) else {
@@ -59,21 +58,21 @@ pub fn hook_process_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                     .unwrap_or_default();
                 uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap_or(0))
                     .unwrap_or_default();
-                return;
+                return 0;
             };
             let Some(filename_ptr) = read_u32(uc, struct_ptr + 8) else {
                 uc.reg_write(RegisterARM::R0, OSAL_ERR_INTERNAL as u64)
                     .unwrap_or_default();
                 uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap_or(0))
                     .unwrap_or_default();
-                return;
+                return 0;
             };
             let Some(cmdline_ptr) = read_u32(uc, struct_ptr + 12) else {
                 uc.reg_write(RegisterARM::R0, OSAL_ERR_INTERNAL as u64)
                     .unwrap_or_default();
                 uc.reg_write(RegisterARM::PC, uc.reg_read(RegisterARM::LR).unwrap_or(0))
                     .unwrap_or_default();
-                return;
+                return 0;
             };
 
             let app_name = read_string(uc, app_name_ptr);
@@ -87,7 +86,7 @@ pub fn hook_process_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                     filename,
                     cmdline
                 );
-                return;
+                return 0;
             }
 
             match process_launcher::spawn_process(&app_name, &filename, &cmdline) {
@@ -111,8 +110,8 @@ pub fn hook_process_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                         .unwrap_or_default();
                 }
             }
-        })
-        .unwrap();
+            0
+        });
 }
 
 fn read_u32(unicorn: &mut Unicorn<'_, Context>, address: u32) -> Option<u32> {

@@ -603,15 +603,22 @@ crate::os::code_stub::trap_site(unicorn, lua_prepare_call, crate::os::code_stub:
         });
 
     let gui_mainloop = base_address + CL_GUI_MAINLOOP;
-    unicorn
-        .        add_code_hook(gui_mainloop as u64, gui_mainloop as u64, |uc, address, _| {
-            if maybe_force_hmi_fi_init(uc, address as u32) {
-                return;
-            }
-            if maybe_inject_hsi_power_state(uc, address as u32) {
-                return;
-            }
+    crate::os::code_stub::trap_site(unicorn, gui_mainloop, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:606", move |uc: &mut Unicorn<'_, Context>| {
+            let address = gui_mainloop;
+            // r751: merged with the old same-address narrow hook
+            // (`GUI_DM_DisplayManager thread entry`): legacy hooks stacked,
+            // trap sites do not, so the thread-entry logic runs here after
+            // the mainloop body - on both paths, exactly like the second
+            // stacked hook fired regardless of the first one's early return.
+            let forced = if maybe_force_hmi_fi_init(uc, address) {
+                true
+            } else if maybe_inject_hsi_power_state(uc, address) {
+                true
+            } else {
+                false
+            };
 
+            if !forced {
             let gui = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             if gui != 0 {
                 GUI_ENGINE_ADDRESS.store(gui, Ordering::Relaxed);
@@ -649,8 +656,10 @@ crate::os::code_stub::trap_site(unicorn, lua_prepare_call, crate::os::code_stub:
                 gui,
                 mode
             );
-        })
-        .unwrap();
+            }
+            force_hmi_mainloop_display_update(uc);
+            0
+        });
 
     let check_msgbox = base_address + CL_GUI_CHECK_MSGBOX;
     
@@ -2135,7 +2144,8 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
         // `EAManager::getBackground` hands the LayerCopy to `mixLayers`, which
         // then calls `LayerCopy::draw`, and `setLayersVisible` is the one place
         // that enables the foreign svg layer at all.
-        (0x0133_f528 - ORIGINAL_BASE, "GUI_DM_EAManager::getBackground"),
+        // (getBackground 0x0133f528 itself carries the functional forced-EA
+        // background trap at `add_code_hooks`:1941 - registered only once.)
         (0x0133_ede4 - ORIGINAL_BASE, "GUI_DM_EAManager::isBlocked"),
         (0x0134_36e4 - ORIGINAL_BASE, "GUI_GL_LayerSync::setLayersVisible"),
         (0x0134_2b24 - ORIGINAL_BASE, "GUI_GL_LayerCopy::free"),
@@ -2148,17 +2158,16 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
             GUI_DM_DISPLAY_MANAGER_UPDATE,
             "GUI_DM_DisplayManager::update",
         ),
-        (
-            GUI_DISPLAY_MANAGER_THREAD,
-            "GUI_DM_DisplayManager thread entry",
-        ),
+        // r751: `GUI_DM_DisplayManager thread entry` (0x0133be70) and
+        // `GUI_DM_EAManager::getBackground` (0x0133f528) are dropped from the
+        // observer list: both addresses carry functional trap sites already
+        // (`bGUIMainloop` at 606 - the old narrow-hook overlap is merged into
+        // it there - and the forced-EA-background trap at 1941), and trap
+        // sites are unique per address, so a duplicate registration would
+        // only demote the functional trap to a legacy fallback hook.
     ] {
         let addr = base_address + offset;
-        unicorn
-            .            add_code_hook(addr as u64, addr as u64, move |uc, address, _| {
-                if name == "GUI_DM_DisplayManager thread entry" {
-                    force_hmi_mainloop_display_update(uc);
-                }
+        crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:2157", move |uc: &mut Unicorn<'_, Context>| {
                 if name == "GUI_DM_DisplayManager::update" {
                     trace_hmi_view_draw_contexts(uc);
                     if LSYNC_MAP_STAGE.load(Ordering::Relaxed) >= 10 {
@@ -2283,12 +2292,19 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
                             .wrapping_sub(base_address as u64),
                     );
                 }
-            })
-            .unwrap();
+            0
+        });
     }
 
     let trace_start = base_address + GUI_MAINLOOP_TRACE_START;
     let trace_end = base_address + GUI_MAINLOOP_TRACE_END;
+    // r751: per-instruction range tracer over bGUIMainloop - pure
+    // observation, and a 64 KiB bounded-hook range forces the per-instruction
+    // dispatch check on every TB of the hot GUI loop (r743: the emulator's
+    // main hook cost).  No trap-site counterpart exists for a fetch-sequence
+    // trace, so it registers only under the prochmi trace env flags now; bare
+    // runs pay zero range-hook cost.
+    if nav_trace_enabled() || lua_call_trace_enabled() {
     unicorn
         .add_code_hook(trace_start as u64, trace_end as u64, move |uc, address, _| {
             if !HMI_MAINLOOP_TRACE_ARMED.load(Ordering::Relaxed) {
@@ -2327,6 +2343,7 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
             }
         })
         .unwrap();
+    }
 }
 
 fn write_svg_layer_status(unicorn: &mut Unicorn<'_, Context>, status: u32) {

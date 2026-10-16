@@ -361,9 +361,7 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
     // capture the returned fd.
     {
         let open_entry = base_address + (0x0081_3180u32 - ORIGINAL_BASE);
-        let res = unicorn.add_code_hook(open_entry as u64, open_entry as u64, {
-            let base = base_address;
-            move |uc, _addr, _| {
+        crate::os::code_stub::trap_site(unicorn, open_entry, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:364", move |uc: &mut Unicorn<'_, Context>| {
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
@@ -376,12 +374,8 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     r1,
                     lr
                 );
-                let _ = base;
-            }
+                0
         });
-        if res.is_err() {
-            log::debug!("dapi: could not hook OSAL_IOOpen wrapper");
-        }
     }
 
     for (address, name) in [
@@ -2242,8 +2236,12 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     if (0x0082_0000..0x0083_0000).contains(&after) {
                         let posted = POST_AFTER.fetch_add(1, Ordering::Relaxed);
                         if posted < 4 {
-                            let lo = (base_address + after - ORIGINAL_BASE) as u64;
-                            let _ = uc.add_code_hook(lo, lo, move |inner, _, _| {
+                            let lo = base_address + after - ORIGINAL_BASE;
+                            // r751: our trap-site flavour of the old one-shot
+                            // return tap.  Queued from inside a handler it is
+                            // patched at the next svc-flush (every syscall);
+                            // for a 4-shot log probe that is early enough.
+                            crate::os::code_stub::trap_site(uc, lo, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:2246", move |inner: &mut Unicorn<'_, Context>| {
                                 let app = {
                                     let sp = inner.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
                                     read_u32_at(inner, sp + 0x20)
@@ -2275,6 +2273,7 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                                 if !dump.is_empty() {
                                     log::warn!("DAPI device-config post strings: {}", dump.join(" "));
                                 }
+                            0
                             });
                         }
                     }
