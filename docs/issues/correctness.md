@@ -248,3 +248,42 @@ manager (+0x40) is NULL (its app object is not an rtf::tclCommThread:
 `rtf::tclCommThread::s32Initialize` branch probes ct-open/ct-msgman fire only
 on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
 (tid81/82) belong to these half-initialized apps.
+
+## procbaselx `exit()` at t~56 s broke the HMI compositing (fixed r753, regression from the trap migration)
+
+- **Symptom:** `******* process "my_program" (PID 1) terminated *******`
+  (argv0 of `procbaselx_out.out`) at guest t~56 s on every boot, and the
+  user-visible HMI compositing degraded right after (prochmi `eglSwapBuffers`
+  dropped from 665 to 22 for the rest of a 340 s run, fix22).
+- **Root cause:** `s32RunEnv()` (procbaselx `0xad13c`) runs the environment
+  by waiting `OSAL_s32EventWait(SpmEvEnd, 1, mode 1, timeout 0xffffffff)` -
+  "run until the SPM master says shutdown".  `libs/libosal_linux/event.rs`
+  implements that wait host-side and parks the thread with
+  `SleepUntil(now+60 s)`; the trap is an *observer*, so on wake the library
+  body continued **mid-function** (past the svc-patched first instruction,
+  with handler-written state like `IN_WAIT=1`) and answered itself err 0xd02
+  + `-1` immediately; three answers reached `main()` and procbaselx exited
+  cleanly.  The golden-era narrow `add_code_hook` handed control back at the
+  *function entry*: the body then re-ran its own prologue and parked on its
+  monitor yield forever (golden `g.txt`: `term=0`, procbaselx alive; its 891
+  background d02s came from other threads and were survivable).  So this was
+  a regression introduced by the r746-r751 Unicorn-hook -> trap-site
+  migration, not a golden-era defect (the golden-era boot death was only the
+  TSE loop, thread [20], fixed separately in r752).
+- **Fix:** infinite-timeout event waits now re-enter the trap handler on
+  wake (`PC = site` before blocking): every 60 s the handler re-checks the
+  event bits (a real `OSAL_s32EventPost` finishes the wait through the
+  satisfaction branch) and re-arms the park - the waiter stays a sleeper
+  forever, exactly like the golden-era monitor-yield park.  Finite waits
+  keep the native-timeout behaviour.
+- **SPM slave start confirmation:** procbaselx is the SPM *slave* (app id
+  `0x1c`); `ahl_tclBaseOneThreadApp::vAppEntry` (`0xe5068`) creates
+  `ev_28` and polls it (5000 ms x 5) for the master's (`spsdm`, not
+  emulated) answer, whose post is driven by the reply's message-queue
+  callback.  The event layer now fakes exactly one confirmation per
+  (thread, `ev_<id>`) pair and consumes the bits immediately (an
+  always-satisfied wait turns the slave poll loop into a 3.5 kHz host
+  spin, run fix23: 1.06 M hits).  `SpmEvEnd` itself is deliberately never
+  answered - it marks shutdown.
+- **Verified:** fix27/fix28: no `terminated` line in a 340 s run, prochmi
+  swaps 1971 in 140 s (fix24: 659 in 340 s), roads and window dumps intact.

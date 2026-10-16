@@ -3034,3 +3034,24 @@ Diagnostics that made this readable (kept): site ring + `last_site()` printed
 on a quantum fault, `site hit`/`site resume` debug lines, and the raw assert
 dump.  Dropped: the `[trap-site-caves]` arena write-watch and the temporary
 `mbx` stat/mq_open logs and the message-queue-create wrapper trace.
+
+## Observer traps that block inside the handler hand control to the library body mid-function (r753)
+
+A legacy narrow `add_code_hook` fires *before* the hook's first instruction:
+if the handler parks the thread (`block_current_thread`) and the thread is
+later woken, the guest resumes at the **function entry** and re-runs its own
+prologue, re-deriving everything the handler touched.  A `trap_site`
+replaces that first instruction: on wake the cave replays it and the guest
+continues at **site+4**, i.e. mid-function, with handler-written state
+(event `IN_WAIT=1`, request words, ...) that the real body was never going
+to see in that position.  For `OSAL_s32EventWait` this turned a golden-era
+"wait forever" (`SpmEvEnd`, timeout 0xffffffff) into an instant native
+timeout (err 0xd02), and procbaselx into an `exit()` at t~56 s whose death
+broke the HMI compositing behind it (correctness.md, r753).
+
+Rule of thumb when migrating an entry hook whose handler can park: every
+wake must land somewhere the handler *re-runs* (re-enter the site by
+writing `PC = site` before blocking, the r753 pattern) or the handler must
+fully own the outcome (`return_result` semantics).  Audit the remaining
+blocking handlers in `libs/libosal_linux/` (message-queue waits park the
+same way) when their wake paths next misbehave.

@@ -24,6 +24,12 @@ fn event_waiters() -> &'static Mutex<HashMap<u32, Vec<EventWaiter>>> {
     WAITERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Waiter/event pairs that already received the faked SPM start confirmation.
+fn spm_confirmations() -> &'static Mutex<std::collections::HashSet<(u32, String)>> {
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<(u32, String)>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
 pub fn hook_event_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     const EVENT_POST: u32 = 0x485065ac - 0x484d8000;
     const EVENT_WAIT: u32 = 0x485067c4 - 0x484d8000;
@@ -54,7 +60,7 @@ fn handle_event_call(unicorn: &mut Unicorn<'_, Context>, addr: u32, base_address
 
     match name {
         "OSAL_s32EventWait" => {
-            handle_event_wait(unicorn, r0, r1, r2, r3);
+            handle_event_wait(unicorn, r0, r1, r2, r3, addr);
         }
         "OSAL_s32EventPost" => {
             handle_event_post(unicorn, r0, r1, r2);
@@ -77,8 +83,20 @@ fn handle_event_wait(
     requested: u32,
     mode: u32,
     timeout: u32,
+    site: u32,
 ) {
     if event == 0 {
+        // r753: silent before; procbaselx's `s32RunEnv` shutdown wait churns
+        // through this path (its SpmEvEnd handle never materialises) and every
+        // -1 here records an err 0xd02, so the death chain was invisible.
+        log::info!(
+            "LIBOSAL: OSAL_s32EventWait null event handle requested={:#x} mode={} timeout={} lr={:#x} elf={}",
+            requested,
+            mode,
+            timeout,
+            r(unicorn, RegisterARM::R14),
+            unicorn.get_data().elf_path,
+        );
         return_result(unicorn, -1);
         return;
     }
@@ -125,6 +143,48 @@ fn handle_event_wait(
                 "PROCHMI: forced HMI_FW_LOOP event wait bits 0x{:08x} -> 0x{:08x} requested=0x{:08x}",
                 bits,
                 forced,
+                requested
+            );
+            return_result(unicorn, 0);
+            return;
+        }
+    }
+
+    // r753: procbaselx is the SPM *slave*.  Its Bosch app framework
+    // (`fc_spmslv_tclApp` -> `ahl_tclBaseOneThreadApp::vAppEntry`,
+    // procbaselx `0xe5068`) creates `ev_<app-id>` for its own app id
+    // (base-lx is app `0x1c`, so `ev_28`), installs the reply callback on its
+    // message queue and sends the "start application" request to the SPM
+    // master (`spsdm`, not part of the emulated process set).  The
+    // master's answer is what makes the callback post the event bits;
+    // without a master nobody posts, the framework polls the event with
+    // `OSAL_s32EventWait(mask 0xffffffff, mode 1, 5000 ms)` ten times, and
+    // the `s32RunEnv` start chain in main gives up with err 0xd02: procbaselx
+    // ran `exit()` at t~56 s every single boot (golden era included) and the
+    // user-visible HMI compositing broke shortly after that death.
+    // Faking the confirmation at the OSAL event layer is the sanctioned
+    // RTOS-fidelity knob here (same pattern as the HMI_FW_LOOP force above).
+    // Exactly *one* satisfaction per waiter and event (the real confirmation
+    // is a single post that the first waiter consumes): an always-satisfied
+    // wait turns the slave's poll loop into a 3.5 kHz host spin.  The forced
+    // bits are consumed immediately so the generic satisfaction path cannot
+    // re-satisfy later polls either.  `SpmEvEnd` is deliberately NOT
+    // answered, it marks shutdown.
+    if unicorn.get_data().elf_path.contains("procbaselx") && is_spm_app_event(&event_name) {
+        let key = (unicorn.get_data().thread_id(), event_name.clone());
+        let first = spm_confirmations()
+            .lock()
+            .map(|mut seen| seen.insert(key))
+            .unwrap_or(false);
+        if first {
+            let bits = try_read_u32(unicorn, event.wrapping_add(EVENT_BITS)).unwrap_or(0);
+            write_u32(unicorn, event.wrapping_add(EVENT_BITS), bits & !requested);
+            write_u32(unicorn, event.wrapping_add(EVENT_IN_WAIT), 0);
+            remove_thread_waiter(event, unicorn.get_data().thread_id());
+            log::info!(
+                "LIBOSAL: faked SPM start confirmation for event={} bits 0x{:08x} consumed requested=0x{:08x}",
+                event_name,
+                bits,
                 requested
             );
             return_result(unicorn, 0);
@@ -218,6 +278,22 @@ fn handle_event_wait(
         mode,
         timeout
     );
+    // r753: an *infinite* OSAL event wait must stay asleep until a real
+    // `OSAL_s32EventPost`.  The block below parks the thread and lets the
+    // library body (the trap is an observer) execute on wake, and that body
+    // records err 0xd02 and answers -1 the moment it regains the CPU:
+    // procbaselx's `s32RunEnv` waits `SpmEvEnd` with timeout=0xffffffff
+    // ("run the environment until the SPM says shutdown"), timed out of our
+    // 60 s park into that body, and `main()` returned - the golden-era
+    // t~56 s death that visibly broke the HMI compositing behind it.
+    // Pointing PC back at the trap site makes the wake re-enter this
+    // handler: it re-checks the bits (a real post then finishes the wait in
+    // the satisfaction branch above) and re-arms the park, so the waiter
+    // stays a sleeper forever, like on the real device.  Finite waits keep
+    // the old native-timeout behaviour (the chronic, survivable d02s).
+    if timeout == u32::MAX {
+        let _ = unicorn.reg_write(RegisterARM::PC, site as u64);
+    }
     block_current_thread(unicorn, BlockReason::SleepUntil(block_until));
 }
 
@@ -383,6 +459,15 @@ fn log_call(
 
 fn read_event_name(unicorn: &Unicorn<'_, Context>, event: u32) -> String {
     read_name(unicorn, event.wrapping_add(EVENT_NAME))
+}
+
+/// `ev_<decimal>`: the per-app-id event names the Bosch app framework builds with
+/// `sprintf("ev_%i", app_id)` (only procbaselx carries that format string).
+fn is_spm_app_event(name: &str) -> bool {
+    match name.strip_prefix("ev_") {
+        Some(digits) => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
 }
 
 fn read_name(unicorn: &Unicorn<'_, Context>, addr: u32) -> String {
