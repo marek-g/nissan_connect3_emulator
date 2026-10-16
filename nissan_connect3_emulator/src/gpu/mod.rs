@@ -591,6 +591,27 @@ fn dump_window_pixels(backend: &mut Backend) {
         };
         std::time::Instant::now() >= *next
     };
+    static DUMP_CALLS: AtomicU32 = AtomicU32::new(0);
+    let c = DUMP_CALLS.fetch_add(1, Ordering::Relaxed);
+    if c % 100 == 0 || c < 3 {
+        static START: std::sync::LazyLock<std::time::Instant> =
+            std::sync::LazyLock::new(std::time::Instant::now);
+        let now = std::time::Instant::now();
+        let delta: i64 = if due {
+            now.checked_duration_since(*WINDOW_NEXT.lock().unwrap()).map(|d| d.as_secs() as i64)
+                .unwrap_or(0)
+        } else {
+            -(WINDOW_NEXT.lock().unwrap().checked_duration_since(now).map(|d| d.as_secs() as i64)
+                .unwrap_or(0))
+        };
+        log::info!(
+            "GPU: TEMP dump_window_pixels call={} due={} t_rel={}s next_in={}s",
+            c,
+            due,
+            (now - *START).as_secs(),
+            delta
+        );
+    }
     if !due {
         return;
     }
@@ -1418,6 +1439,16 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
             unsafe {
                 gl::Finish();
             }
+            static HMI_SWAPS: AtomicU32 = AtomicU32::new(0);
+            let n = HMI_SWAPS.fetch_add(1, Ordering::Relaxed);
+            if n % 200 == 0 || n < 3 {
+                log::info!(
+                    "GPU: TEMP backend hmi-swap n={} hmi_fbo={} visible={}",
+                    n,
+                    backend.hmi_framebuffer,
+                    gpu_backend_visible()
+                );
+            }
             probe_layer_alphas(backend);
             gpu_resource_telemetry();
             if backend.hmi_framebuffer != 0 {
@@ -2125,10 +2156,11 @@ fn log_api(unicorn: &mut Unicorn<'_, Context>, prefix: &str, name: &str) {
         );
     if important || count < 3000 || gpu_trace_all() {
         log::info!(
-            "GPU: {} {} process={} r0={:x} r1={:x} r2={:x} r3={:x}",
+            "GPU: {} {} process={} thread [{}] r0={:x} r1={:x} r2={:x} r3={:x}",
             prefix,
             name,
             process_label(unicorn),
+            unicorn.get_data().inner.thread_id(),
             ureg(unicorn, RegisterARM::R0),
             ureg(unicorn, RegisterARM::R1),
             ureg(unicorn, RegisterARM::R2),

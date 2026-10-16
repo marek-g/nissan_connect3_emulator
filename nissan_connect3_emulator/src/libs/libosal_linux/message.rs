@@ -2396,6 +2396,29 @@ fn bridge_mbx_queue(
             }
 
             if timeout == 0 {
+                // prochmi's AIL run-env mailbox loop (caller prochmi_out.out
+                // +0xfe0990, the wait right after `Activate(AE_109)`) passes
+                // timeout 0 and expects an indefinite wait on its bring-up
+                // mailbox.  The empty-success shortcut makes the run-env treat
+                // the untouched 8-byte buffer as a torn-down command: main
+                // closes mbx_265 and exit(1)s at t~56 s, which orphans the GUI
+                // worker threads - the render/swap thread [51] dies mid-frame
+                // and the window freezes.  In the golden world main parks
+                // around this point and never returns; park here until a real
+                // message lands on the queue (the scheduler poll releases it).
+                let this_thread = unicorn.get_data().inner.thread_id();
+                let lr = unicorn.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                let elf = &unicorn.get_data().elf_path;
+                let run_env_wait = elf.contains("prochmi_out.out")
+                    && base_address != 0
+                    && (lr & !1).wrapping_sub(base_address) == 0xfe0990;
+                if run_env_wait {
+                    log::info!(
+                        "[{this_thread}] [LIBOSAL-MBX] run-env wait on empty {name}: parking instead of empty-success"
+                    );
+                    block_guest_osal_wait(unicorn, queue_id, buf, buf_len, prio_ptr, None, true);
+                    return true;
+                }
                 return_to_caller(unicorn, 0);
                 return true;
             }

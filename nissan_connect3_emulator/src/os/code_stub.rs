@@ -254,7 +254,7 @@ pub fn trap_site<F>(
 /// cannot observe the PC; everything else (branches, literals, `BX`,
 /// 0x46xx/0x47xx high-register moves, conditionals) falls back to a hook.
 fn thumb16_relocatable(h: u16) -> bool {
-    // The T1 cave returns through `ldr r1,[pc,#4]` + `bx r1`, so the replayed
+    // The T1 cave returns through `ldr r1,[pc,#0]` + `bx r1`, so the replayed
     // instruction must not write r1 (the loaded resume would clobber its
     // result).  r1-writing forms per allow-listed class (Rd fields below):
     let writes_r1 = match h {
@@ -367,10 +367,14 @@ fn probe_true_mode(unicorn: &Unicorn<'_, Context>, site: u32, stamped: TrapMode)
             .unwrap_or(false)
     };
     let (arm_ok, thumb_ok) = (decodes(ArchMode::Arm), decodes(ArchMode::Thumb));
+    // Only correct when the *stamped* mode provably fails: almost every
+    // 16-bit Thumb halfword also decodes as some ARM word (capstone is that
+    // generous), so an ARM preference would rewrite true-Thumb sites into
+    // 4-byte ARM svc patches that no longer trap (or fault) in Thumb state.
     let true_mode = match (arm_ok, thumb_ok) {
-        (true, _) => TrapMode::Arm,
+        (true, false) => TrapMode::Arm,
         (false, true) => TrapMode::Thumb,
-        (false, false) => return stamped,
+        _ => return stamped,
     };
     if true_mode != stamped {
         log::warn!(
@@ -397,6 +401,11 @@ fn build_cave(
     let resume;
     let mut patch: &[u8] = &[];
     let mode = probe_true_mode(unicorn, site, p.mode);
+    if p.name.starts_with("libs/procnav") {
+        let mut dbg = [0u8; 8];
+        let ok = unicorn.mem_read(site as u64, &mut dbg).is_ok();
+        log::info!("TEMP build_cave {} site {site:#x} read_ok={ok} bytes {dbg:02x?} stamp {:?}", p.name, p.mode);
+    }
     match mode {
         TrapMode::Arm => {
             let mut w = [0u8; 4];
@@ -404,6 +413,13 @@ fn build_cave(
                 return Err(CaveFail::Retry);
             }
             let word = u32::from_le_bytes(w);
+            if word == 0 {
+                // Mapped-but-unwritten segment page (the loader mmaps the
+                // region before filling it): a filler 0x00000000 would bake
+                // an `andeq r0,r0,r0` cave that skips the real instruction
+                // once the page lands. Retry until the loader writes it.
+                return Err(CaveFail::Retry);
+            }
             if !arm_instruction_relocatable(word) {
                 log::debug!(
                     "trap {}: ARM word {word:#010x} not relocatable",
@@ -445,11 +461,18 @@ fn build_cave(
                 }
                 resume = site.wrapping_add(4);
                 bytes[0..4].copy_from_slice(&word.to_le_bytes());
-                bytes[4..6].copy_from_slice(&0x4801u16.to_le_bytes()); // ldr r1,[pc,#4]
+                bytes[4..6].copy_from_slice(&0x4901u16.to_le_bytes()); // ldr r1,[pc,#4]: unicorn/TCG uses PC=addr+4 for Thumb LDR-lit (r749 forensics) -> Align(+4+4)+4 = +0xc = resume
                 bytes[6..8].copy_from_slice(&0x4708u16.to_le_bytes()); // bx  r1
                 bytes[12..16].copy_from_slice(&(resume | 1).to_le_bytes());
                 patch = &[0x00, 0xf0, 0x00, 0xf8];
             } else {
+                if h0 == 0 {
+                    // Unwritten loader page (see the ARM word==0 guard):
+                    // `movs r0,r0` passes the relocatable check, so this
+                    // must be rejected before it, or the cave silently
+                    // replaces the real instruction that lands later.
+                    return Err(CaveFail::Retry);
+                }
                 if !thumb16_relocatable(h0) {
                     log::debug!("trap {}: Thumb half {h0:#06x} not relocatable", p.name);
                     return Err(if h0 == 0 {
@@ -463,7 +486,7 @@ fn build_cave(
                 // returns to site+2.
                 resume = site.wrapping_add(2);
                 bytes[0..2].copy_from_slice(&h0.to_le_bytes());
-                bytes[2..4].copy_from_slice(&0x4801u16.to_le_bytes()); // ldr r1,[pc,#4] @+2 -> literal @+8
+                bytes[2..4].copy_from_slice(&0x4901u16.to_le_bytes()); // ldr r1,[pc,#4]: unicorn/TCG uses PC=addr+4 for Thumb LDR-lit (r749 forensics) -> Align(+2+4)+4 = +8 = resume
                 bytes[4..6].copy_from_slice(&0x4708u16.to_le_bytes()); // bx  r1 (honours the |1 mode bit)
                 bytes[8..12].copy_from_slice(&(resume | 1).to_le_bytes());
                 patch = &SVC16;
@@ -472,6 +495,9 @@ fn build_cave(
     }
     let cave = *arena;
     *arena += 16;
+    if p.name.starts_with("libs/procnav") {
+        log::info!("TEMP build_cave {} site {site:#x} ACCEPT cave {cave:#x} bytes {:02x?} resume {resume:#x}", p.name, bytes);
+    }
     if unicorn.mem_write(cave as u64, &bytes).is_err() {
         return Err(CaveFail::Retry);
     }

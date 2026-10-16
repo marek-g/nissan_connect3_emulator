@@ -94,10 +94,20 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
     // code cave that replays the replaced instruction and branches back.
     if let Some((key, mut cb, cave, name)) = crate::os::code_stub::take_site(pc) {
         crate::os::code_stub::note_site(name, key);
-        log::debug!(
-            "site hit {name} @ {key:#x} thread [{}]",
-            unicorn.get_data().inner.thread_id()
-        );
+        if name.starts_with("libs/procnav") {
+            let mut cv = [0u8; 16];
+            let _ = unicorn.mem_read((cave & !3) as u64, &mut cv);
+            log::info!(
+                "TEMP site hit {name} @ {key:#x} thread [{}] pc {pc:#x} cave {cave:#x} raw {:02x?}",
+                unicorn.get_data().inner.thread_id(),
+                cv
+            );
+        } else {
+            log::debug!(
+                "site hit {name} @ {key:#x} thread [{}]",
+                unicorn.get_data().inner.thread_id()
+            );
+        }
         crate::os::code_stub::site_handler_enter();
         let ret = cb.call(unicorn);
         crate::os::code_stub::site_handler_leave();
