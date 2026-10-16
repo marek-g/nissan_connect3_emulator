@@ -2158,6 +2158,104 @@ fn cca_server_answer_register(
     );
 }
 
+/// r755: answer the `ServiceData` *requests* (class 0x45, OPTYPE byte @+0x1a
+/// in the client set) the HMI sends once a service registration is
+/// confirmed - the navigation service (0x0027) queries are what the HMI
+/// waits for before it drops the "Starting navigation." wait-widget.  A live
+/// server answers with a server OPTYPE (bIsServerMessage accepts 6..0x0c,
+/// 0x0e): here OPTYPE 9, result word @+0x18 = 0 (no error), dynamic-data
+/// length byte @+0x19 = 0, echoing svc/regid/function so
+/// `ail_tclServiceReference::bIsDataSet(svc, src, regid, func)` matches the
+/// client's own reference and `ail_bHandleMsgServiceData` forwards the
+/// message into the app receiver (dispatch vtable+0x20).
+/// Milestone-1 scope: navigation service 0x0027 on server queue mbx_36 only;
+/// other services need payloads whose schema is not decoded yet.
+fn cca_server_answer_data_request(
+    unicorn: &mut Unicorn<'_, Context>,
+    server_app: u16,
+    client: u16,
+    service: u16,
+    reg_id: u16,
+    function: u16,
+) {
+    static MSG_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x4000);
+    let mut body = vec![0u8; 0x20];
+    body[0..2].copy_from_slice(&server_app.to_le_bytes());
+    body[2..4].copy_from_slice(&client.to_le_bytes());
+    body[4..8].copy_from_slice(&(0x20u32).to_le_bytes());
+    body[8..10].copy_from_slice(&2u16.to_le_bytes());
+    body[0xb] = 0x45;
+    let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    body[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
+    body[0x14..0x16].copy_from_slice(&service.to_le_bytes());
+    body[0x16..0x18].copy_from_slice(&reg_id.to_le_bytes());
+    // +0x18 stays 0: in a response this word is result/no-error (+0x19 is
+    // the dynamic-data length, also 0).  The FunctionId the reference match
+    // (`bIsDataSet`) compares is carried at wire +0x0c, 0 on the request and
+    // 0 here.
+    body[0x1a] = 9; // OPTYPE: server data response
+    let mut blob = Vec::with_capacity(8 + body.len());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&body);
+    let mut spooled = false;
+    {
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
+        let delivered = match state.mq.queue_id_for_name("mbx_265") {
+            Some(q) if pwr_proxy::app_state_change_delivered(client) => {
+                state.mq.grow_msgsize(q, blob.len() as i64);
+                let ok = OsalQueueService::guest_post(&mut state.mq, "mbx_265", blob.clone(), 0);
+                if ok {
+                    state.notify_waiters();
+                }
+                ok
+            }
+            _ => false,
+        };
+        if !delivered {
+            spooled = true;
+        }
+    }
+    if spooled {
+        if let Ok(mut c) = DIR_REPLY_CACHE.lock() {
+            if c.len() < 96 {
+                c.push(body);
+            }
+        }
+    }
+    log::info!(
+        "[LIBOSAL-MBX] cca server {server_app:#06x}: answered ServiceData(svc {service:#06x} regid {reg_id:#04x} func {function:#06x}) from {client:#06x} (spooled {spooled})"
+    );
+}
+
+/// r755: answer `ServiceData` *requests* (class 0x45, OPTYPE byte @+0x1a in
+/// the client set) the HMI sends once a service registration is confirmed.
+/// Only decodes what the navigation service needs (milestone 1).
+fn cca_server_answer_data_request_if_unhosted(
+    unicorn: &mut Unicorn<'_, Context>,
+    name: &str,
+    body: &[u8],
+) {
+    if body.len() < 0x1c || body[0xb] != 0x45 {
+        return;
+    }
+    let client = u16::from_le_bytes([body[0], body[1]]);
+    if client != 0x0109 {
+        return;
+    }
+    let service = u16::from_le_bytes([body[0x14], body[0x15]]);
+    if service != 0x0027 {
+        return;
+    }
+    let server_app = match name.strip_prefix("mbx_").and_then(|d| d.parse::<u32>().ok()) {
+        Some(v) if (1..=0xffff).contains(&v) => v as u16,
+        _ => return,
+    };
+    let reg_id = u16::from_le_bytes([body[0x16], body[0x17]]);
+    let function = u16::from_le_bytes([body[0x18], body[0x19]]);
+    cca_server_answer_data_request(unicorn, server_app, client, service, reg_id, function);
+}
+
 fn bridge_guest_osal_queue(
     unicorn: &mut Unicorn<'_, Context>,
     api_name: &str,
@@ -2573,6 +2671,12 @@ fn bridge_mbx_queue(
                         }
                     }
                 }
+            }
+            // r755: and the follow-up ServiceData requests for the
+            // navigation service (wait-widget data), see
+            // `cca_server_answer_data_request_if_unhosted`.
+            if name != "mbx_265" && name != "mbx_0" {
+                cca_server_answer_data_request_if_unhosted(unicorn, name, &body);
             }
             trace_dapi_map_service_data(name, &body);
             // r755-diag: every mbx_0 post body once per (src, class), so the

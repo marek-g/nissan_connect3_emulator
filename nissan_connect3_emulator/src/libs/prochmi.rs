@@ -294,7 +294,10 @@ fn lua_call_trace_allowed() -> bool {
     if !lua_call_trace_enabled() {
         return false;
     }
-    LUA_CALL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < NAV_STATE_TRACE_LIMIT
+    // r755: dedicated wide cap - prepareCall runs for every Lua-driven
+    // widget/event and the shared 128 limit stopped the trace before boot
+    // finished.
+    LUA_CALL_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) < 4000
 }
 
 fn gui_event_name_trace_allowed() -> bool {
@@ -781,6 +784,38 @@ crate::os::code_stub::trap_site(unicorn, msg_on_message, crate::os::code_stub::T
             {
                 post_gui_internal_events(uc);
             }
+            // r755-diag: enumerate the receiver lists bOnMessage walks
+            // (`this[4]`/`this[5]` = +0x14/+0x18, receiver node event id at
+            // +0xa, fwl_List-style next at +4) to learn every GUI event the
+            // Lua side is waiting on - the unnamed ones are where the
+            // "Starting navigation." hide trigger must live.
+            {
+                static DUMPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let d = DUMPS.fetch_add(1, Ordering::Relaxed);
+                if messaging != 0
+                    && matches!(d, 2 | 9 | 40 | 150 | 600 | 2400 | 9600)
+                {
+                    let mut raw: Vec<String> = Vec::new();
+                    for i in 0..24u32 {
+                        raw.push(format!("{:#x}", read_u32(uc, messaging + i * 4)));
+                    }
+                    log::info!("PROCHMI: GUI_Messaging obj raw n={d} {raw:?}");
+                    for (base, tag) in [(0x10u32, "idle"), (0x14u32, "frozen")] {
+                        let mut ids: Vec<String> = Vec::new();
+                        let mut node = read_u32(uc, messaging + base);
+                        for _ in 0..48 {
+                            if node == 0 || node > 0xf000_0000 {
+                                break;
+                            }
+                            ids.push(format!("{:#x}", read_u16(uc, node + 0xa)));
+                            node = read_u32(uc, node + 4);
+                        }
+                        log::info!(
+                            "PROCHMI: GUI_Messaging receiver list[{tag}] n={d} ids={ids:?}"
+                        );
+                    }
+                }
+            }
         
             0
         });
@@ -1100,6 +1135,47 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
     });
 
     let hmi_perform_new_app_state = base_address + CL_HMI_MNGR_PERFORM_NEW_APP_STATE;
+
+    // r755: `ail_bHandleMsgServiceData` forwards a matched server data
+    // response through the app-interface vtable slot +0x20.  At 0xfe2268
+    // (right before `ldr pc, [r3, #0x20]`) r2 is the app interface, r1 the
+    // amt message; resolve the receiver target and dump the wire body so
+    // the nav (0x27) data path gains a named consumer.
+    let svc_data_forward = base_address + (0x00fe_2268u32 - ORIGINAL_BASE);
+    crate::os::code_stub::trap_site(unicorn, svc_data_forward, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:svc-data-forward", move |uc: &mut Unicorn<'_, Context>| {
+        static HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = HITS.fetch_add(1, Ordering::Relaxed);
+        if n >= 32 {
+            return 0;
+        }
+        let appif = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+        let msg = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+        let vt = read_u32(uc, appif);
+        let target = if vt != 0 { read_u32(uc, vt + 0x20) } else { 0 };
+        let mut bytes: Vec<String> = Vec::new();
+        let content = read_u32(uc, msg + 4);
+        if content > 0x1000 && content < 0xf000_0000 {
+            for i in 0..8u32 {
+                let mut w = [0u8; 4];
+                if uc.mem_read((content + i * 4) as u64, &mut w).is_err() {
+                    break;
+                }
+                bytes.push(format!("{:08x}", u32::from_le_bytes(w)));
+            }
+        }
+        log::info!(
+            "PROCHMI svc-data-forward t={}ms thread=[{}] n={} appif={:#x} vt={:#x} target={:#x} content={:#x} body={:?}",
+            crate::libs::dapi::emu_t0_elapsed_ms(),
+            uc.get_data().inner.thread_id(),
+            n,
+            appif,
+            vt,
+            target,
+            content,
+            bytes,
+        );
+        0
+    });
     
 crate::os::code_stub::trap_site(unicorn, hmi_perform_new_app_state, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:763", move |uc: &mut Unicorn<'_, Context>| {
                 if !hmi_app_state_trace_allowed() {
