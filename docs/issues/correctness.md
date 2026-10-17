@@ -556,3 +556,22 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
   vDoTransition(sm, that-exit-transition) from the safe post-wipe site
   when the fab release completes (honest fakery: the app's own transition
   executor, our provider-level trigger).
+- fix208..213 forensics of the close path (release-wfind + popupslot
+  write-watch): 0x1650478's "found" branch is taken (wfind noop=false -
+  the live current-popup slot [[0x2a13a00]+0x14] holds the wait widget),
+  yet the *entire* call writes NOTHING to that slot (zero popupslot WRITE
+  events through the close) and mutates no head word of the widget.  The
+  path ends in 0x166e718 (list bookkeeping over widget+0x950..0x978) and
+  0x164e478(widget,2,proxy) - a message-registration teardown, NOT a
+  widget-hide.  Conclusion: the C++ close branch of
+  vHandleEnaviServerStatus is bookkeeping; the wait popup's visual
+  visibility is decided solely by the Lua/GUI state machine (the 0x1e5
+  enter-paint / exit-hide pair; see r757), and its vDoTransition/
+  performTransition sites (0x1371170/0x1371390 - both verified real
+  function entries, so the zero hits are NOT the dead-hook quirk) are
+  never called - the transitions in those two functions are not what hid
+  popup #1 either.  The Lua-side show/hide consumer is still unnamed.
+- No .lua/plain-script resources exist in lx001.tar.gz (the GUI logic is
+  compiled into libgw/GUI_ResourcePack-style binaries on the SD pack -
+  next grep target: the SD CRYPTNAV/ resource tree for the
+  "wait popup"-owning resource pack and its state-table event ids).

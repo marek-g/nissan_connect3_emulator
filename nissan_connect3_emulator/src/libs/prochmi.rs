@@ -1397,6 +1397,11 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
         // first words before (here) and after (release-pop) the whole
         // handler to see whether the close touches it at all.
         (0x0165_0478u32 - ORIGINAL_BASE, "release-close"),
+        // fix208: the decision point inside 0x1650478 (`beq` at 0x16504e8,
+        // taken when r5==0 or r0=[GUI singleton +0x14]==0 -> r4:=0 and the
+        // close silently no-ops) - log both operands to see whether the
+        // close actually found a registered popup to remove.
+        (0x0165_04e8u32 - ORIGINAL_BASE, "release-wfind"),
         // fix187 forensics: nSpaceLeft entry gate.  Every legitimate
         // caller passes q in 0..7; a bigger r1 means a mis-wired caller or
         // a stale translation block.  Dumps lr + a stack backtrace so the
@@ -2061,6 +2066,55 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     )
                 }
                 "release-close" | "release-pop" => {
+                    // fix212: slot14 reads identical pre/post - install a
+                    // one-shot write-watch on the singleton slot from the
+                    // close entry (hook applies from the next TB onward,
+                    // i.e. it sees THIS close's stores: writes happen after
+                    // the entry trap) to catch a clear-then-reregister wave.
+                    if label == "release-close" {
+                        static SLOTPEND: AtomicU32 = AtomicU32::new(0);
+                        SLOTPEND.fetch_add(1, Ordering::Relaxed);
+                        if SLOTPEND.load(Ordering::Relaxed) <= 3 {
+                            let holder = read_u32(uc, 0x02a1_3a00);
+                            let singl_addr = if holder != 0 {
+                                read_u32(uc, holder)
+                            } else {
+                                0
+                            };
+                            if singl_addr != 0 {
+                                let res = uc.add_mem_hook(
+                                    unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                                    (singl_addr + 0x14) as u64,
+                                    (singl_addr + 0x18) as u64,
+                                    move |uc: &mut Unicorn<'_, Context>,
+                                          _t,
+                                          address,
+                                          size,
+                                          value| {
+                                        let lr =
+                                            uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                                        let pc =
+                                            uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                                        log::warn!(
+                                            "PROCHMI popupslot WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x} lr={lr:#x}",
+                                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                                            uc.get_data().inner.thread_id(),
+                                            address,
+                                            size,
+                                            value,
+                                            pc,
+                                        );
+                                        true
+                                    },
+                                );
+                                log::info!(
+                                    "PROCHMI popupslot watch on {:#x}: {}",
+                                    singl_addr + 0x14,
+                                    res.is_ok()
+                                );
+                            }
+                        }
+                    }
                     // Diff the popup widget's head words around the close:
                     // release-close sees r0 = widget from 0x1650478's own
                     // entry; release-pop reads [handler+0x7e0] again after
@@ -2074,6 +2128,21 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                         }
                         (read_u32(uc, r5 + 0x7e0), "post")
                     };
+                    // The GUI singleton instance used by 0x1650478 is the
+                    // getter's live return (release-wfind shows r0=
+                    // [singl+0x14] = the registered popup widget there);
+                    // my earlier static guesses (0x2a13a08, 0x2551720) were
+                    // wrong (0x2551720=[0x2cbe398] is a vtable, its +0x14
+                    // is text 0x6172b3).  Read the same slot wfind saw by
+                    // re-walking the getter chain live.
+                    let holder = read_u32(uc, 0x02a1_3a00);
+                    let singl = if holder != 0 { read_u32(uc, holder) } else { 0 };
+                    let slot14 = if singl != 0 {
+                        read_u32(uc, singl + 0x14)
+                    } else {
+                        0
+                    };
+                    let singl_addr = singl;
                     let mut words = Vec::new();
                     if w != 0 {
                         for off in (0..0x30u32).step_by(4) {
@@ -2081,11 +2150,18 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                         }
                     }
                     format!(
-                        " {tag} w={w:#x} vt={:#x} w28={:#x} w98={:#x} head=[{}]",
+                        " {tag} w={w:#x} vt={:#x} w28={:#x} w98={:#x} singl={singl_addr:#x} slot14={slot14:#x} head=[{}]",
                         if w != 0 { read_u32(uc, w) } else { 0 },
                         if w != 0 { read_u32(uc, w + 0x28) } else { 0 },
                         if w != 0 { read_u32(uc, w + 0x98) & 0xffff } else { 0 },
                         words.join(" "),
+                    )
+                }
+                "release-wfind" => {
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    format!(
+                        " slot14={r0:#x} proxy={r5:#x} noop={}",
+                        r5 == 0 || r0 == 0,
                     )
                 }
                 _ => format!(" this={r0:#x}"),
