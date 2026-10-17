@@ -4,3 +4,14 @@ resolver = "2"
 members = [
     "nissan_connect3_emulator",
 ]
+
+# The dev profile built Unicorn's TCG with CMAKE_BUILD_TYPE=Debug (-O0) and
+# UNICORN_LOGGING=ON (unicorn-engine-sys build.rs keys off the cargo profile;
+# cmake-rs derives the type from opt-level), so every guest instruction ran
+# through an unoptimized interpreter - the single biggest wall-clock cost of
+# the minutes-long map pipeline.  opt-level=2 makes cmake-rs pick
+# RelWithDebInfo (cc -O2 -g) for Unicorn and speeds up the hot Rust glue
+# (scheduler, syscalls, hooks); keep debug info for backtraces.
+[profile.dev]
+opt-level = 2
+debug = "line-tables-only"

@@ -411,9 +411,8 @@ impl MountFileSystem {
     }
 
     pub fn is_open(&self, fd: i32) -> bool {
-        self.mount_points
-            .iter()
-            .any(|mp| mp.file_system.is_open(fd))
+        // ride the O(1) fd->mount record (every syscall path probes this)
+        self.get_mount_point(fd).is_some()
     }
 
     pub fn get_length(&mut self, fd: i32) -> u64 {

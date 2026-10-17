@@ -94,3 +94,21 @@ Hot-path problems: per-syscall allocations, O(n) lookups, redundant FFI calls, r
 - Added `pretty_env_logger::init_timed()`: logs carry ms wall timestamps -
   required to profile the minutes-long map pipeline (the plain init printed
   none). NB `formatted_builder()` alone never reads RUST_LOG (silent runs).
+
+## RESOLVED: dev profile compiled Unicorn's TCG with -O0 (CMAKE Debug)
+- unicorn-engine-sys 2.1.5 builds the engine through cmake-rs, which derives
+  CMAKE_BUILD_TYPE from the cargo opt-level: `cargo build` (opt-level=0)
+  produced a Debug libunicorn (-O0) AND turned UNICORN_LOGGING on.  Every
+  guest instruction therefore executed through an unoptimized translator
+  front - the dominant share of the minutes-long "waiting for the map" wall
+  clock (3.9 MB of CCP DAT + WDB parse consumed ~110 s of it).
+- Fix: workspace [profile.dev] opt-level=2 + debug="line-tables-only".
+  cmake-rs now picks RelWithDebInfo (-O2 -g).  Measured (identical 300 s no-
+  env runs): baseline r771 = zero map pixels at t=300 s (cryptnav first-
+  pass DATs opened at t=38..46 s, pipeline still mid-load at kill); r772 =
+  first REAL rendered map pixels at ~t=105 s, DAT first pass done at t=31 s,
+  log throughput +15%.  The map now appears while the process still runs.
+- Wall-clock budget now: HMI ready (popup hidden) ~14 s, first map pixels
+  ~100 s.  What remains is organic guest CPU work (cryptnav decrypt/parse
+  under JIT); further levers: opt-level=3/lto, the AE_13 WDB fault still
+  occasionally killing a PROCNAV pump thread (correctness, not speed).
