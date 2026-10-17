@@ -1210,6 +1210,10 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
         (0x00fc_80c8u32 - ORIGINAL_BASE, "hmicca-svcstate"),
         (0x00fc_68e4u32 - ORIGINAL_BASE, "fi-dispatch"),
         (0x00fc_9ae8u32 - ORIGINAL_BASE, "cca-getnext"),
+        (0x013c_9a70u32 - ORIGINAL_BASE, "gw-regclient"),
+        (0x0135_2d8cu32 - ORIGINAL_BASE, "deliver-fi"),
+        (0x013c_9314u32 - ORIGINAL_BASE, "gw-lookup"),
+        (0x013c_931cu32 - ORIGINAL_BASE, "gw-route"),
         (0x00fc_9af4u32 - ORIGINAL_BASE, "cca-del"),
         (0x00fd_0428u32 - ORIGINAL_BASE, "cpm-update"),
         (0x0135_2df4u32 - ORIGINAL_BASE, "hsi-mngr-appstate"),
@@ -1244,6 +1248,10 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                 && label != "hmicca-svcstate"
                 && label != "fi-dispatch"
                 && label != "cca-getnext"
+                && label != "gw-regclient"
+                && label != "deliver-fi"
+                && label != "gw-lookup"
+                && label != "gw-route"
                 && label != "cca-del"
                 && label != "cpm-update"
             {
@@ -1279,6 +1287,49 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     )
                 }
                 "fi-nav-svcstate" => format!(" this={r0:#x} hsi={:#x}", read_u32(uc, r0 + 8)),
+                "gw-regclient" => format!(" gw={r0:#x} fidata={r1:#x}"),
+                "gw-lookup" => {
+                    // clCCAGateway::bReadSharedMemory routing call site
+                    // (mov lr,pc before ldr pc,[ip,#16]): r0 = clICCAGW_HSI
+                    // handler, r1=svc, r2=src, r3=subid; its client vector is
+                    // at +0xc..+0x10.  Counting clients tells us whether the
+                    // nav svc 0x27 route entry was ever created.
+                    let begin = read_u32(uc, r0.wrapping_add(0xc));
+                    let end = read_u32(uc, r0.wrapping_add(0x10));
+                    let k2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    let k3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                    let n = if end > begin && (end - begin) % 4 == 0 {
+                        (end - begin) / 4
+                    } else {
+                        u32::MAX
+                    };
+                    // Dump each clFiData route entry: svc@+8,
+                    // sourceSubId@+10, registerId@+12, serverAppId@+18.
+                    // pvGetHandler matches (svc, sourceSubId==src,
+                    // registerId==wire subid@+0xe).
+                    let mut dump = String::new();
+                    if n != u32::MAX && n <= 64 {
+                        for i in 0..n {
+                            let e = read_u32(uc, begin + i * 4);
+                            dump.push_str(&format!(
+                                " [{i}]{e:#x}:{:#x}/{:#x}/{:#x}/{:#x}",
+                                read_u16(uc, e + 8),
+                                read_u16(uc, e + 10),
+                                read_u16(uc, e + 12),
+                                read_u16(uc, e + 18),
+                            ));
+                        }
+                    }
+                    format!(
+                        " gw={r0:#x} svc={r1:#x} src={k2:#x} subid={k3:#x} clients={n}{dump}"
+                    )
+                }
+                "deliver-fi" => {
+                    // clHSIMngr::bInitFIs "DELIVER FI'S": the per-FI virtual
+                    // into clHSIMngr+8 (the CCA-gateway registrar adapter).
+                    // r1 = the FI object; FI 8 = clFi_Navi at 0x38f9970.
+                    format!(" registrar={r0:#x} fi={r1:#x}")
+                }
                 "hsi-cmd" => {
                     let mut stack_refs: Vec<String> = Vec::new();
                     let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
@@ -1308,16 +1359,12 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     let tgt = read_u32(uc, vt.wrapping_add(8));
                     let w = read_u32(uc, sd.wrapping_add(4));
                     if (0x9000_0000..0x9200_0000).contains(&w) || (0x300_0000..0x500_0000).contains(&w) {
+                        let mut hex = String::new();
+                        for i in 0..0x28u32 {
+                            hex.push_str(&format!("{:02x} ", read_u8(uc, w + i)));
+                        }
                         format!(
-                            " this={r0:#x} vt={vt:#x} target={tgt:#x} sd={sd:#x} wire={w:#x} src={:#x} dst={:#x} class={:#x} subid={:#x} msgid={:#x} svc={:#x} regid={:#x} func={:#x}",
-                            read_u32(uc, w) & 0xffff,
-                            (read_u32(uc, w) >> 16) & 0xffff,
-                            read_u8(uc, w + 0xb),
-                            read_u16(uc, w + 0xc),
-                            read_u32(uc, w + 0x10),
-                            read_u16(uc, w + 0x14),
-                            read_u16(uc, w + 0x16),
-                            read_u32(uc, w + 0x18),
+                            " this={r0:#x} vt={vt:#x} target={tgt:#x} sd={sd:#x} wire={w:#x} bytes[{hex}]",
                         )
                     } else {
                         format!(" this={r0:#x} sd={sd:#x} wire={w:#x}")
