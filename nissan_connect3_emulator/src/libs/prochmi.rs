@@ -1367,6 +1367,11 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
         // epilogue site: fires only if the vtable+56 virtual call at
         // 0x15e2214 returns (i.e. handler completes).
         (0x015e_221cu32 - ORIGINAL_BASE, "release-pop"),
+        // fix201 forensics: the 0x15e23bc close path calls 0x1650478 with
+        // the popup widget in r0 ([handler+0x7e0]); probe the widget's
+        // first words before (here) and after (release-pop) the whole
+        // handler to see whether the close touches it at all.
+        (0x0165_0478u32 - ORIGINAL_BASE, "release-close"),
         // fix187 forensics: nSpaceLeft entry gate.  Every legitimate
         // caller passes q in 0..7; a bigger r1 means a mis-wired caller or
         // a stale translation block.  Dumps lr + a stack backtrace so the
@@ -1974,13 +1979,42 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     // release branch needs its 1 answer, fix179).
                     fake_cryptcard_into_idapi(uc);
                     let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    // A RUNNING server report implies an established HMI-
+                    // server session: the embedded session object at
+                    // handler+0x19d8 carries its state in u16 +0x98 (getter
+                    // vtable+0x40).  Real hardware shows the popup behind a
+                    // live session, so release takes the close path
+                    // 0x15e23bc (bl 0x1650478 closes widget [handler+0x7e0]);
+                    // state 0 there drops to the 0x15e0418 fallback, which
+                    // leaves the widget painted (fix196..199: hide request
+                    // event 0x81008132 delivered, popup still rendered).
+                    // Same provider-signal class as the RUNNING word itself.
+                    if uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32 == 2 {
+                        let w98 = r5 + 0x19d8 + 0x98;
+                        if read_u32(uc, w98) & 0xffff == 0 {
+                            let _ = uc.mem_write(w98 as u64, &1u16.to_le_bytes());
+                            log::info!(
+                                "PROCHMI enavi-fab: session word {w98:#x} := 1 (RUNNING implies connected) t={}ms",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                            );
+                        }
+                    }
+                    let w7e0 = read_u32(uc, r5 + 0x7e0);
+                    let w98 = read_u32(uc, r5 + 0x19d8 + 0x98) & 0xffff;
+                    let prox = read_u32(uc, r5 + 0x19d8);
+                    let pvt = if prox != 0 { read_u32(uc, prox) } else { 0 };
                     format!(
-                        " h={r5:#x} state148_r3={:#x} r7={:#x} f160={:#x} f15c={:#x} f7e4={:#x} b79={} gate830={:#x}",
+                        " h={r5:#x} state148_r3={:#x} r7={:#x} f160={:#x} f15c={:#x} f7e4={:#x} f7e0={w7e0:#x} w98={w98:#x} f19d8={prox:#x} pvt40={:#x} b79={} gate830={:#x}",
                         uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
                         uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32,
                         read_u32(uc, r5 + 0x160),
                         read_u32(uc, r5 + 0x15c),
                         read_u32(uc, r5 + 0x7e4),
+                        if pvt != 0 {
+                            read_u32(uc, pvt + 0x40)
+                        } else {
+                            0
+                        },
                         read_u8(uc, r5 + 0x79),
                         read_u32(uc, r5 + 0x830),
                     )
@@ -1999,6 +2033,31 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                         } else {
                             0
                         },
+                    )
+                }
+                "release-close" | "release-pop" => {
+                    // Diff the popup widget's head words around the close:
+                    // release-close sees r0 = widget from 0x1650478's own
+                    // entry; release-pop reads [handler+0x7e0] again after
+                    // the handler finished (r5 is callee-saved = handler).
+                    let (w, tag) = if label == "release-close" {
+                        (r0, "pre")
+                    } else {
+                        let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                        (read_u32(uc, r5 + 0x7e0), "post")
+                    };
+                    let mut words = Vec::new();
+                    if w != 0 {
+                        for off in (0..0x30u32).step_by(4) {
+                            words.push(format!("{:#x}", read_u32(uc, w + off)));
+                        }
+                    }
+                    format!(
+                        " {tag} w={w:#x} vt={:#x} w28={:#x} w98={:#x} head=[{}]",
+                        if w != 0 { read_u32(uc, w) } else { 0 },
+                        if w != 0 { read_u32(uc, w + 0x28) } else { 0 },
+                        if w != 0 { read_u32(uc, w + 0x98) & 0xffff } else { 0 },
+                        words.join(" "),
                     )
                 }
                 _ => format!(" this={r0:#x}"),
@@ -2135,6 +2194,60 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
         log::info!(
             "PROCHMI dframe write-watch installed: {}",
             watch_res_dframe.is_ok()
+        );
+        // r761: the release-branch query 0x1706710 is getter vtable+0x40 =
+        // u16[widget+0x98] on the embedded widget handler+0x19d8; its value
+        // decides the 0x15e23bc close path vs the 0x15e0418 fallback.  Watch
+        // the state word to learn who sets it (real device: the popup show
+        // path) and whether our run ever sets it non-zero.
+        let watch_res_w98 = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            (0x38f_99b0 + 0x19d8 + 0x94) as u64,
+            (0x38f_99b0 + 0x19d8 + 0x9f) as u64,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCHMI waitw98 WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    address,
+                    size,
+                    value,
+                    uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32,
+                );
+                true
+            },
+        );
+        log::info!(
+            "PROCHMI waitw98 write-watch installed: {}",
+            watch_res_w98.is_ok()
+        );
+        // fix202: when does the popup widget pointer enter/leave
+        // handler+0x7e0?  A write here is the show (store of the widget) or
+        // the real close (store of 0).  Comparing that timestamp with the
+        // enavi-fab release tells whether we release BEFORE the popup was
+        // ever shown (which is exactly the r757 dangling-paint trap).
+        let watch_res_show = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            (0x38f_99b0 + 0x7e0) as u64,
+            (0x38f_99b0 + 0x7e8) as u64,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCHMI popup7e0 WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    address,
+                    size,
+                    value,
+                    uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32,
+                );
+                true
+            },
+        );
+        log::info!(
+            "PROCHMI popup7e0 write-watch installed: {}",
+            watch_res_show.is_ok()
         );
         // r761: the enavi server startup state word [[IEnavi 0x3a241c8
         // +0x4c]proxy 0x3a31b40]+0xe0 stalls at 1 (STARTING) - the
@@ -3712,16 +3825,41 @@ fn fake_cryptcard_into_idapi(unicorn: &mut Unicorn<'_, Context>) {
 /// r0/r2/r3 would otherwise be clobbered - the evt8001 re-queue guest call
 /// shares this restore step).  See the enavi-chain trap comment for why
 /// the server report must be fabricated at all.
+/// r762: the IEnavi client singleton lives on the heap and its address is
+/// run-variant (0x3a241c8 in most runs, 0x3a0b810 in fix203 - writing via a
+/// stale copy of it silently poisons unrelated memory, fix194/fix203).  The
+/// handler object at 0x38f99b0 is a static (stable across runs) and keeps
+/// the live pointer at +0x7dc; the server-state proxy at [IEnavi+0x4c] is
+/// read live on every handler run (srvstate-get dump), so chain both.
+fn live_srv_proxy(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+    let ienavi = read_u32(unicorn, 0x38f9_9b0 + 0x7dc);
+    if ienavi == 0 {
+        return 0;
+    }
+    read_u32(unicorn, ienavi + 0x4c)
+}
+
 fn enavi_fab_fire_or_restore(unicorn: &mut Unicorn<'_, Context>, site: u32) {
     match ENAVI_FAB_STATE.load(Ordering::Relaxed) {
         1 if crate::libs::dapi::emu_t0_elapsed_ms() as u64
             >= ENAVI_FAB_DEADLINE.load(Ordering::Relaxed)
             // never race the evt8001 re-queue for the single PC slot - wait
             // for the next app-state transition while a re-queue is pending.
-            && EVT8001_REPOST.load(Ordering::Relaxed) == 0 =>
+            && EVT8001_REPOST.load(Ordering::Relaxed) == 0
+            // r762: fire only once the startup internal events have been
+            // released (paint-marker + 750 ms).  Those events are what
+            // (re-)show the wait popup (fix204/205: popup #2 painted at
+            // ~12.4 s, right after the 12 s fallback flush, while the fab
+            // release had already run at 6.5 s and closed the FIRST paint
+            // - the re-shown popup then stayed because the fab is
+            // one-shot).  Same gate as the flush itself: the fabricated
+            // RUNNING report then arrives after the final show, exactly
+            // like on the real device where the server needs seconds to
+            // boot, and closes whichever paint is up (same widget).
+            && startup_events_release_now() =>
         {
             let base = PROCHMI_BASE.load(Ordering::Relaxed);
-            let proxy = read_u32(unicorn, 0x3a24_1c8 + 0x4c);
+            let proxy = live_srv_proxy(unicorn);
             if base == 0 || proxy == 0 {
                 return;
             }
@@ -3850,8 +3988,12 @@ fn maybe_repost_evt8001(unicorn: &mut Unicorn<'_, Context>, original_pc: u32, at
         // app-state transition - exactly when the server posts a state-change
         // event - so log unconditionally (fires rarely).
         {
-            let proxy = read_u32(unicorn, 0x3a24_1c8 + 0x4c);
-            let srv_state = read_u32(unicorn, proxy + 0xe0);
+            let proxy = live_srv_proxy(unicorn);
+            let srv_state = if proxy != 0 {
+                read_u32(unicorn, proxy + 0xe0)
+            } else {
+                0
+            };
             let sink = read_u32(unicorn, 0x38f9_9b0 + 0x82c);
             let gate830 = read_u32(unicorn, 0x38f9_9b0 + 0x830);
             log::info!(

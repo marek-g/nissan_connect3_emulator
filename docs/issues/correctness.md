@@ -500,3 +500,44 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
   scene keeps containing the popup).  Next: find the 0x81008132 case in
   the FI-nav consumer and what visibility flag/animation timer it needs
   (suspect a render-timer or an SVG scene-remove step the stub swallows).
+
+## r762 - release branch verified end-to-end; visual hide is NOT its job (fix198..206)
+
+- Fixed a real bug: the enavi-fab/post-wipe probe read the server-state
+  proxy from a *hardcoded* IEnavi 0x3a241c8, but that singleton's address
+  is heap- and run-variant (fix194/203: [0x3a241c8+0x4c]=0x1000600 - the
+  fab wrote state into unrelated text-segment memory and the handler kept
+  seeing e0=1).  `live_srv_proxy()` now chains the STATIC handler
+  0x38f99b0 +0x7dc -> IEnavi -> +0x4c -> proxy (fix204: write lands,
+  readback=0x2, gate sees state148=2 every run).
+- Release-branch forensics (fix198..206): the query 0x1706710 is
+  vtable+0x40 = u16[widget 0x38fb388+0x98] on the *embedded session
+  object* handler+0x19d8 (segment-mapping gotcha: the binary's second LOAD
+  maps VA=off+0x10000, third +0x268000 - the old off+0x8000 assumption
+  poisoned earlier vtable reads).  A RUNNING report implies a live
+  session, so the release-gate sets that word to 1; the handler then takes
+  the REAL close path 0x15e23bc (`bl 0x1650478` at 0x15e23cc, r4:=1
+  fingerprint) instead of the 0x15e0418 fallback - all traps fire, clean
+  pop, no crash (LR-replay fix of r761 holds across runs).
+- KEY negative result (fix204/206 frames + popup7e0/paint-marker watches):
+  the handler's close branch does NOT repaint the popup away.  The only
+  observed organic visual hide is the GUI-event exit-hide: the 0x8d
+  startup-event flush (post_gui_internal_events) moved the popup state
+  0x1e5 -> 0x1e4 while the widget existed and the paint vanished
+  (fix206 popup #1, gone between the 9 s and 12 s frames).  The same flush
+  then (re-)paints a second "Starting navigation." from the rodata string
+  (paint marker t=12.4 s) - that late paint is what stays visible: after
+  it, the fab's close (n=2 run, state148=2/r7=1/close-traps all good,
+  fix206 t=13.5 s) leaves the widget on screen.
+- fab re-timed to fire only after `startup_events_release_now()` (paint
+  marker + 750 ms, 12 s fallback) so the RUNNING report follows the final
+  paint like on the real device - ordering is now right, the missing
+  piece is a *visual* hide channel after the last paint.
+- Next: the proven channel is GUI-internal events via
+  post_gui_message_queue (0x8d family = Lua state transitions with
+  enter/exit-hide pairs).  Find the GUI event id whose transition's
+  exit-hide covers the wait-popup state (0x1e5) *after* navigation is up
+  (real device: the server-RUNNING notification ultimately rides the
+  CCA/DAPIMgr -> Lua path), and post it through the same emulated queue
+  when the fab fires.  Provider-level event fabrication is the sanctioned
+  layer; the 0x8d flush already proves the queue injection works.
