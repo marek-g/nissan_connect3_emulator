@@ -616,3 +616,42 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
   sibling of that command object is the organic lever.  The bOnMessage
   receiver-list enumeration (r755-diag) remains the map for unnamed Lua
   event ids.
+
+## r765 - popup show/hide is executed by the GUI resource interpreter (fix221..230 probes)
+
+- The old "GUI core 0x47dcxxxx frames" were LIBC (memcpy/strlen in
+  /lib/libc-2.8.so mapped at 0x47d58000) - the r763 note about a GUI-core lib
+  at those VAs was wrong.  Stack-scan backtraces proved stale (the r757
+  popup-string hook's chain picked dead frames), so the probes now log LR +
+  raw stack words (bl-validated).
+- The popup-string reads are all ONE paint: pc = libc memcpy/strlen called
+  from the UTF-16/8 text builder 0x1362cb0 (+0x1362d34 variant, r7 = string
+  ptr).  The builder's saved-LR (stack [3]) is 0x136bf58 = the GUI resource
+  interpreter's virtual tail-call `ldr pc,[r3,#20]` (loop 0x136bc40..,
+  0x874-byte frame): `obj = cmd_class_table[word>>28]; call obj->[vtable+20]
+  (obj, word, arg)`.  For the popup the command WORD is the string pointer
+  itself (0x025186fc>>28 = class 0 = static text) - the interpreter runs the
+  compiled per-SM-state action lists (widget trees), so the SHOW is an entry
+  action of state 0x1e5 and the HIDE is the 0x1e4 entry (or 0x1e5 exit)
+  list - the same interpreter machinery fix214 saw flash by at 12.03 s,
+  BEFORE the async paint (orphan mechanism, r764).
+- Driver of the interpreter: FUN_01913c7c (called from 0x19141a4/0x1914204/
+  0x191f2b0/0x191f444) tail-calls vtable+16 of [obj+0x14]; live interpreter
+  singleton r0=0x391c450, r1=0x391ff90 (stable across runs' lifetimes),
+  r2 = action-list pointer (heap 0x3a184f8-style for the SM-state lists,
+  stack 0x906100c4 for the materialized paint run at t=12431 ms).
+- Probe status: trap_site probes `text-builder`/`text-builder2`/`gui-interp`
+  (own 4000-hit cap, t>10 s gate) and `gui-cmd-*` are installed; the
+  `ldr pc,[r3,#20]` sites (gui-cmd-wrap-exec/gui-cmd-interp) are NOT
+  relocatable so they ride legacy narrow hooks (dead-probe risk, AGENTS.md)
+  - they saw zero hits while the page-hook-proven builder DID fire; prefer
+  extending the builder/gui-interp traps or a page-range hook.
+- NEXT (concrete): (1) at a gui-interp hit during the SM-entry-list runs
+  (t~12.0x s, r2 = heap list) dump 64 words at r2 to learn the command
+  record format; (2) dump the state 0x1e5 object (leaf 0x39ead28 at the
+  12.03 s doTransition) and match fields against those r2 values to locate
+  its entry/exit action-list pointers; (3) after the enavi-fab release,
+  guest-call the interpreter (this=live 0x391c450-equivalent, r1=r2 pair as
+  observed) with the 0x1e4 ENTRY list - that re-runs the app's own hide
+  actions after the orphaned paint.  This stays "honest fakery" (guest
+  calls into the app's own executor, no memory patching).

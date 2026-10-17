@@ -1061,32 +1061,74 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                         return true;
                     }
                     let sp = _uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    // A raw stack scan (the r757 probe) showed stale frames
+                    // from earlier GUI traffic, so only accept words that are
+                    // real ARM `bl` return points: the word before them must
+                    // carry the bl encoding (top byte 0xeb/0x9b-0xdb family).
                     let mut chain: Vec<u32> = Vec::new();
                     if sp > 0x1000 && sp < 0xf000_0000 {
-                        for i in 0..192u32 {
-                            let w = read_u32(_uc, sp + i * 4);
-                            if (w >= 0x8000 && w < 0x0286_5294)
-                                || (w >= 0x47d0_0000 && w < 0x4860_0000)
+                        for i in 0..256u32 {
+                            let w = read_u32(_uc, sp + i * 4) & !1u32;
+                            if !((0x0000_8004..0x0286_5294).contains(&w)
+                                || (0x47d0_0004..0x4860_0000).contains(&w))
                             {
-                                if !chain.contains(&w) {
-                                    chain.push(w);
-                                    if chain.len() >= 12 {
-                                        break;
-                                    }
+                                continue;
+                            }
+                            let caller_insn = read_u32(_uc, w.wrapping_sub(4));
+                            let top = (caller_insn >> 24) & 0xff;
+                            // ARM bl/blx: bits[27:25] = 101, L bit24 -> the
+                            // top byte's low nibble is 0xb (bl) or 0xa (blx).
+                            if !matches!(top & 0x0f, 0x0a | 0x0b) {
+                                continue;
+                            }
+                            if !chain.contains(&w) {
+                                chain.push(w);
+                                if chain.len() >= 10 {
+                                    break;
                                 }
                             }
                         }
                     }
+                    let _ = sp;
                     log::warn!(
-                        "PROCHMI popup-string READ({tag}) {} [{}] addr={:#x} size={} n={} tel={tel} pc={:#x} chain={:?}",
+                        "PROCHMI popup-string READ({tag}) {} [{}] addr={:#x} size={} n={} tel={tel} pc={:#x} lr={:#x} regs={:?}",
                         elf,
                         tid,
                         address,
                         size,
                         count,
                         pc,
+                        _uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                        [
+                            RegisterARM::R0,
+                            RegisterARM::R1,
+                            RegisterARM::R2,
+                            RegisterARM::R3,
+                            RegisterARM::R4,
+                            RegisterARM::R5,
+                            RegisterARM::R6,
+                            RegisterARM::R7,
+                            RegisterARM::R8,
+                            RegisterARM::R9,
+                            RegisterARM::R10,
+                            RegisterARM::R11,
+                        ]
+                        .iter()
+                        .map(|r| format!("{:#x}", _uc.reg_read(*r).unwrap_or(0)))
+                        .collect::<Vec<_>>(),
+                    );
+                    log::warn!(
+                        "PROCHMI popup-string CALLCHAIN({tag}) tel={tel} chain={:?}",
                         chain.iter().map(|w| format!("{w:#x}")).collect::<Vec<_>>(),
                     );
+                    if count == 1 {
+                        let words: Vec<u32> =
+                            (0..48u32).map(|i| read_u32(_uc, sp + i * 4)).collect();
+                        log::warn!(
+                            "PROCHMI popup-string STACK({tag}) tel={tel} sp={sp:#x}: {:?}",
+                            words.iter().map(|w| format!("{w:#x}")).collect::<Vec<_>>(),
+                        );
+                    }
                     true
                 },
             );
@@ -3169,6 +3211,106 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             
             0
         });
+
+    // r765: the popup-string read chain ends in the UTF-16/8 builder pair
+    // 0x1362cb0/0x1362d34 (fix224: strlen inside them reading the string).
+    // Trap the builder entry - its own prologue pushes the caller's return,
+    // so the raw stack [5] and LR name the true presenter.  Cold site: only
+    // GUI text touches fire it.
+    {
+        for (offset, label) in [
+            (0x0136_2cb0u32 - ORIGINAL_BASE, "text-builder"),
+            (0x0136_2d34u32 - ORIGINAL_BASE, "text-builder2"),
+            (0x0136_bc40u32 - ORIGINAL_BASE, "gui-interp"),
+        ] {
+            let address = base_address + offset;
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:textbuilder", move |uc: &mut Unicorn<'_, Context>| {
+                if !nav_trace_enabled() {
+                    return 0;
+                }
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                let now = crate::libs::dapi::emu_t0_elapsed_ms();
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 4000 || now < 10_000 {
+                    return 0;
+                }
+                let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                let words: Vec<u32> =
+                    (0..10u32).map(|i| read_u32(uc, sp + i * 4)).collect();
+                log::warn!(
+                    "PROCHMI {label} t={}ms thread=[{}] r0={:#x} r1={:#x} r2={:#x} r3={:#x} lr={:#x} sp={sp:#x} st={:?}",
+                    now,
+                    uc.get_data().inner.thread_id(),
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                    words.iter().map(|w| format!("{w:#x}")).collect::<Vec<_>>(),
+                );
+                0
+            });
+        }
+    }
+
+    // r765: the popup-string read chain (fix221 run, EMU_PROCHMI_POPUP_TRACE)
+    // proved the "Starting navigation." text - and with it the widget's
+    // SHOW - is executed by the GUI core command interpreter: a resource
+    // driven loop at 0x136bc40..0x136bf58 walks a command table
+    // (`[sp,#0x874]`, entry index in r2, command word `r1 = [[sp,#0x874], sl]`)
+    // and for each word resolves an action object
+    // (`obj = cmd_class_table[word >> 28]`) and tail-calls its
+    // `vtable+20` (vExecute) with (obj, word, arg).  A thin wrapper
+    // 0x1363a10..0x1363a50 does the same for single calls.  The popup's
+    // hide is (near-certainly) the sibling command in the same table run by
+    // the same interpreter on the state's exit transition - which fires ~350
+    // ms BEFORE the paint (fix214/215 SM-page trace).  These two cold-site
+    // traps capture the executed command word, object, vtable and vExecute
+    // target while the paint runs, so the show command is named and the
+    // hide sibling can be found next to it in the table.
+    {
+        for (offset, label) in [
+            (0x0136_3a10u32 - ORIGINAL_BASE, "gui-cmd-wrap"),
+            (0x0136_3a4cu32 - ORIGINAL_BASE, "gui-cmd-wrap-exec"),
+            (0x0136_bf54u32 - ORIGINAL_BASE, "gui-cmd-interp"),
+        ] {
+            let address = base_address + offset;
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:guicmd", move |uc: &mut Unicorn<'_, Context>| {
+                if !nav_trace_enabled() {
+                    return 0;
+                }
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                let hit = HITS.fetch_add(1, Ordering::Relaxed);
+                if hit >= 400 {
+                    return 0;
+                }
+                let (r0, r1, r2) = (
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+                );
+                let (obj, vtable, exec) = if label == "gui-cmd-interp" {
+                    // r0 = obj, r1 = command word, r3 = [obj] vtable already
+                    // loaded; the call target is [r3,#20].
+                    let vt = read_u32(uc, r0);
+                    (r0, vt, read_u32(uc, vt + 20))
+                } else if label == "gui-cmd-wrap-exec" {
+                    // r0 = obj (r4), r3 = [obj], target [r3,#20].
+                    let vt = read_u32(uc, r0);
+                    (r0, vt, read_u32(uc, vt + 20))
+                } else {
+                    // wrapper entry: r0 = this, r1 = command word, r2 = arg.
+                    (0, 0, 0)
+                };
+                log::warn!(
+                    "PROCHMI {label} t={}ms thread=[{}] r0={r0:#x} r1(w)={r1:#x} r2={r2:#x} obj={obj:#x} vt={vtable:#x} exec={exec:#x} lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                );
+                0
+            });
+        }
+    }
 
     for (offset, store) in [
         (CL_HMI_MNGR_B_EXECUTE, "hmi_mngr"),
