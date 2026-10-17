@@ -1341,14 +1341,29 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
                     let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
                     let r10 = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
-                    format!(" this={r0:#x} svc={r6:#x} server={r7:#x} version={r2:#x} state={r10:#x}")
+                    // +0x24 selects between the direct notify loop and the
+                    // client-port lookup path; +0x1c is the port manager the
+                    // lookup runs against.
+                    let gate = read_u8(uc, r0.wrapping_add(0x24));
+                    let mgr = read_u32(uc, r0.wrapping_add(0x1c));
+                    format!(
+                        " this={r0:#x} svc={r6:#x} server={r7:#x} version={r2:#x} state={r10:#x} gate24={gate} portmgr={mgr:#x}"
+                    )
                 }
                 "svcstate-find" => {
                     let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
                     if r6 != 0x27 {
                         return 0;
                     }
-                    format!(" find_result={r0:#x} svc={r6:#x}")
+                    // stack packet handed to the lookup: svc/server/version
+                    // u16, state u8, subid u16 at sp+0x1e..0x27.
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let svc = read_u32(uc, sp.wrapping_add(0x1e)) & 0xffff;
+                    let server = (read_u32(uc, sp.wrapping_add(0x1e)) >> 16) & 0xffff;
+                    let ver_state = read_u32(uc, sp.wrapping_add(0x22));
+                    format!(
+                        " find_result={r0:#x} svc={svc:#x} server={server:#x} pkt={ver_state:#010x}"
+                    )
                 }
                 // no client port -> indirect call on the fallback singleton's
                 // vtable+8 (the two instructions before the site hold the
