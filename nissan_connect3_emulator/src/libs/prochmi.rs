@@ -302,6 +302,17 @@ static HSI_POWER_STATE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static HMI_NAV_HANDLER: AtomicU32 = AtomicU32::new(0);
 static HMI_NAV_HANDLER_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
+/// r760: the app state the HMI framework *visibly* stored last into
+/// `clHMIMngr+0x670` when that state is a pre-NORMAL one (INITIALIZED(2),
+/// OFF(4), PAUSE(5), DIAGNOSIS(6) in HSI coding); 0 = none / NORMAL.  A
+/// ghost writer invisible to `MEM_WRITE` hooks reverts the byte to NORMAL
+/// before the framework's periodic apply pass reads it (the r79/80 collapse
+/// mystery, reproduced fix121..fix124), so `clFi_Navi` never sees the states
+/// its `vNewAppState` startup guard waits for.  The always-on repair in
+/// `prochmi_add_code_hooks` re-asserts this value at the consumption point;
+/// a visible NORMAL store (the framework's own promotion) clears it.
+pub static PENDING_FW_STATE: AtomicU32 = AtomicU32::new(0);
+
 /// Startup GUI internal events driving the HMI lock state machine
 /// (LOCKED -> CHECKING -> ON).  r755: firing 0xcb SYSTEM_ALLOW_USER_ACTION
 /// after these was tried and changes nothing - the "Starting navigation."
@@ -1640,8 +1651,9 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
         // installed during the first setter call missed every writer whose
         // translation block predates it - the code that pre-seeded the
         // initial NORMAL pending silently rewrote OFF(4) back to 3 with no
-        // event (fix79/80: setter `str value=0x4` confirmed, yet
-        // `vPerformNewAppState` read back 3).
+        // event (r79/80: setter `str value=0x4` confirmed, yet
+        // `vPerformNewAppState` read back 3; the always-on repair for this
+        // ghost collapse lives further down, keyed on PENDING_FW_STATE).
         let watch_res = unicorn.add_mem_hook(
             unicorn_engine::unicorn_const::HookType::MEM_WRITE,
             0x38ee_e60u64 + 0x670,
@@ -1662,6 +1674,32 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
         log::info!(
             "PROCHMI appstate-byte load-time write-watch installed: {}",
             watch_res.is_ok()
+        );
+        // r759: dual-mapping hypothesis - if libosal's heap region is mapped
+        // a second time under the 0x4000_0000 libosal window, a store through
+        // the alias lands on the same host bytes but escapes the watch above.
+        // Watch the byte at the identical intra-page offset (0x4d0) in the
+        // 0x4009_4000 page to catch such alias stores.
+        let watch_res3 = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            0x4009_4d0u64,
+            0x4009_4d8u64,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                log::info!(
+                    "PROCHMI alias-watch WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    address,
+                    size,
+                    value,
+                    uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32
+                );
+                true
+            },
+        );
+        log::info!(
+            "PROCHMI alias-watch load-time write-watch installed: {}",
+            watch_res3.is_ok()
         );
         // r759: clFi_Navi::vNewAppState (0x14b9aac) calls vStartupEnaviServer
         // *directly* - no FI wire event needed - when the static "previous
@@ -1709,8 +1747,9 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                 let state = read_u32(uc, (uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32).wrapping_add(0x14));
                 let prev = read_u32(uc, 0x02a7_23e0);
                 let navsrv = read_u32(uc, 0x38f_9970 + 0x30);
+                let flag34 = read_u8(uc, 0x38f_9970 + 0x34);
                 log::info!(
-                    "PROCHMI enavi-chain {label} t={}ms thread=[{}] n={} caller={lr:#x} state={state:#x} prev={prev:#x} navsrv+30={navsrv:#x}",
+                    "PROCHMI enavi-chain {label} t={}ms thread=[{}] n={} caller={lr:#x} state={state:#x} prev={prev:#x} navsrv+30={navsrv:#x} flag34={flag34:#x}",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     uc.get_data().inner.thread_id(),
                     n,
@@ -1718,42 +1757,139 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                 0
             });
         }
-        // r759: the OFF->NORMAL collapse mystery (r79/80: the setter stores
-        // OFF(4) via the strb pair at 0x134ec64/68, yet the consumer
-        // broadcasts NORMAL(3)).  The consumer's pending!=0 branch lands on
-        // 0x134ee18 (where the observed pending=0 clears happen) and then
-        // applies +0x670; trap that entry and the HSI dispatcher entry
-        // (0x1352df4, r1 = state about to be broadcast to every FI) to see
-        // exactly what each observes at the collapse.
+    }
+
+    // r760: always-on OFF->NORMAL state-collapse repair + enavi
+    // start-request fabrication (runs regardless of the trace env).
+    //
+    // The LPM proxy hands the HMI framework its boot app states and the
+    // framework setter visibly stores them at `clHMIMngr+0x670` (strb pair
+    // 0x134ec64/68, hook-confirmed) with the pending flag at +0x671, but a
+    // writer invisible to load-time MEM_WRITE hooks (fix121..fix124: the
+    // apply pass at 0x134ee18 always finds the byte back at NORMAL(3)
+    // ~20 ms later) reverts it before `clHMIMngr::vPerformNewAppState`
+    // (0x134e938) reads it - so `clFi_Navi::vNewAppState` never sees the
+    // INITIALIZED/OFF states whose broadcast the device's slow LPM guarantees
+    // it.  That broadcast is the organic startup trigger: vNewAppState
+    // (0x14b9ba0) calls `clHmiNavServerHandler::vStartupEnaviServer` when
+    // NORMAL/PAUSE arrives while its static previous-state (0x2a723e0) reads
+    // OFF(4), the handler (object+0x30) exists and the start-request flag
+    // (object+0x34) is 1 (0x14b9d70).
+    //
+    // Repair at the consumption point: the watch records every *visible*
+    // pre-NORMAL store (the ghost stays invisible), the apply trap re-asserts
+    // it if the byte already reverted when the framework is about to act -
+    // the emulator is serialized, so nothing runs between the trap and the
+    // consumer's ldrb.  A visible NORMAL store (the framework's own
+    // promotion) disarms it, so the OFF->NORMAL promotion that starts enavi
+    // still flows.  The start-request flag - set on the device only by the
+    // phone-side FI event 0x80108031 (0x14be400; the id occurs nowhere in
+    // any firmware/SD file, scanned fix117..fix126) whose producer, the
+    // smartphone enavi app, does not exist here - is fabricated once at
+    // clHmiNavServerHandler construction (0x15e871c, t~2.3 s: clFi_Navi is
+    // built by then), the same sanctioned fabrication class as the NAVI FI
+    // service answers.  Everything after the guard is real prochmi code.
+    if unicorn.get_data().elf_path.contains("prochmi") {
+        let _ = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            0x38ee_e60u64 + 0x670,
+            0x38ee_e60u64 + 0x672,
+            |_uc: &mut Unicorn<'_, Context>, _t, address, _size, value| {
+                if address == 0x38ee_e60u64 + 0x670 {
+                    match value as u32 {
+                        2 | 4 | 5 | 6 => PENDING_FW_STATE.store(value as u32, Ordering::SeqCst),
+                        3 => PENDING_FW_STATE.store(0, Ordering::SeqCst),
+                        _ => {}
+                    }
+                }
+                true
+            },
+        );
         for (off, label) in [
             (0x0134_ee18u32 - ORIGINAL_BASE, "hmimngr-apply"),
             (0x0135_2df4u32 - ORIGINAL_BASE, "hsimngr-dispatch"),
-            (0x0134_e96cu32 - ORIGINAL_BASE, "hsimngr-dispatch-ret"),
         ] {
             let site = base_address + off;
-            crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:state-collapse", move |uc: &mut Unicorn<'_, Context>| {
-                static HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                let n = HITS.fetch_add(1, Ordering::Relaxed);
-                if n >= 32 {
-                    return 0;
-                }
+            crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:state-repair", move |uc: &mut Unicorn<'_, Context>| {
+                static LOGS: AtomicU32 = AtomicU32::new(0);
                 let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
-                let (r1, r7, fp) = (
-                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
-                    uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32,
-                    uc.reg_read(RegisterARM::R11).unwrap_or(0) as u32,
-                );
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let byte = read_u8(uc, 0x38ee_e60u32 + 0x670);
                 let pending = read_u8(uc, 0x38ee_e60u32 + 0x671);
-                log::info!(
-                    "PROCHMI enavi-chain {label} t={}ms thread=[{}] n={} caller={lr:#x} r1={r1:#x} r7={r7:#x} fp={fp:#x} byte670={byte:#x} pending671={pending:#x}",
-                    crate::libs::dapi::emu_t0_elapsed_ms(),
-                    uc.get_data().inner.thread_id(),
-                    n,
-                );
+                let want = PENDING_FW_STATE.load(Ordering::SeqCst) as u8;
+                let mut repair = "";
+                if label == "hmimngr-apply" && want != 0 && byte != want {
+                    // The ghost reverted the state the framework stored;
+                    // restore it so vPerformNewAppState broadcasts it.  Stay
+                    // armed: the ghost will revert again, and every OFF
+                    // broadcast re-asserts the prev-state enavi waits for.
+                    if write_u8(uc, 0x38ee_e60u32 + 0x670, want) {
+                        repair = " REPAIRED";
+                    }
+                } else if label == "hsimngr-dispatch"
+                    && r1 == 3
+                    && PENDING_FW_STATE.load(Ordering::SeqCst) == 0
+                {
+                    // The promotion out of OFF is in flight: deliver the
+                    // fabricated enavi start-request indication at the
+                    // exact moment the device would have processed its
+                    // queued 0x80108031 event.  Written here (not just at
+                    // the ctor) because the same ghost writer that collapses
+                    // the state byte reverted the ctor-time store (fix127:
+                    // flag read 0 at the first broadcast although the write
+                    // returned ok); the emulator is serialized, so this
+                    // store cannot be clobbered before the guard's ldrb five
+                    // instructions later.
+                    write_u8(uc, 0x38f_9970 + 0x34, 1);
+                    repair = " FLAG1";
+                }
+                if nav_trace_enabled() && LOGS.fetch_add(1, Ordering::Relaxed) < 96 {
+                    log::info!(
+                        "PROCHMI enavi-chain {label} t={}ms thread=[{}] caller={lr:#x} r1={r1:#x} byte670={byte:#x} pending671={pending:#x} want={want:#x}{repair}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                }
                 0
             });
         }
+        // Once-only enavi start-request flag (clFi_Navi+0x34), see above.
+        // fix127: after the ctor-time write the byte read back 0 at the first
+        // vNewAppState call (2.96 s), so watch the byte to name the clearer.
+        let flag_watch = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            0x38f_9970u64 + 0x34,
+            0x38f_9970u64 + 0x34,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCHMI enavi-flag WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    address,
+                    size,
+                    value,
+                    uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32
+                );
+                true
+            },
+        );
+        log::info!(
+            "PROCHMI enavi-flag write-watch installed: {}",
+            flag_watch.is_ok()
+        );
+        let ctor = base_address + (0x015e_871cu32 - ORIGINAL_BASE);
+        crate::os::code_stub::trap_site(unicorn, ctor, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:enavi-startflag", move |uc: &mut Unicorn<'_, Context>| {
+            static DONE: AtomicBool = AtomicBool::new(false);
+            if !DONE.swap(true, Ordering::SeqCst) {
+                let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let ok = write_u8(uc, 0x38f_9970 + 0x34, 1);
+                log::info!(
+                    "PROCHMI fabricated enavi start-request flag (clFi_Navi+0x34=1) ok={ok} at handler ctor this={this:#x}"
+                );
+            }
+            0
+        });
     }
 
     let hmi_perform_new_app_state = base_address + CL_HMI_MNGR_PERFORM_NEW_APP_STATE;
