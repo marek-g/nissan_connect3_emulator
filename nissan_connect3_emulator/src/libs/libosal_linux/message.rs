@@ -2232,6 +2232,16 @@ fn cca_server_answer_register(
         "[LIBOSAL-MBX] cca server {server_app:#06x}: answered ServiceRegister(svc {service:#06x}) from {client:#06x} with RegisterConf+ServiceStatus (live {posted}, spooled {})",
         2 - posted,
     );
+    // r758 experiment: see post_navi_event_probe.  Runs once, right after the
+    // NAVI service registration is answered (the HMI's nav client is live by
+    // then; the data-request phase never starts in the emulator, so this is
+    // the last organic moment on that client's timeline).
+    if service == 0x0027 {
+        static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !FIRED.swap(true, Ordering::Relaxed) {
+            post_navi_event_probe(unicorn, client);
+        }
+    }
 }
 
 /// r755: answer the `ServiceData` *requests* (class 0x45, OPTYPE byte @+0x1a
@@ -2302,6 +2312,58 @@ fn cca_server_answer_data_request(
     log::info!(
         "[LIBOSAL-MBX] cca server {server_app:#06x}: answered ServiceData(svc {service:#06x} regid {reg_id:#04x} func {function:#06x}) from {client:#06x} (spooled {spooled})"
     );
+}
+
+/// r758: see the call site above.  The AppInfo-consumption evidence (fix117:
+/// records whose word@+4 was 0x80108031 surfaced as `ail_bHandleMsgAppInfoMessage`,
+/// i.e. word+4 is the OSAL message type AIL dispatches on) plus the consumer's
+/// own id math (`id - 0x80108030 < 0x4f4`) say FI-8 events arrive as *service
+/// data notifications* whose FunctionId is 0x8030+n and whose receiver composes
+/// `event = 0x80100000 | function`.  So post NAVI (svc 0x27) data records with
+/// func 0x8031 in the four plausible OPTYPE/regid combinations and watch
+/// hsi-fievent-router / fi-nav-events / enavi-startup.
+fn post_navi_event_probe(unicorn: &mut Unicorn<'_, Context>, client: u16) {
+    static MSG_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x8031);
+    // (func @ +0x18, OPTYPE @ +0x1a, regid @ +0x16)
+    const VARIANTS: [(u16, u8, u16); 4] = [
+        (0x8031, 0x0e, 0x00ec), // notification OPTYPE, the client's own regid
+        (0x8031, 0x09, 0x00ec), // plain server-response OPTYPE
+        (0x8031, 0x0e, 0xffff), // notification, wildcard regid
+        (0x0031, 0x0e, 0x00ec), // short function id variant
+    ];
+    for (idx, (func, optype, regid)) in VARIANTS.iter().enumerate() {
+        let mut body = vec![0u8; 0x20];
+        body[0..2].copy_from_slice(&0x0024u16.to_le_bytes());
+        body[2..4].copy_from_slice(&client.to_le_bytes());
+        body[4..8].copy_from_slice(&(0x20u32).to_le_bytes());
+        body[8..10].copy_from_slice(&2u16.to_le_bytes());
+        body[0xb] = 0x45;
+        let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed) as u32;
+        body[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
+        body[0x14..0x16].copy_from_slice(&0x0027u16.to_le_bytes());
+        body[0x16..0x18].copy_from_slice(&regid.to_le_bytes());
+        body[0x18..0x1a].copy_from_slice(&func.to_le_bytes());
+        body[0x1a] = *optype;
+        let mut blob = Vec::with_capacity(8 + body.len());
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&body);
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
+        let delivered = match state.mq.queue_id_for_name("mbx_265") {
+            Some(q) => {
+                state.mq.grow_msgsize(q, blob.len() as i64);
+                let ok = OsalQueueService::guest_post(&mut state.mq, "mbx_265", blob, 0);
+                if ok {
+                    state.notify_waiters();
+                }
+                ok
+            }
+            _ => false,
+        };
+        log::info!(
+            "[LIBOSAL-MBX] navi-event-probe[{idx}]: func={func:#06x} optype={optype:#04x} regid={regid:#04x} delivered {delivered}"
+        );
+    }
 }
 
 /// r755: answer `ServiceData` *requests* (class 0x45, OPTYPE byte @+0x1a in

@@ -1215,6 +1215,11 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
         (0x013c_9314u32 - ORIGINAL_BASE, "gw-lookup"),
         (0x013c_931cu32 - ORIGINAL_BASE, "gw-route"),
         (0x00fc_9af4u32 - ORIGINAL_BASE, "cca-del"),
+        // r758: the gateway's client-delivery indirect call (bReadSharedMemory
+        // tail): handler in r9, amt descriptor in r7, target = vtable+0x10.
+        // Dumping handler/vtable/target names the client class that consumes
+        // nav records - i.e. where the wire bytes meet the CM layer.
+        (0x013c_9340u32 - ORIGINAL_BASE, "gw-deliver"),
         (0x00fd_0428u32 - ORIGINAL_BASE, "cpm-update"),
         (0x0135_2df4u32 - ORIGINAL_BASE, "hsi-mngr-appstate"),
         (0x0161_f754u32 - ORIGINAL_BASE, "ienvi-singleton"),
@@ -1274,6 +1279,7 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                 && label != "svcstate-srv"
                 && label != "svcstate-find"
                 && label != "svcstate-sink"
+                && label != "gw-deliver"
             {
                 return 0;
             }
@@ -1382,6 +1388,26 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     let field = read_u32(uc, r0.wrapping_add(0x650));
                     format!(
                         " sink={r0:#x} vt={vt:#x} target={target:#x} mgr650={field:#x}"
+                    )
+                }
+                "gw-deliver" => {
+                    let r9 = uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32;
+                    let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                    let vt = if r9 != 0 { read_u32(uc, r9) } else { 0 };
+                    let target = if vt != 0 { read_u32(uc, vt + 0x10) } else { 0 };
+                    // amt message body = *(descriptor + 4)
+                    let body = if r7 != 0 { read_u32(uc, r7 + 4) } else { 0 };
+                    let (b0, t14, cls) = if body != 0 {
+                        (
+                            read_u32(uc, body) & 0xffff,
+                            (read_u32(uc, body.wrapping_add(0x14)) & 0xffff) as u16,
+                            read_u8(uc, body.wrapping_add(0xb)),
+                        )
+                    } else {
+                        (0, 0, 0)
+                    };
+                    format!(
+                        " handler={r9:#x} vt={vt:#x} target={target:#x} amt={r7:#x} body={body:#x} key={b0:#x} t14={t14:#x} class={cls:#x}"
                     )
                 }
                 "gw-regclient" => format!(" gw={r0:#x} fidata={r1:#x}"),
@@ -1637,6 +1663,97 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
             "PROCHMI appstate-byte load-time write-watch installed: {}",
             watch_res.is_ok()
         );
+        // r759: clFi_Navi::vNewAppState (0x14b9aac) calls vStartupEnaviServer
+        // *directly* - no FI wire event needed - when the static "previous
+        // framework state" at 0x2a723e0 reads 4 (the HSI-coded OFF the
+        // framework stores when the app enters `vEntryOff`) at the moment a
+        // state-3/5 callback arrives and the nav-server handler pointer
+        // (clFi_Navi+0x30) is non-null (0x14b9ba4 cmp #4 -> 0x14b9d64 ->
+        // bl 0x15e0f74).  Watch it from load time to name the writer, and
+        // trap the guarded entry blocks so every callback's argument and the
+        // global's value at that instant are logged.
+        let watch_res2 = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            0x02a7_23e0u64,
+            0x02a7_23e4u64,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCHMI navprev-global WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    address,
+                    size,
+                    value,
+                    uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32
+                );
+                true
+            },
+        );
+        log::info!(
+            "PROCHMI navprev-global load-time write-watch installed: {}",
+            watch_res2.is_ok()
+        );
+        for (off, label) in [
+            (0x014b_9ba0u32 - ORIGINAL_BASE, "finavi-newstate-35"),
+            (0x014b_9c14u32 - ORIGINAL_BASE, "finavi-newstate-4"),
+        ] {
+            let site = base_address + off;
+            crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:finavi-newstate", move |uc: &mut Unicorn<'_, Context>| {
+                static HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = HITS.fetch_add(1, Ordering::Relaxed);
+                if n >= 24 {
+                    return 0;
+                }
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                let state = read_u32(uc, (uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32).wrapping_add(0x14));
+                let prev = read_u32(uc, 0x02a7_23e0);
+                let navsrv = read_u32(uc, 0x38f_9970 + 0x30);
+                log::info!(
+                    "PROCHMI enavi-chain {label} t={}ms thread=[{}] n={} caller={lr:#x} state={state:#x} prev={prev:#x} navsrv+30={navsrv:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    n,
+                );
+                0
+            });
+        }
+        // r759: the OFF->NORMAL collapse mystery (r79/80: the setter stores
+        // OFF(4) via the strb pair at 0x134ec64/68, yet the consumer
+        // broadcasts NORMAL(3)).  The consumer's pending!=0 branch lands on
+        // 0x134ee18 (where the observed pending=0 clears happen) and then
+        // applies +0x670; trap that entry and the HSI dispatcher entry
+        // (0x1352df4, r1 = state about to be broadcast to every FI) to see
+        // exactly what each observes at the collapse.
+        for (off, label) in [
+            (0x0134_ee18u32 - ORIGINAL_BASE, "hmimngr-apply"),
+            (0x0135_2df4u32 - ORIGINAL_BASE, "hsimngr-dispatch"),
+            (0x0134_e96cu32 - ORIGINAL_BASE, "hsimngr-dispatch-ret"),
+        ] {
+            let site = base_address + off;
+            crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:state-collapse", move |uc: &mut Unicorn<'_, Context>| {
+                static HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = HITS.fetch_add(1, Ordering::Relaxed);
+                if n >= 32 {
+                    return 0;
+                }
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                let (r1, r7, fp) = (
+                    uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R11).unwrap_or(0) as u32,
+                );
+                let byte = read_u8(uc, 0x38ee_e60u32 + 0x670);
+                let pending = read_u8(uc, 0x38ee_e60u32 + 0x671);
+                log::info!(
+                    "PROCHMI enavi-chain {label} t={}ms thread=[{}] n={} caller={lr:#x} r1={r1:#x} r7={r7:#x} fp={fp:#x} byte670={byte:#x} pending671={pending:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    n,
+                );
+                0
+            });
+        }
     }
 
     let hmi_perform_new_app_state = base_address + CL_HMI_MNGR_PERFORM_NEW_APP_STATE;
