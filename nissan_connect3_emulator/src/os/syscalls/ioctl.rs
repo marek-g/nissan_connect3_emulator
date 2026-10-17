@@ -85,6 +85,12 @@ pub fn ioctl(mut unicorn: &mut Unicorn<'_, Context>, fd: u32, request: u32, addr
         Some("/dev/svg_layer") => {
             crate::os::dev::svg_layer::ioctl(&mut unicorn, request, addr) as u32
         }
+        // /dev/errmem: Bosch error-logging shared-memory device (the 'OS'
+        // ioctl family again: 0x534f1000 claim a slot, 0x534f1004 mark used).
+        // The records are guest-side diagnostics only - a successful no-op is
+        // the faithful model; the fall-through -1 made OSAL_vWriteToErrMem
+        // assert on every error write.
+        Some("/dev/errmem") => 0,
         _ => fs.ioctl(&mut unicorn, fd as i32, request, addr) as u32,
     };
 

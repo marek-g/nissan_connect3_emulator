@@ -188,7 +188,12 @@ pub fn ioctl(unicorn: &mut Unicorn<'_, Context>, fd: u32, request: u32, addr: u3
             0
         }
         other => {
-            log::warn!("[IOSC] unhandled ioctl request {:#x}", other);
+            log::warn!(
+                "[IOSC] unhandled ioctl request {:#x} lr={:#x} elf={}",
+                other,
+                unicorn.reg_read(RegisterARM::R14).unwrap_or(0),
+                unicorn.get_data().elf_path,
+            );
             EINVAL
         }
     };

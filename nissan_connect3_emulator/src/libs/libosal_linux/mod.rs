@@ -5,6 +5,7 @@ pub(crate) mod message;
 mod prm;
 mod process;
 mod registry;
+mod sem_track;
 mod svg;
 mod thread;
 mod trace;
@@ -329,6 +330,7 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
     hook_svg_code(unicorn, base_address);
     hook_thread_code(unicorn, base_address);
     hook_trace_code(unicorn, base_address);
+    sem_track::hook_sem_trace(unicorn, base_address);
 
     for (address, name) in [
         (0x4853_707c, "fd_device_ctrl_u32DirectSDCardInfo"),

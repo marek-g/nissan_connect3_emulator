@@ -534,14 +534,57 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
                     Some(Ok(result)) => set_runnable(unicorn, tid, Some(result)),
                     Some(Err(uaddr)) => {
                         // `uaddr` is this owner's VA into the host-backed shm
-                        // region; zeroing it clears the lost unlock globally.
-                        if unicorn.mem_write(uaddr as u64, &[0u8; 4]).is_err() {
+                        // region.  The word is either a PS-mutex (holder TID in
+                        // the low bits - zero it: dead-owner repair, Linux
+                        // would do this via robust lists) or an OSAL sync-pool
+                        // semaphore (WaiSyncObj waits while value==0): a
+                        // NON-zero word there is a pending post whose wake was
+                        // lost, so CONSUME the token instead of destroying it.
+                        // Also name the stuck object: the OSAL pool entry holds
+                        // the ASCII name just below the semaphore word.
+                        let mut wbuf = [0u8; 4];
+                        let word = unicorn
+                            .mem_read(uaddr as u64, &mut wbuf)
+                            .map(|_| u32::from_le_bytes(wbuf))
+                            .unwrap_or(0);
+                        let new_word = if word == 0 { 0 } else { word - 1 };
+                        if unicorn.mem_write(uaddr as u64, &new_word.to_le_bytes()).is_err() {
                             log::warn!(
-                                "[{tid}] shared-futex watchdog: failed to zero word {uaddr:#x}"
+                                "[{tid}] shared-futex watchdog: failed to rewrite word {uaddr:#x}"
                             );
                         } else {
+                            // scan the neighbourhood for the lock's ASCII name
+                            // (OSAL pool entries carry it near the sem word;
+                            // layout not known exactly, so harvest runs)
+                            let mut names: Vec<String> = Vec::new();
+                            let mut run = String::new();
+                            for i in (0..80u32).rev() {
+                                let at = uaddr.wrapping_sub(0x100).wrapping_add(i * 4);
+                                let mut b = [0u8; 4];
+                                let bytes = unicorn
+                                    .mem_read(at as u64, &mut b)
+                                    .map(|_| b)
+                                    .unwrap_or([0u8; 4]);
+                                for byte in bytes {
+                                    if byte.is_ascii_graphic() {
+                                        run.push(byte as char);
+                                    } else {
+                                        if run.len() >= 4 {
+                                            names.push(std::mem::take(&mut run));
+                                        }
+                                        run.clear();
+                                    }
+                                }
+                            }
+                            if run.len() >= 4 {
+                                names.push(run);
+                            }
                             log::warn!(
-                                "[{tid}] shared-futex watchdog: zeroed stuck word {uaddr:#x} after 20 s grace (dead-owner repair)"
+                                "[{tid}] shared-futex watchdog: repaired word {uaddr:#x} {word:#x}->{new_word:#x} (holder tid={} waiters={} stopped={}) ctx-names={names:?} t={}ms",
+                                word & 0x3fff_ffff,
+                                (word >> 30) & 1,
+                                (word >> 31) & 1,
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
                             );
                         }
                         set_runnable(unicorn, tid, Some(0u32));

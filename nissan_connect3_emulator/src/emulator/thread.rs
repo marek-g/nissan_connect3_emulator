@@ -445,8 +445,24 @@ pub fn dump_context(unicorn: &Unicorn<'_, Context>) {
         unicorn.reg_read(RegisterARM::R0).unwrap(),
         unicorn.reg_read(RegisterARM::R1).unwrap(),
         unicorn.reg_read(RegisterARM::R2).unwrap(),
-        unicorn.reg_read(RegisterARM::R3).unwrap()
+        unicorn.reg_read(RegisterARM::R3).unwrap(),
     );
+    // stack window: the frames above the faulting one usually carry the
+    // caller's locals that produced the bad pointer (forensics without gdb)
+    {
+        let sp = unicorn.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+        let base = sp.wrapping_sub(0x20);
+        let words: Vec<String> = (0..40u32)
+            .map(|i| {
+                let mut b = [0u8; 4];
+                match unicorn.mem_read((base + i * 4) as u64, &mut b) {
+                    Ok(_) => format!("{:#010x}", u32::from_le_bytes(b)),
+                    Err(_) => "----------".to_string(),
+                }
+            })
+            .collect();
+        log::error!("stack sp-0x20: {words:?}");
+    }
     print_mmu(unicorn);
 
     let pc = unicorn.reg_read(RegisterARM::PC).unwrap() as u32;

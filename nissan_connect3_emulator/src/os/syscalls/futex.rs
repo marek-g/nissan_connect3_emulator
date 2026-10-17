@@ -79,6 +79,15 @@ pub fn futex(
                 let thread_id = data.thread_id();
 
                 if let Some(key) = shm_futex_key(unicorn, uaddr) {
+                    log::info!(
+                        "futex: SHM-WAIT id-word {:#x} key {:#?} t={} thread [{}] (deadline {:?})",
+                        uaddr,
+                        key,
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        unicorn.get_data().thread_id(),
+                        deadline.map(|d| d.duration_since(Instant::now()).as_millis() as u64),
+                    );
+                    log_futex_backtrace(unicorn, uaddr);
                     // word is in shared memory: register globally so another
                     // process' FUTEX_WAKE can signal it; this process' host
                     // thread reaps it via advance_blocked.
@@ -140,10 +149,31 @@ pub fn futex(
                     .lock()
                     .unwrap()
                     .futex_wake_shared(&key, val as usize);
+                log::info!(
+                    "futex: SHM-WAKE word {:#x} key {:#?} woke {} t={} thread [{}]",
+                    uaddr,
+                    key,
+                    count,
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    unicorn.get_data().thread_id(),
+                );
                 // ring every doorbell so each parked owner reaps its signaled waiter
                 namespace.lock().unwrap().notify_waiters();
                 count as u32
             } else {
+                if (0x4000_0000..0x4100_0000).contains(&uaddr) {
+                    // a wake inside the shared-memory arena that found NO shm
+                    // key: it only reaches this process' own waiters - if the
+                    // lock owner lives elsewhere the cross-process wake is lost
+                    // (this is the shape of the 20 s watchdog repairs)
+                    log::warn!(
+                        "futex: WAKE word {:#x} has NO shm key - in-process only t={} thread [{}] elf={}",
+                        uaddr,
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        unicorn.get_data().thread_id(),
+                        unicorn.get_data().elf_path,
+                    );
+                }
                 wake_waiters(unicorn, uaddr, val)
             }
         }
@@ -255,6 +285,15 @@ fn log_futex_backtrace(unicorn: &Unicorn<'_, Context>, uaddr: u32) {
         sp,
         frames.join(" <- ")
     );
+    if frames.len() > 3 && (0x4000_0000..0x4100_0000).contains(&uaddr) {
+        // duplicate at info for shm-word waits (see futex syscall): names
+        // the guest code that parks on a shared object nobody signals
+        log::info!(
+            "futex backtrace uaddr={:#x}: {}",
+            uaddr,
+            frames.join(" <- ")
+        );
+    }
 }
 
 fn read_timeout_deadline(unicorn: &Unicorn<'_, Context>, timeout: u32) -> Option<Instant> {
