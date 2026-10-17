@@ -1208,6 +1208,9 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
         (0x0182_b7d4u32 - ORIGINAL_BASE, "cmnavi-msg"),
         (0x0182_7b04u32 - ORIGINAL_BASE, "cm-mngr-msg"),
         (0x00fc_80c8u32 - ORIGINAL_BASE, "hmicca-svcstate"),
+        (0x00fc_68e4u32 - ORIGINAL_BASE, "fi-dispatch"),
+        (0x00fc_9ae8u32 - ORIGINAL_BASE, "cca-getnext"),
+        (0x00fc_9af4u32 - ORIGINAL_BASE, "cca-del"),
         (0x00fd_0428u32 - ORIGINAL_BASE, "cpm-update"),
         (0x0135_2df4u32 - ORIGINAL_BASE, "hsi-mngr-appstate"),
         (0x0161_f754u32 - ORIGINAL_BASE, "ienvi-singleton"),
@@ -1239,6 +1242,9 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                 && label != "cmnavi-msg"
                 && label != "cm-mngr-msg"
                 && label != "hmicca-svcstate"
+                && label != "fi-dispatch"
+                && label != "cca-getnext"
+                && label != "cca-del"
                 && label != "cpm-update"
             {
                 return 0;
@@ -1290,6 +1296,33 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     format!(" this={r0:#x} cmd={r1:#x} stack={stack_refs:?}")
                 }
                 "sys-event" => format!(" this={r0:#x} event={r1:#x}"),
+                "fi-dispatch" => {
+                    // hmicca_tclApp::vOnNewMessage's dispatch tail
+                    // (`mov lr,pc; ldr pc,[r3,#8]`): r1 = the service-data
+                    // object created from the wire message; its +4 points at
+                    // the amt wire body.  Correlating this with the
+                    // `clHSI_CMMngr::bExecuteMessage` sMsg.type names the
+                    // wire->type conversion that must yield 0x80108031.
+                    let sd = r1;
+                    let vt = read_u32(uc, r0);
+                    let tgt = read_u32(uc, vt.wrapping_add(8));
+                    let w = read_u32(uc, sd.wrapping_add(4));
+                    if (0x9000_0000..0x9200_0000).contains(&w) || (0x300_0000..0x500_0000).contains(&w) {
+                        format!(
+                            " this={r0:#x} vt={vt:#x} target={tgt:#x} sd={sd:#x} wire={w:#x} src={:#x} dst={:#x} class={:#x} subid={:#x} msgid={:#x} svc={:#x} regid={:#x} func={:#x}",
+                            read_u32(uc, w) & 0xffff,
+                            (read_u32(uc, w) >> 16) & 0xffff,
+                            read_u8(uc, w + 0xb),
+                            read_u16(uc, w + 0xc),
+                            read_u32(uc, w + 0x10),
+                            read_u16(uc, w + 0x14),
+                            read_u16(uc, w + 0x16),
+                            read_u32(uc, w + 0x18),
+                        )
+                    } else {
+                        format!(" this={r0:#x} sd={sd:#x} wire={w:#x}")
+                    }
+                }
                 "hmicca-svcstate" => {
                     // hmicca_tclApp::vOnServiceState(ushort svc, ushort sub,
                     // ushort id, byte state, ushort regid) - CCA tells the HMI

@@ -382,6 +382,32 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
     `hmicca-svcstate` pump enumerates it (`svc=0x27 sub=0x24 id=0xec
     state=0`).  So the wire plumbing works - only the release-message
     producer on the PROCNAV side is missing.
+  - **Exact drop point located (r757b, fix91..fix94).** The nav FI link is
+    wired up end-to-end EXCEPT the final client routing:
+    - `fi-dispatch` (hmicca vOnNewMessage dispatch tail 0xfc68e4) fires for
+      three PROCNAV messages `src=0x24 dst=0x109 class=0x45 svc=0x27
+      regid=0xec func=0x90000 msgid=0x4000..4002` at t~6.7s.  The listener
+      vtable is `clCcaMsg` (_ZTV8clCcaMsg 0x286e950, +8 = vAddMsg
+      0xfc9b84), so the messages are QUEUED into the shared `clCcaMsg`
+      singleton (obj 0x38ead48), not delivered synchronously.
+    - `clCCAGateway::bReadSharedMemory` (0x13c91f8) is the consumer: it
+      calls `clCcaMsg::poGetNextMsg` (0xfc9ae8, cca-getnext trap fires 3x)
+      and `vDeleteMsg` (0xfc9af4, cca-del trap fires 3x) at the same t~6.7s
+      - so all three nav messages ARE consumed and freed.
+    - The routing step (0x13c92f0: read svc=wire+0x14, subid=wire+0xe,
+      client = gateway+0xc vtable+0x10(svc,src,subid)) returns 0 for
+      svc=0x27 - **no client is registered with the CCA gateway for the NAV
+      service** - so the message is freed without fanning out to
+      `clHSI_CMMngr::bExecuteMessage`.  cm-mngr's only hits stay 0x2b0x
+      (hmicca-internal, t~2.4s), never the nav message, so event 0x80108031
+      is never produced and the popup stays.
+    - This is the SAME registration the real device performs: the FI-8 nav
+      client registers with the CCA gateway for svc 0x27, so nav messages
+      route to it and become the HSI event.  The registration is driven by
+      the enavi/NAV_IFM bring-up, which is the upstream PROCNAV-side blocker.
   - **Decision: unblock PROCNAV next** (who must post to mbx_19/
     TEA_TASK1QUEUE); a 60-120s run with `cm-mngr-msg` uncapped should then
-    show whether the startup event appears organically.
+    show whether the startup event appears organically.  The alternative
+    (fabricate the CCA-gateway nav-client registration, or host NAV_IFM so
+    the client self-registers) is the message-layer path allowed by the
+    fidelity rule and is a fallback if the PROCNAV TEA stall proves deeper.
