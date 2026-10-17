@@ -302,16 +302,71 @@ static HSI_POWER_STATE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static HMI_NAV_HANDLER: AtomicU32 = AtomicU32::new(0);
 static HMI_NAV_HANDLER_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// r760: the app state the HMI framework *visibly* stored last into
-/// `clHMIMngr+0x670` when that state is a pre-NORMAL one (INITIALIZED(2),
-/// OFF(4), PAUSE(5), DIAGNOSIS(6) in HSI coding); 0 = none / NORMAL.  A
-/// ghost writer invisible to `MEM_WRITE` hooks reverts the byte to NORMAL
-/// before the framework's periodic apply pass reads it (the r79/80 collapse
-/// mystery, reproduced fix121..fix124), so `clFi_Navi` never sees the states
-/// its `vNewAppState` startup guard waits for.  The always-on repair in
-/// `prochmi_add_code_hooks` re-asserts this value at the consumption point;
-/// a visible NORMAL store (the framework's own promotion) clears it.
-pub static PENDING_FW_STATE: AtomicU32 = AtomicU32::new(0);
+/// r761: set when the HMI framework *visibly* stores a pre-NORMAL state
+/// (INITIALIZED(2), OFF(4), PAUSE(5), DIAGNOSIS(6) in HSI coding) into
+/// `clHMIMngr+0x670`; cleared by a visible NORMAL store (the framework's own
+/// promotion) or after consumption.  A ghost writer invisible to `MEM_WRITE`
+/// hooks reverts the byte to NORMAL before the framework's periodic apply
+/// pass reads it (the r79/80 collapse mystery, reproduced fix121..fix124),
+/// so `clFi_Navi` never sees the OFF dwell its `vNewAppState` startup guard
+/// waits for.  fix126..133 proved that *broadcasting* the OFF (rewriting the
+/// byte at the consumption point) is harmful: dispatcher case 4 zeroes
+/// `clHSIMngr+0x14` and the HMI's CCA client-port registration burst at
+/// t~6 s never happens.  So the flag is consumed instead by the trap in
+/// `prochmi_add_code_hooks`, which only reproduces what the OFF dwell
+/// *leaves behind* on the device (static prev-state = OFF plus the fabricated
+/// enavi start-request) right before the first real NORMAL broadcast.
+pub static OFF_SEEN: AtomicU32 = AtomicU32::new(0);
+
+/// The prev-state value the device's OFF dwell would have left in the static
+/// `clFi_Navi` previous-state global when the first post-OFF NORMAL broadcast
+/// runs; 0 = nothing to reproduce.
+pub static OFF_PREV_TO_RESTORE: AtomicU32 = AtomicU32::new(0);
+
+/// r761: state word of the enavi popup-release rescue machine, values 0..4
+/// documented on maybe_repost_evt8001.  Background: the release event
+/// 0x81008001 is queued organically into the clEventEngine ring (fix140:
+/// ring[0]=0x81008001), but `clEventEngine::vNewAppState` - called by
+/// `clHMIMngr::vPerformNewAppState` on *every* ~20 ms framework cycle - runs
+/// `clEventQueueManager::bResetQueue` for NORMAL(3) *and* OFF(4), always
+/// after that cycle's event producers; the organic pump (`clHMIMngr::
+/// bExecute` -> `clEventEngine::bExecute`, 0x134ece8) never runs because its
+/// host-side wait (idle semaphore) never completes here, so the entry rots
+/// and the "Starting navigation." popup is never released.  On the device
+/// the enavi server posts the release asynchronously between cycles and the
+/// next pump consumes it; maybe_repost_evt8001 restores exactly that
+/// ordering with guest calls into the app's own queue/pump functions.
+pub static EVT8001_REPOST: AtomicU32 = AtomicU32::new(0);
+
+/// r761: fabricate-enavi-server-RUNNING state (0 idle, 1 armed, 2 fired).
+/// See the "bstartup-reg"/"deliver-fi" arms of the enavi-chain trap.
+static ENAVI_FAB_STATE: AtomicU32 = AtomicU32::new(0);
+static ENAVI_FAB_DEADLINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// thread that ran the injected setter call; its next hit on the same trap
+/// site is the setter's return (see the enavi-fab arms).
+static ENAVI_FAB_TID: AtomicU32 = AtomicU32::new(0xffff_ffff);
+/// SP at the moment of the enavi-fab injection (see the sp_slack there).
+static ENAVI_FAB_SP: AtomicU32 = AtomicU32::new(0);
+/// LR at the moment of the enavi-fab injection.  The router trap site is
+/// the function's entry `push {r4-r7,lr}`: when the injected call lands
+/// back on the site the cave replays that push, and without the original
+/// LR the frame stored the callees' leftover lr (bWriteQueue's bl-return
+/// 0x135a3c8 - the fix187..195 fatal pop, see the dframe watch forensics).
+static ENAVI_FAB_LR: AtomicU32 = AtomicU32::new(0);
+/// SP at the moment of the evt8001 engine-pump injection (same sp_slack
+/// story: the dispatch trap site is a function entry push).
+static EVT8001_PUMP_SP: AtomicU32 = AtomicU32::new(0);
+/// LR counterpart for the pump injection (the dispatch site is an entry
+/// push too - see ENAVI_FAB_LR).
+static EVT8001_PUMP_LR: AtomicU32 = AtomicU32::new(0);
+/// r0-r3 of the interrupted `deliver-fi` call, restored when the injected
+/// setter returns onto the trap site (see the enavi-fab arms above).
+static ENAVI_FAB_REGS: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
 
 /// Startup GUI internal events driving the HMI lock state machine
 /// (LOCKED -> CHECKING -> ON).  r755: firing 0xcb SYSTEM_ALLOW_USER_ACTION
@@ -1256,11 +1311,200 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
         (0x013c_a560u32 - ORIGINAL_BASE, "svcstate-sink"),
         (0x0169_e5f8u32 - ORIGINAL_BASE, "navsrv-prio"),
         (0x015f_4828u32 - ORIGINAL_BASE, "navsrv-avail"),
+        (0x015f_48a4u32 - ORIGINAL_BASE, "enavi-srvstate"),
+        // post point inside vOnUpdateEnaviServerState: the ldr that loads the
+        // command-port vtable immediately before (**vtable)(port, 0x81008001)
+        (0x015f_4914u32 - ORIGINAL_BASE, "srvstate-post"),
         (0x0161_fca8u32 - ORIGINAL_BASE, "ienvi-srvready"),
+        // r761: startup-chain progress probes.  fix134: PREV4+FLAG1 fires
+        // vStartupEnaviServer organically at t~3.1 s and the whole CCA
+        // registration burst is back, but no sink ever receives
+        // vOnUpdateEnaviServerState (0x15f48a4 = the sender of the popup
+        // release 0x81008001).  These sites map how far the startup body
+        // gets: sink registration, the server-side broadcast itself, the
+        // state getter, and the enavi action-thread / ProcEnaviStartup
+        // handshake (DAPI dataset availability) that drives it.
+        (0x0161_d5f8u32 - ORIGINAL_BASE, "sink-register"),
+        (0x0161_d3d4u32 - ORIGINAL_BASE, "srvstate-bcast"),
+        (0x0161_ce68u32 - ORIGINAL_BASE, "srvstate-get"),
+        (0x015e_1954u32 - ORIGINAL_BASE, "navsrv-svcready"),
+        (0x017c_2b58u32 - ORIGINAL_BASE, "procstartup-ctor"),
+        (0x017c_2760u32 - ORIGINAL_BASE, "props-before"),
+        (0x017c_73c0u32 - ORIGINAL_BASE, "run-when-running"),
+        // r761: bStartup tail instrumentation (fix164: server state word
+        // stalls at 1; the setter with 2 lives in the 0x17c73c0 FSM handler
+        // which never runs).  These three sites show whether bStartup even
+        // reaches the action-thread constructor and the two registration
+        // calls that hand it to the tcl pump.
+        (0x017b_f6acu32 - ORIGINAL_BASE, "bstartup-kick"),
+        (0x017b_f6d0u32 - ORIGINAL_BASE, "bstartup-reg"),
+        (0x017c_45b4u32 - ORIGINAL_BASE, "actthread-ctor"),
+        // r761: unwind probes for the enavi-fab crash (fix167/169: stack
+        // corrupts during the setter->bcast->sink->post->bWriteQueue return
+        // path).  Dump the return slot just before each epilogue pops it.
+        (0x0161_d478u32 - ORIGINAL_BASE, "bcast-sinkloop-end"),
+        (0x0161_d498u32 - ORIGINAL_BASE, "bcast-epilogue"),
+        // r761: probes along the state==2 popup-release branch of
+        // vHandleEnaviServerStatus (fix177: it is reached with the fused
+        // RUNNING status but dies with a fault inside nQueueSpaceLeft,
+        // 0x135a1cc, before any further trap).
+        (0x015e_2238u32 - ORIGINAL_BASE, "release-branch"),
+        (0x0170_6710u32 - ORIGINAL_BASE, "release-query"),
+        (0x015e_0418u32 - ORIGINAL_BASE, "release-hidefn"),
+        (0x015e_226cu32 - ORIGINAL_BASE, "release-postvtable"),
+        // branch-decision probe: state148 vs {5, 2&&r7==1} gate inputs
+        (0x015e_21a4u32 - ORIGINAL_BASE, "release-gate"),
+        // fix184: the release branch now runs and posts real events; fault
+        // moved deeper - probe the two widget calls of the branch.
+        (0x015e_229cu32 - ORIGINAL_BASE, "release-afterw1"),
+        (0x0162_1a24u32 - ORIGINAL_BASE, "release-widget1"),
+        (0x0162_59d8u32 - ORIGINAL_BASE, "release-widget2"),
+        // fix185: fault is past the widget pair; probe the three handler
+        // calls the branch makes right after them.
+        (0x015d_fce4u32 - ORIGINAL_BASE, "release-call-a"),
+        (0x015d_fb3cu32 - ORIGINAL_BASE, "release-call-b"),
+        (0x015e_1a7cu32 - ORIGINAL_BASE, "release-call-c"),
+        // epilogue site: fires only if the vtable+56 virtual call at
+        // 0x15e2214 returns (i.e. handler completes).
+        (0x015e_221cu32 - ORIGINAL_BASE, "release-pop"),
+        // fix187 forensics: nSpaceLeft entry gate.  Every legitimate
+        // caller passes q in 0..7; a bigger r1 means a mis-wired caller or
+        // a stale translation block.  Dumps lr + a stack backtrace so the
+        // culprit is named even when the fault follows within the same TB.
+        (0x0135_a1c0u32 - ORIGINAL_BASE, "spaceleft-gate"),
+        // fix189 forensics: same anomaly one level up.  The only legal
+        // entry to bWriteQueue is the wrapper at 0x1359d4c (which forces
+        // r1=0) or a `b` from 0x1359d54; these gates name where r1 turns
+        // into a stack address.  Quiet unless the index is implausible.
+        (0x0135_9d4cu32 - ORIGINAL_BASE, "wrappost-gate"),
+        (0x0135_a310u32 - ORIGINAL_BASE, "qwqueue-gate"),
+        // fix190: fatal spaceleft had the frame of the fab's 6438 ms entry
+        // - bracket the post-store region of bWriteQueue to see whether the
+        // fatal bl #3 is a legitimate continuation or a mid-function jump.
+        (0x0135_a374u32 - ORIGINAL_BASE, "qwbody-gate1"),
+        (0x0135_a3c8u32 - ORIGINAL_BASE, "qwbody-gate2"),
+        // r761: vOnUpdateEnaviServerState delivers 0x81008001 through
+        // clEventEngine::bEvent2Engine (NOT the HSI-FI router): bWriteEvent
+        // (guarded by engine+0x484 != 4 and 1 <= id <= 0xfffffffd) then
+        // vtable+8 on the clHMIMngr engine-iface singleton (_DAT_05972998).
+        // These sites name the link that drops the release event.
+        (0x0135_9d4cu32 - ORIGINAL_BASE, "event-write"),
+        (0x0135_9ca0u32 - ORIGINAL_BASE, "event-exec"),
+        (0x0135_9c90u32 - ORIGINAL_BASE, "event-read"),
+        // inside bExecute right after bl bReadEvent: r0 = queue-manager,
+        // [sp+0xc] = event id just dequeued, [r4+0x480] = dispatcher object
+        (0x0135_9cf4u32 - ORIGINAL_BASE, "event-read2"),
+        // clEventQueueManager::bWriteQueue entry + bConfigure entry: tell
+        // whether the queue-0 ring buffer is live when the release event is
+        // posted at t~3.1 s (drop path) versus t~6.7 s (successful events).
+        // (0x0135_a310u32 - ORIGINAL_BASE, "event-qwrite"),  // fix189: removed -
+        // suspected of feeding the fatal mis-parameterised bWriteQueue entry
+        // (svc-cave literal address observed as r1 in the fault, fix187/188).
+        // The evtqm mem-write watch and the event-write wrapper trap already
+        // cover everything this observer reported.
+        (0x0135_9decu32 - ORIGINAL_BASE, "event-conf"),
     ] {
         let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let label: &'static str = label;
+        let site = base_address + offset;
         crate::os::code_stub::trap_site(unicorn, base_address + offset, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:enavi-chain", move |uc: &mut Unicorn<'_, Context>| {
+            // r761: fabricated enavi server bring-up completion (always-on).
+            // The real device's enavi server answers the client's startup
+            // action with a RUNNING report; the client's action FSM (handler
+            // 0x17c73c0) never advances past STARTING(1) here because its
+            // pump - the FSM case that issues and awaits that report - needs
+            // the whole ProcEnaviStartup/PROCNAV handshake (run-fix164/165:
+            // fsm byte stays 0xff, handler never runs, state word
+            // [[IEnavi]+0x4c]+0xe0 stalls at 1, wait-popup never released).
+            // Simulate the server answer at the RTOS boundary (same class of
+            // fabrication as the CCA-directory answers): write the status
+            // word and queue the release event, both shallow; the pump, the
+            // router delivery and the popup-release branch in
+            // vHandleEnaviServerStatus then all run organically.  Fire site
+            // is the HSI-FI router trap: unlike the app-state sites (only
+            // reached on transitions) it keeps ticking while the HMI idles.
+            if label == "hsi-fievent-router" {
+                enavi_fab_fire_or_restore(uc, site);
+            }
+            match label {
+                "bstartup-reg" => {
+                    if EVT8001_REPOST.load(Ordering::Relaxed) < 8 && ENAVI_FAB_STATE.load(Ordering::Relaxed) == 0 {
+                        ENAVI_FAB_DEADLINE.store(
+                            crate::libs::dapi::emu_t0_elapsed_ms() as u64 + 800,
+                            Ordering::Relaxed,
+                        );
+                        ENAVI_FAB_STATE.store(1, Ordering::Relaxed);
+                        log::info!(
+                            "PROCHMI enavi-fab armed (server-RUNNING report in 800 ms) t={}ms",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+            // The nSpaceLeft entry gate is on the hot post path: never
+            // trace it normally, only warn about implausible queue indices
+            // (a legit caller passes q in 0..7; anything else names a
+            // mis-wired caller or stale TB by lr + stack backtrace).
+            if label == "spaceleft-gate" {
+                let r1v = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                if r1v > 7 {
+                    let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                    let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI spaceleft-gate: q={r1v:#x} r0={:#x} lr={lr:#x} sp={sp:#x} bt={:#?}",
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                        (0..12)
+                            .map(|i| read_u32(uc, sp + 4 * i))
+                            .filter(|v| (0x0001_0000..0x0400_0000).contains(v))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                return 0;
+            }
+            // The two post-path gates log every hit (all are rare) so the
+            // fatal mis-parameterised bWriteQueue entry is bracketed.
+            if label == "wrappost-gate"
+                || label == "qwqueue-gate"
+                || label == "qwbody-gate1"
+                || label == "qwbody-gate2"
+            {
+                static GATE_LOGS: AtomicU32 = AtomicU32::new(0);
+                if GATE_LOGS.fetch_add(1, Ordering::Relaxed) < 40 {
+                    let t = crate::libs::dapi::emu_t0_elapsed_ms();
+                    if label == "qwbody-gate2" {
+                        let hexes = |base: u32| -> String {
+                            (0..8)
+                                .map(|i| format!("{:x}", read_u32(uc, base + 4 * i)))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        };
+                        log::info!(
+                            "PROCHMI qwbody-gate2: t={t}ms r0={:#x} r6={:#x} lr={:#x} sp={:#x} hdr=[{}] head=[{}] cnt=[{}] cap0={}",
+                            uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                            uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32,
+                            uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                            uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32,
+                            hexes(0x38ee_ec8),
+                            hexes(0x38ee_ec8 + 0x28),
+                            hexes(0x38ee_ec8 + 0x50),
+                            read_u32(uc, 0x38ee_f2c + 0x3c),
+                        );
+                    } else {
+                        log::info!(
+                            "PROCHMI {label}: t={t}ms r0={:#x} r1={:#x} r2={:#x} r4={:#x} r6={:#x} lr={:#x} sp={:#x}",
+                            uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                            uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                            uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+                            uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32,
+                            uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32,
+                            uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                            uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32,
+                        );
+                    }
+                }
+                return 0;
+            }
             if !nav_trace_enabled() {
                 return 0;
             }
@@ -1305,6 +1549,33 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     read_u32(uc, r0 + 0x830),
                     read_u32(uc, r0 + 0x148),
                 ),
+                // bl 0x17c2a08 in bStartup: r0 = freshly constructed action
+                // object ([server+0xd8]); 0x17c2a08 only kicks it when its FSM
+                // byte-field +0x30 has reached 8.
+                "bstartup-kick" => format!(
+                    " obj={r0:#x} fsm30={:#x} vtab={:#x}",
+                    read_u32(uc, r0.wrapping_add(0x30)),
+                    if r0 != 0 { read_u32(uc, r0) } else { 0 },
+                ),
+                // bl 0x17bf324 in bStartup: r0 = server object, r2 = literal
+                // pool entry (name/vtable arg).
+                "bstartup-reg" => {
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    format!(" srv={r0:#x} r2={r2:#x} obj_d8={:#x}", read_u32(uc, r0 + 0xd8))
+                }
+                "actthread-ctor" => format!(" obj={r0:#x} owner={r1:#x}"),
+                // pop {r4,r5,r6,r7,r8,sl,pc}: the pc slot sits at sp+24.
+                "bcast-sinkloop-end" | "bcast-epilogue" => {
+                    let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    format!(
+                        " this={r0:#x} sp={sp:#x} slot_sp24={:#x} lr={:#x} r4={:#x} r5={:#x} r6={:#x}",
+                        read_u32(uc, sp.wrapping_add(24)),
+                        lr,
+                        uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32,
+                        uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32,
+                        read_u32(uc, r0 + 0x58),
+                    )
+                }
                 "hsi-mngr-appstate" => {
                     let state = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                     // clHSIMngr lives at clHMIMngr+0x4e4, so the framework
@@ -1631,10 +1902,109 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     }
                     format!(" obj={r0:#x} state={state} prev={} stack={stack_refs:?}", read_u8(uc, r0 + 0x670))
                 }
+                "sink-register" => format!(" this={r0:#x} sink={r1:#x}"),
+                "srvstate-bcast" => format!(" this={r0:#x} state={r1:#x}"),
+                "enavi-srvstate" => format!(
+                    " sink={r0:#x} state={r1:#x} dat={:#x} laststate+4={:#x}",
+                    read_u32(uc, 0x0597_3de8),
+                    read_u32(uc, r0 + 4),
+                ),
+                "srvstate-post" => {
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    let vt = if r2 != 0 { read_u32(uc, r2) } else { 0 };
+                    format!(
+                        " port={r2:#x} vtable={vt:#x} hmimngr_dat={:#x}",
+                        read_u32(uc, 0x0597_2998),
+                    )
+                }
+                "event-write" => {
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    format!(
+                        " this={r0:#x} state484={:#x} id={r2:#x}",
+                        read_u32(uc, r0.wrapping_add(0x484)),
+                    )
+                }
+                "event-exec" | "event-read" => {
+                    format!(" this={r0:#x} state484={:#x}", read_u32(uc, r0.wrapping_add(0x484)))
+                }
+                "event-read2" => {
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    let ev = read_u32(uc, sp.wrapping_add(0xc));
+                    if ev == 0x8100_8001 {
+                        // The pump consumed the release event: the repost
+                        // machinery is done (see EVT8001_REPOST).
+                        EVT8001_REPOST.store(0, Ordering::SeqCst);
+                    }
+                    format!(
+                        " engine={r4:#x} id={ev:#x} disp={:#x}",
+                        read_u32(uc, r4.wrapping_add(0x480)),
+                    )
+                }
+                "event-qwrite" => {
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    // clEventQueueManager layout: buf[q] at qm+q*4, head[q]
+                    // at qm+(q+10)*4, count[q] at qm+(q+0x14)*4
+                    let buf = read_u32(uc, r0.wrapping_add(r1 * 4));
+                    format!(
+                        " qm={r0:#x} q={r1:#x} id={r2:#x} buf={buf:#x} cnt={:#x} head={:#x} ring0={:#x}",
+                        read_u32(uc, r0.wrapping_add((r1 + 0x14) * 4)),
+                        read_u32(uc, r0.wrapping_add((r1 + 10) * 4)),
+                        if buf != 0 { read_u32(uc, buf) } else { 0 },
+                    )
+                }
+                "event-conf" => format!(" this={r0:#x} trace={r1:#x}"),
+                "srvstate-get" => {
+                    let v = read_u32(uc, r0 + 0x140);
+                    let proxy = read_u32(uc, r0 + 0x4c);
+                    format!(
+                        " this={r0:#x} +140={v:#x} proxy4c={proxy:#x} e0={:#x}",
+                        if proxy != 0 {
+                            read_u32(uc, proxy + 0xe0)
+                        } else {
+                            0
+                        },
+                    )
+                }
+                "procstartup-ctor" => format!(" this={r0:#x} thread={r1:#x}"),
+                "release-gate" => {
+                    // Last moment before the two idapi queries run: make
+                    // sure the "/dev/cryptcard" lookup can resolve (the
+                    // release branch needs its 1 answer, fix179).
+                    fake_cryptcard_into_idapi(uc);
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    format!(
+                        " h={r5:#x} state148_r3={:#x} r7={:#x} f160={:#x} f15c={:#x} f7e4={:#x} b79={} gate830={:#x}",
+                        uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
+                        uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32,
+                        read_u32(uc, r5 + 0x160),
+                        read_u32(uc, r5 + 0x15c),
+                        read_u32(uc, r5 + 0x7e4),
+                        read_u8(uc, r5 + 0x79),
+                        read_u32(uc, r5 + 0x830),
+                    )
+                }
+                "release-branch" | "release-query" | "release-hidefn" | "release-postvtable" => {
+                    // r4/r5 are callee-saved here: name the objects whose
+                    // virtual calls run on the popup-release path.
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    let navvt = read_u32(uc, 0x38f_9970);
+                    format!(
+                        " this={r0:#x} r4={r4:#x} r5={:#x} r4vt={:#x} navvt={navvt:#x} nav56={:#x}",
+                        uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32,
+                        if r4 != 0 { read_u32(uc, r4) } else { 0 },
+                        if navvt != 0 {
+                            read_u32(uc, navvt + 0x38)
+                        } else {
+                            0
+                        },
+                    )
+                }
                 _ => format!(" this={r0:#x}"),
             };
             log::info!(
-                "PROCHMI enavi-chain {label} t={}ms thread=[{}] n={} caller={lr:#x}{extra}",
+                "PROCHMI enavi-chain {label} t={}ms thread=[{}] n={} caller={lr:#x} r1={r1:#x}{extra}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
                 uc.get_data().inner.thread_id(),
                 n,
@@ -1674,6 +2044,147 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
         log::info!(
             "PROCHMI appstate-byte load-time write-watch installed: {}",
             watch_res.is_ok()
+        );
+        // r761: clEventEngine::bEventDelivery routes 0x81-type events (the
+        // popup release 0x81008001 is one) to *(engine+0x474)'s vtable+0 -
+        // the HSI-FI router port.  fix138: that slot is 0 for the whole run,
+        // so the bWriteQueue ring was never the problem either; find who is
+        // supposed to fill the engine's delivery ports (+0x474 0x81-type,
+        // +0x478 0x85-type, +0x47c 0x87-type, +0x480 unhandled-tracer).
+        let watch_res_eng = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            0x38ee_ebcu64 + 0x474,
+            0x38ee_ebcu64 + 0x480,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCHMI evteng-port WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    address,
+                    size,
+                    value,
+                    uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32
+                );
+                true
+            },
+        );
+        log::info!(
+            "PROCHMI evteng-port write-watch installed: {}",
+            watch_res_eng.is_ok()
+        );
+        // r761: the release event 0x81008001 IS written into the engine ring
+        // (fix140: ring[0]@0x38eef2c), but every clEventEngine::bExecute in
+        // the next 3.5 s sees count[q]==head[q] and the ring entry rots.
+        // Watch the whole clEventQueueManager control block to catch who
+        // re-zeroes count/head after a successful bWriteQueue.
+        let watch_res_qm = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            0x38ee_ec8u64,
+            0x38ee_f50u64,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCHMI evtqm WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    address,
+                    size,
+                    value,
+                    uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32
+                );
+                true
+            },
+        );
+        log::info!(
+            "PROCHMI evtqm write-watch installed: {}",
+            watch_res_qm.is_ok()
+        );
+        // r761 forensics (fix187..194): the fatal crash pops {r5=qm,
+        // r6=&frame, pc=0x135a3c8} off thread 52's mainloop stack around
+        // 0x90610d00.  Watch that word range and log every store of those
+        // smoking-gun values (any push reaching these slots included) to
+        // name the frame that poisoned them.
+        let watch_res_dframe = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            0x9061_0cd0u64,
+            0x9061_0d24u64,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                let v = value as u32;
+                if v == 0x135a_3c8
+                    || v == 0x135a_3e0
+                    || v == 0x135a_310
+                    || v == 0x135a_1c0
+                    || v == 0x9061_0d1c
+                {
+                    let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI dframe WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x} lr={lr:#x} sp={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        address,
+                        size,
+                        v,
+                        uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32,
+                        uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32,
+                    );
+                }
+                true
+            },
+        );
+        log::info!(
+            "PROCHMI dframe write-watch installed: {}",
+            watch_res_dframe.is_ok()
+        );
+        // r761: the enavi server startup state word [[IEnavi 0x3a241c8
+        // +0x4c]proxy 0x3a31b40]+0xe0 stalls at 1 (STARTING) - the
+        // popup-release branch of vHandleEnaviServerStatus needs 2.  Watch
+        // the word to see who writes 1 and whether anything ever advances it.
+        let watch_res_srv = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            0x3a31_c20u64,
+            0x3a31_c28u64,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCHMI enavi-srv WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    address,
+                    size,
+                    value,
+                    uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32,
+                );
+                true
+            },
+        );
+        log::info!(
+            "PROCHMI enavi-srv write-watch installed: {}",
+            watch_res_srv.is_ok()
+        );
+        // r761: fix176 caught the popup handler's getter seeing a different
+        // proxy than the one we wrote - watch IEnavi+0x4c for repointing.
+        let watch_res_pp = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            0x3a24_214u64,
+            0x3a24_218u64,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::info!(
+                    "PROCHMI ienavi-proxy WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    address,
+                    size,
+                    value,
+                    uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32,
+                );
+                true
+            },
+        );
+        log::info!(
+            "PROCHMI ienavi-proxy write-watch installed: {}",
+            watch_res_pp.is_ok()
         );
         // r759: dual-mapping hypothesis - if libosal's heap region is mapped
         // a second time under the 0x4000_0000 libosal window, a store through
@@ -1759,8 +2270,8 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
         }
     }
 
-    // r760: always-on OFF->NORMAL state-collapse repair + enavi
-    // start-request fabrication (runs regardless of the trace env).
+    // r761: always-on enavi start fabrication (runs regardless of the trace
+    // env).
     //
     // The LPM proxy hands the HMI framework its boot app states and the
     // framework setter visibly stores them at `clHMIMngr+0x670` (strb pair
@@ -1776,19 +2287,22 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
     // OFF(4), the handler (object+0x30) exists and the start-request flag
     // (object+0x34) is 1 (0x14b9d70).
     //
-    // Repair at the consumption point: the watch records every *visible*
-    // pre-NORMAL store (the ghost stays invisible), the apply trap re-asserts
-    // it if the byte already reverted when the framework is about to act -
-    // the emulator is serialized, so nothing runs between the trap and the
-    // consumer's ldrb.  A visible NORMAL store (the framework's own
-    // promotion) disarms it, so the OFF->NORMAL promotion that starts enavi
-    // still flows.  The start-request flag - set on the device only by the
-    // phone-side FI event 0x80108031 (0x14be400; the id occurs nowhere in
-    // any firmware/SD file, scanned fix117..fix126) whose producer, the
-    // smartphone enavi app, does not exist here - is fabricated once at
-    // clHmiNavServerHandler construction (0x15e871c, t~2.3 s: clFi_Navi is
-    // built by then), the same sanctioned fabrication class as the NAVI FI
-    // service answers.  Everything after the guard is real prochmi code.
+    // fix126..133 lesson: re-asserting the byte at the consumption point
+    // makes the framework *broadcast* OFF, and dispatcher case 4 zeroes
+    // clHSIMngr+0x14 - the HMI then never registers its CCA client ports at
+    // t~6 s, including the NAVI service 0x27 port whose availability sink
+    // (vOnUpdateNavServerServiceAvailability, 0x15f48a4) is the organic
+    // sender of the 0x81008001 popup-release event.  So instead of faking the
+    // dwell, reproduce only its end state: the watch records visible
+    // pre-NORMAL stores; at the first real NORMAL broadcast through the
+    // dispatcher (trap at 0x1352df4 entry, before the FI fan-out) the static
+    // prev-global is left at the recorded value (OFF here - what the device
+    // dwell would leave in it) and the start-request flag is set.  The flag's
+    // device-side setter is the phone FI event 0x80108031 (0x14be400; the id
+    // occurs nowhere in any firmware/SD file, scanned fix117..fix126) whose
+    // producer, the smartphone enavi app, does not exist here - same
+    // sanctioned fabrication class as the NAVI FI service answers.
+    // Everything downstream of the guard is real prochmi code.
     if unicorn.get_data().elf_path.contains("prochmi") {
         let _ = unicorn.add_mem_hook(
             unicorn_engine::unicorn_const::HookType::MEM_WRITE,
@@ -1797,8 +2311,14 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
             |_uc: &mut Unicorn<'_, Context>, _t, address, _size, value| {
                 if address == 0x38ee_e60u64 + 0x670 {
                     match value as u32 {
-                        2 | 4 | 5 | 6 => PENDING_FW_STATE.store(value as u32, Ordering::SeqCst),
-                        3 => PENDING_FW_STATE.store(0, Ordering::SeqCst),
+                        2 | 4 | 5 | 6 => {
+                            OFF_PREV_TO_RESTORE.store(value as u32, Ordering::SeqCst);
+                            OFF_SEEN.store(1, Ordering::SeqCst);
+                        }
+                        3 => {
+                            OFF_SEEN.store(0, Ordering::SeqCst);
+                            OFF_PREV_TO_RESTORE.store(0, Ordering::SeqCst);
+                        }
                         _ => {}
                     }
                 }
@@ -1816,43 +2336,71 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                 let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                 let byte = read_u8(uc, 0x38ee_e60u32 + 0x670);
                 let pending = read_u8(uc, 0x38ee_e60u32 + 0x671);
-                let want = PENDING_FW_STATE.load(Ordering::SeqCst) as u8;
+                let want = OFF_SEEN.load(Ordering::SeqCst);
+                let prev = OFF_PREV_TO_RESTORE.load(Ordering::SeqCst);
                 let mut repair = "";
-                if label == "hmimngr-apply" && want != 0 && byte != want {
-                    // The ghost reverted the state the framework stored;
-                    // restore it so vPerformNewAppState broadcasts it.  Stay
-                    // armed: the ghost will revert again, and every OFF
-                    // broadcast re-asserts the prev-state enavi waits for.
-                    if write_u8(uc, 0x38ee_e60u32 + 0x670, want) {
-                        repair = " REPAIRED";
-                    }
-                } else if label == "hsimngr-dispatch"
-                    && r1 == 3
-                    && PENDING_FW_STATE.load(Ordering::SeqCst) == 0
-                {
-                    // The promotion out of OFF is in flight: deliver the
-                    // fabricated enavi start-request indication at the
-                    // exact moment the device would have processed its
-                    // queued 0x80108031 event.  Written here (not just at
-                    // the ctor) because the same ghost writer that collapses
-                    // the state byte reverted the ctor-time store (fix127:
-                    // flag read 0 at the first broadcast although the write
-                    // returned ok); the emulator is serialized, so this
-                    // store cannot be clobbered before the guard's ldrb five
-                    // instructions later.
+                if label == "hsimngr-dispatch" && r1 == 3 && want != 0 {
+                    // A NORMAL broadcast is being delivered and the LPM proxy
+                    // genuinely handed the HMI an OFF state a few seconds ago
+                    // (visible store, hook-confirmed).  On the device that
+                    // OFF dwells for seconds - the FI clients record it as
+                    // their previous state and clFi_Navi's static prev-state
+                    // ends at OFF(4).  Here the ghost writer collapses every
+                    // non-NORMAL state within one 20 ms cycle, so reproduce
+                    // only what the dwell *leaves behind*, not the broadcast:
+                    // broadcasting OFF itself zeroes clHSIMngr+0x14 (dispatcher
+                    // case 4) which kills the HMI's CCA client-port
+                    // registration burst at t~6 s (fix126..133: zero
+                    // `cca server answered ServiceRegister` lines, zero
+                    // svc=0x27 gateway hits - the very client the
+                    // vOnUpdateNavServerServiceAvailability sink needs for
+                    // the organic 0x81008001 popup release).  Two stores
+                    // here, three guest instructions before the guard reads
+                    // them (0x14b9ba4 prev, 0x14b9d70 flag), serialized
+                    // emulator => deterministic: prev-global := OFF and the
+                    // fabricated start-request flag (counterpart of the
+                    // phone-side 0x80108031, producer absent here).
+                    let _ = write_u32(uc, 0x02a7_23e0u32, prev);
                     write_u8(uc, 0x38f_9970 + 0x34, 1);
-                    repair = " FLAG1";
+                    OFF_SEEN.store(0, Ordering::SeqCst);
+                    repair = " PREV4+FLAG1";
                 }
                 if nav_trace_enabled() && LOGS.fetch_add(1, Ordering::Relaxed) < 96 {
                     log::info!(
-                        "PROCHMI enavi-chain {label} t={}ms thread=[{}] caller={lr:#x} r1={r1:#x} byte670={byte:#x} pending671={pending:#x} want={want:#x}{repair}",
+                        "PROCHMI enavi-chain {label} t={}ms thread=[{}] caller={lr:#x} r1={r1:#x} byte670={byte:#x} pending671={pending:#x} want={want:#x} offprev={prev:#x}{repair}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                     );
                 }
+                // The engine-pump rescue state machine needs a firing that
+                // runs every framework cycle; the clGUI_MainLoop trap it was
+                // hooked to in fix146/148 turns out to be entered only
+                // sparsely (idle-semaphore blocked, like clHMIMngr::bExecute).
+                // The dispatch site sees the post-pump confirmation; the
+                // post-wipe site (trap below) does the re-write.
+                if label == "hsimngr-dispatch" {
+                    maybe_repost_evt8001(uc, site, false);
+                }
                 0
             });
         }
+        // r761: no traps on the queue machinery itself - the repost/pump
+        // state machine (maybe_repost_evt8001, run from the proven
+        // clGUI_MainLoop trap) observes the ring control fields directly and
+        // arms itself on an unconsumed organic 0x81008001 entry.  (fix144/
+        // 145: traps at bWriteQueue's entry made the guest-call re-enter the
+        // same site on return, the code_stub site ring dropped the callback
+        // and the thread faulted on a garbage PC.)
+        // r761: post-wipe site of the evt8001 rescue state machine (see
+        // maybe_repost_evt8001).  0x134ead8 is the instruction right after
+        // the bl that ran clEventEngine::vNewAppState -> bResetQueue in the
+        // NORMAL branch of clHMIMngr::vPerformNewAppState, executed every
+        // framework cycle.
+        let site_pw = base_address + (0x0134_ead8u32 - ORIGINAL_BASE);
+        crate::os::code_stub::trap_site(unicorn, site_pw, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:evt8001-pump", move |uc: &mut Unicorn<'_, Context>| {
+            maybe_repost_evt8001(uc, site_pw, true);
+            0
+        });
         // Once-only enavi start-request flag (clFi_Navi+0x34), see above.
         // fix127: after the ctor-time write the byte read back 0 at the first
         // vNewAppState call (2.96 s), so watch the byte to name the clearer.
@@ -2796,14 +3344,70 @@ fn ensure_guest_call_stub(unicorn: &mut Unicorn<'_, Context>) -> Option<u32> {
             Prot::READ | Prot::WRITE | Prot::EXEC,
             "[prochmi-call-stub]",
         );
+    // r761: literal-pool return stub.  The previous shape
+    // (`add r12,sp,#0x34; pop {r0-r11,lr}; ldmia r12,{sp,pc}`) is an
+    // unpredictable ARM encoding (LDM with PC *and* base writeback, which
+    // Unicorn's TCG mis-executes: fix144/145/149/150 died with
+    // READ_UNMAPPED at the ldmia although hook-verified SP, frame and r12
+    // were all correct and mapped).  sp/pc now come from two literal slots
+    // at stub+0x10/+0x14 that every `call_guest_function` fills before
+    // launching; the emulator is serialized on the VM lock, so the shared
+    // slots cannot race.
     let stub_code = [
-        0x34, 0xc0, 0x8c, 0xe2, // add r12, sp, #0x34
-        0xff, 0x4f, 0xbd, 0xe8, // pop {r0-r11,lr}
-        0x00, 0xa0, 0xb0, 0xe8, // ldmia r12, {sp,pc}
+        0xff, 0x4f, 0xbd, 0xe8, // pop {r0-r11,lr}          (+0x00)
+        0x04, 0xd0, 0x9d, 0xe5, // ldr sp, [pc, #4]         (+0x04) -> +0x10
+        0x04, 0xf0, 0x9f, 0xe5, // ldr pc, [pc, #4]         (+0x08) -> +0x14
+        0x00, 0x00, 0x00, 0x00, // pad                      (+0x0c)
+        0x00, 0x00, 0x00, 0x00, // saved sp slot            (+0x10)
+        0x00, 0x00, 0x00, 0x00, // saved pc slot            (+0x14)
     ];
     if addr == 0 || unicorn.mem_write(addr as u64, &stub_code).is_err() {
         log::warn!("PROCHMI: failed to allocate ARM r0-r11+sp+pc guest-call stub");
         return None;
+    }
+
+    // r761 CRITICAL: drop any translation of the stub page.  TCG translates
+    // a fresh heap page eagerly at MMAP time while it still reads as zeros;
+    // the resulting TB embeds the old words and is *never* discarded on
+    // mem_write (unicorn 2.x has no tb_flush on softmmu map updates).  fix151
+    // (-149/-153) proved it: the stub bytes here were verified correct, yet
+    // the guest executed the previous stub shape - the `ldmia` TB's embedded
+    // immediate #0x34 and its reglist semantics set sp := pc-slot (= the
+    // trap site 0x134ead8) at every return, faulting the next push.  The
+    // same quirk behind the r79 "ghost" byte writes: stale TBs with baked-in
+    // immediates keep running after the page contents change.
+    let page = addr & !0xfff;
+    let dropped = unicorn
+        .ctl_remove_cache(page as u64, (page + 0xfff) as u64)
+        .is_ok();
+    log::info!(
+        "PROCHMI: guest-call stub at {addr:#x}, tb-cache page {page:#x} dropped: {dropped}",
+    );
+
+    // r761 diagnostic: fire at the return stub's entry instruction (a
+    // notification-only narrow hook; the page is freshly allocated so no
+    // stale translation block can hide it) and dump the stack pointer the
+    // called function returned with - the fix144/149 guest calls died on the
+    // stub's `ldmia r12,{sp,pc}` reading an unmapped frame, and this names
+    // the SP the callee restored.
+    if nav_trace_enabled() {
+        let res = unicorn.add_code_hook(addr as u64, addr as u64, move |uc, _a, _sz| {
+            static HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            let f0 = read_u32(uc, sp);
+            let f13 = read_u32(uc, sp.wrapping_add(52));
+            let f14 = read_u32(uc, sp.wrapping_add(56));
+            let n = HITS.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || f14 == 0 || f14 > 0x4000_0000 {
+                log::info!(
+                    "PROCHMI guest-call stub-entry t={}ms thread=[{}] n={n} sp={sp:#x} lr={lr:#x} frame[0]={f0:#x} frame[sp]={f13:#x} frame[pc]={f14:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                );
+            }
+        });
+        log::info!("PROCHMI guest-call stub-entry hook installed: {}", res.is_ok());
     }
 
     PROCHMI_GUEST_CALL_STUB.store(addr, Ordering::Relaxed);
@@ -2863,6 +3467,14 @@ fn call_guest_function(
         return false;
     }
 
+    // Literal slots for the return stub (see ensure_guest_call_stub): the
+    // callee returns here and the stub pops r0-r11/lr off the frame, then
+    // loads sp/pc from these two words.
+    if !write_u32(unicorn, stub + 0x10, sp) || !write_u32(unicorn, stub + 0x14, original_pc) {
+        log::warn!("PROCHMI: failed to fill guest-call stub slots at {stub:#x}");
+        return false;
+    }
+
     unicorn
         .reg_write(RegisterARM::R13, new_sp as u64)
         .unwrap_or_default();
@@ -2877,6 +3489,56 @@ fn call_guest_function(
         let _ = unicorn.reg_write(register, value as u64);
     }
 
+    if nav_trace_enabled() {
+        static LOGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if LOGS.fetch_add(1, Ordering::Relaxed) < 16 {
+            let mut raw = [0u8; 24];
+            let _ = unicorn.mem_read(stub as u64, &mut raw);
+            log::info!(
+                "PROCHMI guest-call launch t={}ms thread=[{}] fn={function:#x} sp={sp:#x} new_sp={new_sp:#x} stub={stub:#x} resume={original_pc:#x} raw {:02x?}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                unicorn.get_data().inner.thread_id(),
+                raw,
+            );
+        }
+    }
+    true
+}
+
+/// r761: stub-free guest call: load the arguments, point LR at `return_site`
+/// (a trapped instruction, i.e. an `svc #0` the dispatcher owns) and redirect
+/// the PC to `function`.  The callee returns straight onto the trap site,
+/// which re-fires its handler (state machines must tolerate the re-entry);
+/// callee-saved registers survive by ARM ABI, so the surrounding app code is
+/// intact without any save/restore frame.  Preferred over
+/// [`call_guest_function`] - that mechanism's synthetic return stub executes
+/// with a corrupted SP under the current Unicorn (fix144..155: verified
+/// bytes + verified frame, wrong live behaviour), and injecting host code
+/// pages into the guest is the part that misbehaves, not the call itself.
+fn guest_call_via_lr(
+    unicorn: &mut Unicorn<'_, Context>,
+    return_site: u32,
+    function: u32,
+    args: [u32; 4],
+    sp_slack: u32,
+) -> bool {
+    if return_site == 0 || function == 0 {
+        return false;
+    }
+    if sp_slack != 0 {
+        let sp = unicorn.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+        let _ = unicorn.reg_write(RegisterARM::R13, (sp - sp_slack) as u64);
+    }
+    for (register, value) in [
+        (RegisterARM::R0, args[0]),
+        (RegisterARM::R1, args[1]),
+        (RegisterARM::R2, args[2]),
+        (RegisterARM::R3, args[3]),
+        (RegisterARM::R14, return_site),
+        (RegisterARM::PC, function),
+    ] {
+        let _ = unicorn.reg_write(register, value as u64);
+    }
     true
 }
 
@@ -2911,6 +3573,402 @@ fn maybe_force_hmi_fi_init(unicorn: &mut Unicorn<'_, Context>, original_pc: u32)
         return true;
     }
     false
+}
+
+/// r761: rescue state machine for the enavi popup-release event 0x81008001
+/// (background on EVT8001_REPOST).  The event is produced organically
+/// (clFi_Navi startup -> enavi sink vOnUpdateEnaviServerState -> bEvent2Engine
+/// -> clEventQueueManager::bWriteQueue, fix140) but `clEventEngine::
+/// vNewAppState` - driven by `clHMIMngr::vPerformNewAppState` every ~20 ms
+/// framework cycle - wipes the ring via `bResetQueue` for NORMAL(3) *and*
+/// OFF(4), always after the cycle's event producers and before any pump:
+/// the cycle order is  dispatch (bl 0x134e968, producers post here)  ->
+/// engine wipe (bl 0x134ead0)  ->  cycle end.  The organic pump lives in
+/// `clHMIMngr::bExecute` (bl 0x134ece8), whose callers block on the idle
+/// semaphore in this emulator, so nothing drains the ring and the release
+/// event dies in every cycle.  On the device the server thread posts the
+/// event asynchronously (milliseconds later, between cycles) where the next
+/// pump takes it.  This machine reproduces that ordering with organic guest
+/// calls only, driven from two always-on per-cycle traps:
+///  * post-wipe site (0x134ead8, right after `bResetQueue` returns): if the
+///    ring slot holds an unconsumed 0x81008001 (the wipe cleared the
+///    cursors but not the slot), re-queue it with the manager's own
+///    `bWriteQueue`;
+///  * dispatch site (0x1352df4) of the *next* cycle, which runs before that
+///    cycle's wipe: pump once via `clEventEngine::bExecute`, which drains
+///    the ring with its own code and delivers through the engine's real
+///    router port (engine+0x474 = clHSIMngr, fix139); the read cursor then
+///    confirms consumption.
+/// Everything from the event id onwards is untouched app code.
+
+/// r761: fabricate the "/dev/cryptcard" card object so the idapi registry
+/// lookup chain used by vHandleEnaviServerStatus resolves.
+///
+/// The popup-release branch of the handler (0x15e2220) requires r7 == 1
+/// from `0x1614dac(idapi, key, &out)`, which tails to 0x171fcf4 and needs a
+/// card object found by 0x1613ac4's vector search over idapi+0x18 (the
+/// entry's vtable+0x24 "name match" must return non-NULL for the key,
+/// card+0x80 must be 0 or 2 and card+0x98..0x9c must be a record
+/// vector containing a record whose +0x0c == 2).  On the real head unit the
+/// cryptcard driver registers that object at boot; the emulator has no
+/// cryptcard, the search returns NULL, r7 stays 0, the release branch is
+/// skipped, and the state-2 fall-through then faults (fix177..179:
+/// READ_UNMAPPED in nQueueSpaceLeft via a NULL-derived event port).
+/// Fabricating the object is the sanctioned provider-signal class: the
+/// client's own lookup, compare and release logic still all run organically.
+fn fake_cryptcard_into_idapi(unicorn: &mut Unicorn<'_, Context>) {
+    // Handler field holding the idapi object (dumped as `idapi=` by the
+    // enavi-status probe).
+    const IDAPI_FIELD: u32 = 0x38f_99b0 + 0x814;
+    // Name-match stub: static text at 0xfb70f0 is a bare `bx lr`, so as a
+    // virtual method it returns its first argument (the found entry) -
+    // exactly what the 0x1613ac4 search treats as a name match.
+    const NAME_MATCH: u32 = 0x00fb_70f0;
+    // Placement: one private read-write heap page allocated by the emulator
+    // on first use.  Only data lives there (the guest never fetches from
+    // it), so the stale-TB-on-fresh-page quirk cannot bite.
+    static SCRATCH_PAGE: AtomicU32 = AtomicU32::new(0);
+    let mut scratch = SCRATCH_PAGE.load(Ordering::Relaxed);
+    if scratch == 0 {
+        let mmu_arc = {
+            let data = unicorn.get_data();
+            data.mmu.clone()
+        };
+        scratch = mmu_arc.lock().unwrap().heap_alloc(
+            unicorn,
+            0x1000,
+            Prot::READ | Prot::WRITE,
+            "[prochmi-cryptcard-fab]",
+        );
+        SCRATCH_PAGE.store(scratch, Ordering::Relaxed);
+    }
+    if scratch == 0 {
+        log::warn!("PROCHMI cryptcard-fab: heap page allocation failed, skipped");
+        return;
+    }
+    let idapi = read_u32(unicorn, IDAPI_FIELD);
+    if idapi == 0 {
+        return;
+    }
+    if read_u32(unicorn, idapi + 0x18) == scratch + 256 {
+        return; // card already registered this run
+    }
+    let vtbl = scratch; // [0]=card, [0x24]=name-match method
+    let vec = scratch + 256; // copied idapi object vector + our card entry
+    let card = scratch + 32; // 160-byte card object
+    let rec = scratch + 352; // one 24-byte card-status record
+    // The real object vector exists (CCA-style directory) but holds no
+    // cryptcard entry.  Copy it to the private page, append the fabricated
+    // card, and repoint the vector.  The 0x1613ac4 search only reads the
+    // range, nothing resizes it, and the emulator heap page is never freed.
+    let old_begin = read_u32(unicorn, idapi + 0x18);
+    let old_end = read_u32(unicorn, idapi + 0x1c);
+    let count = old_end.wrapping_sub(old_begin) / 4;
+    if count > 240 || (count > 0 && old_begin == 0) {
+        log::warn!("PROCHMI cryptcard-fab: idapi vector {count:#x} entries implausible, skipped");
+        return;
+    }
+    let ok = write_u32(unicorn, vtbl, card)
+        && write_u32(unicorn, vtbl + 0x24, NAME_MATCH)
+        && write_u32(unicorn, vec, card);
+    for i in 0..count {
+        let entry = read_u32(unicorn, old_begin + 4 * i);
+        let _ = write_u32(unicorn, vec + 4 * (i + 1), entry);
+    }
+    // card: vtable, +0x58 -> vtable (search reads [entry+0x58] then calls
+    // [vtable+0x24]), +0x80 status must be 0 or 2 for 0x171fcf4 to scan the
+    // record vector (2 = the "answered" state), +0x88 state enum 0 (the
+    // 0x171fd7c table returns 1 for it), +0x98/+0x9c record vector.
+    let ok = ok
+        && write_u32(unicorn, card, vtbl)
+        && write_u32(unicorn, card + 0x58, vtbl)
+        && write_u32(unicorn, card + 0x80, 2)
+        && write_u32(unicorn, card + 0x88, 0)
+        && write_u32(unicorn, card + 0x98, rec)
+        && write_u32(unicorn, card + 0x9c, rec + 24);
+    // record: +0x04 = status value reported to the caller (1 = card ready),
+    // +0x0c = record kind 2, the ready-status record 0x171fcf4 scans for.
+    let ok = ok
+        && write_u32(unicorn, rec + 0x04, 1)
+        && write_u32(unicorn, rec + 0x0c, 2)
+        && write_u32(unicorn, idapi + 0x18, vec)
+        && write_u32(unicorn, idapi + 0x1c, vec + 4 * (count + 1));
+    if !ok {
+        log::warn!("PROCHMI cryptcard-fab: guest write failed, aborted");
+        return;
+    }
+    log::info!(
+        "PROCHMI cryptcard-fab: idapi={idapi:#x} card={card:#x} registered t={}ms",
+        crate::libs::dapi::emu_t0_elapsed_ms(),
+    );
+}
+
+/// r761: fire (or finish) the fabricated enavi-server RUNNING report from
+/// the post-wipe trap site.  Arming happens on the organic `bstartup-reg`
+/// hit (see the enavi-chain traps); this runs 800 ms later on the next
+/// app-state transition: guest-call the client's own server-state setter
+/// with RUNNING(2) and return onto the trap site, then restore r0-r3 on
+/// the return (the site's `mov r1,#30` replay rewrites r1 anyway, so only
+/// r0/r2/r3 would otherwise be clobbered - the evt8001 re-queue guest call
+/// shares this restore step).  See the enavi-chain trap comment for why
+/// the server report must be fabricated at all.
+fn enavi_fab_fire_or_restore(unicorn: &mut Unicorn<'_, Context>, site: u32) {
+    match ENAVI_FAB_STATE.load(Ordering::Relaxed) {
+        1 if crate::libs::dapi::emu_t0_elapsed_ms() as u64
+            >= ENAVI_FAB_DEADLINE.load(Ordering::Relaxed)
+            // never race the evt8001 re-queue for the single PC slot - wait
+            // for the next app-state transition while a re-queue is pending.
+            && EVT8001_REPOST.load(Ordering::Relaxed) == 0 =>
+        {
+            let base = PROCHMI_BASE.load(Ordering::Relaxed);
+            let proxy = read_u32(unicorn, 0x3a24_1c8 + 0x4c);
+            if base == 0 || proxy == 0 {
+                return;
+            }
+            for (i, reg) in [
+                RegisterARM::R0,
+                RegisterARM::R1,
+                RegisterARM::R2,
+                RegisterARM::R3,
+            ]
+            .iter()
+            .enumerate()
+            {
+                ENAVI_FAB_REGS[i].store(
+                    unicorn.reg_read(*reg).unwrap_or(0) as u32,
+                    Ordering::Relaxed,
+                );
+            }
+            ENAVI_FAB_TID.store(
+                unicorn.get_data().inner.thread_id() as u32,
+                Ordering::Relaxed,
+            );
+            ENAVI_FAB_LR.store(
+                unicorn.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                Ordering::Relaxed,
+            );
+            ENAVI_FAB_STATE.store(2, Ordering::Relaxed);
+            // Shallow fabrication: write the server's RUNNING status word
+            // directly (the very word getter 0x161ce68/vHandleEnaviServerStatus
+            // branch on) and post the release event through bWriteQueue -
+            // the exact shallow guest call the evt8001 re-queue uses daily.
+            // (Deep setter->bcast->sink->post chains executed fine but
+            // correlated with a deterministic 0x90000560 jump in the
+            // interrupted deliver-fi burst, fix167..171 - avoided here.)
+            write_u32(unicorn, proxy + 0xe0, 2);
+            // The router trap site is the *entry push* of the FI-router
+            // function: SP still belongs to its caller, so the injected
+            // call would push its frame over the router's own saved
+            // r5/r6/lr slots - the router epilogue then returned to
+            // bWriteQueue's bl-return mid-function (fix187..193 fatal).
+            // Give the call 32 bytes of its own (push{r4-r7,lr}+sub#12)
+            // and restore SP when it lands back on the site.
+            ENAVI_FAB_SP.store(
+                unicorn.reg_read(RegisterARM::R13).unwrap_or(0) as u32,
+                Ordering::Relaxed,
+            );
+            guest_call_via_lr(
+                unicorn,
+                site,
+                base + (0x0135_a310u32 - ORIGINAL_BASE),
+                [0x38ee_ec8, 0, 0x8100_8001, 0],
+                32,
+            );
+            log::info!(
+                "PROCHMI enavi-fab: state=RUNNING written, release event queued via guest call t={}ms (proxy={proxy:#x} readback={:#x})",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                read_u32(unicorn, proxy + 0xe0),
+            );
+        }
+        // the injected setter returned onto the trap site (same thread's
+        // next hit here; the epilogue pop leaves LR clobbered, so match on
+        // the firing thread - fix170).
+        2 if unicorn.get_data().inner.thread_id() as u32
+            == ENAVI_FAB_TID.load(Ordering::Relaxed) =>
+        {
+            ENAVI_FAB_STATE.store(3, Ordering::Relaxed);
+            let sp = ENAVI_FAB_SP.load(Ordering::Relaxed);
+            if sp != 0 {
+                let _ = unicorn.reg_write(RegisterARM::R13, sp as u64);
+            }
+            // The site instruction is the router's entry push: the cave
+            // that replays it stores LR into the frame, so hand back the
+            // value from firing time (fix187..195: the callees' leftover
+            // lr 0x135a3c8 poisoned the frame and the epilogue returned
+            // into mid-bWriteQueue).
+            let lr = ENAVI_FAB_LR.load(Ordering::Relaxed);
+            if lr != 0 {
+                let _ = unicorn.reg_write(RegisterARM::R14, lr as u64);
+            }
+            for (i, reg) in [
+                RegisterARM::R0,
+                RegisterARM::R1,
+                RegisterARM::R2,
+                RegisterARM::R3,
+            ]
+            .iter()
+            .enumerate()
+            {
+                let v = ENAVI_FAB_REGS[i].load(Ordering::Relaxed);
+                let _ = unicorn.reg_write(*reg, v as u64);
+            }
+            log::info!(
+                "PROCHMI enavi-fab: setter returned, site registers restored t={}ms",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn maybe_repost_evt8001(unicorn: &mut Unicorn<'_, Context>, original_pc: u32, at_post_wipe: bool) {
+    // EVT8001_REPOST values: 0 idle/watch, 1 re-queued awaiting pump,
+    // 2 pumped awaiting confirmation, 3 delivered (latched), 4 gave up.
+    static FIRES: AtomicU32 = AtomicU32::new(0);
+    static LOGS: AtomicU32 = AtomicU32::new(0);
+    let qm = 0x38ee_ec8u32;
+    // clEventQueueManager queue 0 control (fix141 read): read cursor at
+    // qm+0x14, write cursor at qm+0x28, queued count at qm+0x50, ring slot 0
+    // at qm+0x64.  bQueueEmpty is read==write; bResetQueue zeroes the three
+    // counters but not the ring slot itself.
+    let reader = read_u32(unicorn, qm + 0x14);
+    let writer = read_u32(unicorn, qm + 0x28);
+    let slot = read_u32(unicorn, qm + 0x19 * 4);
+    let state = EVT8001_REPOST.load(Ordering::Relaxed);
+    if state == 3 || state == 4 {
+        return;
+    }
+    let base = PROCHMI_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    if at_post_wipe {
+        // r761: the enavi server's startup state machine lives at
+        // [[IEnavi]+0x4c proxy]+0xe0 (getter 0x161ce68, the value
+        // vHandleEnaviServerStatus stores to handler+0x148 and branches on:
+        // 2 -> release wait popup, 5 -> running).  This trap runs on every
+        // app-state transition - exactly when the server posts a state-change
+        // event - so log unconditionally (fires rarely).
+        {
+            let proxy = read_u32(unicorn, 0x3a24_1c8 + 0x4c);
+            let srv_state = read_u32(unicorn, proxy + 0xe0);
+            let sink = read_u32(unicorn, 0x38f9_9b0 + 0x82c);
+            let gate830 = read_u32(unicorn, 0x38f9_9b0 + 0x830);
+            log::info!(
+                "PROCHMI enavi-srv-state t={}ms state={srv_state} proxy={proxy:#x} sink={sink:#x} gate830={gate830:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+            );
+        }
+        if state != 0 {
+            if state != 3 && state != 4 {
+                static REFIRED: AtomicU32 = AtomicU32::new(0);
+                if nav_trace_enabled() && REFIRED.fetch_add(1, Ordering::Relaxed) < 8 {
+                    log::info!(
+                        "PROCHMI evt8001 pump-site re-fire t={}ms state={state} sp={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        unicorn.reg_read(RegisterARM::R13).unwrap_or(0) as u32,
+                    );
+                }
+            }
+            return;
+        }
+        if FIRES.fetch_add(1, Ordering::Relaxed) >= 60 {
+            EVT8001_REPOST.store(4, Ordering::SeqCst);
+            log::warn!("PROCHMI evt8001 rescue gave up after 60 write attempts");
+            return;
+        }
+        // Unconsumed release event sitting in a freshly wiped ring?  (The
+        // organic write happened earlier this cycle, before the wipe.)
+        if reader == 0 && writer == 0 && slot == 0x8100_8001
+            // don't clobber the enavi-fab guest call's pending return slot
+            && ENAVI_FAB_STATE.load(Ordering::Relaxed) != 2
+        {
+            let ok = guest_call_via_lr(
+                unicorn,
+                original_pc,
+                base + (0x0135_a310u32 - ORIGINAL_BASE),
+                [qm, 0, 0x8100_8001, 0],
+                0,
+            );
+            EVT8001_REPOST.store(1, Ordering::SeqCst);
+            if LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
+                log::info!(
+                    "PROCHMI evt8001 re-queued after wipe t={}ms ok={ok}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                );
+            }
+        }
+        return;
+    }
+    // dispatch site (runs before this cycle's wipe)
+    match state {
+        1 => {
+            if nav_trace_enabled() {
+                static DLOGS: AtomicU32 = AtomicU32::new(0);
+                if DLOGS.fetch_add(1, Ordering::Relaxed) < 8 {
+                    log::info!(
+                        "PROCHMI evt8001 dispatch-site t={}ms reader={reader:#x} writer={writer:#x} sp={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        unicorn.reg_read(RegisterARM::R13).unwrap_or(0) as u32,
+                    );
+                }
+            }
+            if writer != 0 && reader == 0 {
+                EVT8001_PUMP_SP.store(
+                    unicorn.reg_read(RegisterARM::R13).unwrap_or(0) as u32,
+                    Ordering::Relaxed,
+                );
+                EVT8001_PUMP_LR.store(
+                    unicorn.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                    Ordering::Relaxed,
+                );
+                let ok = guest_call_via_lr(
+                    unicorn,
+                    original_pc,
+                    base + (0x0135_9ca0u32 - ORIGINAL_BASE),
+                    [0x38ee_ebc, 0, 0, 0],
+                    32,
+                );
+                EVT8001_REPOST.store(2, Ordering::SeqCst);
+                if LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
+                    log::info!(
+                        "PROCHMI evt8001 engine pumped t={}ms ok={ok}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                    );
+                }
+            } else if writer == 0 {
+                // wiped again before pumping: back to watching (the
+                // post-wipe site will re-queue).
+                EVT8001_REPOST.store(0, Ordering::SeqCst);
+            }
+        }
+        2 => {
+            // The pump returned onto the trap site (its entry push): undo
+            // the sp_slack reserved for it and hand back the LR from fire
+            // time before the site instruction replays - the cave re-runs
+            // the entry `push {...,lr}` and would otherwise store the
+            // pump's leftover lr into the dispatcher's frame (same
+            // landmine the enavi-fab LR restore closes).
+            let sp = EVT8001_PUMP_SP.swap(0, Ordering::Relaxed);
+            if sp != 0 {
+                let _ = unicorn.reg_write(RegisterARM::R13, sp as u64);
+            }
+            let lr = EVT8001_PUMP_LR.swap(0, Ordering::Relaxed);
+            if lr != 0 {
+                let _ = unicorn.reg_write(RegisterARM::R14, lr as u64);
+            }
+            if reader != 0 {
+                EVT8001_REPOST.store(3, Ordering::SeqCst);
+                log::info!(
+                    "PROCHMI evt8001 consumed by engine pump t={}ms, rescue done",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                );
+            } else {
+                EVT8001_REPOST.store(0, Ordering::SeqCst);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn maybe_inject_hsi_power_state(unicorn: &mut Unicorn<'_, Context>, original_pc: u32) -> bool {

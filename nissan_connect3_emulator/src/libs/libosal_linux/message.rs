@@ -2240,10 +2240,10 @@ fn cca_server_answer_register(
         static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !FIRED.swap(true, Ordering::Relaxed) {
             post_navi_event_probe(unicorn, client);
-            // The once-only enavi start-request flag (the counterpart of the
-            // phone-side FI event 0x80108031) is fabricated at
-            // clHmiNavServerHandler construction - see PENDING_FW_STATE and
-            // the enavi-startflag trap in libs/prochmi.rs.
+            // The enavi start-request flag (the counterpart of the
+            // phone-side FI event 0x80108031) is fabricated right before the
+            // first post-OFF NORMAL broadcast - see OFF_SEEN and the
+            // hsimngr-dispatch trap in libs/prochmi.rs.
         }
     }
 }

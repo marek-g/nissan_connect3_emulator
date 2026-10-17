@@ -620,7 +620,13 @@ fn dump_window_pixels(backend: &mut Backend) {
         return;
     }
     if let Ok(mut next) = WINDOW_NEXT.lock() {
-        *next = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // r760: interval knob so short validation runs (<30 s) can capture a
+        // post-milestone frame too (EMU_MAP_DUMP_SECS, default 30).
+        let secs: u64 = std::env::var("EMU_MAP_DUMP_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+        *next = std::time::Instant::now() + std::time::Duration::from_secs(secs);
     }
     let (mut draw_w, mut draw_h) = (800i32, 480i32);
     let mut win_w = 800i32;

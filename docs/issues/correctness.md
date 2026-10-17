@@ -461,3 +461,42 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
     emission site (objdump 0x13c1d00..0x13c2400, coverage gap - decode by
     hand or page-watch it), and check the +0x24 gate byte of the gateway
     method 0x13ca4c8 (its zero branch takes a completely different loop).
+
+## r761 - popup release branch executes end-to-end (fix179..197)
+
+- Gate decoded: `vHandleEnaviServerStatus` (0x15e2070, handler 0x38f99b0)
+  releases the wait popup iff `[handler+0x148]==2 && r7==1`, where 2 comes
+  from the enavi server-state word `[[IEnavi 0x3a241c8+0x4c]proxy+0xe0]`
+  and r7 from the idapi query `0x1614dac(idapi,"/dev/cryptcard",0)`
+  (tail 0x171fcf4: needs a card object in the idapi+0x18 vector whose
+  +0x80 in {0,2} and whose +0x98..0x9c record vector holds a +0x0c==2
+  record; name match via entry+0x58 vtable +0x24).
+- enavi-fab (shallow): write proxy+0xe0=2 + guest-call bWriteQueue(qm,0,
+  0x81008001); fires 800 ms after the organic `bstartup-reg` hit, on the
+  next hsi-fievent-router trap.  The real handler then runs its own
+  release branch (0x15e2220: widget query 0x1706710, hide request
+  0x15e0418 -> posts 0x81008132/0x81023200 into the engine, progress-bar
+  0x1621a24/0x16259d8, cleanup 0x15dfce4/0x15dfb3c/0x15e1a7c) and pops
+  cleanly; 0x81008132 is consumed+delivered via the real router (disp
+  0x38ca510).  r7==1 is achieved by `fake_cryptcard_into_idapi`: vtable/
+  card/record fabricated on an emulator heap page (data only, name-match
+  = text gadget 0xfb70f0 `bx lr`), copied idapi vector + appended entry.
+- Root cause of the fix177..195 fatal (READ_UNMAPPED at 0x135a1cc,
+  q=0x90610d1c): BOTH injections (enavi-fab at router site 0x13528a0 and
+  the evt8001 pump at dispatch site 0x1352df4) fire on *function-entry
+  `push {...,lr}`* instructions.  The trap defers the push (cave replay)
+  to the injected call's return, and the replay stored the callee's
+  leftover LR (bWriteQueue bl-return 0x135a3c8 - caught red-handed by the
+  0x90610cd0..0x90610d24 dframe write-watch) into the frame's lr slot:
+  the owner's epilogue then `pop {...,pc}`-returned into mid-bWriteQueue.
+  Fixed by `sp_slack` (32-byte private frame for the injected call, SP
+  restored on re-fire) + saving/restoring LR at fire time
+  (ENAVI_FAB_SP/LR, EVT8001_PUMP_SP/LR).  Rule: an injection returning
+  onto a trap site must restore every register the site instruction
+  consumes - entry pushes consume LR, `bl` sites self-heal.
+- Still open: the popup remains visible although the hide request ran and
+  its event 0x81008132 was delivered (fix197 frames 6.5s..18s show it
+  unchanged; GPU REAL-draw count grows uniformly +60/flush, i.e. the
+  scene keeps containing the popup).  Next: find the 0x81008132 case in
+  the FI-nav consumer and what visibility flag/animation timer it needs
+  (suspect a render-timer or an SVG scene-remove step the stub swallows).
