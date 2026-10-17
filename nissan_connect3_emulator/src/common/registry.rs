@@ -127,8 +127,66 @@ impl Registry {
         registry.load_referenced_process_registries(&dir);
         registry.load_display_process_registries(&dir);
         registry.load_compatibility_entries();
+        registry.load_navi_region_pack(&dir);
         registry.mark_process_started("LBASE");
         registry
+    }
+
+    /// The PROCNAVI hive (`NAVAPP.REG`) references encrypted per-region
+    /// `.ERG` blobs whose plaintext we cannot read.  The eur pack ships its
+    /// sub-hives as plain `.reg` files next to the blob - `hminavserver.reg`
+    /// configures the HMI_NAVSERVER component (NavIF/NAVIF_PRIO), the piece
+    /// of PROCNAV that serves the HMI's navigation service.  On the device
+    /// the executive decrypts the ERG stream into the registry before the
+    /// components read it, so folding the readable eur files in is the
+    /// closest stand-in for that step.
+    fn load_navi_region_pack(&mut self, dir: &Path) {
+        const PACK_FILES: &[&str] = &[
+            "ni2k_eur/hminavserver.reg",
+            "ni2k_eur/sdsapp.reg",
+            "ni2k_eur/sdstsapp.reg",
+        ];
+        for file in PACK_FILES {
+            let path = dir.join(file);
+            match self.load_file(&path) {
+                Ok(entries) => log::debug!("registry: navi pack {} entries {entries}", path.display()),
+                Err(error) => log::debug!(
+                    "registry: navi pack {} unavailable: {}",
+                    path.display(),
+                    error
+                ),
+            }
+        }
+    }
+
+    /// Keys TIMA (PROCNAV's traffic-info component) opens during
+    /// `bOnInit`, whose values live only inside the encrypted
+    /// `NAVAPP.ERG`/`sdsapp.reg` blobs we cannot read.  Without the keys the
+    /// io-open fails and TIMA's init retries forever, holding up the
+    /// component bring-up thread that later starts HMI_NAVSERVER - the
+    /// server the wait-popup waits for.  Create the branch so the opens
+    /// succeed; values the component then queries simply miss (a tolerated
+    /// path - other components' optional values miss on the emulator too),
+    /// and the miss log names them for future seeding.
+    fn seed_navi_hive_gaps(&mut self) {
+        const NAVAPP: &str = "/dev/registry/LOCAL_MACHINE/SOFTWARE/BLAUPUNKT/PROCESS/NAVAPP";
+        for key in [
+            "",
+            "/TIMA",
+            "/TIMA/APP_CONFIG",
+            "/TIMA/APP_CONFIG/KTIMA",
+            "/TIMA/APP_CONFIG/KTIMA/MSG_MANAGEMENT",
+            "/TIMA/APP_CONFIG/KTIMA/PERSISTENT_STORAGE",
+            "/TIMA/APP_CONFIG/KTIMA/TABLE_MANAGEMENT",
+            "/TIMA/APP_CONFIG/KTIMA/RDSLOCK",
+            "/TIMA/APP_CONFIG/KTIMA/MSG_PRESENTATION",
+        ] {
+            let path = format!("{NAVAPP}{key}");
+            // set_u32 creates the whole path; a sentinel value is harmless
+            // (queries for real names still miss) and keeps the node from
+            // looking like an empty parse artifact.
+            self.set_u32(&path, "EMU_FILLED", 1);
+        }
     }
 
     pub fn load_compatibility_entries(&mut self) -> usize {
