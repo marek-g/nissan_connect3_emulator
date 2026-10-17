@@ -853,12 +853,14 @@ Findings (runs fix278..fix287, semtrack + EMU_WATCH forensics):
   per-process ServiceAppMap Rb_tree that the device serialises with exactly
   these semaphores.  1 crash in ~6 runs (281: 2, 282/284/285/286: 0, 287-1:
   1); killing one AE worker parks a map pump in some runs.
-- Fixed here: watchdog consumed a pending post instead of destroying it
-  (word 1 -> 0 + wake), repairs ALL waiters of the word at once (the host
-  model is serialized, one grace must free every contender), errmem ioctls
-  answered (the -1 asserted every OSAL_vWriteToErrMem), IOSC
-  `shared_mem_free` (0x534f0001) modelled, `stack sp-0x20` dump added to
-  thread-death diagnostics.
+- Fixed here: watchdog consumes a pending post instead of destroying it
+  (word 1 -> 0 + wake), errmem ioctls answered (the -1 asserted every
+  OSAL_vWriteToErrMem), IOSC `shared_mem_free` (0x534f0001) modelled,
+  `stack sp-0x20` dump added to thread-death diagnostics.  A broadcast
+  variant (repair every waiter of the word at once, 99f6c76) had to be
+  REVERTED (3c66d37): the fake acquire then lets whole cohorts into the
+  same critical section and the DAPI map re-open chain dies - see
+  design.md r773.
 - Remaining root gap (milestone-2 territory): give the stuck semaphores real
   producers - SCD bring-up completes only when the administration/SPM answer
   path delivers (see gw-deliver probes); until then the watchdog papers over
