@@ -108,6 +108,30 @@ impl SystemNamespace {
         Some(waiter.uaddr)
     }
 
+    /// Watchdog repair for a word with possibly MANY waiters: mark every
+    /// waiter registered on the same shm word as signalled and return the
+    /// word address. The owner of `id` repairs the word and reaps itself via
+    /// `futex_poll_shared`; the other owners reap their waiters on their next
+    /// blocked-thread pass once `notify_waiters` rings their doorbells.
+    /// Repairing only one waiter per 20 s grace (the old behaviour) charged
+    /// the full grace again per process, because the host model is fully
+    /// serialized: while one waiter slept the lock contenders never ran.
+    pub fn futex_signal_key(&mut self, id: usize) -> Option<u32> {
+        let key = self.futex_slab.get(&id)?.key.clone();
+        let mut uaddr = None;
+        if let Some(queue) = self.futex_by_key.get(&key) {
+            for waiter_id in queue.iter() {
+                if let Some(waiter) = self.futex_slab.get_mut(waiter_id) {
+                    waiter.signaled = true;
+                    if *waiter_id == id {
+                        uaddr = Some(waiter.uaddr);
+                    }
+                }
+            }
+        }
+        uaddr
+    }
+
     /// Signal up to `val` pending waiters of a shared futex word. Returns how
     /// many were marked; the caller rings the process doorbells (via
     /// `notify_waiters`) so the owners reap them.
