@@ -362,7 +362,38 @@ static EVT8001_PUMP_LR: AtomicU32 = AtomicU32::new(0);
 /// r763: set once the enavi-fab release handler has completed, asking the
 /// bOnMessage trap to re-post the visual-hide GUI transition 0x8d (see the
 /// there comment).
-static FAB_HIDE_EVENT_PENDING: AtomicU32 = AtomicU32::new(0);
+/// r763: the enavi-fab release completed - the post-wipe trap re-posts the
+/// popup exit-hide GUI event 0x8d paced once per app-state transition (see
+/// the there comment); REMAIN counts the remaining posts.
+static FAB_HIDE_EVENT_REMAIN: AtomicU32 = AtomicU32::new(0);
+/// r764: direct drive of the popup exit transition.  The SM-page trace
+/// (fix214/215/218) shows the state machine PASSES THROUGH state 0x1e5
+/// (SYSDLG nav-starting-up) within ~20 ms during the startup cascade, while
+/// the Lua side only paints the widget ~350 ms later (paint marker): on
+/// every run the organic exit-hide fires BEFORE the paint and the popup is
+/// orphaned - exactly the r757 marker-trap seen from the other side.  After
+/// the release, re-posting event 0x8d is useless (the leaf long left the
+/// 0x1e5 region, fix218).  So replay the recorded transition itself:
+/// vDoTransition(0x1371170, sm, id) just stores the record pointer
+/// (table 0x25a9568 + id*0x10) at [sm+0xc] with NO source validation, and
+/// performTransition(0x1371390, sm) executes the pending record (exit chain
+/// of src -> entry chain of tgt, Lua actions included) and clears pending.
+/// Calling both with the real exit transition 0x2061 (0x1e5 -> 0x1e4, kind
+/// 4, event 0x8d) runs the app's own hide machinery after the orphaned
+/// paint.  SM_HIDE_SM is captured from the SM-page hook whenever a
+/// doTransition touches a 0x1eX sysdlg state, so only the real SM instance
+/// of that region is driven.
+static SM_HIDE_STATE: AtomicU32 = AtomicU32::new(0);
+static SM_HIDE_SM: AtomicU32 = AtomicU32::new(0);
+static SM_HIDE_REGS: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+static SM_HIDE_SP: AtomicU32 = AtomicU32::new(0);
+static SM_HIDE_LR: AtomicU32 = AtomicU32::new(0);
+static SM_HIDE_TID: AtomicU32 = AtomicU32::new(0);
 /// r0-r3 of the interrupted `deliver-fi` call, restored when the injected
 /// setter returns onto the trap site (see the enavi-fab arms above).
 static ENAVI_FAB_REGS: [AtomicU32; 4] = [
@@ -891,27 +922,6 @@ crate::os::code_stub::trap_site(unicorn, msg_on_message, crate::os::code_stub::T
                 && startup_events_release_now()
             {
                 post_gui_internal_events(uc);
-            }
-            // r763: the enavi-fab RUNNING report has been released (popup
-            // closed via the handler's own branch); re-post the proven
-            // visual-hide transition 0x8d once.  fix204/206: that
-            // transition's exit-hide is the only channel that actually
-            // repaints the wait popup away, but the startup flush re-paints
-            // it ~300 ms later from rodata, after the handler's bookkeeping
-            // close has already run.  On the real device the navigation-
-            // ready notification drives a further Lua transition; the
-            // re-post stands in for it (same queue, same organic consumer).
-            if messaging != 0 && FAB_HIDE_EVENT_PENDING.swap(0, Ordering::SeqCst) != 0 {
-                let queue = read_u32(uc, messaging + 4);
-                if post_gui_message_queue(uc, queue, messaging, 0x8d) {
-                    log::info!(
-                        "PROCHMI: posted post-fab hide event=0x8d queue={queue:#x} t={}ms",
-                        crate::libs::dapi::emu_t0_elapsed_ms(),
-                    );
-                } else {
-                    // queue not ready yet - retry on the next bOnMessage.
-                    FAB_HIDE_EVENT_PENDING.store(1, Ordering::SeqCst);
-                }
             }
             // r755-diag: enumerate the receiver lists bOnMessage walks
             // (`this[4]`/`this[5]` = +0x14/+0x18, receiver node event id at
@@ -1460,6 +1470,11 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
             // reached on transitions) it keeps ticking while the HMI idles.
             if label == "hsi-fievent-router" {
                 enavi_fab_fire_or_restore(uc, site);
+                // r764: two-stage popup exit-transition injection (see the
+                // sm_hide_fire_or_restore doc - the 0x8d re-posts of r763
+                // only replayed the startup cascade because the leaf long
+                // left the sysdlg region by release time).
+                sm_hide_fire_or_restore(uc, site);
             }
             match label {
                 "bstartup-reg" => {
@@ -2124,7 +2139,21 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     } else {
                         let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
                         if read_u32(uc, r5 + 0x148) == 2 {
-                            FAB_HIDE_EVENT_PENDING.store(1, Ordering::SeqCst);
+                            // r764 (DISABLED, fix219): arming the two-stage
+                            // vDoTransition+performTransition injection
+                            // crashed the thread - performTransition's
+                            // state-object resolution (ldr r1,[r8,#8] @
+                            // 0x1371434) READ_UNMAPPEDs outside the real
+                            // event-dispatch context (the organic caller at
+                            // 0x136b3fc obtains sm via the owner's
+                            // vtable+16 accessor and pushes a RUNTIME
+                            // record pointer from the owner's transition
+                            // list, not a static-id record).  The 0x8d
+                            // re-posts of r763 were also proven to only
+                            // replay the startup cascade (fix218).  The
+                            // popup's visual hide is owned by the Lua/GUI
+                            // widget-command layer - next attack vector
+                            // (see correctness.md r764 entry).
                         }
                         (read_u32(uc, r5 + 0x7e0), "post")
                     };
@@ -3028,6 +3057,75 @@ crate::os::code_stub::trap_site(unicorn, state_do_transition, crate::os::code_st
         
             0
         });
+
+    // r763 forensics: the narrow trap sites on GUI_StateMachine
+    // vDoTransition (0x1371170) and performTransition (0x1371390) show zero
+    // hits across fix204..213 while the popup demonstrably hid once - a
+    // zero-hit probe proves nothing until re-checked with a page-range hook
+    // (AGENTS.md, unicorn HOOK_EXISTS_BOUNDED quirk).  Both targets share
+    // page 0x1371000; dispatch on the exact fetch address there and log any
+    // other traffic on the page as a liveness witness.
+    if nav_trace_enabled() {
+        let page = base_address + 0x0137_1000u32 - ORIGINAL_BASE;
+        let do_t = base_address + GUI_STATEMACHINE_DO_TRANSITION;
+        let perf_t = base_address + GUI_STATEMACHINE_PERFORM_TRANSITION;
+        let res = unicorn.add_code_hook(
+            page as u64,
+            (page + 0xfff) as u64,
+            move |uc: &mut Unicorn<'_, Context>, address, _size| {
+                let addr = address as u32;
+                let sm = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                if addr == do_t {
+                    let transition =
+                        uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
+                    let leaf = if sm != 0 {
+                        read_u32(uc, sm + GUI_STATE_SM_CURRENT_LEAF)
+                    } else {
+                        0
+                    };
+                    let state_id = if leaf != 0 {
+                        read_u16(uc, leaf + GUI_STATE_STATE_ID)
+                    } else {
+                        0
+                    };
+                    // r764: remember which SM instance owns the sysdlg
+                    // state family (0x1e4..0x1ef) - that is the popup's
+                    // state machine the SM-hide injection must be driven on.
+                    if (0x1e4..=0x1ef).contains(&state_id) {
+                        SM_HIDE_SM.store(sm, Ordering::Relaxed);
+                    }
+                    log::warn!(
+                        "PROCHMI SM-PAGE doTransition t={}ms sm={sm:#x} leaf={leaf:#x} state={state_id:#x} trans={transition:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                    );
+                } else if addr == perf_t {
+                    let transition = if sm != 0 {
+                        read_u32(uc, sm + GUI_STATE_SM_PENDING_TRANSITION)
+                    } else {
+                        0
+                    };
+                    log::warn!(
+                        "PROCHMI SM-PAGE performTransition t={}ms sm={sm:#x} pending={transition:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                    );
+                } else {
+                    static OTHERS: AtomicU32 = AtomicU32::new(0);
+                    let n = OTHERS.fetch_add(1, Ordering::Relaxed);
+                    if n < 4 {
+                        log::info!(
+                            "PROCHMI SM-PAGE other-fetch t={}ms addr={addr:#x} lr={:#x}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                        );
+                    }
+                }
+            },
+        );
+        log::info!(
+            "PROCHMI SM page-hook 0x{page:x} installed: {}",
+            res.is_ok()
+        );
+    }
 
     let state_add_transition = base_address + GUI_STATE_ADD_TRANSITION;
     
@@ -4063,6 +4161,124 @@ fn enavi_fab_fire_or_restore(unicorn: &mut Unicorn<'_, Context>, site: u32) {
     }
 }
 
+/// r764: two-stage injection of the recorded popup exit transition (see the
+/// SM_HIDE_STATE comment).  Stage 1 (state 1) calls vDoTransition(sm,
+/// 0x2061) - the app's own "queue transition record" setter - stage 2 (the
+/// return trap) chains straight into performTransition(sm), which executes
+/// the pending record and clears it; stage 3 restores the site registers
+/// and ends.  Fire/return site is the router entry push, so both callees
+/// run with their own stack slack and LR is handed back exactly (r761
+/// lesson: entry-push sites consume SP and LR).
+fn sm_hide_fire_or_restore(unicorn: &mut Unicorn<'_, Context>, site: u32) {
+    let base = PROCHMI_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    match SM_HIDE_STATE.load(Ordering::Relaxed) {
+        // Arm: the release handler completed.  Never race the enavi-fab or
+        // the evt8001 re-queue for the single PC slot.
+        1 if ENAVI_FAB_STATE.load(Ordering::Relaxed) == 3
+            && EVT8001_REPOST.load(Ordering::Relaxed) == 0 =>
+        {
+            let sm = SM_HIDE_SM.load(Ordering::Relaxed);
+            if sm == 0 {
+                return;
+            }
+            for (i, reg) in [
+                RegisterARM::R0,
+                RegisterARM::R1,
+                RegisterARM::R2,
+                RegisterARM::R3,
+            ]
+            .iter()
+            .enumerate()
+            {
+                SM_HIDE_REGS[i].store(
+                    unicorn.reg_read(*reg).unwrap_or(0) as u32,
+                    Ordering::Relaxed,
+                );
+            }
+            SM_HIDE_TID.store(
+                unicorn.get_data().inner.thread_id() as u32,
+                Ordering::Relaxed,
+            );
+            SM_HIDE_LR.store(
+                unicorn.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                Ordering::Relaxed,
+            );
+            SM_HIDE_SP.store(
+                unicorn.reg_read(RegisterARM::R13).unwrap_or(0) as u32,
+                Ordering::Relaxed,
+            );
+            SM_HIDE_STATE.store(2, Ordering::Relaxed);
+            guest_call_via_lr(
+                unicorn,
+                site,
+                base + (0x0137_1170u32 - ORIGINAL_BASE),
+                [sm, 0x2061, 0, 0],
+                32,
+            );
+            log::info!(
+                "PROCHMI sm-hide: vDoTransition(sm={sm:#x}, 0x2061) injected t={}ms",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+            );
+        }
+        // Stage 2: vDoTransition landed back on the site, pending [sm+0xc]
+        // now points at record 0x2061 - chain performTransition(sm) to run
+        // it (96 bytes of slack: its prologue pushes 8 regs and a 68-byte
+        // frame).
+        2 if unicorn.get_data().inner.thread_id() as u32
+            == SM_HIDE_TID.load(Ordering::Relaxed) =>
+        {
+            let sm = SM_HIDE_SM.load(Ordering::Relaxed);
+            SM_HIDE_STATE.store(3, Ordering::Relaxed);
+            guest_call_via_lr(
+                unicorn,
+                site,
+                base + (0x0137_1390u32 - ORIGINAL_BASE),
+                [sm, 0, 0, 0],
+                128,
+            );
+            log::info!(
+                "PROCHMI sm-hide: performTransition(sm={sm:#x}) injected (pending={:#x}) t={}ms",
+                read_u32(unicorn, sm + 0xc),
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+            );
+        }
+        // Stage 3: performTransition returned - hand the site back.
+        3 if unicorn.get_data().inner.thread_id() as u32
+            == SM_HIDE_TID.load(Ordering::Relaxed) =>
+        {
+            SM_HIDE_STATE.store(4, Ordering::Relaxed);
+            let sp = SM_HIDE_SP.load(Ordering::Relaxed);
+            if sp != 0 {
+                let _ = unicorn.reg_write(RegisterARM::R13, sp as u64);
+            }
+            let lr = SM_HIDE_LR.load(Ordering::Relaxed);
+            if lr != 0 {
+                let _ = unicorn.reg_write(RegisterARM::R14, lr as u64);
+            }
+            for (i, reg) in [
+                RegisterARM::R0,
+                RegisterARM::R1,
+                RegisterARM::R2,
+                RegisterARM::R3,
+            ]
+            .iter()
+            .enumerate()
+            {
+                let v = SM_HIDE_REGS[i].load(Ordering::Relaxed);
+                let _ = unicorn.reg_write(*reg, v as u64);
+            }
+            log::info!(
+                "PROCHMI sm-hide: transition executed, site registers restored t={}ms",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+            );
+        }
+        _ => {}
+    }
+}
+
 fn maybe_repost_evt8001(unicorn: &mut Unicorn<'_, Context>, original_pc: u32, at_post_wipe: bool) {
     // EVT8001_REPOST values: 0 idle/watch, 1 re-queued awaiting pump,
     // 2 pumped awaiting confirmation, 3 delivered (latched), 4 gave up.
@@ -4104,6 +4320,37 @@ fn maybe_repost_evt8001(unicorn: &mut Unicorn<'_, Context>, original_pc: u32, at
                 "PROCHMI enavi-srv-state t={}ms state={srv_state} proxy={proxy:#x} sink={sink:#x} gate830={gate830:#x}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
             );
+        }
+        // r763: paced popup exit-hide posts.  The wait popup's visual hide
+        // is the GUI state machine transition 0x2061 (0x1e5 -> 0x1e4,
+        // decoded from the static transition table at 0x25a9568), driven by
+        // GUI event 0x8d.  The startup-event flush posts 0x8d ~30 ms BEFORE
+        // the SM reaches 0x1e5 (fix214/215 SM-page trace), so it is
+        // swallowed by the earlier state and the popup stays painted.  One
+        // re-post is not enough either: event 0x8d also has a CHILD handler
+        // (0xa02, 0x1e6 -> 0x1e8) that consumes it while the leaf is 0x1e6,
+        // exactly like the r757-era batch that had to churn 0x1e6 -> 0x1e8
+        // before the 0x1e5 parent's 0x2061 bubbled and hid the widget.  So
+        // post a few paced copies (one per app-state transition, ~1 s
+        // apart) once the release handler completed.  This site is the
+        // post-wipe trap: it runs on every transition even with the GUI
+        // idle, unlike bOnMessage which goes silent (fix216: only 3 hits
+        // after the release-pop, all before the settle window).
+        if FAB_HIDE_EVENT_REMAIN.load(Ordering::SeqCst) != 0 {
+            let messaging = GUI_MESSAGING_POINTER.load(Ordering::Relaxed);
+            if messaging != 0 {
+                let queue = read_u32(unicorn, messaging + 4);
+                let posted = post_gui_message_queue(unicorn, queue, messaging, 0x8d);
+                let left = if posted {
+                    FAB_HIDE_EVENT_REMAIN.fetch_sub(1, Ordering::SeqCst) - 1
+                } else {
+                    FAB_HIDE_EVENT_REMAIN.load(Ordering::SeqCst)
+                };
+                log::info!(
+                    "PROCHMI: post-fab hide event=0x8d ok={posted} queue={queue:#x} remain={left} t={}ms",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                );
+            }
         }
         if state != 0 {
             if state != 3 && state != 4 {

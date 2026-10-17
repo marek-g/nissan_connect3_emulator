@@ -575,3 +575,44 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
   compiled into libgw/GUI_ResourcePack-style binaries on the SD pack -
   next grep target: the SD CRYPTNAV/ resource tree for the
   "wait popup"-owning resource pack and its state-table event ids).
+
+## r764 - the SM page-hook resolves the transition forensics; hide is an async-paint orphan (fix214..220)
+
+- SM-PAGE page-hook (page 0x1371000, trace-only) proves vDoTransition
+  (0x1371170) and performTransition (0x1371390) DO run - the earlier
+  zero-hit trap_sites were over-filtered (doTransition's arm only matched
+  trans 0x1977/state 0x1e5, never the real ids), not dead.  Full startup
+  cascade captured (fix214/215): at t~12.03 s the SM walks
+  0x1e3 -(trans 0x6eb)-> 0x1e5 (SYSDLG nav-starting-up, popup painted by
+  the Lua side at paint-marker t~12.4 s) and LEAVES the sysdlg family
+  within ~20 ms (0x1e7/0x1e6/0x1e9/0x1ed/0x1ee/0x1fc/.../0x132).
+- ROOT-CAUSE SHAPE of the persistent popup: the SM's exit-pair for 0x1e5
+  fires while the widget is not painted yet (Lua paints ~350 ms later,
+  asynchronously) - the orphaned paint is never re-hidden.  This is the
+  r757 paint-marker trap from the other side.
+- fix218 negative result: paced re-posts of GUI event 0x8d after the
+  release (via post_gui_message_queue, 4x) produce a fresh identical
+  cascade but never re-enter 0x1e5 (leaf rests at 0x13x) - the popup is
+  unaffected.  The static transition-table decode at 0x25a9568 matches
+  isolated records (0x6eb 0x1e3->0x1e5, 0x2061 0x1e5->0x1e4 event 0x8d,
+  0xa02 0x1e6->0x1e8) but decodes garbage for the cascade's other ids -
+  the u16 id-mask or a per-region table split breaks the linear model;
+  do not trust the decoded protocol beyond individually confirmed records.
+- fix219 negative result (mechanism DISABLED in code, kept dormant):
+  guest-calling vDoTransition(sm, 0x2061) sets [sm+0xc] pending fine, but
+  the chained performTransition(sm) faults READ_UNMAPPED at 0x1371434
+  (ldr r1,[r8,#8]): its state-object resolution only works in the real
+  event-dispatch context - the organic caller 0x136b3fc reads sm via the
+  owner object's vtable+16 accessor and pushes a RUNTIME record pointer
+  from the owner's transition list (entry +8), not a static base+id*0x10
+  record.  Directly driving the SM from the router site is therefore not
+  viable.
+- Next attack vector (widget layer, sanctioned guest calls): enumerate
+  the wait-widget class vtable of the slot14-registered widget
+  ([[0x2a13a00] singleton +0x14], set at the 12.4 s paint; the C++ close
+  branch leaves it set - fix212 popupslot watch) and find its vShow/vHide
+  pair in the GUI widget base class; the 12.4 s paint ran through a
+  vtable+20 command dispatch (0x1363a4c/0x136bf54 read-chain) - the HIDE
+  sibling of that command object is the organic lever.  The bOnMessage
+  receiver-list enumeration (r755-diag) remains the map for unnamed Lua
+  event ids.
