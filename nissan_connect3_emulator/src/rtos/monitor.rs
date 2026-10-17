@@ -2157,7 +2157,26 @@ fn complete_osal_mbx_create(unicorn: &mut Unicorn<'_, Context>, thread: u32, blo
     guard.mq.grow_msgsize(queue_id, size.max(8) as i64 * count.max(1) as i64);
     drop(guard);
     log::info!("monitor: OSAL[{thread}] queue create name {name:?} size {size} count {count}");
+    // Dump the creating thread's stack: the mbx_* queues are all created by
+    // the same libosal wrapper, so the guest function that requested the
+    // queue (its return addresses) is the only way to name the queue owner.
+    dump_wait_stack(unicorn, thread, "create");
     0
+}
+
+/// Log up to 16 stack words of the current guest thread so return addresses
+/// into the process image can be matched against the Ghidra listing.
+fn dump_wait_stack(unicorn: &mut Unicorn<'_, Context>, thread: u32, tag: &str) {
+    if let Ok(sp) = unicorn.reg_read(RegisterARM::R13) {
+        let sp = sp as u32;
+        let mut words = Vec::new();
+        for i in 0..16u32 {
+            if let Ok(w) = read_word(unicorn, sp + i * 4) {
+                words.push(format!("{w:#010x}"));
+            }
+        }
+        log::info!("monitor: OSAL[{thread}] {tag} stack sp={sp:#x}: {words:?}");
+    }
 }
 
 /// Handle token for a named queue (stable per name, allocated on first use by
@@ -2342,6 +2361,19 @@ fn complete_osal_mbx_wait(
         let mut seen = SEEN.lock().unwrap();
         if seen.insert((thread, name.clone())) {
             log::info!("monitor: OSAL[{thread}] pump waits on {name} (handle {handle:#x})");
+            // Dump the waiter's stack so the return addresses name the guest
+            // function parking here (runtimes map PROCNAV/prochmi VAs 1:1 to
+            // their Ghidra images, so these words are directly decompilable).
+            if let Ok(sp) = unicorn.reg_read(RegisterARM::R13) {
+                let sp = sp as u32;
+                let mut words = Vec::new();
+                for i in 0..16u32 {
+                    if let Ok(w) = read_word(unicorn, sp + i * 4) {
+                        words.push(format!("{w:#010x}"));
+                    }
+                }
+                log::info!("monitor: OSAL[{thread}] wait stack sp={sp:#x}: {words:?}");
+            }
         }
     }
     let prio_ptr = read_word(unicorn, block + 0xc).unwrap_or(0);

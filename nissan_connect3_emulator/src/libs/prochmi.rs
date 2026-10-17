@@ -1224,6 +1224,23 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
         (0x00fc_95d4u32 - ORIGINAL_BASE, "appstates-entry-x5d4"),
         (0x00fc_96ccu32 - ORIGINAL_BASE, "appstates-entry-normal"),
         (0x00fc_6574u32 - ORIGINAL_BASE, "appstates-onnew"),
+        // r758: the HMI-side server object.  `vStartupEnaviServer` is a method
+        // of clHmiNavServerHandler, and the component's own bring-up reads
+        // FUNCTIONAL_COMPONENT\HMINAVSERVER (fix105: prochmi never opens those
+        // keys, so the chain presumably dies before the registry read).  The
+        // constructor tells whether the handler object is even instantiated;
+        // vOpenPathHmiNavServerRegistry / u32GetHmiNavServerThreadPriority are
+        // its first two registry-touching steps; bIsNavServerReady answers the
+        // question the wait-popup widget asks.
+        (0x015e_871cu32 - ORIGINAL_BASE, "navsrv-ctor"),
+        (0x0169_dba8u32 - ORIGINAL_BASE, "navsrv-reg-open"),
+        (0x00fc_4660u32 - ORIGINAL_BASE, "reg-bopen"),
+        (0x013c_a4c8u32 - ORIGINAL_BASE, "svcstate-srv"),
+        (0x013c_a534u32 - ORIGINAL_BASE, "svcstate-find"),
+        (0x013c_a560u32 - ORIGINAL_BASE, "svcstate-sink"),
+        (0x0169_e5f8u32 - ORIGINAL_BASE, "navsrv-prio"),
+        (0x015f_4828u32 - ORIGINAL_BASE, "navsrv-avail"),
+        (0x0161_fca8u32 - ORIGINAL_BASE, "ienvi-srvready"),
     ] {
         let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let label: &'static str = label;
@@ -1254,6 +1271,9 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                 && label != "gw-route"
                 && label != "cca-del"
                 && label != "cpm-update"
+                && label != "svcstate-srv"
+                && label != "svcstate-find"
+                && label != "svcstate-sink"
             {
                 return 0;
             }
@@ -1287,6 +1307,68 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     )
                 }
                 "fi-nav-svcstate" => format!(" this={r0:#x} hsi={:#x}", read_u32(uc, r0 + 8)),
+                // r758: `vOpenPathHmiNavServerRegistry` runs (t~2.35 s) but no
+                // OSAL_IOOpen follows: dump the static reg_tclRegKey object's
+                // vtable (0x0597e990, BSS), the path pointer global
+                // (0x054e4bf0) and what it points at, plus the "opened" flag
+                // (0x0597edb0), to see which precondition drops the open.
+                "navsrv-reg-open" => {
+                    let vptr = read_u32(uc, 0x0597_e990);
+                    let pathp = read_u32(uc, 0x054e_4bf0);
+                    let first = if pathp != 0 { read_u8(uc, pathp) } else { 0 };
+                    let flag = read_u32(uc, 0x0597_edb0);
+                    format!(" vptr={vptr:#x} pathp={pathp:#x} byte0={first} openedflag={flag}")
+                }
+                "reg-bopen" => {
+                    let vptr = if r0 != 0 { read_u32(uc, r0) } else { 0 };
+                    let head = if r1 > 0x1000 {
+                        (read_u8(uc, r1), read_u8(uc, r1.wrapping_add(1)))
+                    } else {
+                        (0, 0)
+                    };
+                    format!(" key={r0:#x} path={r1:#x} head=[{:02x} {:02x}] vptr={vptr:#x}", head.0, head.1)
+                }
+                // r758: clCCAGateway(+0x18) service-state method (dispatched
+                // for every vOnServiceState): entry args and the client-port
+                // lookup result.  svc lives in r6 (callee-saved across the
+                // lookup call), server in r7, state in sl([sp+0x50]); only
+                // interesting for the NAVI service.
+                "svcstate-srv" => {
+                    let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                    if r6 != 0x27 {
+                        return 0;
+                    }
+                    let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    let r10 = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
+                    format!(" this={r0:#x} svc={r6:#x} server={r7:#x} version={r2:#x} state={r10:#x}")
+                }
+                "svcstate-find" => {
+                    let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                    if r6 != 0x27 {
+                        return 0;
+                    }
+                    format!(" find_result={r0:#x} svc={r6:#x}")
+                }
+                // no client port -> indirect call on the fallback singleton's
+                // vtable+8 (the two instructions before the site hold the
+                // object in r0 and its vtable in r3)
+                "svcstate-sink" => {
+                    let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                    if r6 != 0x27 {
+                        return 0;
+                    }
+                    let vt = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                    let target = if vt != 0 { read_u32(uc, vt + 8) } else { 0 };
+                    // The sink is clHMIMngr; vtable+8 is a thunk that returns
+                    // immediately while clHMIMngr+0x650 is null, so dump that
+                    // field too: it names whether the notification dies at
+                    // the guard.
+                    let field = read_u32(uc, r0.wrapping_add(0x650));
+                    format!(
+                        " sink={r0:#x} vt={vt:#x} target={target:#x} mgr650={field:#x}"
+                    )
+                }
                 "gw-regclient" => format!(" gw={r0:#x} fidata={r1:#x}"),
                 "gw-lookup" => {
                     // clCCAGateway::bReadSharedMemory routing call site
