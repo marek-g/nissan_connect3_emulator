@@ -2183,6 +2183,13 @@ fn cca_server_answer_register(
         body[0x16..0x18].copy_from_slice(&0xffffu16.to_le_bytes());
         if class == 0x43 {
             body[0x18] = 1; // conf result: accepted
+        } else if service == 0x0027 {
+            // r758: the HMI-side FI-8 branch that starts the enavi server fires
+            // on event id 0x80108031 = the CMNAVI event base 0x80108030 + the
+            // service state, and the popup's whole release chain keys off it.
+            // A state-0 (fastmap ACTIVE) status only ever produces the base
+            // id; the nav service needs state 1 to reach the startup case.
+            body[0x18] = 1; // ServiceStatus: state 1 for the NAVI service
         } // else ServiceStatus: state byte 0 = ACTIVE (fastmap precedent)
         stamp_registration_id("mbx_265", &mut body);
         answers.push(body);
