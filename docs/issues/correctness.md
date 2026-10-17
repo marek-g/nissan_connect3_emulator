@@ -655,3 +655,61 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
   observed) with the 0x1e4 ENTRY list - that re-runs the app's own hide
   actions after the orphaned paint.  This stays "honest fakery" (guest
   calls into the app's own executor, no memory patching).
+
+## r767 - popup is OVERLAY view 917; MenuManager swap chain decoded but destructive (fix237..253)
+
+- Script-object forensics (POPUPCELLS/NODE probes on the popup paint): the
+  painted widgets are GUI_Label/GUI_BGImg script objects (class vtables
+  0x2872150/0x28721c8, RTTI "9GUI_Label"), [obj+0x1c] = impl widget, and the
+  VM dispatcher record (0x391ff90-style) = {sibling, flags 0x10406, argtable,
+  ctx, code, nargs} entries whose `code` IS the 0x136bc40 interpreter -
+  gui-interp runs are VM method-table invocations ("Text" property id 0x21
+  binds the popup label).  GUI_Scripted lifecycle = bOnMessage/vOnDataUpdate
+  call Lua by REF (prepareCallByRef, refs at +0x6c..+0xa4), so per-widget
+  hide logic lives in Lua refs we cannot name statically.
+- Event pacing fixed to match the device: the fabricated internal events are
+  staged - 0x8d on the release gate (completes SM wiring + shows the wait
+  popup, async paint ~12.4 s), 0x8e/0x8f (the service-ready effects: main
+  view change + app-state moves) and the enavi-fab RUNNING write fire only
+  at paint+750 ms (enavi_fab_fire_now(), 15 s fallback).  fix241 had all of
+  them on one 12 s gate, so the 12.16 s organic view-change destroyed the
+  popup's view 285 ms BEFORE its paint -> orphaned pixels no hide channel
+  could erase.
+- View lifecycle decoded (viewfac probes + perform asm, objdump immediates
+  are DECIMAL): GUI_MenuManager (GOT 0x2a13f50) slots = u16 (drawn,pending)
+  pairs at +0x12/+0x1a overlay, +0x14/+0x1c alert, +0x16/+0x1e extended,
+  +0x18/+0x20 main (vSetView slot k <-> perform loop i = 3-k), u16 object
+  slots at +0x00..+0x0f = pGetView(0..3), u8 +0x30 = zombie-panic marker
+  (path B sets it).  Popup = overlay view cid 0x395 (917, created on the
+  main view 247/0xf7 at paint time); boot view cid 1 destroyed organically
+  at ~12.1 s, main = 247.  vSetView is pure slot bookkeeping; the tree
+  rebuild only happens inside vPerformViewChange (0x136465c) when
+  pending != drawn.
+- The 3-stage injection (vLeave(record) -> vSetView(mm, MAIN_CID, main) ->
+  vPerformViewChange(mm), MAIN_CID captured from the organic main-block
+  pCreateView) executes the whole swap cleanly - destroy(main)/create(247)
+  + destroy(917)/create(0) all run, focus-broadcast 0x59 (whose
+  vFireInternalEvent receiver==0 faults, no 0x59 listener exists here) is
+  skipped via an entry trap window.  BUT the run then breaks: the stale
+  aux-slot garbage (0xffff/0x6157, 0xffff/0x6e72 from startup alert churn)
+  forced extra destroy/create rounds, and destroying the overlay view
+  zeroes pGetView(1) - the object slot the mainloop view-pump (0x1365224)
+  polls every frame (r0 0x391ab88 -> 0 across perform, fix252 viewpump
+  probe) -> READ_UNMAPPED 0x136524c, thread 52 dies, screen black.
+- ⇒ the real device must NOT close sysind overlays via a plain
+  bDestroyView+null-slot; the organic close goes through a path that keeps
+  the polled view slot valid (candidates: vShuffleOverlay 0x136432c, the
+  GUI_LUA "DestroyWidgetInstance" method seen at prepareCall sites - Lua
+  tears the WIDGET down while the view object survives - or a Lua
+  view-change handler).  The chain is DISABLED in
+  sm_hide_fire_or_restore (documented return at the top); capture probes
+  (record/globals/view cids/viewpump/focus-skip) stay installed.
+- NEXT: (1) probe vShuffleOverlay + GUI_LUA_Interface prepareCall sites for
+  a DestroyWidgetInstance/"Visible" SetProperty pattern during the organic
+  0x1e5-leave attempts; (2) guest-call the popup label script-object's
+  vBeforeUninitialize (0x137a0e0, runs its Lua ref) - it may tear the
+  widget tree down WITHOUT nulling the view slot - then trigger a repaint
+  of the main view's rect; (3) if that fails, replicate the device's alert
+  slot hygiene (zero aux pairs at boot-factory time, before the first
+  perform, instead of mid-rebuild) and retry the swap with drawn slots kept
+  consistent so i-loop rounds skip.
