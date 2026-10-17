@@ -330,7 +330,12 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
     hook_svg_code(unicorn, base_address);
     hook_thread_code(unicorn, base_address);
     hook_trace_code(unicorn, base_address);
-    sem_track::hook_sem_trace(unicorn, base_address);
+    // sem_track is forensic-only and proved too invasive for the map
+    // pipeline (trap sites on the hot sem_* PLT stubs change the delivery
+    // race); keep the code but require EMU_SEMTRACK=1 to install it.
+    if std::env::var("EMU_SEMTRACK").as_deref() == Ok("1") {
+        sem_track::hook_sem_trace(unicorn, base_address);
+    }
 
     for (address, name) in [
         (0x4853_707c, "fd_device_ctrl_u32DirectSDCardInfo"),

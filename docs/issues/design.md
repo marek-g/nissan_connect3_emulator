@@ -3055,3 +3055,16 @@ writing `PC = site` before blocking, the r753 pattern) or the handler must
 fully own the outcome (`return_result` semantics).  Audit the remaining
 blocking handlers in `libs/libosal_linux/` (message-queue waits park the
 same way) when their wake paths next misbehave.
+
+## r773 - the shared-futex watchdog may only fake ONE waiter (99f6c76 reverted)
+Broadcasting the watchdog repair to every waiter of a stuck shm word
+(`futex_signal_key` + doorbell ring) looked like free wall-clock (one 20 s
+grace instead of N), but the repair is a FALSE acquire: the woken guest
+thread proceeds as if it held a lock somebody else holds.  Releasing all
+contenders at once lets several processes run inside the same guest
+critical section simultaneously and corrupts what those locks protect -
+observed as the DAPI DeviceManager job chain never scheduling the
+NAV*.DAT re-open (fix288/289: no re-open even at 240 s, zero map pixels),
+while the one-waiter repair (fix291) re-opens at +88 s and renders real
+map pixels (shots291/map_pub_0003..0011).  Keep repairs single-waiter and
+keep the pending-post consumption (word 1 -> 0 instead of word := 0).

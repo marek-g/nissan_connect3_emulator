@@ -512,16 +512,20 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
                                 if watchdog {
                                     // Dead-owner repair: the guest asked for an
                                     // open-ended wait, so the deadline is the
-                                    // emulator watchdog. Signal every waiter on
-                                    // this word (the serialized host model means
-                                    // one grace period must free ALL contenders,
-                                    // not one per 20 s), zero the mutex word in
+                                    // emulator watchdog. Zero the mutex word in
                                     // the shared host buffer (this owner's
                                     // mapping is host-ptr backed, so the write
                                     // is coherent for every process) and wake
                                     // with success; the guest's lock retry then
                                     // takes the uncontended word.
-                                    ns.futex_signal_key(id).map(Err).or(Some(Ok(0u32)))
+                                    // Repair exactly ONE waiter (self): the
+                                    // fake success bypasses the guest's mutual
+                                    // exclusion, so mass-releasing every
+                                    // contender of a word (broadcast) corrupts
+                                    // the very data the lock protects (DAPI
+                                    // device state / SCD trees) and kills the
+                                    // map re-open job chain.
+                                    ns.futex_steal_shared(id).map(Err).or(Some(Ok(0u32)))
                                 } else {
                                     ns.futex_remove_shared(id);
                                     Some(Ok(-110i32 as u32)) // -ETIMEDOUT
@@ -591,10 +595,6 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
                             );
                         }
                         set_runnable(unicorn, tid, Some(0u32));
-                        // the co-waiters live in other processes: ring their
-                        // doorbells so they reap the signalled waiters now
-                        // instead of whenever they next wake up
-                        namespace.lock().unwrap().notify_waiters();
                     }
                     None => {}
                 }
