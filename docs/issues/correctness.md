@@ -752,3 +752,48 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
   internal event with a registered receiver (any id the FM1 view listens
   to) forces one full redraw pass after the hide; (3) popup is invisible
   in the widget tree - a frame proof needs any composite pass >14 s.
+
+## r769 - MILESTONE: "Starting navigation." popup visually GONE (fix266..268)
+
+- The hide channel (sm_hide_fire_or_restore stage 1 + the 1145-handler loop)
+  now runs end-to-end at paint+~1.4 s with ZERO execution errors and the
+  post-hide composite frames (shots268 k0006-k0008) show the full FM1 screen
+  with NO popup - the wait-popup is finally gone from the display.
+- Channel anatomy (all app code, no instruction patching):
+  1. Capture at paint: text-builder NODE probe stores the popup script CELLS
+     (Label 0x2872150 / BGImg 0x28721c8 vtables) and their owner widget f6
+     (+0x18) = the painted popup CONTAINER (kids=2). PU_WIDGET (slot14 of
+     the popup singleton) is rejected by the widget-shape guard - it is not
+     a GUI_Widget - and correctly skipped.
+  2. Hide: store tagged-false (0x10000000) over container+0x3c (the same
+     word GUI_Widget::bSetProperty writes for the visible property; old
+     value CID 0x70000010). GUI_Widget::vDraw skips invisible children, so
+     subsequent renders of that subtree draw nothing.
+  3. Render: on the clGUIWidgetEngine::bExecute site (0x133c134 - NOT the
+     router site, fix255 re-entrancy) the loop guest-calls, per target:
+     GUI_Widget::vInvalidate(container), popup-ctx [vt+0x14](ctx,1)
+     (0x1347010, the GUI_GUIAPI__vInvalidate whole-ctx call), then the
+     overlay render triple DisplayManager::update() would run: ctx->[8] =
+     GUI_GL_OpenGLContext::drawBegin (0x1348980, binds the layer FBO),
+     GUI_Widget::callDraw(ovrRoot,0,0) (0x137af7c), ctx->[0xc] = drawEnd
+     (0x13488f4) - drawEnd issues the app's own eglSwapBuffers, so the
+     erased layer (damage from the +0x14 call, tree now invisible) presents
+     WITHOUT the popup. The pGetView-slot targets self-skip: [0x40] of the
+     slot objects is a data wrapper (0x209/heap words, not a vtable) and the
+     DisplayManager global [0x2a12928] is junk here (code word at +0), so
+     update()/mixLayers cannot run at all in our unit - hence driving the
+     per-view block manually on the popup's REAL OpenGLContext.
+  4. Site hygiene: the trap site's original instruction replays on EVERY
+     injected-call return (entry push each leg), so the loop saves
+     r0-r3/sp/lr on entry and restores them at loop end (fix267 crash at
+     0x133c138 READ_UNMAPPED = SP drift with only r0 restored).
+  5. Proof capture: gpu::request_forced_present() -> FORCE_PRESENT_REQ is
+     served by the GPU backend thread (command path + 16 ms timeout tick)
+     with one handle_surface_swap(Hmi): pure presentation of what the guest
+     rendered + EMU_MAP_DUMP_DIR dump, since the idle app issues no further
+     swaps itself.
+- NEXT: strip the TEMP forensics probes (POPUPCELLS/NODE, viewfac/viewpump
+  dumps, eng/v3/parent-chain diagnostics) keeping capture+hide+render+
+  present; then multi-minute runs toward real map pixels. DisplayManager/
+  OpenGL pool globals staying junk ([0x2a12928]/[0x2a12958]/[0x2a12948]) is
+  the tracked root gap for any engine-driven (non-injected) repaint.

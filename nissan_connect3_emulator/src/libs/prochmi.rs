@@ -482,6 +482,20 @@ static PU_WIDGET: AtomicU32 = AtomicU32::new(0);
 /// GUI_Widget::vInvalidate returns onto the site (the prologue must see
 /// the real engine pointer, fix251 lesson).
 static PU_THIS: AtomicU32 = AtomicU32::new(0);
+/// r768: live draw context ([[popup widget +0x28]+0x40], fix259:
+/// 0x38f7b28-class) used for the whole-context `ctx->[0x14](ctx, 1)`
+/// redraw trigger.
+static PU_CTX: AtomicU32 = AtomicU32::new(0);
+/// r768: pGetView(3) - the LIVE main view (kids=50, the FM1 tree; fix264:
+/// slots 0/1 are empty shells, the drawn world hangs off slot 3) and its
+/// draw context [v3+0x40].  Markers 0xF1/0xF2/0xF3 replay update()'s own
+/// view-render triple on them (ctx->[8] drawBegin, callDraw(v3,0,0),
+/// ctx->[0xc] drawEnd) - the organic path the 12.1 s view-change used.
+static PU_V3: AtomicU32 = AtomicU32::new(0);
+static PU_V3CTX: AtomicU32 = AtomicU32::new(0);
+/// r768: overlay widget root (popup container's +0x28 ctx-holder), the
+/// second render triple's tree.
+static PU_OVR: AtomicU32 = AtomicU32::new(0);
 /// r0-r3 of the interrupted `deliver-fi` call, restored when the injected
 /// setter returns onto the trap site (see the enavi-fab arms above).
 static ENAVI_FAB_REGS: [AtomicU32; 4] = [
@@ -3738,67 +3752,117 @@ crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::A
                 // before letting the prologue replay (fix251: bGUIMainloop
                 // ran with r0=0 off a clobbered re-entry).
                 let st = SM_HIDE_STATE.load(Ordering::Relaxed);
-                if st == 2 {
-                    PU_THIS.store(ptr, Ordering::Relaxed);
-                    PU_I.store(0, Ordering::Relaxed);
-                    SM_HIDE_STATE.store(3, Ordering::Relaxed);
-                    let t = PU_OBJS[0].load(Ordering::Relaxed);
-                    // 0xFE000000|slot = whole-view GUI_GUIAPI__vInvalidate
-                    // (0x134ae6c), plain value = widget vInvalidate (0x137bdac).
-                    let (fn_off, args) = if t & 0xff00_0000 == 0xfe00_0000 {
-                        (0x0134_ae6cu32 - ORIGINAL_BASE, [t & 0xff, 0, 0, 0])
-                    } else {
-                        (0x0137_bdacu32 - ORIGINAL_BASE, [t, 1, 0, 0])
-                    };
-                    guest_call_via_lr(
-                        uc,
-                        addr,
-                        base_address + fn_off,
-                        args,
-                        64,
-                    );
-                    log::info!(
-                        "PROCHMI popup-uninit: invalidate target {t:#x} 1/{} posted t={}ms",
-                        PU_COUNT.load(Ordering::Relaxed),
-                        crate::libs::dapi::emu_t0_elapsed_ms(),
-                    );
-                    return 0;
-                }
-                if st == 3 {
+                if st == 2 || st == 3 {
+                    // Invalidate loop.  Walk to the next callable target
+                    // (a zero function address means the queued object
+                    // lost its context since stage 1 - skip it), call it,
+                    // and on loop end hand the site back.  fix267: the
+                    // return from each injected call re-fires this site,
+                    // and returning 0 replays its ORIGINAL instruction
+                    // (an entry push) once more per leg - so the entry
+                    // context (r0-r3/sp/lr) is saved on the first visit
+                    // and fully restored at loop end before the final
+                    // replay (r766 pattern; fix267 crashed at site+4 with
+                    // only r0 restored).
                     let n = PU_COUNT.load(Ordering::Relaxed) as usize;
-                    let i = PU_I.load(Ordering::Relaxed) as usize + 1;
-                    if i < n {
-                        PU_I.store(i as u32, Ordering::Relaxed);
-                        let t = PU_OBJS[i].load(Ordering::Relaxed);
-                        let (fn_off, args) = if t & 0xff00_0000 == 0xfe00_0000 {
-                            (0x0134_ae6cu32 - ORIGINAL_BASE, [t & 0xff, 0, 0, 0])
-                        } else {
-                            (0x0137_bdacu32 - ORIGINAL_BASE, [t, 1, 0, 0])
-                        };
-                        guest_call_via_lr(
-                            uc,
-                            addr,
-                            base_address + fn_off,
-                            args,
-                            64,
+                    let mut i = if st == 2 {
+                        PU_THIS.store(ptr, Ordering::Relaxed);
+                        for (ri, reg) in [
+                            RegisterARM::R0,
+                            RegisterARM::R1,
+                            RegisterARM::R2,
+                            RegisterARM::R3,
+                        ]
+                        .iter()
+                        .enumerate()
+                        {
+                            SM_HIDE_REGS[ri].store(
+                                uc.reg_read(*reg).unwrap_or(0) as u32,
+                                Ordering::Relaxed,
+                            );
+                        }
+                        SM_HIDE_LR.store(
+                            uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                            Ordering::Relaxed,
                         );
+                        SM_HIDE_SP.store(
+                            uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32,
+                            Ordering::Relaxed,
+                        );
+                        SM_HIDE_TID.store(
+                            uc.get_data().inner.thread_id() as u32,
+                            Ordering::Relaxed,
+                        );
+                        0usize
+                    } else {
+                        PU_I.load(Ordering::Relaxed) as usize + 1
+                    };
+                    while i < n
+                        && pu_target_fn(uc, base_address, PU_OBJS[i].load(Ordering::Relaxed)).0 == 0
+                    {
+                        i += 1;
+                    }
+                    if i >= n {
+                        SM_HIDE_STATE.store(0, Ordering::Relaxed);
+                        let sp = SM_HIDE_SP.load(Ordering::Relaxed);
+                        if sp != 0 {
+                            let _ = uc.reg_write(RegisterARM::R13, sp as u64);
+                        }
+                        let lr = SM_HIDE_LR.load(Ordering::Relaxed);
+                        if lr != 0 {
+                            let _ = uc.reg_write(RegisterARM::R14, lr as u64);
+                        }
+                        for (ri, reg) in [
+                            RegisterARM::R0,
+                            RegisterARM::R1,
+                            RegisterARM::R2,
+                            RegisterARM::R3,
+                        ]
+                        .iter()
+                        .enumerate()
+                        {
+                            let v = SM_HIDE_REGS[ri].load(Ordering::Relaxed);
+                            let _ = uc.reg_write(*reg, v as u64);
+                        }
                         log::info!(
-                            "PROCHMI popup-uninit: invalidate target {t:#x} {}/{} posted t={}ms",
-                            i + 1,
-                            n,
+                            "PROCHMI popup-uninit: invalidation loop done, site registers restored t={}ms",
                             crate::libs::dapi::emu_t0_elapsed_ms(),
                         );
+                        // r768: the damage the loop posted produced no composite
+                        // pass (fix256/257: prochmi idles without eglSwapBuffers
+                        // and the empty GUI_Messaging receiver lists never flush
+                        // it).  Nudge the dispatcher with one more internal
+                        // event - 0x8f (enavi status, already handled once, its
+                        // handler is idempotent) - routed like the startup burst
+                        // through [messaging+4].  Any pass it wakes repaints the
+                        // now-invisible popup region.
+                        let messaging = GUI_MESSAGING_POINTER.load(Ordering::Relaxed);
+                        if messaging != 0 {
+                            let q = read_u32(uc, messaging + 4);
+                            if post_gui_message_queue(uc, q, messaging, 0x8f) {
+                                log::info!(
+                                    "PROCHMI popup-uninit: re-posted internal event 0x8f queue={q:#x} t={}ms",
+                                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                                );
+                            }
+                        }
+                        // fix266: ask the host GPU layer to present+dump
+                        // the HMI surface once (pure presentation of what
+                        // the guest rendered; no synthesized pixels).
+                        crate::gpu::request_forced_present();
                         return 0;
                     }
-                    SM_HIDE_STATE.store(0, Ordering::Relaxed);
-                    let this_ = PU_THIS.load(Ordering::Relaxed);
-                    let _ = uc.reg_write(RegisterARM::R0, this_ as u64);
+                    PU_I.store(i as u32, Ordering::Relaxed);
+                    SM_HIDE_STATE.store(3, Ordering::Relaxed);
+                    let t = PU_OBJS[i].load(Ordering::Relaxed);
+                    let (fn_addr, args) = pu_target_fn(uc, base_address, t);
+                    guest_call_via_lr(uc, addr, fn_addr, args, 64);
                     log::info!(
-                        "PROCHMI popup-uninit: invalidation loop done, engine this={this_:#x} restored t={}ms",
+                        "PROCHMI popup-uninit: invalidate target {t:#x} fn={fn_addr:#x} {}/{} posted t={}ms",
+                        i + 1,
+                        n,
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                     );
-                    let ptr = this_;
-                    HMI_GUI_POINTER.store(ptr, Ordering::Relaxed);
                     return 0;
                 }
                 if ptr != 0 {
@@ -4818,6 +4882,82 @@ fn enavi_fab_fire_or_restore(unicorn: &mut Unicorn<'_, Context>, site: u32) {
 /// Fire/return site is the router entry push, so each callee runs with its
 /// own stack slack and LR is handed back exactly (r761 lesson: entry-push
 /// sites consume SP and LR).
+/// Resolve a popup-uninit invalidate-loop target to (function, args):
+/// 0xFE000000|slot = whole-view GUI_GUIAPI__vInvalidate (0x134ae6c, only
+/// ever queued after the host verified its MenuManager global),
+/// 0xFD000000 = the app's whole-context redraw on PU_CTX exactly as
+/// GUI_GUIAPI__vInvalidate performs it (`ctx->[0x14](ctx, 1)`, resolved
+/// live from the object's vtable), plain value = GUI_Widget::vInvalidate
+/// (0x137bdac).
+fn pu_target_fn(
+    uc: &mut Unicorn<'_, Context>,
+    base: u32,
+    t: u32,
+) -> (u32, [u32; 4]) {
+    if t & 0xff00_0000 == 0xfe00_0000 {
+        (
+            base + 0x0134_ae6cu32 - ORIGINAL_BASE,
+            [t & 0xff, 0, 0, 0],
+        )
+    } else if t & 0xff00_0000 == 0xfd00_0000 {
+        let ctx = PU_CTX.load(Ordering::Relaxed);
+        let vt = read_u32(uc, ctx);
+        let f = read_u32(uc, vt + 0x14);
+        if (ORIGINAL_BASE..0x0286_0000).contains(&f) {
+            (f, [ctx, 1, 0, 0])
+        } else {
+            (0, [0, 0, 0, 0])
+        }
+    } else if matches!(t >> 24, 0xf1..=0xf6) {
+        // Render triples (DisplayManager::update's per-view block):
+        //   main view3    : 0xF1 ctx->[8] | 0xF2 callDraw(v3) | 0xF3 ctx->[0xc]
+        //   overlay root  : 0xF4 ctx->[8] | 0xF5 callDraw(ovr) | 0xF6 ctx->[0xc]
+        // A resolved vtable slot must point into prochmi text: fix266
+        // showed [view3+0x40] is a plain data wrapper (its "+8" word is
+        // another pool pointer), so those markers self-skip via fn=0.
+        let (obj, ctx) = match t >> 24 {
+            0xf1 | 0xf2 | 0xf3 => (PU_V3.load(Ordering::Relaxed), PU_V3CTX.load(Ordering::Relaxed)),
+            _ => (PU_OVR.load(Ordering::Relaxed), PU_CTX.load(Ordering::Relaxed)),
+        };
+        let vt = read_u32(uc, ctx);
+        match t >> 24 {
+            0xf1 | 0xf4 => {
+                let f = read_u32(uc, vt + 8);
+                if (ORIGINAL_BASE..0x0286_0000).contains(&f) {
+                    (f, [ctx, 0, 0, 0])
+                } else {
+                    (0, [0, 0, 0, 0])
+                }
+            }
+            0xf2 | 0xf5 => (base + 0x0137_af7cu32 - ORIGINAL_BASE, [obj, 0, 0, 0]),
+            _ => {
+                let f = read_u32(uc, vt + 0xc);
+                if (ORIGINAL_BASE..0x0286_0000).contains(&f) {
+                    (f, [ctx, 0, 0, 0])
+                } else {
+                    (0, [0, 0, 0, 0])
+                }
+            }
+        }
+    } else if t & 0xff00_0000 == 0xff00_0000 {
+        // View-context full invalidate: slot = bits 15:8, arg = bits 7:0.
+        // Queued only after stage 1 verified view != 0 && ctx != 0.
+        let slot = (t >> 8) & 0xff;
+        let mm = read_u32(uc, 0x02a1_3f50);
+        let obj = read_u32(uc, mm + slot * 4);
+        let vctx = read_u32(uc, obj + 0x40);
+        let vt = read_u32(uc, vctx);
+        let f = read_u32(uc, vt + 0x14);
+        if (ORIGINAL_BASE..0x0286_0000).contains(&f) {
+            (f, [vctx, t & 0xff, 0, 0])
+        } else {
+            (0, [0, 0, 0, 0])
+        }
+    } else {
+        (base + 0x0137_bdacu32 - ORIGINAL_BASE, [t, 1, 0, 0])
+    }
+}
+
 fn sm_hide_fire_or_restore(unicorn: &mut Unicorn<'_, Context>, site: u32) {
     let _ = site;
     // r768 stage 1 (router site): hide the popup through the engine's own
@@ -4910,8 +5050,15 @@ fn sm_hide_fire_or_restore(unicorn: &mut Unicorn<'_, Context>, site: u32) {
             if w == 0 {
                 break;
             }
+            // GUI_Widget::getDrawContext (0x137ae94): [[w+0x28]+0x40].
+            let w28 = read_u32(unicorn, w + 0x28);
+            let ctx = if w28 != 0 {
+                read_u32(unicorn, w28 + 0x40)
+            } else {
+                0
+            };
             chain.push(format!(
-                "{w:#x}(vis={:#x} kids={} vt={:#x})",
+                "{w:#x}(vis={:#x} kids={} w28={w28:#x} ctx={ctx:#x} vt={:#x})",
                 read_u32(unicorn, w + 0x3c),
                 read_u32(unicorn, w + 0x20),
                 read_u32(unicorn, w)
@@ -4936,6 +5083,185 @@ fn sm_hide_fire_or_restore(unicorn: &mut Unicorn<'_, Context>, site: u32) {
             }
         }
         PU_COUNT.store(tn as u32, Ordering::Relaxed);
+    }
+    // fix261: the REAL render gate, decoded from clGUIWidgetEngine::
+    // bGUIMainloop (0x133be70): every pump iteration calls
+    // GUI_DM_DisplayManager::update() (0x133d99c) only when isDirty() -
+    // and isViewDirty (0x133d758) = (*(ctx->vtable+4))() on the VIEW's own
+    // draw context [pGetView(i)+0x40].  When dirty, update() does the
+    // device's own per-view redraw: ctx->[8] (drawBegin) +
+    // GUI_Widget::callDraw(view,0,0) + ctx->[0xc] (drawEnd) for every
+    // dirty view.  The widget-level damage fix256-258 posted went to the
+    // WIDGET-resolved ctx and relied on messaging to mark the view dirty
+    // - the dead channel.  So queue the app's whole-context invalidate
+    // directly on both views' contexts: main (slot 0, repaints FM1 over
+    // the popup area) and overlay (slot 1, the popup's own view - redraws
+    // without the now-invisible container).  Marker 0xFF000001|slot.
+    {
+        let ef = 1u32; // GUI_GUIAPI__vInvalidate passes 1 to ctx->[0x14]
+        for slot in [0u32, 1] {
+            let obj = read_u32(unicorn, mm + slot * 4);
+            let vctx = if obj != 0 { read_u32(unicorn, obj + 0x40) } else { 0 };
+            if vctx != 0 && tn < PU_OBJS.len() {
+                PU_OBJS[tn].store(0xff00_0000 | (slot << 8) | ef, Ordering::Relaxed);
+                tn += 1;
+                log::info!(
+                    "PROCHMI popup-uninit: queued view[slot={slot}]={obj:#x} ctx={vctx:#x} full invalidate (render-gate open)"
+                );
+            } else {
+                log::info!(
+                    "PROCHMI popup-uninit: view[slot={slot}]={obj:#x} ctx={vctx:#x} - no ctx, cannot dirty"
+                );
+            }
+        }
+        PU_COUNT.store(tn as u32, Ordering::Relaxed);
+    }
+    // fix264 finding: the DisplayManager global [0x2a12928] is junk here
+    // (0x47514c70 with CODE at +0 - never initialized in our unit), so
+    // bGUIMainloop's update()-gate reads random memory and never renders.
+    // The engine object gates the swap helper (0x1345d50) on [engine+0x134]
+    // - dump the engine's display-related slots to find the REAL display
+    // /DisplayManager candidate to repoint the global at.
+    {
+        let eng = HMI_GUI_POINTER.load(Ordering::Relaxed);
+        let mut slots = Vec::new();
+        for off in [0x3cu32, 0x40, 0x44, 0x130, 0x134, 0x138, 0x13c] {
+            slots.push(format!("{off:#x}={:#x}", read_u32(unicorn, eng + off)));
+        }
+        // pGetView slots 2/3 too - the FM1 widgets must hang off SOME view.
+        let mut vs = Vec::new();
+        for slot in [2u32, 3] {
+            let v = read_u32(unicorn, mm + slot * 4);
+            let kc = read_u32(unicorn, v + 0x20);
+            vs.push(format!("v{slot}={v:#x}(kids={kc} ctx={:#x})", read_u32(unicorn, v + 0x40)));
+        }
+        log::info!(
+            "PROCHMI popup-uninit: eng={eng:#x} [{}] {} t={}ms",
+            slots.join(" "),
+            vs.join(" "),
+            crate::libs::dapi::emu_t0_elapsed_ms(),
+        );
+    }
+    // fix263 deep diagnostics: GUI_View IS a GUI_Widget (update() passes
+    // the view itself to callDraw), so the main tree hangs in view0's own
+    // child slots; ctx = [view+0x40].  Dump both contexts' vtables to map
+    // the invalidate/isPending slots, the DM dirty byte, and view0's kids.
+    {
+        let view0 = read_u32(unicorn, mm);
+        let mut kids = Vec::new();
+        if view0 != 0 {
+            let kc = read_u32(unicorn, view0 + 0x20).min(4);
+            let arr = read_u32(unicorn, view0 + 0x1c);
+            for k in 0..kc {
+                let cw = if arr != 0 { read_u32(unicorn, arr + k * 4) } else { 0 };
+                kids.push(format!(
+                    "{cw:#x}(w28={:#x} vis={:#x})",
+                    read_u32(unicorn, cw + 0x28),
+                    read_u32(unicorn, cw + 0x3c)
+                ));
+            }
+        }
+        let vctx0 = if view0 != 0 { read_u32(unicorn, view0 + 0x40) } else { 0 };
+        let vt0 = read_u32(unicorn, vctx0);
+        let vt1 = read_u32(unicorn, PU_CTX.load(Ordering::Relaxed));
+        let s0: Vec<String> = (0..7u32)
+            .map(|i| format!("{:#x}", read_u32(unicorn, vt0 + i * 4)))
+            .collect();
+        let s1: Vec<String> = (0..7u32)
+            .map(|i| format!("{:#x}", read_u32(unicorn, vt1 + i * 4)))
+            .collect();
+        let dm = read_u32(unicorn, 0x02a1_2928);
+        log::info!(
+            "PROCHMI popup-uninit: view0={view0:#x} kids=[{}] ctx0={vctx0:#x} vt0=[{}] | overlay ctx={:#x} vt1=[{}] | dm={dm:#x} dm+0={:#x} dirty3c={} t={}ms",
+            kids.join(","),
+            s0.join(","),
+            PU_CTX.load(Ordering::Relaxed),
+            s1.join(","),
+            read_u32(unicorn, dm),
+            read_u32(unicorn, dm + 0x3c) & 0xff,
+            crate::libs::dapi::emu_t0_elapsed_ms(),
+        );
+        // Queue the MAIN view itself as a vInvalidate target: as a widget
+        // its own +0x28 ctx-holder slot may be 0, but its damage path via
+        // update() reads [view0+0x40] directly - the guest-call harmlessly
+        // no-ops if getDrawContext misses; keep it for the side effects.
+        if view0 != 0 && tn < PU_OBJS.len() {
+            PU_OBJS[tn].store(view0, Ordering::Relaxed);
+            tn += 1;
+            PU_COUNT.store(tn as u32, Ordering::Relaxed);
+            log::info!("PROCHMI popup-uninit: queued GUI_Widget::vInvalidate(view0 {view0:#x})");
+        }
+    }
+    // fix262: the view-ctx vtable's slot +0x14 is zero (0x391b8e0 is not a
+    // fix259: the widget-level damage never schedules a pass, but the ctx
+    // is alive (fix259: [[w+0x28]+0x40] = 0x38f7b28) - queue the app's
+    // OWN whole-context invalidate: GUI_GUIAPI__vInvalidate performs
+    // (*(ctx->[0x14]))(ctx, 1) on the view's draw context (0x134ae6c), the
+    // device's sledgehammer redraw trigger.  We cannot call that function
+    // (its MenuManager global [0x2a12ae0] is junk here), but the ctx
+    // object and vtable call are identical - marker 0xFD000000 resolves
+    // the vtable method stage-side and runs it on PU_CTX.
+    let w0 = PU_OBJS[0].load(Ordering::Relaxed);
+    let w28 = read_u32(unicorn, w0 + 0x28);
+    let ctx = if w28 != 0 { read_u32(unicorn, w28 + 0x40) } else { 0 };
+    if ctx != 0 && tn < PU_OBJS.len() {
+        PU_CTX.store(ctx, Ordering::Relaxed);
+        PU_OBJS[tn].store(0xfd00_0000, Ordering::Relaxed);
+        tn += 1;
+        PU_COUNT.store(tn as u32, Ordering::Relaxed);
+        log::info!("PROCHMI popup-uninit: queued ctx->[0x14](ctx={ctx:#x}, 1) whole-context invalidate");
+        // Overlay-side triple (fix266): the popup's own layer is drawn by
+        // this ctx; repainting its now-empty tree with the update() recipe
+        // refreshes that texture without the popup's pixels.
+        PU_OVR.store(w28, Ordering::Relaxed);
+        for m in [0xf400_0000u32, 0xf500_0000, 0xf600_0000] {
+            if tn < PU_OBJS.len() {
+                PU_OBJS[tn].store(m, Ordering::Relaxed);
+                tn += 1;
+            }
+        }
+        PU_COUNT.store(tn as u32, Ordering::Relaxed);
+        log::info!("PROCHMI popup-uninit: queued overlay render triple on ovr={w28:#x} ctx={ctx:#x}");
+    }
+    // fix266: replay DisplayManager::update()'s OWN render triple on the
+    // live main view (pGetView(3), 50 kids = the FM1 tree, fix264) since
+    // the DM global [0x2a12928] is junk here and its update()-gate can
+    // never run: ctx->[8](ctx) + GUI_Widget::callDraw(v3,0,0) +
+    // ctx->[0xc](ctx), exactly as update()'s per-view block does it.  A
+    // repaint of the full main tree replaces every pixel of the region,
+    // including the orphaned popup's, from the surviving widget data.
+    {
+        let v3 = read_u32(unicorn, mm + 3 * 4);
+        let v3ctx = if v3 != 0 { read_u32(unicorn, v3 + 0x40) } else { 0 };
+        let vt = read_u32(unicorn, v3ctx);
+        log::info!(
+            "PROCHMI popup-uninit: v3={v3:#x} ctx={v3ctx:#x} vt={vt:#x} [4)={:#x} [8)={:#x} [c)={:#x} [10)={:#x}",
+            read_u32(unicorn, vt + 4),
+            read_u32(unicorn, vt + 8),
+            read_u32(unicorn, vt + 0xc),
+            read_u32(unicorn, vt + 0x10),
+        );
+        if v3 != 0 && v3ctx != 0 && read_u32(unicorn, v3 + 0x20) > 0 {
+            PU_V3.store(v3, Ordering::Relaxed);
+            PU_V3CTX.store(v3ctx, Ordering::Relaxed);
+            // The wrapper at [v3+0x40] is data-only (fix266), so only the
+            // callDraw leg can run - and only if v3's widget ctx chain
+            // resolves ([[v3+0x28]+0x40] non-null, else callDraw's own
+            // getDrawContext deref faults).
+            let w28v = read_u32(unicorn, v3 + 0x28);
+            let wctxv = if w28v != 0 { read_u32(unicorn, w28v + 0x40) } else { 0 };
+            log::info!("PROCHMI popup-uninit: v3 w28={w28v:#x} wctx={wctxv:#x}");
+            let mut ms = 0u32;
+            if wctxv != 0 {
+                ms = 0xf200_0000;
+            }
+            if ms != 0 && tn < PU_OBJS.len() {
+                PU_OBJS[tn].store(ms, Ordering::Relaxed);
+                tn += 1;
+                PU_COUNT.store(tn as u32, Ordering::Relaxed);
+                log::info!("PROCHMI popup-uninit: queued main-view callDraw on v3={v3:#x}");
+            }
+        }
     }
     // Hand over to the bExecute site (0x133c134) for the invalidate loop.
     SM_HIDE_STATE.store(2, Ordering::Relaxed);

@@ -60,6 +60,20 @@ struct GpuCommand {
     reply: mpsc::Sender<GpuOutput>,
 }
 
+/// r768: one-shot request to run a full HMI present + window dump on the
+/// GPU thread without a guest eglSwapBuffers (the app idles GL-free once
+/// its startup cascades end; the popup widget-hide channel renders the
+/// main view but nothing presents it).  Presentation only - the surface
+/// content is exactly what the guest rendered.
+static FORCE_PRESENT_REQ: AtomicBool = AtomicBool::new(false);
+
+/// Ask the GPU backend thread to run one HMI present (+ EMU_MAP_DUMP_DIR
+/// window dump) at its next opportunity.  Safe before the backend thread
+/// exists (the flag simply waits for it).
+pub fn request_forced_present() {
+    FORCE_PRESENT_REQ.store(true, Ordering::Relaxed);
+}
+
 /// GLSL ES sources substituted for the map engine's precompiled (Vivante
 /// `glShaderBinary`) shader blobs, which no other GPU can load.  The map
 /// engine's `rl_tclOpenGLShader` resolves *all* of its interface by name
@@ -1900,6 +1914,10 @@ fn backend_main(rx: mpsc::Receiver<GpuCommand>, ready_tx: mpsc::Sender<bool>) {
                         return;
                     }
                 }
+                // r768: on-demand present (see request_forced_present).
+                if FORCE_PRESENT_REQ.swap(false, Ordering::Relaxed) {
+                    handle_surface_swap(&mut backend, GpuTarget::Hmi);
+                }
 
                 let _ = command.reply.send(output);
 
@@ -1908,6 +1926,14 @@ fn backend_main(rx: mpsc::Receiver<GpuCommand>, ready_tx: mpsc::Sender<bool>) {
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
+                // r768: the guest idles without swapping once its startup
+                // cascades end (see docs r768 repaint gap), so the timeout
+                // tick must serve forced presents too - prochmi posts one
+                // after the widget-hide channel re-renders the main view.
+                if FORCE_PRESENT_REQ.swap(false, Ordering::Relaxed) {
+                    make_target_current(&mut backend, GpuTarget::Hmi);
+                    handle_surface_swap(&mut backend, GpuTarget::Hmi);
+                }
                 if poll_events(&mut backend) {
                     return;
                 }
