@@ -409,3 +409,55 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
   - **Decision: unblock PROCNAV next** (who must post to mbx_19/
     TEA_TASK1QUEUE); a 60-120s run with `cm-mngr-msg` uncapped should then
     show whether the startup event appears organically.
+- r758 (fix102b..fix113): the PROCNAV side was unblocked, the producer still
+  isn't there - and the popup's actual server turned out to be **inside
+  prochmi**.  Findings, in order:
+  - PROCNAV component bring-up was serialized behind TIMA's registry retry
+    loop (every `PROCESS\NAVAPP\TIMA\APP_CONFIG\KTIMA\*` open failed because
+    that branch lives in the encrypted `NAVAPP.ERG`).  Seeding the KTIMA
+    branches + APP03's copy + `TIMA\APPID` + `HMINAVSERVER` APPID/SERVICES
+    in registry_compat (commit 5a7395e) made TIMA (`mbx_3`+`MQB_3`) and WDB
+    (`mbx_23`) start, and the SCD resolves `HMINAVSERVER` APPID=0x24/
+    SERVICEID=0x27 stably.  The `CONFIG\<APP>\APPID` misses are a benign
+    directory enumeration (4x per app, uniform), not a loop.
+  - **Correction to r757c's premise:** the three "PROCNAV nav messages"
+    (src=0x24 msgid=0x4000..4002 func=0x90000) were OUR OWN r756 echoes
+    (msgid 0x4000 = the fabrication's MSG_ID seed; "func=0x90000" was the
+    trap misreading the OPTYPE byte at +0x1a as part of the func word).
+    PROCNAV never sends nav service traffic in the emulator; it doesn't
+    host the NAVI FI server at all.
+  - `HMINAVSERVER` strings exist only in prochmi_out.out: `di_hmi_navserver`
+    (`clHmiNavServerHandler`, 537 symbols, ctor 0x15e871c, `vStartupEnaviServer`
+    is one of its methods) is compiled INTO prochmi.  The "enavi server" the
+    popup waits for is this HMI-internal server; app 0x24 (would-be mbx_36)
+    is ITS CCA identity.  prochmi's registry reads go through the libosal
+    REGISTRY stubs (log level trace - earlier "prochmi never opens the
+    branch" observations were log artifacts); with the eur pack now loaded it
+    opens APP_CONFIG fine (fix109).
+  - Runtime chain probes (commit 38fb9ff): handler constructed t~2.3s
+    (thread 52, caller 0x14c28f4); our r755 ServiceStatus for svc 0x27
+    reaches `hmicca_tclApp::vOnServiceState` -> `nav-state-dispatch` ->
+    `clCCAGateway` vtable+0x18 method (0x13ca4c8): client-port lookup fails
+    (that's the design - fallback path), and the vtable+8 fallback sink
+    0x134e91c on clHMIMngr (0x38eee60) passes its guard (+0x650 =
+    hmicca_tclApp) and tail-calls into hmicca_tclApp's notify tail
+    (0xfc8854).  With the state-1 experiment (commit 7554252) the FULL chain
+    runs at t~6.1s, yet the router sees NO 0x80108031: FI-8 events observed
+    are only 0x810080a4/c4/a8 (other producers).
+  - The id is still not present as any constant anywhere (re-scanned
+    prochmi/PROCNAV/DAPIAPP/procmapengine/procbaselx/libosal for
+    0x80108030/80108000/108030/8030 LE words; the PROCNAV/procmapengine
+    hits are misaligned false positives inside Thumb code - 0x8030 is a
+    Thumb `strh` encoding).
+  - Remaining hypotheses for the producer: (a) the MQServStateChg poller
+    (wait loop at prochmi+0x13c230c, consumer side of the state pump) needs
+    a second, non-null client-port entry to emit the +1 event - the r757c
+    route table entries were built from our fabrications and may lack the
+    field that makes `find` (0xfb6e9c) succeed; (b) the id is composed by an
+    enavi component (`enavi_tclRegistry`/HmiNavServer) only once the real
+    navif ENGINE link (procmapengine/DAPI, svc 0x26 family) is READY, i.e.
+    popup release is downstream of the map-engine data path, not of CCA at
+    all.  Next: probe the MQServStateChg consumer loop body for the event
+    emission site (objdump 0x13c1d00..0x13c2400, coverage gap - decode by
+    hand or page-watch it), and check the +0x24 gate byte of the gateway
+    method 0x13ca4c8 (its zero branch takes a completely different loop).
