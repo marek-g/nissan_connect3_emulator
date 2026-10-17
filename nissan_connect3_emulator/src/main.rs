@@ -43,7 +43,12 @@ fn seed_dynamic_ffs_recursive(source: &Path, destination: &Path) -> io::Result<(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
-    pretty_env_logger::init();
+    // Millisecond timestamps: the map pipeline spans minutes and every
+    // phase-gap question needs a wall clock in the log (the old plain init
+    // printed none, forcing line-position guesses).  init_timed() keeps the
+    // RUST_LOG parsing of init() (a bare formatted_builder() would log
+    // nothing - it does not read the environment).
+    pretty_env_logger::init_timed();
     seed_dynamic_ffs()?;
 
     // Self-diagnostic: an empty navbin silently produces a PROCNAV-less boot

@@ -83,17 +83,37 @@ pub fn push_text_on_stack(unicorn: &mut Unicorn<'_, Context>, address: u32, text
 }
 
 pub fn read_string(unicorn: &Unicorn<'_, Context>, mut addr: u32) -> String {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
+    // read in 256-byte chunks: one FFI call per byte made every path
+    // syscall (open/stat/readlink...) pay O(len) expensive crossings
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 256];
     loop {
-        if unicorn.mem_read(addr as u64, &mut byte).is_err() || addr == 0xffff_ffff {
+        if addr == 0xffff_ffff {
             break;
         }
-        if byte[0] == 0 {
-            break;
+        match unicorn.mem_read(addr as u64, &mut chunk) {
+            Ok(()) => {
+                if let Some(pos) = chunk.iter().position(|&b| b == 0) {
+                    buf.extend_from_slice(&chunk[..pos]);
+                    break;
+                }
+                buf.extend_from_slice(&chunk);
+                addr += chunk.len() as u32;
+            }
+            Err(_) => {
+                // straddles the end of a mapped region: finish byte-wise
+                // (the old behavior) instead of truncating the path
+                let mut byte = [0u8; 1];
+                loop {
+                    if unicorn.mem_read(addr as u64, &mut byte).is_err() || byte[0] == 0 {
+                        break;
+                    }
+                    buf.push(byte[0]);
+                    addr += 1;
+                }
+                break;
+            }
         }
-        buf.push(byte[0]);
-        addr += 1;
     }
     String::from_utf8_lossy(&buf).into_owned()
 }

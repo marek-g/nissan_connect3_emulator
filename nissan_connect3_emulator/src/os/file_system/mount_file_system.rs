@@ -66,6 +66,11 @@ pub struct MountFsFileData {
     /// mount point the file was opened on - part of the inode key so that
     /// identical relative paths on different mounts do not collide in st_ino
     pub mount_point: String,
+    /// index into `MountFileSystem::mount_points` for `mount_point`: the fd
+    /// to mount lookup behind every read/write/seek/close was walking all
+    /// mounts (each with its own lock + hashmap probe); with the map's own
+    /// record this becomes O(1) (performance.md)
+    pub mount_index: usize,
     pub file_status_flags: u32,
 }
 
@@ -98,12 +103,26 @@ impl MountFileSystem {
     }
 
     pub fn get_mount_point(&self, fd: i32) -> Option<&MountPoint> {
+        // O(1) via the open-file record (falls back to the scan for fds
+        // that carry no record, e.g. driver fds minted outside open())
+        if let Some(&idx) = self.file_data.get(&fd).map(|d| &d.mount_index) {
+            if let Some(mp) = self.mount_points.get(idx) {
+                if mp.file_system.is_open(fd) {
+                    return Some(mp);
+                }
+            }
+        }
         self.mount_points
             .iter()
             .find(|mp| mp.file_system.is_open(fd))
     }
 
     pub fn get_mount_point_mut(&mut self, fd: i32) -> Option<&mut MountPoint> {
+        if let Some(&idx) = self.file_data.get(&fd).map(|d| &d.mount_index) {
+            if idx < self.mount_points.len() && self.mount_points[idx].file_system.is_open(fd) {
+                return Some(&mut self.mount_points[idx]);
+            }
+        }
         self.mount_points
             .iter_mut()
             .find(|mp| mp.file_system.is_open(fd))
@@ -195,9 +214,16 @@ impl MountFileSystem {
                     // store the global path (not the mount-relative one) so that
                     // dirfd-based operations (openat, getdents) re-resolve entries
                     // against the file's real location
+                    let mount_name = mount_point.mount_point.clone();
+                    let mount_index = self
+                        .mount_points
+                        .iter()
+                        .position(|mp| mp.mount_point == mount_name)
+                        .unwrap_or(usize::MAX);
                     let mount_fs_file_data = MountFsFileData {
                         file_path: absolute_path.clone(),
-                        mount_point: mount_point.mount_point.clone(),
+                        mount_point: mount_name,
+                        mount_index,
                         file_status_flags: 0,
                     };
 
@@ -259,11 +285,17 @@ impl MountFileSystem {
             }
             mount_point.mount_point.clone()
         };
+        let mount_index = self
+            .mount_points
+            .iter()
+            .position(|mp| mp.mount_point == mount_name)
+            .unwrap_or(usize::MAX);
         self.file_data.insert(
             new_fd,
             MountFsFileData {
                 file_path: absolute_path,
                 mount_point: mount_name,
+                mount_index,
                 file_status_flags: 0,
             },
         );

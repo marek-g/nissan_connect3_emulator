@@ -82,3 +82,15 @@ Hot-path problems: per-syscall allocations, O(n) lookups, redundant FFI calls, r
   design.  Legacy `add_code_hook` registrations on the normal path: **0**
   (only `add_mem_hook` watchpoints, the svc intr hook, and rejected-site
   fallbacks remain).
+
+## RESOLVED: read_string one-byte FFI + O(#mounts) fd->mount scan
+- `read_string` (src/emulator/utils.rs) now reads 256-byte chunks with a
+  byte-wise fallback when the chunk straddles an unmapped page.
+- `MountFileSystem::get_mount_point(_mut)` resolves the fd through the
+  existing `file_data` map's new `mount_index` field (recorded at open/dup2)
+  instead of probing every mount's `is_open`; the linear scan remains only as
+  fallback for fds with no record (driver fds). `get_unique_fd` rides the
+  same O(1) lookup now.
+- Added `pretty_env_logger::init_timed()`: logs carry ms wall timestamps -
+  required to profile the minutes-long map pipeline (the plain init printed
+  none). NB `formatted_builder()` alone never reads RUST_LOG (silent runs).
