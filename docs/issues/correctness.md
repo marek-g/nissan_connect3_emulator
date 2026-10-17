@@ -713,3 +713,42 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
   slot hygiene (zero aux pairs at boot-factory time, before the first
   perform, instead of mid-rebuild) and retry the swap with drawn slots kept
   consistent so i-loop rounds skip.
+
+## r768 - popup hidden via widget visibility data (clean); repaint channel is the gap (fix254..257)
+
+- fix254 lesson: the painted "script objects" (GUI_Label 0x2872150 /
+  GUI_BGImg 0x28721c8 vtables) are VM-materialized CELLS, not GUI_Scripted
+  widgets - driving GUI_Scripted::vUninitialize over them dereferences
+  garbage Lua ref slots and called the HSI router with junk (READ_UNMAPPED
+  0x13528a8, thread 52 died).
+- GUI_Widget::vDraw (0x137bb88) walks children ([this+0x1c], count +0x20)
+  and skips any child whose tagged visibility ContentId at +0x3c resolves
+  to 0.  The popup owner chain (captured at paint: both script cells' f6
+  = same container): container widget (kids=2: Label+BGImg, vt 0x2872aa8)
+  -> overlay-view root widget (kids=1, vt 0x2871fd8, parent 0).  Writing
+  the tagged-false literal 0x10000000 over the container's +0x3c (the same
+  store GUI_Widget::bSetProperty performs for the visible property; old
+  value was the CID ref 0x70000010) removes the popup subtree from any
+  further draw pass - zero errors, no slot/queue corruption (sm_hide_fire
+  _or_restore stage 1 + PU_* capture probes).
+- Repaint gap: GUI_Widget::vInvalidate now runs from the clGUIWidgetEngine
+  ::bExecute trap site (0x133c134) - NOT the router site: the callee's
+  message machinery re-enters the router and executes the just-consumed
+  site instruction with clobbered r0/r1 (fix255 crash).  The bExecute-host
+  handler restores the engine `this` into r0 on the injected return
+  (fix251 lesson: bGUIMainloop once ran with r0=0 that way).  But the
+  post-hide damage produces NO composite pass: prochmi stops issuing
+  eglSwapBuffers when idle and the invalidate never schedules a redraw.
+  Consistent with the golden-era finding that GUI_Messaging receiver lists
+  ([singleton]+0x10/+0x14) stay EMPTY the whole run - the message-driven
+  repaint channel is dead in our emulated unit; the ~120 real swaps came
+  from Lua data-update bursts during startup cascades only.
+- GUI_GUIAPI__vInvalidate (0x134ae6c) is unusable as-is: its MenuManager
+  global [0x2a12ae0] holds a LIBC-region value (0x47dc8080) here, NOT the
+  mm ([0x2a13f50]); the host-side guard skips those slots (fix257 log).
+- NEXT: (1) investigate why vAddReceiver registrations vanish (the empty
+  GUI_Messaging lists) - fixing messaging revives repaint-on-damage for
+  the WHOLE GUI, not just the popup; (2) meanwhile test whether posting an
+  internal event with a registered receiver (any id the FM1 view listens
+  to) forces one full redraw pass after the hide; (3) popup is invisible
+  in the widget tree - a frame proof needs any composite pass >14 s.

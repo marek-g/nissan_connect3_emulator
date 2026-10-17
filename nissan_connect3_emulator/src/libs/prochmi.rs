@@ -441,6 +441,47 @@ static SM_HIDE_REGS: [AtomicU32; 4] = [
 static SM_HIDE_SP: AtomicU32 = AtomicU32::new(0);
 static SM_HIDE_LR: AtomicU32 = AtomicU32::new(0);
 static SM_HIDE_TID: AtomicU32 = AtomicU32::new(0);
+/// r768: the popup's painted script objects (GUI_Label vtable 0x2872150 /
+/// secondary 0x28721a4, GUI_BGImg vtable 0x28721c8) and their impl widgets
+/// ([obj+0x1c]), captured at paint time by the text-builder POPUPCELLS
+/// NODE probe.  The widget-teardown channel (sm_hide_fire_or_restore) runs
+/// the app's own GUI_Scripted dismiss pair over PU_OBJS (switches the
+/// +0x68 paint gate off) and then GUI_Widget::vInvalidate over PU_IMPS to
+/// post the damage rect, so the compositor repaints the region from the
+/// surviving main-view tree.
+static PU_OBJS: [AtomicU32; 8] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+static PU_IMPS: [AtomicU32; 8] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+static PU_COUNT: AtomicU32 = AtomicU32::new(0);
+static PU_I: AtomicU32 = AtomicU32::new(0);
+/// r768: the popup GUI_Widget as the popup manager knows it - [singleton
+/// +0x14] of [[0x2a13a00]], captured live by the release-wfind/release-pop
+/// probes (r762 forensics: that slot held 0x3a0ecf8 across the organic
+/// release).  Making this widget's +0x3c visibility ContentId resolve to
+/// false removes the whole painted popup subtree from GUI_Widget::vDraw.
+static PU_WIDGET: AtomicU32 = AtomicU32::new(0);
+/// r768: `this` of the clGUIWidgetEngine/clHMI bExecute site that hosted
+/// the invalidate loop - re-stored into r0 when the injected
+/// GUI_Widget::vInvalidate returns onto the site (the prologue must see
+/// the real engine pointer, fix251 lesson).
+static PU_THIS: AtomicU32 = AtomicU32::new(0);
 /// r0-r3 of the interrupted `deliver-fi` call, restored when the injected
 /// setter returns onto the trap site (see the enavi-fab arms above).
 static ENAVI_FAB_REGS: [AtomicU32; 4] = [
@@ -2262,6 +2303,11 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                         0
                     };
                     let singl_addr = singl;
+                    if slot14 != 0 {
+                        // r768: the popup singleton's registered widget -
+                        // the widget the hide channel makes invisible.
+                        PU_WIDGET.store(slot14, Ordering::Relaxed);
+                    }
                     let mut words = Vec::new();
                     if w != 0 {
                         for off in (0..0x30u32).step_by(4) {
@@ -2278,6 +2324,9 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                 }
                 "release-wfind" => {
                     let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    if (0x0380_0000..0x0800_0000).contains(&r0) {
+                        PU_WIDGET.store(r0, Ordering::Relaxed);
+                    }
                     format!(
                         " slot14={r0:#x} proxy={r5:#x} noop={}",
                         r5 == 0 || r0 == 0,
@@ -3360,6 +3409,30 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         for cell in targets {
                             let nf: Vec<u32> =
                                 (0..12u32).map(|i| read_u32(uc, cell + i * 4)).collect();
+                            // r768: capture the painted popup script objects -
+                            // GUI_Label (primary vtable 0x2872150, secondary
+                            // 0x28721a4) and GUI_BGImg (0x28721c8).  Their
+                            // vDraw runs the Lua paint only while obj+0x68 is
+                            // set, so the widget-teardown channel can switch
+                            // them off without touching any MenuManager slot.
+                            const SCRIPT_VT: [u32; 3] =
+                                [0x0287_2150, 0x0287_21a4, 0x0287_21c8];
+                            if SCRIPT_VT.contains(&nf[0]) {
+                                let n = PU_COUNT.load(Ordering::Relaxed) as usize;
+                                let already = (0..n)
+                                    .any(|k| PU_OBJS[k].load(Ordering::Relaxed) == cell);
+                                if n < PU_OBJS.len() && !already {
+                                    PU_OBJS[n].store(cell, Ordering::Relaxed);
+                                    // the cell's owning widget (f6, +0x18)
+                                    PU_IMPS[n].store(read_u32(uc, cell + 0x18), Ordering::Relaxed);
+                                    PU_COUNT.store(n as u32 + 1, Ordering::Relaxed);
+                                    log::warn!(
+                                        "PROCHMI popup-uninit: captured cell {cell:#x} vt={:#x} owner={:#x}",
+                                        nf[0],
+                                        read_u32(uc, cell + 0x18),
+                                    );
+                                }
+                            }
                             // C++ class name: GUI classes keep the mangled
                             // name pointer near vtable+0x2c (r765 forensics
                             // on GUI_StateView); resolve [cell] vtables too.
@@ -3657,6 +3730,77 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         
 crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:1145", move |uc: &mut Unicorn<'_, Context>| {
                 let ptr = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                // r768: popup-uninit invalidate loop (see
+                // sm_hide_fire_or_restore).  State 2 = widgets hidden,
+                // targets pending; state 3 = a vInvalidate injected from
+                // this site is returning.  On that return r0 is the
+                // callee's result, NOT the engine `this`, so restore it
+                // before letting the prologue replay (fix251: bGUIMainloop
+                // ran with r0=0 off a clobbered re-entry).
+                let st = SM_HIDE_STATE.load(Ordering::Relaxed);
+                if st == 2 {
+                    PU_THIS.store(ptr, Ordering::Relaxed);
+                    PU_I.store(0, Ordering::Relaxed);
+                    SM_HIDE_STATE.store(3, Ordering::Relaxed);
+                    let t = PU_OBJS[0].load(Ordering::Relaxed);
+                    // 0xFE000000|slot = whole-view GUI_GUIAPI__vInvalidate
+                    // (0x134ae6c), plain value = widget vInvalidate (0x137bdac).
+                    let (fn_off, args) = if t & 0xff00_0000 == 0xfe00_0000 {
+                        (0x0134_ae6cu32 - ORIGINAL_BASE, [t & 0xff, 0, 0, 0])
+                    } else {
+                        (0x0137_bdacu32 - ORIGINAL_BASE, [t, 1, 0, 0])
+                    };
+                    guest_call_via_lr(
+                        uc,
+                        addr,
+                        base_address + fn_off,
+                        args,
+                        64,
+                    );
+                    log::info!(
+                        "PROCHMI popup-uninit: invalidate target {t:#x} 1/{} posted t={}ms",
+                        PU_COUNT.load(Ordering::Relaxed),
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                    );
+                    return 0;
+                }
+                if st == 3 {
+                    let n = PU_COUNT.load(Ordering::Relaxed) as usize;
+                    let i = PU_I.load(Ordering::Relaxed) as usize + 1;
+                    if i < n {
+                        PU_I.store(i as u32, Ordering::Relaxed);
+                        let t = PU_OBJS[i].load(Ordering::Relaxed);
+                        let (fn_off, args) = if t & 0xff00_0000 == 0xfe00_0000 {
+                            (0x0134_ae6cu32 - ORIGINAL_BASE, [t & 0xff, 0, 0, 0])
+                        } else {
+                            (0x0137_bdacu32 - ORIGINAL_BASE, [t, 1, 0, 0])
+                        };
+                        guest_call_via_lr(
+                            uc,
+                            addr,
+                            base_address + fn_off,
+                            args,
+                            64,
+                        );
+                        log::info!(
+                            "PROCHMI popup-uninit: invalidate target {t:#x} {}/{} posted t={}ms",
+                            i + 1,
+                            n,
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                        );
+                        return 0;
+                    }
+                    SM_HIDE_STATE.store(0, Ordering::Relaxed);
+                    let this_ = PU_THIS.load(Ordering::Relaxed);
+                    let _ = uc.reg_write(RegisterARM::R0, this_ as u64);
+                    log::info!(
+                        "PROCHMI popup-uninit: invalidation loop done, engine this={this_:#x} restored t={}ms",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                    );
+                    let ptr = this_;
+                    HMI_GUI_POINTER.store(ptr, Ordering::Relaxed);
+                    return 0;
+                }
                 if ptr != 0 {
                     if store == "hmi_mngr" {
                         HMI_MNGR_POINTER.store(ptr, Ordering::Relaxed);
@@ -4653,226 +4797,152 @@ fn enavi_fab_fire_or_restore(unicorn: &mut Unicorn<'_, Context>, site: u32) {
     }
 }
 
-/// r766: one-stage injection of the app's own view dismiss: guest-call
-/// GUI_StateView::vLeave (0x1375be8) on the live record of state 0x1e5
-/// captured by the SM-page hook.  vLeave runs GUI_MenuManager::vLeaveView
-/// (clears the view slots for the popup's view id) + vSetView(mm, 0) - the
-/// organic exit action that on the real device fires when the SM leaves
-/// 0x1e5 (which here happens ~350 ms BEFORE the async paint, orphaning it;
-/// r764/r765).  Fire/return site is the router entry push, so the callee
-/// runs with its own stack slack and LR is handed back exactly (r761
-/// lesson: entry-push sites consume SP and LR).
-#[allow(unreachable_code)]
+/// r768: popup widget-hide channel.  The wait popup keeps painting because
+/// the overlay's widget subtree is still alive and GUI_Widget::vDraw
+/// (0x137bb88) walks it every frame - and it SKIPS every child whose
+/// tagged visibility ContentId at +0x3c resolves to 0 (fix254/255
+/// forensics).  So the hide is exactly the store the app's own
+/// GUI_Widget::bSetProperty performs for the visible property: write the
+/// tagged-false literal (tag 1, value 0 = 0x10000000) over the popup
+/// container widget's slot, then post damage with GUI_Widget::vInvalidate
+/// (0x137bdac, param_3=0 so it runs even after the widget became invisible)
+/// and the compositor repaints the region from the surviving main-view
+/// tree.  Targets: the registered popup widget ([singleton+0x14] of
+/// [[0x2a13a00]], captured by the release-wfind/release-pop probes) plus
+/// the owner widgets captured with the painted script cells (PU_IMPS).
+/// Earlier fix254 attempt ran GUI_Scripted::vUninitialize over those script
+/// CELLS - they are VM-materialized cells, not GUI_Scripted objects, and
+/// the freeRef chain called the HSI router with garbage (READ_UNMAPPED
+/// 0x13528a8, thread death); the view-rebuild chain (r767) nulls a
+/// view-pumped MenuManager slot.  Both lessons are in docs r767/r768.
+/// Fire/return site is the router entry push, so each callee runs with its
+/// own stack slack and LR is handed back exactly (r761 lesson: entry-push
+/// sites consume SP and LR).
 fn sm_hide_fire_or_restore(unicorn: &mut Unicorn<'_, Context>, site: u32) {
-    // r767 DISABLED (fix246..252 forensics): the vLeave + vSetView +
-    // vPerformViewChange chain runs to completion and does destroy the
-    // popup's overlay view, but it also drags the MAIN view through a full
-    // destroy/recreate (the drawn-slot u16 pairs hold stale non-factory
-    // garbage - 0x82d8/0x395/0xffff/0x6157 - so perform cannot swap
-    // surgically): the screen repaints black, the mainloop view-pump then
-    // faults on a nulled queue pointer ([[0x2a18274] chain, READ_UNMAPPED
-    // 0x136524c) and thread 52 dies.  The slot model is still conflating
-    // two objects ([[0x2a13f50]] vs [[0x2a18274]]-4 - pGetView indexes
-    // [mm+slot*4] objects, pump reads [mm+4] as a stable queue).  Before
-    // re-arming, re-derive the TRUE MenuManager instance (pGetView probe +
-    // bDestroyView argument-vs-slot correlation) and find how the real
-    // device closes a sysind overlay without nulling a pumped queue slot.
-    // The record/global capture and view-cid probes below stay live for
-    // forensics; SM_HIDE_STATE never advances past 0 so nothing fires.
-    let _ = (unicorn, site);
-    return;
-    #[allow(clippy::never_loop)]
-    let base = PROCHMI_BASE.load(Ordering::Relaxed);
-    if base == 0 {
+    let _ = site;
+    // r768 stage 1 (router site): hide the popup through the engine's own
+    // visibility data.  GUI_Widget::vDraw (0x137bb88) skips every child
+    // whose tagged visibility ContentId at +0x3c resolves to 0 - the same
+    // word the app's GUI_Widget::bSetProperty writes for the visible
+    // property - so a tagged-false store (0x10000000) over the popup
+    // container widget drops the whole painted subtree out of the next
+    // draw pass.  Damage is then posted by GUI_Widget::vInvalidate
+    // (0x137bdac) calls - but NOT from this site: fix255 caught the callee
+    // re-entering the router site (its message machinery calls
+    // clHSIMngr::bEvent2App) and executing the just-consumed router trap
+    // site with clobbered r0/r1 -> READ_UNMAPPED 0x13528a8.  The
+    // invalidation loop therefore runs on the clGUIWidgetEngine::bExecute
+    // trap site (0x133c134, see the "1145" handler), a clean pump context
+    // whose r0 the handler restores on the injected call's return (the
+    // fix251 lesson: clobbered r0 there corrupts the engine `this`).
+    if SM_HIDE_STATE.load(Ordering::Relaxed) != 1 {
         return;
     }
-    match SM_HIDE_STATE.load(Ordering::Relaxed) {
-        // Arm: the release handler completed.  Never race the enavi-fab or
-        // the evt8001 re-queue for the single PC slot.
-        1 if ENAVI_FAB_STATE.load(Ordering::Relaxed) == 3
-            && EVT8001_REPOST.load(Ordering::Relaxed) == 0 =>
-        {
-            let record = SM_HIDE_RECORD.load(Ordering::Relaxed);
-            if record == 0 {
-                return;
-            }
-            for (i, reg) in [
-                RegisterARM::R0,
-                RegisterARM::R1,
-                RegisterARM::R2,
-                RegisterARM::R3,
-            ]
-            .iter()
-            .enumerate()
-            {
-                SM_HIDE_REGS[i].store(
-                    unicorn.reg_read(*reg).unwrap_or(0) as u32,
-                    Ordering::Relaxed,
-                );
-            }
-            SM_HIDE_TID.store(
-                unicorn.get_data().inner.thread_id() as u32,
-                Ordering::Relaxed,
-            );
-            SM_HIDE_LR.store(
-                unicorn.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
-                Ordering::Relaxed,
-            );
-            SM_HIDE_SP.store(
-                unicorn.reg_read(RegisterARM::R13).unwrap_or(0) as u32,
-                Ordering::Relaxed,
-            );
-            SM_HIDE_STATE.store(2, Ordering::Relaxed);
-            SM_HIDE_MM.store(
-                read_u32(unicorn, 0x02a1_3f50),
-                Ordering::Relaxed,
-            );
-            guest_call_via_lr(
-                unicorn,
-                site,
-                base + (0x0137_5be8u32 - ORIGINAL_BASE),
-                [record, 0, 0, 0],
-                64,
-            );
-            log::info!(
-                "PROCHMI sm-hide: GUI_StateView::vLeave(record={record:#x}) injected (mm={:#x}) t={}ms",
-                SM_HIDE_MM.load(Ordering::Relaxed),
-                crate::libs::dapi::emu_t0_elapsed_ms(),
-            );
-        }
-        // Stage 2: vLeave returned - chain GUI_MenuManager::vSetView(mm,
-        // main_drawn, 0) (0x1364558).  fix245 asm decode (objdump immediates
-        // are DECIMAL): the mm u16 slots are +0x10 main drawn / +0x18 main
-        // pending / +0x12 overlay drawn / +0x1a overlay pending - the popup
-        // is OVERLAY view 607 drawn on top of main view 247.  Re-pointing
-        // main pending at the live main cid (247) arms vPerformViewChange's
-        // path-A block (0x1364724): destroy(main drawn) + pCreateView(main
-        // pending) + init/notify - the app's own full main-view rebuild,
-        // which repaints the screen without the stale overlay.  (fix240's
-        // crash was feeding perform a *zero* pending: path B only sets the
-        // dirty flag and path A then destroyed a never-instantiated cid.)
-        2 if unicorn.get_data().inner.thread_id() as u32
-            == SM_HIDE_TID.load(Ordering::Relaxed) =>
-        {
-            let mm = SM_HIDE_MM.load(Ordering::Relaxed);
-            if mm == 0 {
-                SM_HIDE_STATE.store(4, Ordering::Relaxed);
-                return;
-            }
-            let cur = {
-                let factory_cid = SM_HIDE_MAIN_CID.load(Ordering::Relaxed);
-                if factory_cid != 0 {
-                    factory_cid
-                } else {
-                    read_u16(unicorn, mm + 0x10) as u32
-                }
-            };
-            if cur == 0 {
-                SM_HIDE_STATE.store(4, Ordering::Relaxed);
-                log::info!(
-                    "PROCHMI sm-hide: main view slot empty (mm+0x10=0), skipping rebuild t={}ms",
-                    crate::libs::dapi::emu_t0_elapsed_ms(),
-                );
-                return;
-            }
-            SM_HIDE_STATE.store(3, Ordering::Relaxed);
-            guest_call_via_lr(
-                unicorn,
-                site,
-                base + (0x0136_4558u32 - ORIGINAL_BASE),
-                [mm, cur, 0, 0],
-                64,
-            );
-            log::info!(
-                "PROCHMI sm-hide: GUI_MenuManager::vSetView(mm={mm:#x}, {cur:#x}, main) injected t={}ms",
-                crate::libs::dapi::emu_t0_elapsed_ms(),
-            );
-        }
-        // Stage 3: vSetView returned - run GUI_MenuManager::vPerformViewChange
-        // (mm) (0x136465c): bBeforeDestroy + bDestroyView(current) +
-        // pCreateView(pending) - the app's own view-tree teardown/creation,
-        // i.e. the organic paint pass that removes the orphaned popup.
-        3 if unicorn.get_data().inner.thread_id() as u32
-            == SM_HIDE_TID.load(Ordering::Relaxed) =>
-        {
-            let mm = SM_HIDE_MM.load(Ordering::Relaxed);
-            if mm == 0 {
-                SM_HIDE_STATE.store(4, Ordering::Relaxed);
-                return;
-            }
-            SM_HIDE_STATE.store(4, Ordering::Relaxed);
-            // fix249: perform's slot loop (i=0..3 over the (drawn, pending)
-            // u16 pairs at +0x12/+0x1a overlay, +0x14/+0x1c alert,
-            // +0x16/+0x1e extended, +0x18/+0x20 main) also replays the
-            // alert/extended slots - in our run they hold stale garbage
-            // (0xffff drawn / 0x6177 pending) from the startup's alert
-            // churn; pCreateView(0x6177) then rebuilt a half-dead view whose
-            // dangling widget root faulted getDrawContext (0x137ae9c).  The
-            // real device never carries stale alert/extended state across a
-            // view change (all four pairs are clean 0 there), so zero the
-            // two auxiliary pairs before driving the swap.
-            let stale_alert = read_u16(unicorn, mm + 0x14);
-            let stale_alert_p = read_u16(unicorn, mm + 0x1c);
-            let stale_ext = read_u16(unicorn, mm + 0x16);
-            let stale_ext_p = read_u16(unicorn, mm + 0x1e);
-            if stale_alert | stale_alert_p | stale_ext | stale_ext_p != 0 {
-                log::info!(
-                    "PROCHMI sm-hide: clearing stale aux view slots alert={stale_alert:#x}/{stale_alert_p:#x} ext={stale_ext:#x}/{stale_ext_p:#x} t={}ms",
-                    crate::libs::dapi::emu_t0_elapsed_ms(),
-                );
-                for off in [0x14u32, 0x16, 0x1c, 0x1e] {
-                    let _ = unicorn.mem_write((mm + off) as u64, &[0u8, 0]);
-                }
-            }
-            // fix246/248: open the focus-broadcast skip window (see
-            // SM_HIDE_FOCUS_SKIP on the static) across the rebuild.
-            SM_HIDE_FOCUS_SKIP.store(1, Ordering::Relaxed);
-            guest_call_via_lr(
-                unicorn,
-                site,
-                base + (0x0136_465cu32 - ORIGINAL_BASE),
-                [mm, 0, 0, 0],
-                256,
-            );
-            log::info!(
-                "PROCHMI sm-hide: GUI_MenuManager::vPerformViewChange(mm={mm:#x}) injected t={}ms",
-                crate::libs::dapi::emu_t0_elapsed_ms(),
-            );
-        }
-        // Stage 4: last callee returned - hand the site back.
-        4 if unicorn.get_data().inner.thread_id() as u32
-            == SM_HIDE_TID.load(Ordering::Relaxed) =>
-        {
-            SM_HIDE_STATE.store(4, Ordering::Relaxed);
-            // Close the focus-broadcast skip window.
-            SM_HIDE_FOCUS_SKIP.store(0, Ordering::Relaxed);
-            let sp = SM_HIDE_SP.load(Ordering::Relaxed);
-            if sp != 0 {
-                let _ = unicorn.reg_write(RegisterARM::R13, sp as u64);
-            }
-            let lr = SM_HIDE_LR.load(Ordering::Relaxed);
-            if lr != 0 {
-                let _ = unicorn.reg_write(RegisterARM::R14, lr as u64);
-            }
-            for (i, reg) in [
-                RegisterARM::R0,
-                RegisterARM::R1,
-                RegisterARM::R2,
-                RegisterARM::R3,
-            ]
-            .iter()
-            .enumerate()
-            {
-                let v = SM_HIDE_REGS[i].load(Ordering::Relaxed);
-                let _ = unicorn.reg_write(*reg, v as u64);
-            }
-            log::info!(
-                "PROCHMI sm-hide: transition executed, site registers restored t={}ms",
-                crate::libs::dapi::emu_t0_elapsed_ms(),
-            );
-        }
-        _ => {}
+    if ENAVI_FAB_STATE.load(Ordering::Relaxed) != 3
+        || EVT8001_REPOST.load(Ordering::Relaxed) != 0
+        || SM_HIDE_RECORD.load(Ordering::Relaxed) == 0
+    {
+        return;
     }
+    // Target list: the popup manager's registered widget ([singleton
+    // +0x14], captured by the release-wfind/release-pop probes) plus the
+    // owner widgets of the painted script cells (PU_IMPS), deduped and
+    // only accepted when they pass a GUI_Widget shape guard (child array
+    // pointer + child count).
+    let mut tgts: Vec<u32> = Vec::new();
+    let w = PU_WIDGET.load(Ordering::Relaxed);
+    if w != 0 {
+        tgts.push(w);
+    }
+    let ncell = PU_COUNT.load(Ordering::Relaxed) as usize;
+    for k in 0..ncell.min(PU_IMPS.len()) {
+        let p = PU_IMPS[k].load(Ordering::Relaxed);
+        if p != 0 && !tgts.contains(&p) {
+            tgts.push(p);
+        }
+    }
+    let mut tn = 0usize;
+    for t in tgts {
+        let kids = read_u32(unicorn, t + 0x20);
+        let arr = read_u32(unicorn, t + 0x1c);
+        if kids > 64 || (arr != 0 && !(0x0380_0000..0x0800_0000).contains(&arr)) {
+            log::warn!(
+                "PROCHMI popup-uninit: target {t:#x} rejected (kids={kids} arr={arr:#x}) t={}ms",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+            );
+            continue;
+        }
+        let old = read_u32(unicorn, t + 0x3c);
+        let _ = unicorn.mem_write((t + 0x3c) as u64, &0x1000_0000u32.to_le_bytes());
+        log::info!(
+            "PROCHMI popup-uninit: hid widget {t:#x} (visible {old:#x} -> tagged false) t={}ms",
+            crate::libs::dapi::emu_t0_elapsed_ms(),
+        );
+        if tn < PU_OBJS.len() {
+            PU_OBJS[tn].store(t, Ordering::Relaxed);
+            tn += 1;
+        }
+    }
+    PU_COUNT.store(tn as u32, Ordering::Relaxed);
+    if tn == 0 {
+        SM_HIDE_STATE.store(0, Ordering::Relaxed);
+        log::info!(
+            "PROCHMI popup-uninit: no widget-shaped targets, channel closed t={}ms",
+            crate::libs::dapi::emu_t0_elapsed_ms(),
+        );
+        return;
+    }
+    // r768 forensics + heavy trigger: the widget-level vInvalidate of
+    // fix256 ran clean but produced no composite (prochmi issues no
+    // eglSwapBuffers once idle - the damage never reached the view draw
+    // pass).  Also queue the app's whole-view GUI_GUIAPI__vInvalidate
+    // (0x134ae6c, slot 0 = main / 1 = overlay): it fully null-guarded, but
+    // its MenuManager global is [0x2a12ae0] - only arm a slot when that
+    // global matches the capture-proven mm ([0x2a13f50]) and the slot's
+    // view object is non-null.  The parent-chain dump below (host reads)
+    // shows why the widget rect did not schedule.
+    let mm = read_u32(unicorn, 0x02a1_3f50);
+    let mm2 = read_u32(unicorn, 0x02a1_2ae0);
+    let mut chain = Vec::new();
+    {
+        let mut w = PU_OBJS[0].load(Ordering::Relaxed);
+        for _ in 0..6 {
+            if w == 0 {
+                break;
+            }
+            chain.push(format!(
+                "{w:#x}(vis={:#x} kids={} vt={:#x})",
+                read_u32(unicorn, w + 0x3c),
+                read_u32(unicorn, w + 0x20),
+                read_u32(unicorn, w)
+            ));
+            w = read_u32(unicorn, w + 0x18);
+        }
+    }
+    log::info!(
+        "PROCHMI popup-uninit: mm={mm:#x} mm_guiapi={mm2:#x} parent-chain=[{}] t={}ms",
+        chain.join(" -> "),
+        crate::libs::dapi::emu_t0_elapsed_ms(),
+    );
+    if mm != 0 && mm2 == mm {
+        for slot in [0u32, 1] {
+            let obj = read_u32(unicorn, mm + slot * 4);
+            if obj != 0 && tn < PU_OBJS.len() {
+                PU_OBJS[tn].store(0xfe00_0000 | slot, Ordering::Relaxed);
+                tn += 1;
+                log::info!(
+                    "PROCHMI popup-uninit: queued GUI_GUIAPI__vInvalidate(slot={slot}) view={obj:#x}"
+                );
+            }
+        }
+        PU_COUNT.store(tn as u32, Ordering::Relaxed);
+    }
+    // Hand over to the bExecute site (0x133c134) for the invalidate loop.
+    SM_HIDE_STATE.store(2, Ordering::Relaxed);
+    log::info!(
+        "PROCHMI popup-uninit: {tn} widgets hidden, invalidation queued on bExecute site t={}ms",
+        crate::libs::dapi::emu_t0_elapsed_ms(),
+    );
 }
 
 fn maybe_repost_evt8001(unicorn: &mut Unicorn<'_, Context>, original_pc: u32, at_post_wipe: bool) {
