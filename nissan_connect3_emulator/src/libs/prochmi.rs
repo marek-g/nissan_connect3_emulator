@@ -359,6 +359,10 @@ static EVT8001_PUMP_SP: AtomicU32 = AtomicU32::new(0);
 /// LR counterpart for the pump injection (the dispatch site is an entry
 /// push too - see ENAVI_FAB_LR).
 static EVT8001_PUMP_LR: AtomicU32 = AtomicU32::new(0);
+/// r763: set once the enavi-fab release handler has completed, asking the
+/// bOnMessage trap to re-post the visual-hide GUI transition 0x8d (see the
+/// there comment).
+static FAB_HIDE_EVENT_PENDING: AtomicU32 = AtomicU32::new(0);
 /// r0-r3 of the interrupted `deliver-fi` call, restored when the injected
 /// setter returns onto the trap site (see the enavi-fab arms above).
 static ENAVI_FAB_REGS: [AtomicU32; 4] = [
@@ -887,6 +891,27 @@ crate::os::code_stub::trap_site(unicorn, msg_on_message, crate::os::code_stub::T
                 && startup_events_release_now()
             {
                 post_gui_internal_events(uc);
+            }
+            // r763: the enavi-fab RUNNING report has been released (popup
+            // closed via the handler's own branch); re-post the proven
+            // visual-hide transition 0x8d once.  fix204/206: that
+            // transition's exit-hide is the only channel that actually
+            // repaints the wait popup away, but the startup flush re-paints
+            // it ~300 ms later from rodata, after the handler's bookkeeping
+            // close has already run.  On the real device the navigation-
+            // ready notification drives a further Lua transition; the
+            // re-post stands in for it (same queue, same organic consumer).
+            if messaging != 0 && FAB_HIDE_EVENT_PENDING.swap(0, Ordering::SeqCst) != 0 {
+                let queue = read_u32(uc, messaging + 4);
+                if post_gui_message_queue(uc, queue, messaging, 0x8d) {
+                    log::info!(
+                        "PROCHMI: posted post-fab hide event=0x8d queue={queue:#x} t={}ms",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                    );
+                } else {
+                    // queue not ready yet - retry on the next bOnMessage.
+                    FAB_HIDE_EVENT_PENDING.store(1, Ordering::SeqCst);
+                }
             }
             // r755-diag: enumerate the receiver lists bOnMessage walks
             // (`this[4]`/`this[5]` = +0x14/+0x18, receiver node event id at
@@ -2044,6 +2069,9 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                         (r0, "pre")
                     } else {
                         let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                        if read_u32(uc, r5 + 0x148) == 2 {
+                            FAB_HIDE_EVENT_PENDING.store(1, Ordering::SeqCst);
+                        }
                         (read_u32(uc, r5 + 0x7e0), "post")
                     };
                     let mut words = Vec::new();

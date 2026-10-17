@@ -541,3 +541,18 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
   CCA/DAPIMgr -> Lua path), and post it through the same emulated queue
   when the fab fires.  Provider-level event fabrication is the sanctioned
   layer; the 0x8d flush already proves the queue injection works.
+- fix207 negative result: re-posting GUI event 0x8d through the messaging
+  queue right after the release-pop (state148==2, flag FAB_HIDE_EVENT_
+  PENDING -> bOnMessage posts 0x8d again, "posted post-fab hide event"
+  t=13.5s) does NOT hide the repainted popup - the Lua FSM has consumed
+  that event's transition already and ignores the duplicate.
+- Open forensic gap before driving the SM directly: the GUI_StateMachine
+  performTransition (0x1371390, mid-function) and vDoTransition
+  (0x1371170) probes show ZERO hits across fix204..207 while the popup
+  demonstrably hid once organically - classic narrow-dead-hook signature
+  (AGENTS.md): convert both to page-range xp-watch probes to learn (a) the
+  live sm pointer, (b) the transition id that hid popup #1 at ~12 s, and
+  (c) the transition that re-entered the paint at 12.4 s.  Then guest-call
+  vDoTransition(sm, that-exit-transition) from the safe post-wipe site
+  when the fab release completes (honest fakery: the app's own transition
+  executor, our provider-level trigger).
