@@ -341,3 +341,47 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
   find the ContentLanguage table index for the string and its users; wire
   the DAPI<->PROCNAV FI link (TEA_TASK1) which is already on the plan for
   the GPS consumer work.
+- **r757 follow-up (runs fix79..fix90) - the FI-event mechanism is fully
+  mapped, the producer of the release event is NOT in any binary:**
+  - Power pacing works (OFF@~3s -> delayed NORMAL@~6s -> `appstates-onnew
+    cur=8 new=3`, dir flush 40 replies).  The framework state byte
+    `clHMIMngr+0x670` gets seeded 3+pending by code whose TB predates even
+    a load-time MEM_WRITE watch, and 4->3 likewise - both reads (trap and
+    guest) agree the byte is 3 at perform time; the broadcast reaching
+    `clFi_Navi::vNewAppState` is therefore always 3, never 4 (fix80/82).
+    Not worth chasing further: the vNewAppState startup branch ALSO needs
+    gate34=1, which ONLY the event branch below ever sets (constructors
+    0x14c28fc/0x14c299c write 0).
+  - Event router `clHSIMngr` 0x13528a0 (no symbol) routes `event` to FI
+    slot `(event>>12)&0xff` via that FI's vtable+0x3c.  FI 8 = Navi:
+    `clFi_Navi::ReceiveEventsFromEvtEn` switch table2 covers ids
+    0x80108030..0x80108523 (and 0x81008030.. by wrap) - slot 1
+    (0x80108031/0x81008031) sets gate34=1 and calls `vStartupEnaviServer`
+    directly.  `vHandleEnaviServerStatus` (0x15e2070) hard-guards
+    +0x7dc/+0x814/+0x15c/+0x830 - all created only by that startup, so the
+    event is the SINGLE gate for hiding the popup.
+  - Feeder chain observed live: CCA wire msg -> `hmicca_tclApp::
+    vOnNewMessage` -> CCAGW -> `clHSI_CMMngr::bExecuteMessage` (0x1827b04,
+    also entered via +4 this-adjusting thunk - untrapped) fans to every
+    `clHSI_CM*` client; the clients' default case forwards `sMsg.type`
+    VERBATIM as `clHSI_CMBase::bSendHSICommand(cmd=sMsg.type)` -> router.
+    Proved live: types 0x2b09/a/b (hmicca-internal msgs at t~2.4s) arrive
+    at CMNAVI (0x182b7d4, sMsg+4 = scalar type, ~0x2900..0x2bff family)
+    and are forwarded verbatim (caller=0x18641a0).  Named senders exist
+    for siblings: `clHSI_CMSystem::vTellNaviAboutMetricsChange` sends
+    0x810080a4 (literal at 0x184d974); the CMNAVI literal pool 0x182c8d4
+    holds 0x81008030 (slot 0) but NOTHING anywhere holds 0x80108031 /
+    0x81008031 (scanned prochmi, PROCNAV_dec, DAPIAPP, full lx001 for LE
+    bytes; no movw/movt forms).  => the id is COMPUTED by its producer
+    (or arrives as a message type), most plausibly by PROCNAV's
+    navif/NAV_IFM machinery once its server is up - which needs the same
+    TEA/mbx_19 fix the GPS consumer work needs.
+  - PROCNAV already posts real svc-0x27 traffic to the HMI
+    (`src=0x24 dst=0x109 class=0x45 svc=0x27 regid=0xec func=0x90000`,
+    `msgid=0x4000`) and it IS materialised into mbx_265; the HMI-side
+    `hmicca-svcstate` pump enumerates it (`svc=0x27 sub=0x24 id=0xec
+    state=0`).  So the wire plumbing works - only the release-message
+    producer on the PROCNAV side is missing.
+  - **Decision: unblock PROCNAV next** (who must post to mbx_19/
+    TEA_TASK1QUEUE); a 60-120s run with `cm-mngr-msg` uncapped should then
+    show whether the startup event appears organically.
