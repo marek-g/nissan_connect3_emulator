@@ -824,3 +824,42 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
   fab RUNNING 13465 ms -> release-pop n=2 13580 ms -> hide 13789 ms ->
   invalidation loop done 13791 ms, 0 Execution errors, final frames show the
   full FM1 screen without the popup (shots270/window_0006).
+
+## r773 - shared-futex watchdog semantics decoded; OSAL pool semaphores need producers
+Findings (runs fix278..fix287, semtrack + EMU_WATCH forensics):
+- The "stuck words" the 20 s watchdog repairs (0x4000365c, 0x4010a9ec,
+  0x4010c02c, 0x4010c42c/6c/ac, ...) are NOT mutexes: they are OSAL sync-pool
+  POSIX semaphores (`WaiSyncObj`/`CreSyncObj`/`LockOsal` in
+  libosal_linux_so.so, pool = the 1 MiB `/dev/shm` segment mapped at 0x40000000
+  in every process).  `FUTEX_WAIT(word, 0)` there means "sleep while the
+  semaphore value is 0" - the waiter waits for a POST, not for an unlock.
+- Protocol (disassembled): `vGenerateSyncObjects` (procbaselx boot) seeds
+  slot sems to 1; `WaiSyncObj` zeroes the word after a successful acquire
+  (libosal+0x14608 `str`); `UnLockOsal` = `sem_post` + counter--.  Healthy
+  pool sems (0x400195c8, 0x4010c1ec..0xc4ac, 0x40023890...) cycle
+  wait/post normally through the shared-futex registry.
+- The STUCK ones are genuine inter-process semaphores whose producer thread
+  never runs in the emulator (SCD bring-up handshakes - names `CB00Tim`,
+  `_0NN(OSAL`; the waiter stacks are `OSAL_s32SemaphoreWait` from scd/app
+  init and the procbaselx SPM worker).  The watchdog's wake-with-success is
+  the designed mitigation; it is NOT a lost-wake bug (zero WAKE syscalls are
+  ever issued for these words, and `sem_init(1)`...`sem_wait(0)` sequences
+  show the token is legitimately consumed elsewhere).
+- Consequence to keep in mind: wake-with-success lets two processes enter
+  the same guest critical section.  This is the mechanism behind the
+  intermittent PROCNAV AE-worker crash
+  `scd_tclServiceAppMap::bReadData -> bpstl::less<u16>` READ_UNMAPPED
+  (PC 0x35952a, r1 = small integer as node key): two AE workers race in the
+  per-process ServiceAppMap Rb_tree that the device serialises with exactly
+  these semaphores.  1 crash in ~6 runs (281: 2, 282/284/285/286: 0, 287-1:
+  1); killing one AE worker parks a map pump in some runs.
+- Fixed here: watchdog consumed a pending post instead of destroying it
+  (word 1 -> 0 + wake), repairs ALL waiters of the word at once (the host
+  model is serialized, one grace must free every contender), errmem ioctls
+  answered (the -1 asserted every OSAL_vWriteToErrMem), IOSC
+  `shared_mem_free` (0x534f0001) modelled, `stack sp-0x20` dump added to
+  thread-death diagnostics.
+- Remaining root gap (milestone-2 territory): give the stuck semaphores real
+  producers - SCD bring-up completes only when the administration/SPM answer
+  path delivers (see gw-deliver probes); until then the watchdog papers over
+  it and the AE race stays possible.

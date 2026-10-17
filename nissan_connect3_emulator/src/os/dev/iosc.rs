@@ -21,6 +21,10 @@ use unicorn_engine::{RegisterARM, Unicorn};
 
 // ioctl command numbers (type 'OS' = 0x534f), recovered from libiosclib_so.so
 const IOSC_SHARED_MALLOC: u32 = 0x534f0000;
+/// `iosc_shared_mem_free` (libiosclib `0x48119868`): block `[&mem, id, size]`
+/// like malloc. The region stays mapped (a real driver would unmap it, but our
+/// consumers keep the pointer; a no-op success is the safe model).
+const IOSC_SHARED_MEM_FREE: u32 = 0x534f0001;
 const IOSC_CREATE_MUTEX: u32 = 0x534f000a;
 const IOSC_CREATE_SEMAPHORE: u32 = 0x534f0002;
 const IOSC_OBTAIN_SEMAPHORE: u32 = 0x534f0004;
@@ -174,6 +178,10 @@ pub fn ioctl(unicorn: &mut Unicorn<'_, Context>, fd: u32, request: u32, addr: u3
 
     let res = match request {
         IOSC_SHARED_MALLOC => shared_malloc(unicorn, addr),
+        IOSC_SHARED_MEM_FREE => {
+            log::trace!("[IOSC] shared_mem_free({addr:#x}) => 0 (no-op)");
+            0
+        }
         IOSC_CREATE_MUTEX => create_mutex(unicorn),
         IOSC_CREATE_SEMAPHORE => create_semaphore(unicorn, addr),
         IOSC_OBTAIN_SEMAPHORE => obtain_semaphore(unicorn, addr),
