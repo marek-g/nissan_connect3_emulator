@@ -733,8 +733,9 @@ crate::os::code_stub::trap_site(unicorn, drop, crate::os::code_stub::TrapMode::A
         // `dap_tclJob::u16AddAction` -> `dap_tclActionList::bSetBlock`: an
         // external CCA request is turned into a job here; when the action
         // block cannot be opened the job is discarded and the client never
-        // hears back. Log the list state so the failure mode is visible
-        // (+0x30 = capacity, +0x34 = block-descriptor array).
+        // hears back. Log the list state (action number via [this+4], see
+        // `cou16GetActionNumber` 0xb6b2f4; +0x34 = descriptor array) so the
+        // failure mode is visible.
         // `dap_map_tclWorker::vReportError(code, file, line, func)`: every
         // failure of the CCA map-data worker ends here.
         let report = base_address + (0x0084_4e78u32 - ORIGINAL_BASE);
@@ -862,21 +863,33 @@ crate::os::code_stub::trap_site(unicorn, setblock, crate::os::code_stub::TrapMod
                 let read = |r| uc.reg_read(r).unwrap_or(0) as u32;
                 let this = read(RegisterARM::R0);
                 let mut buf = [0u8; 4];
-                let cap = uc
-                    .mem_read((this + 0x30) as u64, &mut buf)
-                    .map(|_| u16::from_le_bytes([buf[0], buf[1]]))
-                    .unwrap_or(0xffff);
+                // `cou16GetActionNumber` (`0xb6b2f4`) reads the u16 action
+                // number through `[this+4]`, and `bSetBlock` fails when that
+                // number is 0 or `idx` exceeds it; the array pointer at +0x34
+                // only says whether the ctor allocated descriptor storage.
+                let array = uc
+                    .mem_read((this + 4) as u64, &mut buf)
+                    .map(|_| u32::from_le_bytes(buf))
+                    .unwrap_or(0);
+                let cap = if array != 0 {
+                    uc.mem_read(array as u64, &mut buf)
+                        .map(|_| u16::from_le_bytes([buf[0], buf[1]]))
+                        .unwrap_or(0xffff)
+                } else {
+                    0
+                };
                 let blocks = uc
                     .mem_read((this + 0x34) as u64, &mut buf)
                     .map(|_| u32::from_le_bytes(buf))
                     .unwrap_or(0);
                 log::warn!(
-                    "DAPI ActionList::bSetBlock this={:#x} name={:#x} size={:#x} idx={} capacity={} blocks={:#x} lr={:#x}",
+                    "DAPI ActionList::bSetBlock this={:#x} name={:#x} size={:#x} idx={} actionnumber={} array={:#x} blocks={:#x} lr={:#x}",
                     this,
                     read(RegisterARM::R1),
                     read(RegisterARM::R2),
                     read(RegisterARM::R3),
                     cap,
+                    array,
                     blocks,
                     read(RegisterARM::LR),
                 );
