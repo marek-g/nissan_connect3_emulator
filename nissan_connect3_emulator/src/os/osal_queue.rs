@@ -63,6 +63,31 @@ pub(crate) fn finish_guest_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, no
                         queue_id,
                         message.data.len()
                     );
+                    // r757 diagnostic: dump the wire header of every CCA blob
+                    // that gets materialised for a waiter.  The CCA gateway
+                    // hands the message msgid (@body+0x10) to the HSI layer as
+                    // the sMsg type, and the HSI-NAV client forwards that type
+                    // verbatim as an FI event id - so a message with msgid
+                    // 0x81008031 is what releases the wait-widget.  This dump
+                    // names the posters of the real 0x2b09-0x2b0b family.
+                    let body = &message.data[8.min(message.data.len())..];
+                    if body.len() >= 0x1c {
+                        let rd16 = |o: usize| u16::from_le_bytes([body[o], body[o + 1]]);
+                        let rd32 = |o: usize| {
+                            u32::from_le_bytes([body[o], body[o + 1], body[o + 2], body[o + 3]])
+                        };
+                        log::info!(
+                            "[LIBOSAL-MBX]   wire body: src={:#x} dst={:#x} class={:#x} subid={:#x} msgid={:#x} svc={:#x} regid={:#x} func={:#x}",
+                            rd16(0),
+                            rd16(2),
+                            body[0xb],
+                            rd16(0xc),
+                            rd32(0x10),
+                            rd16(0x14),
+                            rd16(0x16),
+                            rd32(0x18),
+                        );
+                    }
                     set_runnable_with_result(unicorn, tid, result);
                 }
                 None => {

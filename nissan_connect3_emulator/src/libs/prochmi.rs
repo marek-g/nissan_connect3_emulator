@@ -252,6 +252,43 @@ static GUI_MENU_MANAGER_VIEW_CHANGE_STORE_CONTEXT: u32 = 0x0136_4770 - ORIGINAL_
 static GUI_MENU_MANAGER_OVERLAY_STORE_CONTEXT: u32 = 0x0136_4964 - ORIGINAL_BASE;
 const GOT_GUI_GL_OPENGLCONTEXT_VTABLE: u32 = 0x02a1_db34 - ORIGINAL_BASE;
 static GUI_INTERNAL_POST_PENDING: AtomicU32 = AtomicU32::new(0);
+
+// r757: the startup internal events used to flush the moment they were armed
+// (t=3.18s) - BEFORE the widget engine had painted the "Starting navigation."
+// popup (first string read t~3.4s).  The 0x8d transition then left the popup's
+// state (`0x1e5` -> `0x1e4`) while the widget did not exist yet, so the
+// state's exit-hide found nothing and the later-painted popup stayed forever.
+// The flush now waits for the popup's string to be read once (paint marker,
+// set by the popup-string read hook, installed unconditionally) plus a settle
+// delay; a fallback releases the events on runs where the popup never paints.
+static POPUP_PAINT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn popup_paint_marker() {
+    if POPUP_PAINT_MS
+        .compare_exchange(
+            0,
+            crate::libs::dapi::emu_t0_elapsed_ms() as u64,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+    {
+        log::info!(
+            "PROCHMI: popup paint marker set at t={}ms (startup events release at paint+750ms)",
+            crate::libs::dapi::emu_t0_elapsed_ms()
+        );
+    }
+}
+
+fn startup_events_release_now() -> bool {
+    let paint = POPUP_PAINT_MS.load(Ordering::Relaxed);
+    let now = crate::libs::dapi::emu_t0_elapsed_ms() as u64;
+    if paint != 0 {
+        now >= paint + 750
+    } else {
+        now >= 12_000
+    }
+}
 static NAV_STATE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static LUA_CALL_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static GUI_EVENT_NAME_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -781,6 +818,7 @@ crate::os::code_stub::trap_site(unicorn, msg_on_message, crate::os::code_stub::T
             if GUI_INTERNAL_POST_PENDING.load(Ordering::Relaxed) != 0
                 && messaging != 0
                 && GUI_INTERNAL_EVENT_SENT_COUNT.load(Ordering::Relaxed) < GUI_INTERNAL_EVENT_COUNT
+                && startup_events_release_now()
             {
                 post_gui_internal_events(uc);
             }
@@ -861,15 +899,21 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
             });
     }
 
-    // r755: find the popup's presenter and hider from the string itself.
+    // r755/r757: find the popup's presenter and hider from the string itself.
     // "Starting navigation." sits at VA 0x025186fc (file offset 0x25106fc in
     // the LOAD segment based at 0x8000) and IS presented during boot, so a
     // MEM_READ hook over the string reports every pc that touches it - the
     // first hits are the presenter, any later distinct pc is the hider or a
-    // re-paint.  The page is cold, so the hook is cheap; still env-gated so
-    // bare runs install nothing new.
-    if std::env::var_os("EMU_PROCHMI_POPUP_TRACE").is_some() {
+    // re-paint.  Since r757 the hook is installed unconditionally: any read of
+    // the string marks the popup as painted (`popup_paint_marker`), which is
+    // the release signal for the startup internal events.  The (cheap on this
+    // cold page) trace logging stays env-gated.
+    {
         use unicorn_engine::unicorn_const::HookType;
+        fn popup_string_trace_enabled() -> bool {
+            static ENABLED: OnceLock<bool> = OnceLock::new();
+            *ENABLED.get_or_init(|| std::env::var_os("EMU_PROCHMI_POPUP_TRACE").is_some())
+        }
         // "Starting navigation." VA 0x025186fc (file 0x25106fc),
         // "STARTING NAVIGATION" VA 0x02452d6c (file 0x244ad6c) - both + 0x8000.
         for (lo, hi, tag) in [
@@ -882,6 +926,10 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                 lo,
                 hi,
                 move |_uc, _t, address, size, _value| {
+                    popup_paint_marker();
+                    if !popup_string_trace_enabled() {
+                        return true;
+                    }
                     static SEEN: std::sync::LazyLock<
                         std::sync::Mutex<std::collections::HashMap<(u32, u64), u32>>,
                     > = std::sync::LazyLock::new(|| {
@@ -1133,6 +1181,286 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
         );
         0
     });
+
+    // r757: enavi-server bring-up chain probes (popup chain in
+    // docs/issues/correctness.md).  `vStartupEnaviServer` is the ONLY writer of
+    // the FI interface fields (+0x7dc IEnavi, +0x814 IDAPI, +0x15c clFi_Navi)
+    // that make `vHandleEnaviServerStatus` get past its early-return guards.
+    // It has two live call sites: `clFi_Navi::vNewAppState` (needs previous fw
+    // state 4 AND byte +0x34 == 1) and a branch inside
+    // `clFi_Navi::ReceiveEventsFromEvtEn` (VA 0x14be3fc: sets +0x34 = 1 and
+    // calls it) selected by event id 0x80108031 (switch base 0x80108030, ARM
+    // jump table at 0x14bcdf8).  The constructor zeroes +0x34, so that event
+    // branch is the only way the gate ever opens.  `poGetIEnaviServer` is the
+    // lazy singleton behind +0x7dc.  One EMU_PROCHMI_NAV_TRACE=1 run names the
+    // dead link.
+    for (offset, label) in [
+        (0x015e_0f74u32 - ORIGINAL_BASE, "enavi-startup"),
+        (0x015e_0bacu32 - ORIGINAL_BASE, "enavi-shutdown"),
+        (0x015e_2070u32 - ORIGINAL_BASE, "enavi-status"),
+        (0x014b_9148u32 - ORIGINAL_BASE, "fi-nav-instance"),
+        (0x014b_9aacu32 - ORIGINAL_BASE, "fi-nav-appstate"),
+        (0x014b_b270u32 - ORIGINAL_BASE, "fi-nav-svcstate"),
+        (0x014b_cd74u32 - ORIGINAL_BASE, "fi-nav-events"),
+        (0x0135_28a0u32 - ORIGINAL_BASE, "hsi-fievent-router"),
+        (0x0180_a95cu32 - ORIGINAL_BASE, "hsi-cmd"),
+        (0x0180_a8bcu32 - ORIGINAL_BASE, "sys-event"),
+        (0x0182_b7d4u32 - ORIGINAL_BASE, "cmnavi-msg"),
+        (0x0182_7b04u32 - ORIGINAL_BASE, "cm-mngr-msg"),
+        (0x00fc_80c8u32 - ORIGINAL_BASE, "hmicca-svcstate"),
+        (0x00fd_0428u32 - ORIGINAL_BASE, "cpm-update"),
+        (0x0135_2df4u32 - ORIGINAL_BASE, "hsi-mngr-appstate"),
+        (0x0161_f754u32 - ORIGINAL_BASE, "ienvi-singleton"),
+        (0x0134_ec20u32 - ORIGINAL_BASE, "hmi-appstate-set"),
+        (0x00fc_9788u32 - ORIGINAL_BASE, "appstates-entry-off"),
+        (0x00fc_9888u32 - ORIGINAL_BASE, "appstates-entry-pause"),
+        (0x00fc_95d4u32 - ORIGINAL_BASE, "appstates-entry-x5d4"),
+        (0x00fc_96ccu32 - ORIGINAL_BASE, "appstates-entry-normal"),
+        (0x00fc_6574u32 - ORIGINAL_BASE, "appstates-onnew"),
+    ] {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let label: &'static str = label;
+        crate::os::code_stub::trap_site(unicorn, base_address + offset, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:enavi-chain", move |uc: &mut Unicorn<'_, Context>| {
+            if !nav_trace_enabled() {
+                return 0;
+            }
+            let n = hits.fetch_add(1, Ordering::Relaxed);
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            // The wait-widget's release event must survive the probe budget,
+            // so it is exempt from the per-site cap.  The FI-event router is
+            // uncapped: its full event spectrum names the feeder of the
+            // enavi-start event 0x80108031.
+            if n >= 12
+                && !((label == "fi-nav-events" || label == "hsi-fievent-router")
+                    && (r1 == 0x8010_8031 || r1 == 0x8100_8031))
+                && label != "hsi-fievent-router"
+                && label != "sys-event"
+                && label != "hsi-cmd"
+                && label != "cmnavi-msg"
+                && label != "cm-mngr-msg"
+                && label != "hmicca-svcstate"
+                && label != "cpm-update"
+            {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            let extra = match label {
+                "enavi-startup" | "enavi-status" => format!(
+                    " this={r0:#x} navsrv={:#x} ienavi={:#x} idapi={:#x} gate830={:#x} state148={:#x}",
+                    read_u32(uc, r0 + 0x15c),
+                    read_u32(uc, r0 + 0x7dc),
+                    read_u32(uc, r0 + 0x814),
+                    read_u32(uc, r0 + 0x830),
+                    read_u32(uc, r0 + 0x148),
+                ),
+                "hsi-mngr-appstate" => {
+                    let state = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    // clHSIMngr lives at clHMIMngr+0x4e4, so the framework
+                    // state byte (+0x670) sits at hsi+0x18c: dump it beside the
+                    // broadcast parameter to see whether the byte already
+                    // changed or the value was lost between the two functions.
+                    let byte = read_u8(uc, r0.wrapping_add(0x18c));
+                    format!(" state={state:#x} hsi={r0:#x} byte670={byte}")
+                }
+                "fi-nav-appstate" => {
+                    let state = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    format!(
+                        " this={r0:#x} state={state:#x} handler={:#x} gate34={} laststate={}",
+                        read_u32(uc, r0 + 0x30),
+                        read_u8(uc, r0 + 0x34),
+                        read_u32(uc, 0x02a7_23e0),
+                    )
+                }
+                "fi-nav-svcstate" => format!(" this={r0:#x} hsi={:#x}", read_u32(uc, r0 + 8)),
+                "hsi-cmd" => {
+                    let mut stack_refs: Vec<String> = Vec::new();
+                    let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    if sp > 0x1000 {
+                        for i in 0..32u32 {
+                            let w = read_u32(uc, sp + i * 4);
+                            if (0x8000..0x0286_5294).contains(&w) && !stack_refs.contains(&format!("{w:#x}")) {
+                                stack_refs.push(format!("{w:#x}"));
+                                if stack_refs.len() >= 6 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    format!(" this={r0:#x} cmd={r1:#x} stack={stack_refs:?}")
+                }
+                "sys-event" => format!(" this={r0:#x} event={r1:#x}"),
+                "hmicca-svcstate" => {
+                    // hmicca_tclApp::vOnServiceState(ushort svc, ushort sub,
+                    // ushort id, byte state, ushort regid) - CCA tells the HMI
+                    // a service changed state.  A READY report for the NAV
+                    // service (0x27) is what should wake the HSI-NAV client and
+                    // ultimately emit FI event 0x81008031.
+                    let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    let v2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    let v3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                    // 6-arg member call: this,svc,sub,id in r0..r3; the byte
+                    // `state` and the trailing `ushort regid` are passed on the
+                    // stack (AAPCS promotes both to word slots).
+                    let state = read_u32(uc, sp) & 0xff;
+                    let regid = read_u32(uc, sp + 4) & 0xffff;
+                    format!(
+                        " this={r0:#x} svc={r1:#x} sub={v2:#x} id={v3:#x} state={state:#x} regid={regid:#x}"
+                    )
+                }
+                "cpm-update" => {
+                    // ahl_tclClientPortMngr::enUpdate(const amt_tclServiceData*)
+                    // - client-port state propagation into the HMI app.
+                    format!(
+                        " this={r0:#x} data={r1:#x} d0={:#x} d1={:#x} d2={:#x} d3={:#x}",
+                        read_u32(uc, r1),
+                        read_u32(uc, r1 + 4),
+                        read_u32(uc, r1 + 8),
+                        read_u32(uc, r1 + 0xc),
+                    )
+                }
+                "cm-mngr-msg" => {
+                    // clHSI_CMMngr::bExecuteMessage(sMsg*) fans the message
+                    // out to every clHSI_CM* client (CMNAVI included).  The
+                    // backtrace names the queue pump that feeds it.
+                    let mut stack_refs: Vec<String> = Vec::new();
+                    let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    if sp > 0x1000 {
+                        for i in 0..40u32 {
+                            let w = read_u32(uc, sp + i * 4);
+                            if (0x8000..0x0286_5294).contains(&w) && !stack_refs.contains(&format!("{w:#x}")) {
+                                stack_refs.push(format!("{w:#x}"));
+                                if stack_refs.len() >= 8 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // Verify the sMsg.type <-> wire linkage: dump the payload
+                    // pointer dwords and, when one looks like a pointer into
+                    // the materialised pool, the wire msgid@+0x10 it points at.
+                    let d0 = read_u32(uc, r1);
+                    let ty = read_u32(uc, r1 + 4);
+                    let d2 = read_u32(uc, r1 + 8);
+                    let p10 = read_u32(uc, r1 + 0x10);
+                    let p14 = read_u32(uc, r1 + 0x14);
+                    let wire = if (0x9000_0000..0x9100_0000).contains(&p10) {
+                        read_u32(uc, p10 + 0x10)
+                    } else if (0x9000_0000..0x9100_0000).contains(&p14) {
+                        read_u32(uc, p14 + 0x10)
+                    } else {
+                        0
+                    };
+                    format!(
+                        " msg={r1:#x} type={ty:#x} d0={d0:#x} d2={d2:#x} p10={p10:#x} p14={p14:#x} wiremsgid={wire:#x} stack={stack_refs:?}"
+                    )
+                }
+                "cmnavi-msg" => {
+                    // clHSI_CMNAVI::bExecuteMessage(sMsg*): sMsg+0x04 is a
+                    // scalar message type the function dispatches on (values
+                    // ~0x29xx); dump the header dwords.
+                    let m = r1;
+                    format!(
+                        " this={r0:#x} msg={m:#x} d0={:#x} type={:#x} d2={:#x} d3={:#x}",
+                        read_u32(uc, m),
+                        read_u32(uc, m + 4),
+                        read_u32(uc, m + 8),
+                        read_u32(uc, m + 0xc),
+                    )
+                }
+                "hsi-fievent-router" => {
+                    // clHSIMngr (unnamed, 0x13528a0): routes event r1 to FI
+                    // slot (r1 >> 12) & 0xff through that FI's vtable+0x3c.
+                    // Backtrace names the producers of 0x810080xx (and should
+                    // one day name the producer of the enavi-start event
+                    // 0x80108031).
+                    let mut stack_refs: Vec<String> = Vec::new();
+                    let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    if sp > 0x1000 {
+                        for i in 0..24u32 {
+                            let w = read_u32(uc, sp + i * 4);
+                            if (0x8000..0x0286_5294).contains(&w) && !stack_refs.contains(&format!("{w:#x}")) {
+                                stack_refs.push(format!("{w:#x}"));
+                                if stack_refs.len() >= 6 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    format!(
+                        " event={r1:#x} fi={:#x} hsi={r0:#x} stack={stack_refs:?}",
+                        (r1 >> 12) & 0xff
+                    )
+                }
+                "fi-nav-events" => {
+                    format!(" this={r0:#x} event={r1:#x} gate34={}", read_u8(uc, r0 + 0x34))
+                }
+                "appstates-onnew" => {
+                    let cur = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let new = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    format!(" app={r0:#x} cur={cur} new={new}")
+                }
+                "hmi-appstate-set" => {
+                    let state = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let mut stack_refs: Vec<String> = Vec::new();
+                    let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    if sp > 0x1000 {
+                        for i in 0..24u32 {
+                            let w = read_u32(uc, sp + i * 4);
+                            if (0x8000..0x0286_5294).contains(&w) && !stack_refs.contains(&format!("{w:#x}")) {
+                                stack_refs.push(format!("{w:#x}"));
+                                if stack_refs.len() >= 6 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    format!(" obj={r0:#x} state={state} prev={} stack={stack_refs:?}", read_u8(uc, r0 + 0x670))
+                }
+                _ => format!(" this={r0:#x}"),
+            };
+            log::info!(
+                "PROCHMI enavi-chain {label} t={}ms thread=[{}] n={} caller={lr:#x}{extra}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                n,
+            );
+            0
+        });
+    }
+
+    if nav_trace_allowed() {
+        // r757: watch the clHMIMngr framework state byte (+0x670) and its
+        // pending flag (+0x671) from t=0.  The object sits at 0x38eee60
+        // (heap layout has been deterministic across runs fix77..fix80).
+        // Installing the watch from the *load path* matters: a watch
+        // installed during the first setter call missed every writer whose
+        // translation block predates it - the code that pre-seeded the
+        // initial NORMAL pending silently rewrote OFF(4) back to 3 with no
+        // event (fix79/80: setter `str value=0x4` confirmed, yet
+        // `vPerformNewAppState` read back 3).
+        let watch_res = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            0x38ee_e60u64 + 0x670,
+            0x38ee_e60u64 + 0x678,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                log::info!(
+                    "PROCHMI appstate-byte WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    address,
+                    size,
+                    value,
+                    uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32
+                );
+                true
+            },
+        );
+        log::info!(
+            "PROCHMI appstate-byte load-time write-watch installed: {}",
+            watch_res.is_ok()
+        );
+    }
 
     let hmi_perform_new_app_state = base_address + CL_HMI_MNGR_PERFORM_NEW_APP_STATE;
 
@@ -1412,7 +1740,8 @@ crate::os::code_stub::trap_site(unicorn, state_on_message, crate::os::code_stub:
             let m10 = read_u32(uc, message + 0x10);
             if nav_trace_allowed() {
                 log::info!(
-                    "PROCHMI: nav startup bOnMessage sm={:#x} leaf={:#x} event={:#x} msg={:#x} caller={:#x} [0x{:08x},0x{:08x},0x{:08x},0x{:08x}]",
+                    "PROCHMI: nav startup bOnMessage t={}ms sm={:#x} leaf={:#x} event={:#x} msg={:#x} caller={:#x} [0x{:08x},0x{:08x},0x{:08x},0x{:08x}]",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
                     sm,
                     leaf,
                     event,
@@ -1455,7 +1784,8 @@ crate::os::code_stub::trap_site(unicorn, state_perform_transition, crate::os::co
                 let kind = read_u16(uc, transition + GUI_TRANSITION_TYPE);
                 if nav_trace_allowed() {
                     log::info!(
-                        "PROCHMI: GUI_StateMachine performTransition sm={:#x} leaf={:#x} state={:#x} trans={:#x} event={:#x} src={:#x} tgt={:#x} kind={:#x}",
+                        "PROCHMI: GUI_StateMachine performTransition t={}ms sm={:#x} leaf={:#x} state={:#x} trans={:#x} event={:#x} src={:#x} tgt={:#x} kind={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
                         sm,
                         leaf,
                         state_id,
@@ -1493,7 +1823,8 @@ crate::os::code_stub::trap_site(unicorn, state_do_transition, crate::os::code_st
             }
             if nav_trace_allowed() {
                 log::info!(
-                    "PROCHMI: nav startup doTransition sm={:#x} leaf={:#x} transition_id={:#x}",
+                    "PROCHMI: nav startup doTransition t={}ms sm={:#x} leaf={:#x} transition_id={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
                     sm,
                     leaf,
                     transition
@@ -1915,9 +2246,37 @@ fn post_gui_util_startup_anim_status(unicorn: &mut Unicorn<'_, Context>, status:
 
 pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
     let now = Instant::now();
+    // TEMP r757 diagnostic: sample the framework state byte every scheduler
+    // pass.  Runs fix79-81 proved +0x670 changes (0xff -> 3, 4 -> 3) with no
+    // MEM_WRITE event even when the watch was live from t=0, so the writer is
+    // not a guest instruction on this unicorn (host mem_write or a cross-VM
+    // alias).  The sampler brackets the change in time to correlate it with
+    // emulator-side activity.
+    if nav_trace_allowed() && unicorn.get_data().elf_path.contains("prochmi") {
+        static LAST_SAMPLE: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0xffff_ffff);
+        let byte = read_u8(unicorn, 0x38ee_e60 + 0x670) as u32;
+        let pending = read_u8(unicorn, 0x38ee_e60 + 0x671) as u32;
+        let sample = byte | (pending << 8);
+        let last = LAST_SAMPLE.swap(sample, Ordering::Relaxed);
+        if last != sample {
+            log::info!(
+                "PROCHMI appstate-byte SAMPLE t={}ms {:#x} -> {:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                last,
+                sample
+            );
+        }
+    }
+    // r757: release the PWR proxy's paced HMI messages (NORMAL after OFF) as
+    // plain queue posts once their virtual-time deadline passes; the HMI
+    // dispatcher never re-enters its Wait, so the Wait-serve channel is dead
+    // for them (run_fix77).
+    crate::libs::libosal_linux::message::post_due_power_messages(unicorn);
     if GUI_INTERNAL_POST_PENDING.load(Ordering::Relaxed) != 0
         && GUI_MESSAGING_POINTER.load(Ordering::Relaxed) != 0
         && GUI_INTERNAL_EVENT_SENT_COUNT.load(Ordering::Relaxed) < GUI_INTERNAL_EVENT_COUNT
+        && startup_events_release_now()
     {
         post_gui_internal_events(unicorn);
     }

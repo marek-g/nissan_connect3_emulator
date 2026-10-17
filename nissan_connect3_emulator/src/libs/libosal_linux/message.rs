@@ -1984,6 +1984,44 @@ fn dir_reply_flush(unicorn: &mut Unicorn<'_, Context>) {
     log::info!("[LIBOSAL-MBX] cca directory: flushed ApplicationInfoStatus replies to mbx_265: {posted}");
 }
 
+/// Post every due PWR-proxy PowerMessage into its target application's host
+/// queue.  Delayed messages (the HMI's spaced NORMAL/CVM after the OFF step)
+/// must not ride the Wait-serve channel because the HMI's AIL dispatcher sits
+/// in an eternal `mbx_265` Wait the moment the OFF request has been processed
+/// (run_fix77) - a plain host `guest_post` wakes it like any other poster.
+/// The blob layout matches `dir_reply_flush` / the GPS provider
+/// (`[u32 flag, u32 len, body]`), which the monitor's `0x2d` wait materialises
+/// into the waiter's VM.  Called from `prochmi::tick`.
+pub fn post_due_power_messages(unicorn: &mut Unicorn<'_, Context>) {
+    for message in crate::rtos::pwr_proxy::take_due_all() {
+        let name = format!("mbx_{}", message.app_id);
+        let mut blob = Vec::with_capacity(8 + message.body.len());
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&(message.body.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&message.body);
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
+        match state.mq.queue_id_for_name(&name) {
+            Some(q) => {
+                state.mq.grow_msgsize(q, blob.len() as i64);
+                if OsalQueueService::guest_post(&mut state.mq, &name, blob, 0) {
+                    state.notify_waiters();
+                    log::info!(
+                        "[LIBOSAL-MBX] PWR proxy: posted delayed PowerType {:#x} (data {}) to {name}",
+                        message.power_type,
+                        message.power_data1
+                    );
+                } else {
+                    log::warn!("[LIBOSAL-MBX] PWR proxy: delayed post to {name} failed, message dropped");
+                }
+            }
+            None => log::warn!(
+                "[LIBOSAL-MBX] PWR proxy: {name} missing, delayed PowerType {:#x} dropped",
+                message.power_type
+            ),
+        }
+    }
+}
+
 /// Parse one `mbx_0` post; when it is an HMI `ApplicationInfoRegister`,
 /// build and spool/queue the LPM's ApplicationInfoStatus answer.
 fn observe_cca_directory(    unicorn: &mut Unicorn<'_, Context>,
@@ -2015,6 +2053,37 @@ fn observe_cca_directory(    unicorn: &mut Unicorn<'_, Context>,
         return;
     }
     let server_app = u16::from_le_bytes([body[0x14], body[0x15]]);
+    // r757: on the unit the HMI framework boots through fw state OFF(4) *before*
+    // NORMAL(3): `clFi_Navi::vNewAppState` starts the enavi server (and with it
+    // the whole DAPI<->PROCNAV FI link that eventually hides the
+    // "Starting navigation." wait-widget) only on a `previous == 4 -> 3`
+    // transition.  The framework state mirrors the LPM (app 0x0000) application
+    // status: an ApplicationInfoStatus with ServerAppState 0 runs
+    // `clAppStates::vEntryOff` (fw 4), state 1 runs `vEntryNormal` (fw 3).
+    // Stand in for the LPM's "not running yet" announcement: on its own
+    // registration spool a state-0 answer first, so the flush delivers
+    // UNAVAILABLE before AVAILABLE (FIFO).
+    if server_app == 0 {
+        static SEEN_OFF: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+            std::sync::LazyLock::new(|| std::sync::atomic::AtomicBool::new(false));
+        if !SEEN_OFF.swap(true, Ordering::Relaxed) {
+            log::info!(
+                "[LIBOSAL-MBX] cca directory: self ApplicationInfoRegister -> spooling ApplicationInfoStatus(state 0 UNAVAILABLE) before state 1"
+            );
+            let mut off = vec![0u8; 0x18];
+            off[0..2].copy_from_slice(&0u16.to_le_bytes());
+            off[2..4].copy_from_slice(&src.to_le_bytes());
+            off[4..8].copy_from_slice(&(0x18u32).to_le_bytes());
+            off[8..10].copy_from_slice(&2u16.to_le_bytes());
+            off[0xb] = 0x50;
+            off[0x10..0x14].copy_from_slice(&0x1FFFu32.to_le_bytes());
+            off[0x14..0x16].copy_from_slice(&server_app.to_le_bytes());
+            off[0x16] = 0; // ServerAppState: UNAVAILABLE
+            if let Ok(mut c) = DIR_REPLY_CACHE.lock() {
+                c.insert(0, off);
+            }
+        }
+    }
     // The LPM's answer.  Layout mirrors the register body (same base
     // message header); the fields `ail_bHandleMsgAppInfoMessage` reads are
     // ServerAppID @+0x14 and ServerAppState @+0x16.  State 1 is the value
@@ -2276,6 +2345,22 @@ fn bridge_guest_osal_queue(
                 Some(data) => data,
                 None => return false,
             };
+
+            // r757 diagnostic: name the CCA wire posts (msgid is what the
+            // HSI layer later forwards as the FI event id).
+            if data.len() >= 0x1c {
+                log::info!(
+                    "[LIBOSAL-MBX] {name} <- post tid=[{}] src={:#x} dst={:#x} class={:#x} msgid={:#x} svc={:#x} regid={:#x} func={:#x}",
+                    unicorn.get_data().inner.thread_id(),
+                    u16::from_le_bytes([data[0], data[1]]),
+                    u16::from_le_bytes([data[2], data[3]]),
+                    data[0xb],
+                    u32::from_le_bytes([data[0x10], data[0x11], data[0x12], data[0x13]]),
+                    u16::from_le_bytes([data[0x14], data[0x15]]),
+                    u16::from_le_bytes([data[0x16], data[0x17]]),
+                    u32::from_le_bytes([data[0x18], data[0x19], data[0x1a], data[0x1b]]),
+                );
+            }
 
             let accepted = {
                 let mut state = unicorn.get_data().namespace.lock().unwrap();

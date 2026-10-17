@@ -47,6 +47,16 @@ pub const APP_STATE_UNINITIALIZED: u32 = 1;
 pub const APP_STATE_INITIALIZED: u32 = 2;
 pub const APP_STATE_NORMAL: u32 = 3;
 pub const APP_STATE_DIAGNOSIS: u32 = 4;
+/// `ail_coszAppStatus` OFF: what the unit's LPM puts the HMI through before
+/// NORMAL (fw state 4 via `clAppStates::vEntryOff`).
+pub const APP_STATE_OFF: u32 = 8;
+
+/// prochmi's CCA application id (`mbx_265`).
+const APP_ID_HMI: u16 = 0x0109;
+
+/// Virtual-time gap between the HMI's OFF and NORMAL `STATE_CHANGE_REQ` (see
+/// `PendingPowerMessage::not_before_ms`).
+const HMI_OFF_TO_NORMAL_MS: u64 = 3000;
 
 /// CVM voltage signal values (`ail_coszCVMStatus`).
 pub const CVM_VOLTAGE_NORMAL: u32 = 0;
@@ -93,6 +103,15 @@ pub struct PendingPowerMessage {
     pub power_data1: u32,
     pub power_data2: u32,
     pub body: Vec<u8>,
+    /// Earliest emulator virtual time (ms since t0) at which the message may
+    /// leave the queue.  Used to pace the HMI's OFF -> NORMAL promotion:
+    /// `clHMIMngr` stores the pending state in one byte and performs it from
+    /// its main-loop `bExecute`, so two `STATE_CHANGE_REQ`s delivered within
+    /// one main-loop period collapse into the last one and the OFF state is
+    /// never observed by the FI broadcast.  The unit's LPM leaves far more
+    /// than a main-loop period between the two; we space them in virtual
+    /// time (`take_next` refuses to pop before this deadline).
+    pub not_before_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -103,6 +122,8 @@ struct AppRecord {
     initialized: bool,
     state_change_delivered: bool,
     cvm_signal_delivered: bool,
+    /// The OFF -> NORMAL promotion sequence has been queued once.
+    promotion_queued: bool,
 }
 
 /// Everything the proxy tracks. Kept small and lock-fast so both the Wait
@@ -111,6 +132,15 @@ struct AppRecord {
 pub struct PwrProxyState {
     apps: HashMap<u16, AppRecord>,
     pending: HashMap<u16, VecDeque<PendingPowerMessage>>,
+    /// Messages waiting for their `not_before_ms` deadline.  They MUST NOT sit
+    /// in `pending`: the Wait hooks (libosal entry and monitor 0x2d) only
+    /// consult the proxy when a Wait *starts*, and the HMI dispatcher blocks
+    /// forever on its `mbx_265` right after processing the OFF request - a
+    /// front-held message would then never be reached.  Due messages are
+    /// posted straight into the host message queue by
+    /// `message::post_due_power_messages` (called from `prochmi::tick`),
+    /// which wakes the blocked Wait like any other poster does.
+    delayed: HashMap<u16, VecDeque<PendingPowerMessage>>,
 }
 
 impl PwrProxyState {
@@ -128,6 +158,7 @@ impl PwrProxyState {
                 initialized: false,
                 state_change_delivered: false,
                 cvm_signal_delivered: false,
+                promotion_queued: false,
             });
         record.queue_open_observed = true;
         log::info!(
@@ -145,6 +176,17 @@ impl PwrProxyState {
     }
 
     fn push_pending(&mut self, app_id: u16, power_type: u16, data1: u32, data2: u32) {
+        self.push_pending_delayed(app_id, power_type, data1, data2, 0);
+    }
+
+    fn push_pending_delayed(
+        &mut self,
+        app_id: u16,
+        power_type: u16,
+        data1: u32,
+        data2: u32,
+        delay_ms: u64,
+    ) {
         let body = encode_power_message(
             PROXY_APP_ID,
             app_id,
@@ -153,13 +195,22 @@ impl PwrProxyState {
             data2,
             PROXY_SUB_ID,
         );
-        self.pending.entry(app_id).or_default().push_back(PendingPowerMessage {
+        let message = PendingPowerMessage {
             app_id,
             power_type,
             power_data1: data1,
             power_data2: data2,
+            not_before_ms: crate::libs::dapi::emu_t0_elapsed_ms() as u64 + delay_ms,
             body,
-        });
+        };
+        if delay_ms > 0 {
+            // Delayed messages live in their own table (see the
+            // `delayed` field comment): `pending` may only hold messages that
+            // a Wait can take immediately.
+            self.delayed.entry(app_id).or_default().push_back(message);
+        } else {
+            self.pending.entry(app_id).or_default().push_back(message);
+        }
     }
 
     /// Mark `sender` as having acknowledged initialization. Immediately
@@ -179,6 +230,7 @@ impl PwrProxyState {
                     initialized: false,
                     state_change_delivered: false,
                     cvm_signal_delivered: false,
+                    promotion_queued: false,
                 },
             );
         }
@@ -192,27 +244,47 @@ impl PwrProxyState {
             "PWR proxy: app 0x{:04x} acknowledged initialization; promoting to NORMAL",
             sender
         );
-        if self
+        let already_queued = self
             .apps
             .get(&sender)
-            .map(|r| !r.state_change_delivered)
-            .unwrap_or(false)
-        {
+            .map(|r| r.promotion_queued)
+            .unwrap_or(false);
+        if !already_queued {
             if let Some(record) = self.apps.get_mut(&sender) {
-                record.state_change_delivered = true;
+                record.promotion_queued = true;
             }
-            self.push_pending(sender, PWR_STATE_CHANGE_REQ, APP_STATE_NORMAL, 0);
-        }
-        if self
-            .apps
-            .get(&sender)
-            .map(|r| !r.cvm_signal_delivered)
-            .unwrap_or(false)
-        {
-            if let Some(record) = self.apps.get_mut(&sender) {
-                record.cvm_signal_delivered = true;
+            if sender == APP_ID_HMI {
+                // r757: the unit's LPM does not hand NORMAL over directly from
+                // INITIALIZED - the HMI framework first passes through OFF
+                // (`clAppStates::bSwitchFromInitialized(8)` legally runs
+                // `vEntryOff`, fw state 4), and only the following `4 -> 3`
+                // transition lets `clFi_Navi::vNewAppState` start the enavi
+                // server (the FI link behind the "Starting navigation."
+                // wait-widget).  `clHMIMngr` collapses state changes faster
+                // than its main loop performs them, so NORMAL is released only
+                // `HMI_OFF_TO_NORMAL_MS` of virtual time after OFF.
+                self.push_pending(sender, PWR_STATE_CHANGE_REQ, APP_STATE_OFF, 0);
+                self.push_pending_delayed(
+                    sender,
+                    PWR_STATE_CHANGE_REQ,
+                    APP_STATE_NORMAL,
+                    0,
+                    HMI_OFF_TO_NORMAL_MS,
+                );
+                self.push_pending_delayed(
+                    sender,
+                    PWR_CVM_SIGNAL_CHANGED,
+                    CVM_VOLTAGE_NORMAL,
+                    0,
+                    HMI_OFF_TO_NORMAL_MS + 1000,
+                );
+                log::info!(
+                    "PWR proxy: HMI promotion queued as OFF -> NORMAL in {HMI_OFF_TO_NORMAL_MS}ms"
+                );
+            } else {
+                self.push_pending(sender, PWR_STATE_CHANGE_REQ, APP_STATE_NORMAL, 0);
+                self.push_pending(sender, PWR_CVM_SIGNAL_CHANGED, CVM_VOLTAGE_NORMAL, 0);
             }
-            self.push_pending(sender, PWR_CVM_SIGNAL_CHANGED, CVM_VOLTAGE_NORMAL, 0);
         }
     }
 
@@ -223,7 +295,51 @@ impl PwrProxyState {
                 record.start_conf_delivered = true;
             }
         }
+        // `app_state_change_delivered` gates the CCA directory's class-0x50
+        // flush (dispatch drops those below admin state RUNNING), so it flips
+        // when the NORMAL message actually leaves the proxy - both delivery
+        // channels report through this helper.
+        self.note_state_change_taken(&message);
         Some(message)
+    }
+
+    /// Pop every delayed message for `app_id` whose deadline has passed.
+    /// The caller is responsible for posting each message body into the
+    /// application's `mbx_<app_id>` host queue.
+    fn take_due(&mut self, app_id: u16) -> Vec<PendingPowerMessage> {
+        let now = crate::libs::dapi::emu_t0_elapsed_ms() as u64;
+        let mut due_list = Vec::new();
+        if let Some(queue) = self.delayed.get_mut(&app_id) {
+            while let Some(front) = queue.front() {
+                let due = front.not_before_ms;
+                if due > now {
+                    break;
+                }
+                let message = queue.pop_front().expect("front checked");
+                let _ = &message;
+                // Inline `note_state_change_taken` semantics without
+                // re-borrowing `self.delayed` (borrow-checker).
+                if message.power_type == PWR_STATE_CHANGE_REQ
+                    && message.power_data1 == APP_STATE_NORMAL
+                {
+                    if let Some(record) = self.apps.get_mut(&app_id) {
+                        record.state_change_delivered = true;
+                    }
+                }
+                due_list.push(message);
+            }
+        }
+        due_list
+    }
+
+    fn note_state_change_taken(&mut self, message: &PendingPowerMessage) {
+        if message.power_type == PWR_STATE_CHANGE_REQ
+            && message.power_data1 == APP_STATE_NORMAL
+        {
+            if let Some(record) = self.apps.get_mut(&message.app_id) {
+                record.state_change_delivered = true;
+            }
+        }
     }
 }
 
@@ -276,6 +392,19 @@ pub fn observe_power_post(sender_app_id: u16, power_type: u16, data1: u32, data2
 pub fn take_pending_for(app_id: u16) -> Option<PendingPowerMessage> {
     let mut state = global().lock().unwrap();
     state.take_next(app_id)
+}
+
+/// Pop every delayed PowerMessage whose deadline has passed, for any app
+/// (see `PwrProxyState::delayed`).  The caller posts each body into the
+/// application's host message queue, which wakes any blocked Wait.
+pub fn take_due_all() -> Vec<PendingPowerMessage> {
+    let mut state = global().lock().unwrap();
+    let app_ids: Vec<u16> = state.delayed.keys().copied().collect();
+    let mut due = Vec::new();
+    for app_id in app_ids {
+        due.append(&mut state.take_due(app_id));
+    }
+    due
 }
 
 /// Whether the proxy has already handed this application its NORMAL
