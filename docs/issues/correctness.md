@@ -797,3 +797,30 @@ on tid76/77); the two tolerated startup `0x430010` vEntry nullpointer errors
   present; then multi-minute runs toward real map pixels. DisplayManager/
   OpenGL pool globals staying junk ([0x2a12928]/[0x2a12958]/[0x2a12948]) is
   the tracked root gap for any engine-driven (non-injected) repaint.
+
+## r770 - wait-popup hide channel made default-run capable (no env vars)
+- Symptom (user report): with a bare launch (no EMU_PROCHMI_NAV_TRACE) the
+  "Starting navigation." popup never disappeared although r769 had proven the
+  channel.  Root cause: the channel's DATA PATH was scattered behind
+  trace-gated probe code:
+  1. EVT8001_REPOST reset (pump consumed 0x8100_8001) lived only in the
+     trace-gated "event-read2" label arm -> REPOST stayed 1 forever in
+     no-env runs, blocking both the enavi-fab fire gate and the hide arm.
+  2. The whole enavi-chain label match (cryptcard answer, session word,
+     PU_WIDGET capture, SM_HIDE_STATE arming) sat behind
+     `if !nav_trace_enabled() { return 0; }`.
+  3. The popup script-cell capture (PU_OBJS/PU_IMPS owners) sat behind the
+     same gate in the textbuilder probe.
+  4. The hide arm required SM_HIDE_RECORD, captured only by the trace-only
+     0x1371000 page hook.
+- Fix (prochmi.rs): all data-path side effects now run unconditionally -
+  always-on event-read2 REPOST reset before the gate; release-gate/close/
+  wfind/pop labels exempt from the gate (rare sites, zero cost); textbuilder
+  probe runs the PU_* capture with only the forensic dumps (POPUPCELLS/NODE/
+  gui-interp) behind nav_trace_enabled(); arm gate accepts the unconditional
+  popup paint marker as "popup really painted" evidence instead of the
+  trace-only SM record.  Logging behaviour unchanged.
+- Verified (fix270, EMU_PROCHMI_NAV_TRACE unset): paint marker 12460 ms ->
+  fab RUNNING 13465 ms -> release-pop n=2 13580 ms -> hide 13789 ms ->
+  invalidation loop done 13791 ms, 0 Execution errors, final frames show the
+  full FM1 screen without the popup (shots270/window_0006).

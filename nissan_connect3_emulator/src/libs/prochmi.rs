@@ -1699,7 +1699,29 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                 }
                 return 0;
             }
-            if !nav_trace_enabled() {
+            // r769: the pump consuming the 0x8001 release event finalises
+            // the evt8001 repost machinery (EVT8001_REPOST -> 0), which the
+            // enavi-fab fire gate and the hide arm both require.  The
+            // label-match below is trace-gated, so run just this reset on
+            // the always-on path (event-read2 is the engine event pump).
+            if label == "event-read2" && !nav_trace_enabled() {
+                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                if read_u32(uc, sp.wrapping_add(0xc)) == 0x8100_8001 {
+                    EVT8001_REPOST.store(0, Ordering::SeqCst);
+                }
+                return 0;
+            }
+            // r769: the release-* label arms below are hide-channel data
+            // path (cryptcard answer, session word, PU_WIDGET capture,
+            // SM_HIDE_STATE arming) and must run in default no-env runs -
+            // they are rare sites, so letting them through the trace gate
+            // costs nothing.  Everything else stays trace-gated.
+            if !nav_trace_enabled()
+                && !matches!(
+                    label,
+                    "release-gate" | "release-pop" | "release-close" | "release-wfind"
+                )
+            {
                 return 0;
             }
             let n = hits.fetch_add(1, Ordering::Relaxed);
@@ -3376,7 +3398,13 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         ] {
             let address = base_address + offset;
             crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:textbuilder", move |uc: &mut Unicorn<'_, Context>| {
-                if !nav_trace_enabled() {
+                // r769: the script-cell capture below is the hide
+                // channel's data path (PU_OBJS/PU_IMPS) and must run in
+                // default no-env runs; only the forensic dumps stay
+                // behind EMU_PROCHMI_NAV_TRACE.  Once both painted cells
+                // are captured a trace-less hit is a cheap early return.
+                let tracing = nav_trace_enabled();
+                if !tracing && PU_COUNT.load(Ordering::Relaxed) >= 2 {
                     return 0;
                 }
                 static HITS: AtomicU32 = AtomicU32::new(0);
@@ -3395,15 +3423,17 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // object being painted (resource SYSDLG_NAV_STARTING_UP_
                 // SYSIND), the handle the hide must be driven on.
                 let r1v = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
-                if label == "text-builder" && r1v == 0x0251_86fc {
-                    static DONE: AtomicU32 = AtomicU32::new(0);
-                    if DONE.fetch_add(1, Ordering::Relaxed) < 2 {
-                        let cells: Vec<u32> =
-                            (0..40u32).map(|i| read_u32(uc, r0 + i * 4)).collect();
-                        log::warn!(
-                            "PROCHMI {label} POPUPCELLS r0={r0:#x}: {:?}",
-                            cells.iter().map(|w| format!("{w:#x}")).collect::<Vec<_>>(),
-                        );
+                    if label == "text-builder" && r1v == 0x0251_86fc {
+                        static DONE: AtomicU32 = AtomicU32::new(0);
+                        if DONE.fetch_add(1, Ordering::Relaxed) < 2 {
+                            let cells: Vec<u32> =
+                                (0..40u32).map(|i| read_u32(uc, r0 + i * 4)).collect();
+                            if tracing {
+                                log::warn!(
+                                    "PROCHMI {label} POPUPCELLS r0={r0:#x}: {:?}",
+                                    cells.iter().map(|w| format!("{w:#x}")).collect::<Vec<_>>(),
+                                );
+                            }
                         let mut targets: Vec<u32> = cells
                             .iter()
                             .copied()
@@ -3450,6 +3480,11 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             // C++ class name: GUI classes keep the mangled
                             // name pointer near vtable+0x2c (r765 forensics
                             // on GUI_StateView); resolve [cell] vtables too.
+                            // (pure forensics - skipped without tracing, the
+                            // PU_* capture above already ran.)
+                            if !tracing {
+                                continue;
+                            }
                             let mut classes: Vec<String> = Vec::new();
                             for fld in [nf[0], nf[2], nf[4]] {
                                 if !(0x0286_5294..0x02d0_0000).contains(&fld) {
@@ -3508,7 +3543,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // action list it is about to run (r2) - the record format
                 // is what the r766 replay needs (entry list of state 0x1e4
                 // = the organic hide action sequence).
-                if label == "gui-interp" {
+                if tracing && label == "gui-interp" {
                     // r765: dump printable strings inside the script object
                     // referenced by the list header (list[2], list[4]) -
                     // the VM's string constants name the popup's actions
@@ -4980,7 +5015,12 @@ fn sm_hide_fire_or_restore(unicorn: &mut Unicorn<'_, Context>, site: u32) {
     }
     if ENAVI_FAB_STATE.load(Ordering::Relaxed) != 3
         || EVT8001_REPOST.load(Ordering::Relaxed) != 0
-        || SM_HIDE_RECORD.load(Ordering::Relaxed) == 0
+        // r769: the SM-page hook that captures the 0x1e5 record only
+        // exists under EMU_PROCHMI_NAV_TRACE; the paint marker is set
+        // unconditionally and is equally good "popup really painted"
+        // evidence for a no-env run.
+        || (SM_HIDE_RECORD.load(Ordering::Relaxed) == 0
+            && POPUP_PAINT_MS.load(Ordering::Relaxed) == 0)
     {
         return;
     }
