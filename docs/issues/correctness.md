@@ -865,3 +865,23 @@ Findings (runs fix278..fix287, semtrack + EMU_WATCH forensics):
   producers - SCD bring-up completes only when the administration/SPM answer
   path delivers (see gw-deliver probes); until then the watchdog papers over
   it and the AE race stays possible.
+
+## r774 - IOSC shared_mem_free is a no-op (bounded leak; refcount upgrade path)
+- `0x534f0001` (libiosclib `iosc_shared_mem_free`) answers success but keeps
+  the region mapped and the host buffer alive.  Deliberate: the emulated
+  guests keep using pool pointers AFTER calling free (DAPI's SPM clients do),
+  so the real driver's unmap-on-caller would only manufacture
+  READ_UNMAPPED faults on pointers the guest still dereferences.
+- Why the leak cannot grow: host buffers are keyed by pool id
+  (`IoscState::get_or_create_shared`), the ids are a closed set
+  (measured 0x09..0x5b, 42 distinct, ~23 MiB in a 100 s run), re-malloc of a
+  known id clones the same Arc, and the guests free almost never (3 frees
+  vs ~30 mallocs per 100 s) - these pools live to boot-completion on the
+  device too.
+- Upgrade path IF the emulator ever must run for many hours: refcount each
+  id (map id -> attachment count), unmap the CALLER's region (mmu.unmap of
+  the VA read back through *[ppMem]) at free, and drop the host buffer only
+  at the last attachment; keep a per-process "attached ids" list because
+  each process maps its own VA.  Verify against the DAPI SPM client's
+  use-after-free pattern first (it would fault - gate the unmap behind
+  EMU_IOSC_STRICT_FREE until the client behaviour is understood).
