@@ -1079,3 +1079,36 @@ word+0x18 (SEM_LOCK 0x195c8, SYNC_LOCK 0x10a1ec, EV__LOCK 0x1cc, TSK_LOCK
   never sized/shown (geometry 0), or they draw into the MAP layer target
   which our window dump does not show.  EMU_ISB_LATE="start:end" moves the
   isBlocked forensic window over any scripted-tap schedule (added r780).
+
+## r781 - MAP SCROLL "black body" was misdiagnosed; real gap = touch vs live map
+- Probe suite (all EMU_VDRAW_LOG-windowed, kept): GUI_Rect::intersects entry
+  (r780: callDraw's clip branch is mid-TB, unicorn only dispatches TB entries,
+  so read rects from the intersects entry itself), GUI_Scripted::vDraw gate
+  (+0x68/+0x6c/+0x70/+0x74), prepareCallByRef + callInts, GUI_Image/
+  GUI_Button::vDraw entry (handle +0x60).  Plus EMU_DRAWTRI_LOG (drawImage
+  tex/rect dump) and gpu::map_draw_calls() (post-dump `mapdraws=` field).
+- Facts after MAP SCROLL (cid 246) opens at t=25 s:
+  * clip stack is full-screen and EVERY visited widget rect intersects ->
+    callDraw->vDraw runs for all of them (earlier "clip/geometry 0" theory
+    falsified).
+  * 4 widgets are GUI_Scripted: gate byte +0x68=1, Lua ref +0x6c set, no
+    pre-fn (+0x70=0), post-draw fn +0x74 set; prepareCallByRef SUCCEEDS and
+    callInts runs every frame - the scripted paint path is healthy, the
+    Lua funcs simply draw nothing in idle (no pan state).
+  * 2 GUI_Image + 2 GUI_Button (the title bar icon/strip) draw normally.
+- The page's real "body" is the live map.  At t=25 s the map engine has not
+  painted yet (first paint burst at t~118 s in current builds), so behind
+  the title everything is black regardless of the page -> the defect I filed
+  in r780 was (mostly) the engine-idle black, not a widget gap.  RETRACTED.
+- After the engine burst the main page looks correct (full-screen land
+  polygons + intact card/Menu/compass/scale overlay, dump at t=118 s).
+- REAL NEW GAP: once the map surface is live, a tap in the map area is no
+  longer dispatched at all (t=163 s run: vPressed/vReleased delivered, zero
+  msg-fire, zero SM transitions, zero pixel change).  Before the first paint
+  the same tap passed through to the HMI background and opened MAP SCROLL.
+  On the device the map engine receives touch (pan/zoom) and informs the
+  HMI, which is what opens the MAP SCROLL page; our stack never relays
+  touch to procmapengine, so map interaction is dead while the map is up.
+  Next defect to work: touch routing to the map engine (procmapengine
+  input path via OSAL queue/registry - investigate its PortControl/
+  message loop).

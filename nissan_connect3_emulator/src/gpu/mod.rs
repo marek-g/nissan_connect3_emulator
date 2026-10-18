@@ -1744,6 +1744,14 @@ static HMI_DRAW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 pub fn hmi_draw_calls() -> u64 {
     HMI_DRAW_CALLS.load(Ordering::Relaxed)
 }
+
+/// Same for the MAP target (engine side): tells whether the map engine
+/// keeps painting while a full-page map view (MAP SCROLL) is up.
+static MAP_DRAW_CALLS: AtomicU64 = AtomicU64::new(0);
+
+pub fn map_draw_calls() -> u64 {
+    MAP_DRAW_CALLS.load(Ordering::Relaxed)
+}
 static WINDOW_BLITS: AtomicU32 = AtomicU32::new(0);
 
 // Reproduce a user resize without anyone at the keyboard: `EMU_GPU_TEST_RESIZE`
@@ -4439,12 +4447,14 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
             let first = ureg(unicorn, RegisterARM::R1) as i32;
             let count = ureg(unicorn, RegisterARM::R2) as i32;
             if current_gpu_target() == GpuTarget::Hmi {
-                HMI_DRAW_CALLS.fetch_add(1, Ordering::Relaxed);
-                // r779 attribution (measured here, probes since removed):
+                HMI_DRAW_CALLS.fetch_add(1, Ordering::Relaxed);                // r779 attribution (measured here, probes since removed):
                 // the LR at these stub entries is STALE, the real painters
                 // are GUI_GL_OpenGL::drawImage (widget pass, see the
                 // DRAW_IMAGE_CALLS counter in libs/prochmi.rs) and mixLayers
                 // composites (idle floor = 2 quads/frame).
+            }
+            if current_gpu_target() == GpuTarget::Map {
+                MAP_DRAW_CALLS.fetch_add(1, Ordering::Relaxed);
             }
             if current_gpu_target() == GpuTarget::Map
                 && std::env::var_os("EMU_NO_ENGINE_DRAW").is_some()
@@ -4536,6 +4546,7 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
             let offset = ureg(unicorn, RegisterARM::R3);
             if current_gpu_target() == GpuTarget::Map {
                 refresh_map_client_arrays(unicorn);
+                MAP_DRAW_CALLS.fetch_add(1, Ordering::Relaxed);
             }
             if gpu_void_clear(move || unsafe {
                 gl::DrawElements(mode, count, kind, offset as *const std::ffi::c_void);

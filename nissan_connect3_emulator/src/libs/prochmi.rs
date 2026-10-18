@@ -3906,9 +3906,208 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 if address as u32 == want {
                     VDRAW_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                // r780: GUI_Scripted::vDraw gate probe (same page): scripted
+                // flag (+0x68) and the Lua refs (+0x6c ref, +0x70 enter-fn,
+                // +0x74 leave-fn) decide whether the scripted paint runs.
+                let scripted = base_address + 0x0137_a398u32 - ORIGINAL_BASE;
+                if address as u32 == scripted {
+                    static SC_WIN: std::sync::OnceLock<(u128, u128)> =
+                        std::sync::OnceLock::new();
+                    static SC_N: AtomicU32 = AtomicU32::new(0);
+                    let (w0, w1) =
+                        *SC_WIN.get_or_init(|| match std::env::var("EMU_VDRAW_LOG") {
+                            Ok(s) => {
+                                let mut it = s.split(':').filter_map(|p| p.parse().ok());
+                                (
+                                    it.next().unwrap_or(0),
+                                    it.next().unwrap_or(u128::MAX),
+                                )
+                            }
+                            Err(_) => (u128::MAX, 0),
+                        });
+                    let t_ms = crate::libs::dapi::emu_t0_elapsed_ms();
+                    if t_ms < w0 || t_ms > w1 {
+                        return;
+                    }
+                    let n = SC_N.fetch_add(1, Ordering::Relaxed);
+                    if n < 24 {
+                        let obj = _uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                        log::warn!(
+                            "PROCHMI scriptDraw#{n} t={t_ms}ms obj={obj:#x} vt={:#x} flag68={} ref6c={:#x} fn70={:#x} fn74={:#x}",
+                            read_u8(_uc, obj + 0x68),
+                            read_u32(_uc, obj + 0x6c),
+                            read_u32(_uc, obj + 0x70),
+                            read_u32(_uc, obj + 0x74),
+                            read_u32(_uc, obj),
+                        );
+                    }
+                    return;
+                }
             },
         );
         log::info!("PROCHMI vDraw page-hook 0x{page:x} installed: {}", res.is_ok());
+    }
+
+    // r780: GUI_Rect::intersects (0x1362f3c) entry probe - callDraw's clip
+    // test is a mid-TB branch (unicorn range hooks dispatch at TB entries
+    // only), so read the rects straight from the intersects entry (r0 = clip,
+    // r1 = widget rect, both s32[4]).  EMU_VDRAW_LOG="a:b" ms window.
+    {
+        let want = base_address + 0x0136_2f3cu32 - ORIGINAL_BASE;
+        let page = want & !0xfff;
+        let res = unicorn.add_code_hook(
+            page as u64,
+            (page + 0xfff) as u64,
+            move |_uc: &mut Unicorn<'_, Context>, address, _size| {
+                if address as u32 != want {
+                    return;
+                }
+                static IN_WIN: std::sync::OnceLock<(u128, u128)> =
+                    std::sync::OnceLock::new();
+                static IN_N: AtomicU32 = AtomicU32::new(0);
+                let (w0, w1) =
+                    *IN_WIN.get_or_init(|| match std::env::var("EMU_VDRAW_LOG") {
+                        Ok(s) => {
+                            let mut it = s.split(':').filter_map(|p| p.parse().ok());
+                            (
+                                it.next().unwrap_or(0),
+                                it.next().unwrap_or(u128::MAX),
+                            )
+                        }
+                        Err(_) => (u128::MAX, 0),
+                    });
+                let t_ms = crate::libs::dapi::emu_t0_elapsed_ms();
+                if t_ms < w0 || t_ms > w1 {
+                    return;
+                }
+                let n = IN_N.fetch_add(1, Ordering::Relaxed);
+                if n >= 48 {
+                    return;
+                }
+                let clip = _uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let wr = _uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let cr: Vec<i32> =
+                    (0..4u32).map(|i| read_u32(_uc, clip + i * 4) as i32).collect();
+                let wv: Vec<i32> =
+                    (0..4u32).map(|i| read_u32(_uc, wr + i * 4) as i32).collect();
+                log::warn!(
+                    "PROCHMI intersects#{n} t={t_ms}ms lr={:#x} clip={:?} widget={:?}",
+                    _uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                    cr,
+                    wv,
+                );
+            },
+        );
+        log::info!("PROCHMI intersects page-hook 0x{page:x} installed: {}", res.is_ok());
+    }
+
+    // r780: GUI_LUA_Interface::prepareCallByRef (0x1368b68) + callInts
+    // (0x136898c) probes.  GUI_Scripted::vDraw paints through a by-ref Lua
+    // call (registry ref +0x6c, fn id +0x70 pre / +0x74 post); a registry
+    // lookup miss returns 0 silently.  EMU_VDRAW_LOG="a:b" logs (interface,
+    // ref, fn) per attempt and every callInts entry (proves the call was
+    // actually prepared and executed).
+    {
+        let p1 = base_address + 0x0136_8b68u32 - ORIGINAL_BASE;
+        let p2 = base_address + 0x1368_98cu32 - ORIGINAL_BASE;
+        let page = p1 & !0xfff;
+        let res = unicorn.add_code_hook(
+            page as u64,
+            (page + 0xfff) as u64,
+            move |_uc: &mut Unicorn<'_, Context>, address, _size| {
+                let a = address as u32;
+                if a != p1 && a != p2 {
+                    return;
+                }
+                static PC_WIN: std::sync::OnceLock<(u128, u128)> =
+                    std::sync::OnceLock::new();
+                static PC_N: AtomicU32 = AtomicU32::new(0);
+                let (w0, w1) =
+                    *PC_WIN.get_or_init(|| match std::env::var("EMU_VDRAW_LOG") {
+                        Ok(s) => {
+                            let mut it = s.split(':').filter_map(|p| p.parse().ok());
+                            (
+                                it.next().unwrap_or(0),
+                                it.next().unwrap_or(u128::MAX),
+                            )
+                        }
+                        Err(_) => (u128::MAX, 0),
+                    });
+                let t_ms = crate::libs::dapi::emu_t0_elapsed_ms();
+                if t_ms < w0 || t_ms > w1 {
+                    return;
+                }
+                let n = PC_N.fetch_add(1, Ordering::Relaxed);
+                if n >= 32 {
+                    return;
+                }
+                if a == p1 {
+                    log::warn!(
+                        "PROCHMI prepByRef#{n} t={t_ms}ms ifc={:#x} ref={:#x} fn={:#x}",
+                        _uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                        _uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                        _uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+                    );
+                } else {
+                    log::warn!(
+                        "PROCHMI callInts#{n} t={t_ms}ms ifc={:#x} out={:#x}",
+                        _uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                        _uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                    );
+                }
+            },
+        );
+        log::info!("PROCHMI prepByRef page-hook 0x{page:x} installed: {}", res.is_ok());
+    }
+
+    // r780: GUI_Image::vDraw (0x13a97d8) + GUI_Button::vDraw (0x13a897c)
+    // probes: dump the texture/resource handle (+0x60, +0x14 for buttons)
+    // and the draw-state flag (+0x4c).  A 0 / invalid handle means the
+    // widget's FI resource never bound and the draw is a silent no-op.
+    // Same EMU_VDRAW_LOG window.
+    for off in [0x013a_97d8u32, 0x013a_897cu32] {
+        let want = base_address + off - ORIGINAL_BASE;
+        let page = want & !0xfff;
+        let res = unicorn.add_code_hook(
+            page as u64,
+            (page + 0xfff) as u64,
+            move |_uc: &mut Unicorn<'_, Context>, address, _size| {
+                if address as u32 != want {
+                    return;
+                }
+                static GI_WIN: std::sync::OnceLock<(u128, u128)> =
+                    std::sync::OnceLock::new();
+                static GI_N: AtomicU32 = AtomicU32::new(0);
+                let (w0, w1) =
+                    *GI_WIN.get_or_init(|| match std::env::var("EMU_VDRAW_LOG") {
+                        Ok(s) => {
+                            let mut it = s.split(':').filter_map(|p| p.parse().ok());
+                            (
+                                it.next().unwrap_or(0),
+                                it.next().unwrap_or(u128::MAX),
+                            )
+                        }
+                        Err(_) => (u128::MAX, 0),
+                    });
+                let t_ms = crate::libs::dapi::emu_t0_elapsed_ms();
+                if t_ms < w0 || t_ms > w1 {
+                    return;
+                }
+                let n = GI_N.fetch_add(1, Ordering::Relaxed);
+                if n >= 26 {
+                    return;
+                }
+                let obj = _uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCHMI imgBtnDraw#{n} t={t_ms}ms cls={} obj={obj:#x} r60={:#x} f4c={} r48={}",
+                    if off == 0x013a_97d8u32 { "img" } else { "btn" },
+                    read_u32(_uc, obj + 0x60),
+                    read_u8(_uc, obj + 0x4c),
+                    read_u32(_uc, obj + 0x48) as i32,
+                );
+            },
+        );
+        log::info!("PROCHMI img/btn vDraw hook 0x{want:x} installed: {}", res.is_ok());
     }
 
     // r779: GUI_GL_OpenGL::drawImage (0x1345a18) is the real HMI painter: the
@@ -3926,6 +4125,41 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     return;
                 }
                 DRAW_IMAGE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // r780 forensics (MAP SCROLL black page): EMU_DRAWTRI_LOG="a:b"
+                // dumps texture/rect/blend of the calls inside that ms window.
+                static TRI_WIN: std::sync::OnceLock<(u128, u128)> =
+                    std::sync::OnceLock::new();
+                static TRI_N: AtomicU32 = AtomicU32::new(0);
+                let (w0, w1) =
+                    *TRI_WIN.get_or_init(|| match std::env::var("EMU_DRAWTRI_LOG") {
+                        Ok(s) => {
+                            let mut it = s.split(':').filter_map(|p| p.parse().ok());
+                            (
+                                it.next().unwrap_or(0),
+                                it.next().unwrap_or(u128::MAX),
+                            )
+                        }
+                        Err(_) => (u128::MAX, 0),
+                    });
+                let t_ms = crate::libs::dapi::emu_t0_elapsed_ms();
+                if t_ms >= w0 && t_ms <= w1 {
+                    let n = TRI_N.fetch_add(1, Ordering::Relaxed);
+                    if n < 24 {
+                        let tex = _uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                        let rect = _uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                        let pos = _uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                        let r: Vec<u32> =
+                            (0..4u32).map(|i| read_u32(_uc, rect + i * 4)).collect();
+                        log::warn!(
+                            "PROCHMI drawImage#{n} t={t_ms}ms tex={tex:#x} rect=[{},{},{},{}] pos={pos:#x} lr={:#x}",
+                            r[0] as i32,
+                            r[1] as i32,
+                            r[2] as i32,
+                            r[3] as i32,
+                            _uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                        );
+                    }
+                }
             },
         );
         log::info!("PROCHMI drawImage page-hook 0x{page:x} installed: {}", res.is_ok());
@@ -6116,11 +6350,12 @@ fn drain_gui_touch_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
         let di = DRAW_IMAGE_CALLS.load(Ordering::Relaxed);
         let di_snap = TOUCH_DI_SNAP.load(Ordering::Relaxed);
         line.push_str(&format!(
-            " draws={total} d_release={} paint={} d_paint={} vdraw={}",
+            " draws={total} d_release={} paint={} d_paint={} vdraw={} mapdraws={}",
             total - snap,
             di,
             di - di_snap,
             VDRAW_CALLS.load(Ordering::Relaxed),
+            crate::gpu::map_draw_calls(),
         ));
         TOUCH_POST_COUNTDOWN.store(120, Ordering::Relaxed);
         TOUCH_DRAW_SNAP.store(total, Ordering::Relaxed);
