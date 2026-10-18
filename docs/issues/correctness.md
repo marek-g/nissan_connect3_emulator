@@ -1040,3 +1040,8 @@ word+0x18 (SEM_LOCK 0x195c8, SYNC_LOCK 0x10a1ec, EV__LOCK 0x1cc, TSK_LOCK
   (HMI_DRAW_CALLS, DRAW_IMAGE_CALLS via drawImage page hook, VDRAW_CALLS),
   isBlocked observer late-window dump; nav_trace-only SM-DEC/SM-PAGE and
   viewfac probes document the click->transition->view chain.
+- r779 follow-up: intra-menu navigation verified too - a second tap on
+  "Next Page" (650,400) at t=64 s renders menu page 2 (Show Route On Map /
+  Show Waypoints / Options / Guidance & Map Settings / Show Position
+  Information / Previous Page), 39% window pixel change - the pump re-arms
+  per view-create, so every subsequent page switch self-heals the same way.
