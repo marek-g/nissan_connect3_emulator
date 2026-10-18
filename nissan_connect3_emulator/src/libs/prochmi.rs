@@ -6608,9 +6608,24 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
                     static LATE: AtomicU32 = AtomicU32::new(0);
                     let h = HITS.fetch_add(1, Ordering::Relaxed);
                     let t_ms = crate::libs::dapi::emu_t0_elapsed_ms();
-                    let late = t_ms > 59_500 && t_ms < 66_000;
+                    // Late-window (tap-window forensics): default covers the
+                    // 60 s scripted tap; EMU_ISB_LATE="start:end" (ms) moves
+                    // it over other tap schedules (clickability scans).
+                    static WIN: std::sync::OnceLock<(u128, u128)> =
+                        std::sync::OnceLock::new();
+                    let (w0, w1) = *WIN.get_or_init(|| match std::env::var("EMU_ISB_LATE") {
+                        Ok(s) => {
+                            let mut it = s.split(':').filter_map(|p| p.parse().ok());
+                            (
+                                it.next().unwrap_or(0),
+                                it.next().unwrap_or(u128::MAX),
+                            )
+                        }
+                        Err(_) => (59_500, 66_000),
+                    });
+                    let late = t_ms > w0 && t_ms < w1;
                     let late_n = if late { LATE.fetch_add(1, Ordering::Relaxed) } else { 999 };
-                    if h < 8 || late_n < 24 {
+                    if h < 8 || (late && late_n % 60 < 2) {
                         let ea = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                         let view = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                         let eaw = read_u32(uc, ea + 0x124);

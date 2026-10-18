@@ -1045,3 +1045,37 @@ word+0x18 (SEM_LOCK 0x195c8, SYNC_LOCK 0x10a1ec, EV__LOCK 0x1cc, TSK_LOCK
   Show Waypoints / Options / Guidance & Map Settings / Show Position
   Information / Previous Page), 39% window pixel change - the pump re-arms
   per view-create, so every subsequent page switch self-heals the same way.
+
+## r780 - clickability scan of the main screen + menu item navigation verified
+- Scripted single taps (fresh run each, base = main map page) + window-dump
+  pixel diffs:
+  * Menu (67,335): MAP OPTIONS pages 1+2 render (r779, re-verified).
+  * Menu item "Enter Destination" (205,165 on page 1): fires the exit path
+    the engine itself uses - SM 0x1e9->0x322, GUI_StateView::vLeave ->
+    GUI_MenuManager::vLeaveView(229), view-create cid 294 = NAVIGATION
+    submenu, fully rendered, its own Next Page (650,400) renders page 2
+    (Address Book / Intersection / My Points Of Interest / Previous Page).
+    So menu open AND menu-internal navigation are usable end to end; there
+    is no back-to-map control on the FI menu pages themselves (device
+    design: leaving = choosing a function item).
+  * Compass/recenter button (67,415): tap delivered, zero pixel change, no
+    view-create - it is a map-engine command, invisible without a panned
+    map; no emulator defect shown.
+  * Scale bar / map area (155,455 / 157,137): click passes THROUGH the EA
+    radio-card layer (it carries no HMI hit-test widgets) onto the map
+    window -> opens MAP SCROLL (cid 246, SM + view-create + Lua creates 16
+    widgets) but only the page title paints: body widgets never issue a
+    single drawImage.  NEW DEFECT (below), independent of r779: update()
+    runs the draw block for the page every frame (both views pass
+    isViewDirty+isBlocked continuously once EA state is 2).
+  * Radio presets 1-6 / card header (65,217 etc.): no visible effect, no
+    message fired - the foreign svg card layer is not touch-targeted in
+    this stack (device behavior likely identical; inputs there go through
+    HSI/hardkeys).  Recorded as fidelity question, not a defect.
+- NEW DEFECT (open, milestone-3 tail): MAP SCROLL body invisible.  Facts:
+  cid 246, 16 CreateWidgetInstance after view-create, render pass active
+  (vDraw/draw burst, title paints), yet no body drawImage.  Hypotheses to
+  discriminate next: widgets parented to a map-surface container that is
+  never sized/shown (geometry 0), or they draw into the MAP layer target
+  which our window dump does not show.  EMU_ISB_LATE="start:end" moves the
+  isBlocked forensic window over any scripted-tap schedule (added r780).
