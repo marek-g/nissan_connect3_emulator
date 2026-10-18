@@ -179,7 +179,17 @@ pub fn ioctl(unicorn: &mut Unicorn<'_, Context>, fd: u32, request: u32, addr: u3
     let res = match request {
         IOSC_SHARED_MALLOC => shared_malloc(unicorn, addr),
         IOSC_SHARED_MEM_FREE => {
-            log::trace!("[IOSC] shared_mem_free({addr:#x}) => 0 (no-op)");
+            // Block layout like malloc: [&mem, id, size].  The region stays
+            // mapped on purpose: the guest clients keep using the pool
+            // pointers after free, so an unmap would turn those accesses into
+            // READ_UNMAPPED faults the emulated guest (unlike the device one)
+            // does not survive.  Nothing accumulates either: host buffers are
+            // keyed by id and the clients use a closed set of pool ids
+            // (0x09..0x5b), so the footprint is bounded regardless.
+            log::trace!(
+                "[IOSC] shared_mem_free(id={:#x}) => 0 (stays mapped)",
+                read_u32(unicorn, addr + 4)
+            );
             0
         }
         IOSC_CREATE_MUTEX => create_mutex(unicorn),
