@@ -914,3 +914,61 @@ Findings (runs fix278..fix287, semtrack + EMU_WATCH forensics):
   MO classes; the landcover-only look of fix297 was the usual harvest-lottery
   variance, not a regression.  Styling is still the untextured 2-color
   palette (no labels/textures yet).
+
+## r776 - every watched pool word decoded; r773 "missing producers" mostly REVERTED to parks
+With the new OSAL-level semtrack (`hook_osal_trace`, EMU_SEMTRACK=1: OSAL
+sem/event create/open/wait/post log name+slot-id+LR, LockOsal/UnLockOsal log
+the fixed-lock names at word+0x18), every word the 20 s watchdog repairs is
+now identified.  Structures (from libosal decompile): sync slots at pool
++0x10a22c, 1003 x 0x40 B, per-slot name `OSAL_%04d` (what r773 saw as
+`_0NN(OSAL`); AMES semaphore-handle table at pool+0x19608 (0x34 B entries,
+slot id +0x8, NAME +0x11); NTVE event table at pool+0x20c (0x3c B entries,
+sync id +0x10, name +0x18); `CreateOsalLock` fixed locks carry their name at
+word+0x18 (SEM_LOCK 0x195c8, SYNC_LOCK 0x10a1ec, EV__LOCK 0x1cc, TSK_LOCK
+0x30f4, MQ__LOCK 0x251e0, TIM_LOCK 0x23890, PRC_LOCK 0x2f97c...).  Verdicts:
+- 0x4000365c = sync slot 0 = the NTVE event "SpmEvEnd" (pool+0x20c, first
+  event).  Its waiter is procbaselx `s32RunEnv()`: after `fc_spmslv_tclApp::
+  vStart()` + server start it waits SpmEvEnd with infinite timeout - the
+  designed end-of-watch park, woken only by SPM shutdown.  Not stuck.
+- 0x4010a9ec (slot 31) = DAPI `90019FE0_LICENSE_TO_KILL`; 0x4010c02c (slot
+  120) = procmapengine `900A8AC0_LICENSE_TO_KILL` (format `%08X_LICENSE_TO_
+  KILL`).  They belong to `s32RunExeEnvironment` (DAPI 0x813988, also linked
+  into procmapengine): create sem(0), `s32InitApp07(h)` + `s32InitAppFc_lbsm
+  (h)` - each posts h once when its app finishes/de-participates (the not-in
+  -registry branch posts immediately, DAPIAPP.OUT 0x81f200) - then the env
+  thread waits once per successful init and only proceeds to `vExitApp07`/
+  `vExitAppFc_lbsv` after ALL tokens.  Parking there for the whole uptime is
+  the designed steady state; APPID 7 is DAPIAPP itself (registry_compat.reg
+  line 14), so the async `dap_tclDapiApp` bring-up path is taken legitimately
+  - its answer path is the genuine remaining producer gap (below).
+- 0x4010c42c/46c/4ac (slots 136/137/138) = the DAPI AE dispatch channel
+  (producer thread [36] posts, workers [72]/[73]/[74] consume): healthy
+  wait/post ping-pong for 8 rounds during bring-up (t=15.6..16.7 s), idle
+  park afterwards.  The watchdog only repairs the IDLE waits.
+- Watchdog wake on a word still 0 is a benign no-op: after the futex returns
+  success, glibc/WaiSyncObj re-checks the sem value, finds 0 and re-parks
+  (observed: repaired tids never advanced, they just re-armed the 20 s
+  repair; no `[14] quantum` lines between repairs).  So the repair can only
+  release a waiter when the word is >0 (consumes a real pending post).  The
+  r773 note "wake-with-success lets two processes enter the same critical
+  section" is therefore wrong for these words - r773's broadcast-regression
+  story stays true, but the AE race cannot be watchdog-driven.
+- AE crash re-framed: in run_semtrk2 the crash `[78] 0x35952a READ_UNMAPPED`
+  happened ~13 s AFTER the channel burst and ~17 s BEFORE the first repair
+  of any channel word.  0x35952a is Thumb, PROCNAV: inside
+  `bpstl::less<unsigned short>::operator()` (`ldrh r2,[r2]`) called from
+  `scd_tclServiceAppMap` tree search - the Rb_tree itself contains a
+  garbage node pointer, and the crashed thread [78] is a PROCNAV TSE worker
+  fed by OSAL queue messages (monitor-yield svc 0x2d0564), not by pool sems.
+  Corruption source is the tree's WRITE path (SCD answer ingestion), not the
+  lock protocol.  Frequency: 0/6 golden runs, 1/2 semtrack runs (traps shift
+  timing) - still intermittent, root cause = next milestone task: trace what
+  writes ServiceAppMap entries (the SCD administration/SPM answer ingestion)
+  and which answer is malformed or half-delivered in the emulator.
+- Genuine remaining producer gap (unchanged core of r773's last bullet): the
+  `dap_tclDapiApp` (APPID 7) / lbsm bring-up answer path - after 8 dispatch
+  rounds DAPI's producer thread [36] stops feeding the AE workers, i.e. the
+  SPM/administration answer exchange (DpSemSrvIf sem, Dp00000001 event) ends
+  incomplete.  Until it completes, LICENSE_TO_KILL tokens never arrive (the
+  env thread parks without its tokens - harmless) and PROCNAV's ServiceAppMap
+  stays half-populated (the AE crash candidate).

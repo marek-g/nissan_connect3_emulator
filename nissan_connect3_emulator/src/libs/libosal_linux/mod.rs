@@ -335,6 +335,7 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
     // race); keep the code but require EMU_SEMTRACK=1 to install it.
     if std::env::var("EMU_SEMTRACK").as_deref() == Ok("1") {
         sem_track::hook_sem_trace(unicorn, base_address);
+        sem_track::hook_osal_trace(unicorn, base_address);
     }
 
     for (address, name) in [
