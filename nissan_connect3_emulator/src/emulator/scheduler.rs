@@ -512,20 +512,48 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
                                 if watchdog {
                                     // Dead-owner repair: the guest asked for an
                                     // open-ended wait, so the deadline is the
-                                    // emulator watchdog. Zero the mutex word in
-                                    // the shared host buffer (this owner's
-                                    // mapping is host-ptr backed, so the write
-                                    // is coherent for every process) and wake
-                                    // with success; the guest's lock retry then
-                                    // takes the uncontended word.
-                                    // Repair exactly ONE waiter (self): the
-                                    // fake success bypasses the guest's mutual
-                                    // exclusion, so mass-releasing every
-                                    // contender of a word (broadcast) corrupts
-                                    // the very data the lock protects (DAPI
-                                    // device state / SCD trees) and kills the
-                                    // map re-open job chain.
-                                    ns.futex_steal_shared(id).map(Err).or(Some(Ok(0u32)))
+                                    // emulator watchdog.
+                                    // r777: repair only when the word actually
+                                    // holds something.  A NON-zero word is a
+                                    // ps-mutex with a dead holder (holder TID
+                                    // in the low bits) or a pending post whose
+                                    // wake was lost - steal the word and wake
+                                    // this ONE waiter (the fake acquire bypasses
+                                    // the guest's mutual exclusion, so
+                                    // mass-releasing every contender of a word
+                                    // corrupts the very data the lock protects;
+                                    // see design.md r773).  A ZERO word is one
+                                    // of the decoded OSAL sync-pool parks
+                                    // (SpmEvEnd, `%08X_LICENSE_TO_KILL`, AE
+                                    // dispatch slots, docs r776): the token has
+                                    // simply not been posted yet.  Waking there
+                                    // fabricates a futex success glibc and
+                                    // WaiSyncObj reject on their value
+                                    // re-check anyway (the waiter only re-parks,
+                                    // so the repair is pure churn), and the
+                                    // steal would deregister the waiter from
+                                    // the shared registry until the next
+                                    // 20 s re-arm - losing a real wake that
+                                    // races with it.  Leave such waiters
+                                    // registered and re-arm the window: the
+                                    // design-faithful sleep until a peer posts.
+                                    let parked = ns
+                                        .futex_peek_shared(id)
+                                        .map(|uaddr| {
+                                            let mut b = [0u8; 4];
+                                            unicorn
+                                                .mem_read(uaddr as u64, &mut b)
+                                                .map(|_| u32::from_le_bytes(b) == 0)
+                                                .unwrap_or(false)
+                                        })
+                                        .unwrap_or(false);
+                                    if parked {
+                                        drop(ns);
+                                        rearm_shared_watchdog(&threads, tid);
+                                        None
+                                    } else {
+                                        ns.futex_steal_shared(id).map(Err).or(Some(Ok(0u32)))
+                                    }
                                 } else {
                                     ns.futex_remove_shared(id);
                                     Some(Ok(-110i32 as u32)) // -ETIMEDOUT
@@ -641,6 +669,31 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
             }
             BlockReason::SignalWait { .. } => {
                 crate::os::syscalls::signal::finish_signal_wait(unicorn, tid, now);
+            }
+        }
+    }
+
+    /// r777: extend the synthetic 20 s watchdog window of a shared-futex waiter
+    /// that sits on a still-zero OSAL pool semaphore (a designed park): the
+    /// waiter stays registered in the shared registry (peer wakes keep working)
+    /// and simply gets a fresh window instead of a fabricated success.
+    fn rearm_shared_watchdog(
+        threads: &std::sync::Arc<std::sync::Mutex<Vec<GuestThread>>>,
+        tid: u32,
+    ) {
+        const WINDOW: Duration = Duration::from_secs(20);
+        let mut guard = threads.lock().unwrap();
+        if let Some(thread) = guard.iter_mut().find(|t| t.id == tid) {
+            if let ThreadStatus::Blocked(BlockReason::FutexWaitShared {
+                deadline,
+                watchdog: true,
+                ..
+            }) = &mut thread.status
+            {
+                *deadline = Some(crate::emulator::vtime::deadline(WINDOW));
+                log::debug!(
+                    "[{tid}] shared-futex watchdog: park word still empty, re-arming"
+                );
             }
         }
     }

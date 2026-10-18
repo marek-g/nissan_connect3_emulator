@@ -953,22 +953,50 @@ word+0x18 (SEM_LOCK 0x195c8, SYNC_LOCK 0x10a1ec, EV__LOCK 0x1cc, TSK_LOCK
   r773 note "wake-with-success lets two processes enter the same critical
   section" is therefore wrong for these words - r773's broadcast-regression
   story stays true, but the AE race cannot be watchdog-driven.
-- AE crash re-framed: in run_semtrk2 the crash `[78] 0x35952a READ_UNMAPPED`
-  happened ~13 s AFTER the channel burst and ~17 s BEFORE the first repair
-  of any channel word.  0x35952a is Thumb, PROCNAV: inside
-  `bpstl::less<unsigned short>::operator()` (`ldrh r2,[r2]`) called from
-  `scd_tclServiceAppMap` tree search - the Rb_tree itself contains a
-  garbage node pointer, and the crashed thread [78] is a PROCNAV TSE worker
-  fed by OSAL queue messages (monitor-yield svc 0x2d0564), not by pool sems.
-  Corruption source is the tree's WRITE path (SCD answer ingestion), not the
-  lock protocol.  Frequency: 0/6 golden runs, 1/2 semtrack runs (traps shift
-  timing) - still intermittent, root cause = next milestone task: trace what
-  writes ServiceAppMap entries (the SCD administration/SPM answer ingestion)
-  and which answer is malformed or half-delivered in the emulator.
-- Genuine remaining producer gap (unchanged core of r773's last bullet): the
-  `dap_tclDapiApp` (APPID 7) / lbsm bring-up answer path - after 8 dispatch
-  rounds DAPI's producer thread [36] stops feeding the AE workers, i.e. the
+- AE crash RESOLVED as the OLD benign guest bug: the run_semtrk2 fault
+  `[78] 0x35952a READ_UNMAPPED` (LR 0x34e4e9, R2 garbage node ptr) is the
+  exact fix52 fingerprint already documented above ("PROCNAV thread [77]:
+  SXM/AGW service-discovery thread exits with code 1 and faults unwinding"):
+  the service-discovery thread exits code 1 when its SXM/AGW directory query
+  misses (the emulated registry has no PROCSXM service tree), and the guest's
+  own exit-unwind then walks a garbage Rb_tree node once.  Confirmed in
+  run_semtrk2: `[78] thread exited with code 1` immediately precedes the
+  fault, and WDB opened `SXM_SMS_AGW\...` keys just before.  Benign, no
+  navigation impact, NOT watchdog-driven and NOT ServiceAppMap write-path
+  corruption - r773's "two AE workers race" model is hereby retired (the
+  `probe-less-u16` constant already recorded tid 76 faulting there during
+  channel-factory init in an earlier era, same story).
+- Genuine remaining producer gap (narrowed, unchanged core of r773's last
+  bullet): the `dap_tclDapiApp` (APPID 7) / lbsm bring-up answer path - the
   SPM/administration answer exchange (DpSemSrvIf sem, Dp00000001 event) ends
-  incomplete.  Until it completes, LICENSE_TO_KILL tokens never arrive (the
-  env thread parks without its tokens - harmless) and PROCNAV's ServiceAppMap
-  stays half-populated (the AE crash candidate).
+  incomplete, so the LICENSE_TO_KILL tokens never arrive.  All decoded
+  waiters simply park (which is their designed steady state until shutdown),
+  so nothing observable depends on it today; it stays listed as emulation
+  surface completeness (shutdown-path fidelity), not as a milestone-2
+  blocker.  r777 removed the watchdog's incentive to touch those words.
+
+## r777 - shared-futex watchdog repairs only real tokens; pool parks sleep in peace
+- Policy (scheduler.rs watchdog branch): when the synthetic 20 s window of a
+  `watchdog: true` shared-futex wait expires, first PEEK the word
+  (`SystemNamespace::futex_peek_shared`, added).  NON-zero word -> unchanged
+  dead-owner repair: steal + consume one token + wake exactly this one waiter
+  (ps-mutex with dead holder, or pending post whose wake was lost).  ZERO
+  word -> the waiter sits on an OSAL pool semaphore whose post has simply not
+  been produced yet (decoded parks of r776): re-arm the window
+  (`rearm_shared_watchdog`) and leave the waiter REGISTERED in the shared
+  registry.  Benefits: (a) no fabricated futex successes - glibc/WaiSyncObj
+  rejected them on their value re-check anyway, so guests now behave exactly
+  like the device (sleep until a real post); (b) the steal path no longer
+  deregisters park waiters for the repair round-trip, closing a window where
+  a real peer `FUTEX_WAKE` racing the watchdog could be lost; (c) a real
+  shutdown post to `SpmEvEnd`/`LICENSE_TO_KILL` can never be consumed/
+  destroyed by a watchdog tick again.
+- Verified: 80 s smoke run - zero `repaired word` lines (were ~3/cycle), zero
+  errors; 175 s golden run - render-kick burst at t=157.7 s, map publishes up
+  to n=11 with nonblack=384000, delivered frame is the top-down road network
+  ((23,23,23) roads over (204,206,217) bg, 2-color palette), milestone-2
+  intact.
+- Kept as-is on purpose: the AE dispatch channel words (slots 136-138) also
+  fall into the zero-word re-arm now; a genuinely lost wake there self-heals
+  as soon as the producer posts the next message (FUTEX_WAKE path), which is
+  again the device behavior.

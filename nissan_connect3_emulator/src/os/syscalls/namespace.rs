@@ -108,6 +108,13 @@ impl SystemNamespace {
         Some(waiter.uaddr)
     }
 
+    /// r777: peek the owner VA of a registered shared-futex wait without
+    /// deregistering it - the watchdog inspects the word before deciding
+    /// whether the waiter may be touched at all.
+    pub fn futex_peek_shared(&self, id: usize) -> Option<u32> {
+        self.futex_slab.get(&id).map(|waiter| waiter.uaddr)
+    }
+
     /// Signal up to `val` pending waiters of a shared futex word. Returns how
     /// many were marked; the caller rings the process doorbells (via
     /// `notify_waiters`) so the owners reap them.
