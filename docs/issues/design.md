@@ -3068,3 +3068,19 @@ NAV*.DAT re-open (fix288/289: no re-open even at 240 s, zero map pixels),
 while the one-waiter repair (fix291) re-opens at +88 s and renders real
 map pixels (shots291/map_pub_0003..0011).  Keep repairs single-waiter and
 keep the pending-post consumption (word 1 -> 0 instead of word := 0).
+
+## r777 - the watchdog fabricates nothing: zero-word shared-futex waits re-arm
+r773's invariant (repair exactly ONE waiter, never broadcast) stays, but r776
+showed every word the 20 s watchdog kept "repairing" is actually a decoded
+park or an idle request channel, and a wake on a still-ZERO word fabricates a
+futex success that glibc `sem_wait`/`WaiSyncObj` reject on their value
+re-check - the guest just re-parks, so the repair was churn that also briefly
+deregistered the waiter from the shared wake registry.  New design: peek the
+word first (SystemNamespace::futex_peek_shared); non-zero keeps the
+single-waiter consume-and-wake repair (dead-holder mutex / lost wake), zero
+only re-arms the window and leaves the registration intact.  The shutdown
+tokens (SpmEvEnd, %08X_LICENSE_TO_KILL) can therefore never be eaten by a
+watchdog tick, and park waiters behave exactly like on the device: asleep
+until a peer really posts.  (Choosing per-word whitelists of addresses was
+rejected - slot ids depend on creation order; the word value itself is the
+robust signal.)
