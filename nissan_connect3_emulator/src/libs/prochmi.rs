@@ -186,6 +186,39 @@ fn gui_startup_anim_enabled() -> bool {
 static GUI_UTIL_MSGBOX_QUEUE: AtomicU32 = AtomicU32::new(0);
 static GUI_ENGINE_ADDRESS: AtomicU32 = AtomicU32::new(0);
 static TOUCH_EVENTS_DELIVERED: AtomicU32 = AtomicU32::new(0);
+static TOUCH_POST_DUMP: AtomicU32 = AtomicU32::new(0);
+// GUI_GL_OpenGL::drawImage entry counter (page-hook in install_lib hooks):
+// the paint funnel of the HMI; a page switch that paints widgets moves this.
+pub(crate) static DRAW_IMAGE_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+// GUI_Widget::vDraw entry counter (see r779 page hook): widget paint passes.
+static VDRAW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// HMI glDrawArrays volume across the switch + a delayed second sample:
+// a page that creates widgets but draws nothing shows a flat draw rate.
+static TOUCH_DRAW_SNAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TOUCH_DI_SNAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TOUCH_POST_COUNTDOWN: AtomicU32 = AtomicU32::new(0);
+// r779 page-switch paint pump: after a view-create the freshly built widget
+// tree never enters the damage/composite pass (idle stays 2 background
+// paints/frame).  Milestone-1 proved the working recipe is vInvalidate over
+// each view's draw context (ctx->[0x14](1)) + one internal-event dispatcher
+// nudge + forced present; run it a beat after the view switches, one guest
+// call per mainloop iteration through guest_call_via_lr.
+static VIEW_PAINT_STATE: AtomicU32 = AtomicU32::new(0);
+static VIEW_PAINT_CD: AtomicU32 = AtomicU32::new(0);
+static VIEW_PAINT_I: AtomicU32 = AtomicU32::new(0);
+static VIEW_PAINT_FNS: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+static VIEW_PAINT_CTXS: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
 // `guest_call_via_lr` clobbers r0-r3/lr and, via `sp_slack`, r13: a touch
 // call returning onto the bGUIMainloop trap site re-enters its handler with
 // those entry values gone.  r1-r3/r12 must come back too - bGUIMainloop's
@@ -3288,12 +3321,27 @@ crate::os::code_stub::trap_site(unicorn, state_do_transition, crate::os::code_st
         let page = base_address + 0x0137_1000u32 - ORIGINAL_BASE;
         let do_t = base_address + GUI_STATEMACHINE_DO_TRANSITION;
         let perf_t = base_address + GUI_STATEMACHINE_PERFORM_TRANSITION;
+        // r779: decision points inside vPerformTransition for the post-click
+        // autopsies: which gate (from/to path, LCA, [sm+0x18] byte, dynamic
+        // stack) aborts a pending transition.  Armed whenever performTransition
+        // runs with pending != 0 on that same sm.
+        let dec_points: [(u32, &'static str); 7] = [
+            (base_address + 0x0137_152cu32 - ORIGINAL_BASE, "from-path"),
+            (base_address + 0x0137_1544u32 - ORIGINAL_BASE, "to-path"),
+            (base_address + 0x0137_15a8u32 - ORIGINAL_BASE, "lca"),
+            (base_address + 0x0137_1674u32 - ORIGINAL_BASE, "lca-check"),
+            (base_address + 0x0137_170cu32 - ORIGINAL_BASE, "flag18"),
+            (base_address + 0x0137_1724u32 - ORIGINAL_BASE, "dynstack-empty"),
+            (base_address + 0x0137_177cu32 - ORIGINAL_BASE, "dynsm-active"),
+        ];
         let res = unicorn.add_code_hook(
             page as u64,
             (page + 0xfff) as u64,
             move |uc: &mut Unicorn<'_, Context>, address, _size| {
                 let addr = address as u32;
                 let sm = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                static DEC_SM: AtomicU32 = AtomicU32::new(0);
+                static DEC_WIN: AtomicU32 = AtomicU32::new(0);
                 if addr == do_t {
                     let transition =
                         uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
@@ -3363,10 +3411,154 @@ crate::os::code_stub::trap_site(unicorn, state_do_transition, crate::os::code_st
                     } else {
                         0
                     };
+                    if nav_trace_enabled() {
+                        if transition != 0 {
+                            DEC_SM.store(sm, Ordering::Relaxed);
+                            DEC_WIN.store(3, Ordering::Relaxed);
+                        } else if DEC_WIN.load(Ordering::Relaxed) > 0
+                            && sm == DEC_SM.load(Ordering::Relaxed)
+                        {
+                            DEC_WIN.fetch_sub(1, Ordering::Relaxed);
+                        }
+                    }
+                    if transition != 0 {
+                        // Which state machine is stuck: dump its header
+                        // (vtable + candidate name/descriptor pointers) once
+                        // per pending pointer so the strings resolve offline.
+                        static STUCK: AtomicU32 = AtomicU32::new(0);
+                        if STUCK.fetch_add(1, Ordering::Relaxed) < 40 {
+                            let words: Vec<u32> =
+                                (0..12u32).map(|i| read_u32(uc, sm + i * 4)).collect();
+                            // Record layout (GUI_StateMachine::vPerformTransition):
+                            // +4 flags, +8 from-state id (>>16), +0xc low = to-state
+                            // id, +0xc >>16 = trigger kind (5/9 = silent cancel).
+                            let rec4 = read_u32(uc, transition + 4);
+                            let rec8 = read_u32(uc, transition + 8);
+                            let recc = read_u32(uc, transition + 0xc);
+                            // Resolve the from/to state names the way
+                            // vPerformTransition does: global state table
+                            // ([iRam05973d70] + id*4) then the state's owner
+                            // object ([iRam05972a30] + family*4); its word
+                            // pointing at rodata holds the trace name.
+                            // State table load as done by vPerformTransition
+                            // (ARM, GOT base fp = 0x2a12818): table =
+                            // [*[*0x2a14178] + 4], owner array = *0x2a13300,
+                            // owner = owners[[state+8 >> 28]].
+                            let got_table = read_u32(
+                                uc,
+                                PROCHMI_BASE.load(Ordering::Relaxed) + 0x02a1_4178u32 - ORIGINAL_BASE,
+                            );
+                            let g_table = read_u32(uc, read_u32(uc, got_table) + 4);
+                            let owners_base = read_u32(
+                                uc,
+                                PROCHMI_BASE.load(Ordering::Relaxed) + 0x02a1_3300u32 - ORIGINAL_BASE,
+                            );
+                            let gsm = 0u32;
+                            let _ = gsm;
+                            let mut names = [String::new(), String::new()];
+                            for (slot, id) in [
+                                (0usize, (rec8 >> 16) as usize),
+                                (1usize, (recc & 0xffff) as usize),
+                            ] {
+                                let st = read_u32(uc, g_table + (id as u32) * 4);
+                                if st == 0 {
+                                    names[slot] = "NULL".into();
+                                    continue;
+                                }
+                                let family = (read_u32(uc, st + 8) >> 28) as usize;
+                                let owner = read_u32(uc, owners_base + (family as u32) * 4);
+                                let mut found = String::new();
+                                for src in [st, owner] {
+                                    if src == 0 || !found.is_empty() {
+                                        continue;
+                                    }
+                                    for w in 0..24u32 {
+                                        let s = read_sm_name(uc, read_u32(uc, src + w * 4));
+                                        if !s.is_empty() {
+                                            found = s;
+                                            break;
+                                        }
+                                    }
+                                }
+                                // Simulate bGetStatePath: parent chain via
+                                // state+0xc until NULL; failure iff the chain
+                                // tops at a state whose vtable+0x10 returns 3.
+                                let mut chain = Vec::new();
+                                let mut cur = st;
+                                while cur != 0 && chain.len() < 30 {
+                                    chain.push(cur);
+                                    cur = read_u32(uc, cur + 0xc);
+                                }
+                                let root = *chain.last().unwrap_or(&0);
+                                let root_vt = if root != 0 { read_u32(uc, root) } else { 0 };
+                                let root_typefn =
+                                    if root_vt != 0 { read_u32(uc, root_vt + 0x10) } else { 0 };
+                                names[slot] = format!(
+                                    "st{st:#x} f{family}/{found} d{} root={root:#x} rt10={root_typefn:#x}",
+                                    chain.len()
+                                );
+                            }
+                            let n98 = read_u32(uc, sm + 0x98);
+                            let n118 = read_u32(uc, sm + 0x118);
+                            log::warn!(
+                                "PROCHMI SM-PAGE stuck t={}ms sm={sm:#x} pending={transition:#x} from={:#x}=>{} to={:#x}=>{} trig={:#x} n98={n98:#x} n118={n118:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                rec8 >> 16,
+                                names[0],
+                                recc & 0xffff,
+                                names[1],
+                                (recc >> 16) & 0xff,
+                            );
+                            for (i, w) in words.iter().enumerate() {
+                                let s = read_sm_name(uc, *w);
+                                if !s.is_empty() {
+                                    log::warn!("PROCHMI SM-PAGE stuck sm+{:#x} -> \"{s}\"", i * 4);
+                                }
+                            }
+                        }
+                    }
                     log::warn!(
                         "PROCHMI SM-PAGE performTransition t={}ms sm={sm:#x} pending={transition:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                     );
+                } else if nav_trace_enabled() {
+                    for (dec_addr, dec_name) in dec_points.iter() {
+                        if addr != *dec_addr {
+                            continue;
+                        }
+                        let sm7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                        if DEC_WIN.load(Ordering::Relaxed) > 0
+                            && sm7 == DEC_SM.load(Ordering::Relaxed)
+                        {
+                            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                            let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                            let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                            let r9 = uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32;
+                            let n98 = read_u32(uc, sm7 + 0x98).min(20);
+                            let n118 = read_u32(uc, sm7 + 0x118).min(20);
+                            let a1 = read_u32(uc, sm7 + 0x94);
+                            let a2 = read_u32(uc, sm7 + 0x114);
+                            let ids = |arr: u32, cnt: u32| -> Vec<u32> {
+                                (0..=cnt)
+                                    .map(|i| {
+                                        let st = read_u32(uc, arr + i * 4);
+                                        if st == 0 {
+                                            0xffff
+                                        } else {
+                                            read_u16(uc, st + GUI_STATE_STATE_ID) as u32
+                                        }
+                                    })
+                                    .collect()
+                            };
+                            log::warn!(
+                                "PROCHMI SM-DEC {dec_name} t={} sm={sm7:#x} r0={r0:#x} r3={r3:#x} r4={r4:#x} r9={r9:#x} p1={:?} p2={:?}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                ids(a1, n98),
+                                ids(a2, n118),
+                            );
+                        }
+                        break;
+                    }
                 } else {
                     static OTHERS: AtomicU32 = AtomicU32::new(0);
                     let n = OTHERS.fetch_add(1, Ordering::Relaxed);
@@ -3673,6 +3865,73 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         }
     }
 
+    // r778: GUI_Messaging::vFireInternalEvent - which internal GUI message
+    // (id/type words) does a widget click put on the bus, and who is the
+    // receiver?  Trace-only probe to attribute page-switch chains.
+    {
+        let address = base_address + 0x0136_5868u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:msg-fire", move |uc: &mut Unicorn<'_, Context>| {
+            if !nav_trace_enabled() {
+                return 0;
+            }
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 300 {
+                return 0;
+            }
+            let msg = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let receiver = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let w0 = read_u32(uc, msg);
+            let w1 = read_u32(uc, msg + 4);
+            let w2 = read_u32(uc, msg + 8);
+            log::warn!(
+                "PROCHMI msg-fire t={}ms msg={msg:#x} w=[{w0:#x},{w1:#x},{w2:#x}] receiver={receiver:#x} lr={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                read_u32(uc, (uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32).wrapping_sub(8)),
+            );
+            0
+        });
+    }
+
+    // r779: GUI_Widget::vDraw (0x137af7c) - the per-view render-block entry
+    // the PU fix266 triple calls for a repaint.  Counting it tells whether
+    // DisplayManager::update() ran a widget paint pass for the new page at
+    // all (startup: hundreds; after a menu switch without the gate open: 0).
+    {
+        let want = base_address + 0x0137_af7cu32 - ORIGINAL_BASE;
+        let page = want & !0xfff;
+        let res = unicorn.add_code_hook(
+            page as u64,
+            (page + 0xfff) as u64,
+            move |_uc: &mut Unicorn<'_, Context>, address, _size| {
+                if address as u32 == want {
+                    VDRAW_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+        );
+        log::info!("PROCHMI vDraw page-hook 0x{page:x} installed: {}", res.is_ok());
+    }
+
+    // r779: GUI_GL_OpenGL::drawImage (0x1345a18) is the real HMI painter: the
+    // idle screen is 2 mixLayers quads/frame, and a widget paint pass shows
+    // up as a burst on this counter.  Page-range hook (dead-trap quirk),
+    // counter only.
+    {
+        let want = base_address + 0x0134_5a18u32 - ORIGINAL_BASE;
+        let page = want & !0xfff;
+        let res = unicorn.add_code_hook(
+            page as u64,
+            (page + 0xfff) as u64,
+            move |_uc: &mut Unicorn<'_, Context>, address, _size| {
+                if address as u32 != want {
+                    return;
+                }
+                DRAW_IMAGE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+        );
+        log::info!("PROCHMI drawImage page-hook 0x{page:x} installed: {}", res.is_ok());
+    }
+
+
     // r767: which code creates/destroys the popup's view (cid 1)?  With the
     // mm singleton decoded (current view = mm+0x18, previous = mm+0x10) the
     // fix240 vPerformViewChange crash proved view 1 was ALREADY destroyed
@@ -3692,6 +3951,25 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     let l = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
                     if c != 0 && l == base_address + 0x0136_474cu32 - ORIGINAL_BASE {
                         SM_HIDE_MAIN_CID.store(c, Ordering::Relaxed);
+                    }
+                    // r778: a fresh view (page switch, e.g. Menu click ->
+                    // menu view cid) has a brand-new draw context that the
+                    // engine only dirties through paths that stay dead in
+                    // the emulator; re-arm the (capped) forced dirty pass so
+                    // the new view actually renders instead of staying an
+                    // invisible widget tree.
+                    HMI_VIEW_DIRTY_FORCE_COUNT.store(0, Ordering::Relaxed);
+                    // r779: schedule the page-switch paint pump a beat later
+                    // (widget creation continues after this entry returns).
+                    // Only for real main-page switches: invalidating during
+                    // the popup/startup phase (cid<=1, t<15 s) corrupts the
+                    // live widget dispatch (A/B r779: click chain died).
+                    if std::env::var_os("EMU_NO_VIEW_PAINT").is_none()
+                        && c > 1
+                        && crate::libs::dapi::emu_t0_elapsed_ms() > 15_000
+                    {
+                        VIEW_PAINT_CD.store(30, Ordering::Relaxed);
+                        VIEW_PAINT_STATE.store(1, Ordering::Relaxed);
                     }
                 }
                 if !nav_trace_enabled() {
@@ -5823,6 +6101,161 @@ fn force_display_manager_dirty(unicorn: &mut Unicorn<'_, Context>, base_address:
 /// `forced` branches, which already arm their own guest call.
 fn drain_gui_touch_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
     inject_scripted_touch_test();
+    if TOUCH_POST_DUMP.swap(0, Ordering::Relaxed) == 1 {
+        let base = PROCHMI_BASE.load(Ordering::Relaxed);
+        let slot = read_u32(unicorn, base + GOT_GUI_MENU_MANAGER_INSTANCE);
+        let mm = read_u32(unicorn, slot);
+        let mut line = format!("PROCHMI touch-post-dump slot={slot:#x} mm={mm:#x}");
+        for slot in 0..4u32 {
+            let obj = if mm != 0 { read_u32(unicorn, mm + slot * 4) } else { 0 };
+            let vt = if obj != 0 { read_u32(unicorn, obj) } else { 0 };
+            line.push_str(&format!(" s{slot}={obj:#x}/vt{vt:#x}"));
+        }
+        let total = crate::gpu::hmi_draw_calls();
+        let snap = TOUCH_DRAW_SNAP.load(Ordering::Relaxed);
+        let di = DRAW_IMAGE_CALLS.load(Ordering::Relaxed);
+        let di_snap = TOUCH_DI_SNAP.load(Ordering::Relaxed);
+        line.push_str(&format!(
+            " draws={total} d_release={} paint={} d_paint={} vdraw={}",
+            total - snap,
+            di,
+            di - di_snap,
+            VDRAW_CALLS.load(Ordering::Relaxed),
+        ));
+        TOUCH_POST_COUNTDOWN.store(120, Ordering::Relaxed);
+        TOUCH_DRAW_SNAP.store(total, Ordering::Relaxed);
+        TOUCH_DI_SNAP.store(di, Ordering::Relaxed);
+        log::warn!("{line}");
+    } else if TOUCH_POST_COUNTDOWN.load(Ordering::Relaxed) > 0 {
+        let left = TOUCH_POST_COUNTDOWN.fetch_sub(1, Ordering::Relaxed);
+        if left == 1 {
+            let total = crate::gpu::hmi_draw_calls();
+            let di = DRAW_IMAGE_CALLS.load(Ordering::Relaxed);
+            log::warn!(
+                "PROCHMI touch-draw-rate total={} delta_120_iters={} paint={} d_paint_120={}",
+                total,
+                total - TOUCH_DRAW_SNAP.load(Ordering::Relaxed),
+                di,
+                di - TOUCH_DI_SNAP.load(Ordering::Relaxed),
+            );
+        }
+    }
+    // Page-switch paint pump (see VIEW_PAINT_STATE).  One step per mainloop
+    // iteration; never blocks.
+    match VIEW_PAINT_STATE.load(Ordering::Relaxed) {
+        0 => {}
+        1 => {
+            if VIEW_PAINT_CD.fetch_sub(1, Ordering::Relaxed) <= 1 {
+                // Collect invalidation targets: every live menu-manager slot
+                // view's draw context vtable slot +0x14 (GUI_GUIAPI__vInvalidate).
+                let base = PROCHMI_BASE.load(Ordering::Relaxed);
+                let slot = read_u32(unicorn, base + GOT_GUI_MENU_MANAGER_INSTANCE);
+                let mm = read_u32(unicorn, slot);
+                let mut n = 0u32;
+                for i in 0..4u32 {
+                    let obj = if mm != 0 { read_u32(unicorn, mm + i * 4) } else { 0 };
+                    let view = if obj != 0 { read_u32(unicorn, obj + 0x28) } else { 0 };
+                    let ctx = if view != 0 { read_u32(unicorn, view + 0x40) } else { 0 };
+                    let vt = if ctx != 0 { read_u32(unicorn, ctx) } else { 0 };
+                    let f = if vt != 0 { read_u32(unicorn, vt + 0x14) } else { 0 };
+                    if f >= base && f < base + 0x0286_0000u32 - ORIGINAL_BASE {
+                        VIEW_PAINT_FNS[n as usize].store(f, Ordering::Relaxed);
+                        VIEW_PAINT_CTXS[n as usize].store(ctx, Ordering::Relaxed);
+                        n += 1;
+                    }
+                }
+                VIEW_PAINT_I.store(0, Ordering::Relaxed);
+                VIEW_PAINT_CD.store(n, Ordering::Relaxed);
+                VIEW_PAINT_STATE.store(if n == 0 { 3 } else { 2 }, Ordering::Relaxed);
+                log::warn!(
+                    "PROCHMI view-paint: collected {n} invalidate targets t={}ms",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                );
+            }
+        }
+        2 => {
+            let i = VIEW_PAINT_I.load(Ordering::Relaxed) as usize;
+            let f = VIEW_PAINT_FNS[i].load(Ordering::Relaxed);
+            let ctx = VIEW_PAINT_CTXS[i].load(Ordering::Relaxed);
+            if f != 0 {
+                // Same register-wrap contract as the touch injection: the
+                // callee returns onto this trap site and the entry state is
+                // restored by the TOUCH_RETURN_PENDING branch in site 606.
+                for (index, register) in [
+                    RegisterARM::R0,
+                    RegisterARM::R1,
+                    RegisterARM::R2,
+                    RegisterARM::R3,
+                    RegisterARM::R12,
+                    RegisterARM::R13,
+                    RegisterARM::R14,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    TOUCH_RETURN_REGS[index].store(
+                        unicorn.reg_read(register).unwrap_or(0) as u32,
+                        Ordering::Relaxed,
+                    );
+                }
+                TOUCH_RETURN_PENDING.store(1, Ordering::Relaxed);
+                let ok = guest_call_via_lr(unicorn, resume_pc, f, [ctx, 1, 0, 0], 64);
+                if !ok {
+                    TOUCH_RETURN_PENDING.store(0, Ordering::Relaxed);
+                }
+                log::warn!(
+                    "PROCHMI view-paint: invalidated ctx={ctx:#x} fn={f:#x} {}/{} ok={ok} t={}ms",
+                    i + 1,
+                    VIEW_PAINT_CD.load(Ordering::Relaxed),
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                );
+            }
+            let next = i as u32 + 1;
+            if next >= VIEW_PAINT_CD.load(Ordering::Relaxed) {
+                VIEW_PAINT_STATE.store(3, Ordering::Relaxed);
+            } else {
+                VIEW_PAINT_I.store(next, Ordering::Relaxed);
+            }
+        }
+        _ => {
+            // r779: un-block the render pass first.  update() skips the
+            // per-view draw block while GUI_DM_EAManager::isBlocked(view)
+            // returns true; with the live EA record ([ea+0x124]) its state
+            // word (+8) is stuck at 0, while the code path treats 2
+            // ("shown") as pass-through (r779 diagnosis: w=[3,4,0,0,1,0]
+            // returns 1 only because [eaw+8]!=2).  This is EA lifecycle data
+            // the head-unit receives from the media stack - faked device
+            // state, same class as the forced app-state/display gates; the
+            // drawing itself stays entirely the engine's.
+            let dm_slot = read_u32(
+                unicorn,
+                PROCHMI_BASE.load(Ordering::Relaxed) + GOT_GUI_DM_DISPLAY_MANAGER_SINGLETON,
+            );
+            let dm = read_u32(unicorn, dm_slot);
+            let ea = if dm != 0 { read_u32(unicorn, dm) } else { 0 };
+            let eaw = if ea != 0 { read_u32(unicorn, ea + 0x124) } else { 0 };
+            if eaw != 0 && read_u32(unicorn, eaw + 8) != 2 {
+                let _ = unicorn.mem_write((eaw + 8) as u64, &2u32.to_le_bytes());
+                log::warn!(
+                    "PROCHMI view-paint: forced EA record {eaw:#x} state->2 t={}ms",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                );
+            }
+            // Dispatcher nudge + forced present (milestone-1 r768 recipe).
+            let messaging = GUI_MESSAGING_POINTER.load(Ordering::Relaxed);
+            if messaging != 0 {
+                let q = read_u32(unicorn, messaging + 4);
+                if post_gui_message_queue(unicorn, q, messaging, 0x8f) {
+                    log::warn!(
+                        "PROCHMI view-paint: posted dispatcher kick 0x8f t={}ms",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                    );
+                }
+            }
+            crate::gpu::request_forced_present();
+            VIEW_PAINT_STATE.store(0, Ordering::Relaxed);
+        }
+    }
     if GUI_ENGINE_ADDRESS.load(Ordering::Relaxed) == 0 {
         // Widget engine (and with it the GUI_TouchPad timers) not up yet.
         return;
@@ -5871,6 +6304,15 @@ fn drain_gui_touch_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
         TOUCH_RETURN_PENDING.store(0, Ordering::Relaxed);
     }
     let seen = TOUCH_EVENTS_DELIVERED.fetch_add(1, Ordering::Relaxed);
+    if event.kind == crate::input::TouchKind::Release && delivered {
+        // The page switch runs inside the vReleased call: dump the live
+        // menu-manager slots (the r760 dirty walk's objects, with vtables so
+        // the classes resolve in Ghidra) on the next drain entry, i.e. after
+        // the switch completed.
+        TOUCH_DRAW_SNAP.store(crate::gpu::hmi_draw_calls(), Ordering::Relaxed);
+        TOUCH_DI_SNAP.store(DRAW_IMAGE_CALLS.load(Ordering::Relaxed), Ordering::Relaxed);
+        TOUCH_POST_DUMP.store(1, Ordering::Relaxed);
+    }
     if delivered {
         if seen < 40 || seen % 200 == 0 {
             log::info!(
@@ -5934,6 +6376,30 @@ fn inject_scripted_touch_test() {
     );
 }
 
+/// Best-effort: if `ptr` points into prochmi's rodata and starts a printable
+/// ASCII string, return it (SM/record name resolution for diagnostics).
+fn read_sm_name(unicorn: &mut Unicorn<'_, Context>, ptr: u32) -> String {
+    let base = PROCHMI_BASE.load(Ordering::Relaxed);
+    if base == 0 || ptr < base + 0x0200_0000u32 - ORIGINAL_BASE || ptr > base + 0x0400_0000u32 {
+        return String::new();
+    }
+    let mut out = Vec::new();
+    for i in 0..48u32 {
+        let b = read_u8(unicorn, ptr + i);
+        if b == 0 {
+            break;
+        }
+        if !(0x20..0x7f).contains(&b) {
+            return String::new();
+        }
+        out.push(b);
+    }
+    if out.len() < 3 {
+        return String::new();
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn force_hmi_mainloop_display_update(unicorn: &mut Unicorn<'_, Context>) {
     let base = PROCHMI_BASE.load(Ordering::Relaxed);
     if base == 0 {
@@ -5969,6 +6435,13 @@ fn force_hmi_view_draw_regions(unicorn: &mut Unicorn<'_, Context>) {
         let widget = read_u32(unicorn, menu_manager + index * 4);
         let view = read_u32(unicorn, widget + 0x28);
         let draw_context = read_u32(unicorn, view + 0x40);
+        if nav_trace_enabled() && HMI_VIEW_DIRTY_FORCE_COUNT.load(Ordering::Relaxed) % 40 == 0 {
+            log::warn!(
+                "PROCHMI dirty-walk index={index} mm={menu_manager:#x} widget={widget:#x} view={view:#x} ctx={draw_context:#x} ctx28={:#x} ctxb8={:#x}",
+                if draw_context != 0 { read_u8(unicorn, draw_context + 0x28) } else { 0xff },
+                if draw_context != 0 { read_u32(unicorn, draw_context + 0xb8) } else { 0 },
+            );
+        }
         if widget != 0 && view != 0 && draw_context != 0 {
             let _ = write_u8(unicorn, draw_context + 0x28, 0);
             if read_u32(unicorn, draw_context + 0xb8) == 0 {
@@ -6125,6 +6598,38 @@ fn install_gl_layer_copy_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_ad
                 if name == "GUI_DM_EAManager::updateEAShow" {
                     LSYNC_EA_MANAGER.store(uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32, Ordering::Relaxed);
                     LSYNC_EA_ENTRY.store(uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32, Ordering::Relaxed);
+                }
+                if name == "GUI_DM_EAManager::isBlocked" {
+                    // Reaching this observer already means isViewDirty(view)
+                    // was TRUE (update() calls isBlocked only then): the hit
+                    // rate IS the dirty-view rate.  Dump the decision inputs
+                    // (r779 page-switch render-gate diagnosis, capped).
+                    static HITS: AtomicU32 = AtomicU32::new(0);
+                    static LATE: AtomicU32 = AtomicU32::new(0);
+                    let h = HITS.fetch_add(1, Ordering::Relaxed);
+                    let t_ms = crate::libs::dapi::emu_t0_elapsed_ms();
+                    let late = t_ms > 59_500 && t_ms < 66_000;
+                    let late_n = if late { LATE.fetch_add(1, Ordering::Relaxed) } else { 999 };
+                    if h < 8 || late_n < 24 {
+                        let ea = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                        let view = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                        let eaw = read_u32(uc, ea + 0x124);
+                        let ctx = read_u32(uc, view + 0x40);
+                        let vt = if ctx != 0 { read_u32(uc, ctx) } else { 0 };
+                        log::warn!(
+                            "PROCHMI isBlocked#{h} t={}ms ea={ea:#x} view={view:#x} eaw={eaw:#x} w=[{},{},{},{},{},{}] ctx={ctx:#x} vt={vt:#x} s0={:#x} s8={:#x} s10={:#x}",
+                            t_ms,
+                            if eaw != 0 { read_u8(uc, eaw + 0x34) } else { 0xff },
+                            if eaw != 0 { read_u32(uc, eaw + 0x24) } else { 0 },
+                            if eaw != 0 { read_u32(uc, eaw + 8) } else { 0 },
+                            if eaw != 0 { read_u32(uc, eaw + 0x1c) } else { 0 },
+                            if eaw != 0 { read_u32(uc, eaw + 0x20) } else { 0 },
+                            if eaw != 0 { read_u8(uc, eaw + 0x2c) } else { 0xff },
+                            if vt != 0 { read_u32(uc, vt) } else { 0 },
+                            if vt != 0 { read_u32(uc, vt + 8) } else { 0 },
+                            if vt != 0 { read_u32(uc, vt + 0x10) } else { 0 },
+                        );
+                    }
                 }
                 if name == "GUI_GL_OpenGL::mixLayers"
                     && LSYNC_MAP_STAGE.load(Ordering::Relaxed) == 99

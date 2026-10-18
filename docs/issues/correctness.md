@@ -1000,3 +1000,43 @@ word+0x18 (SEM_LOCK 0x195c8, SYNC_LOCK 0x10a1ec, EV__LOCK 0x1cc, TSK_LOCK
   fall into the zero-word re-arm now; a genuinely lost wake there self-heals
   as soon as the producer posts the next message (FUTEX_WAKE path), which is
   again the device behavior.
+
+## r779 - page switches render: GUI_DM_EAManager::isBlocked gate un-faked
+- Symptom (milestone 3): a Menu tap (67,335) ran the whole engine chain
+  (event 0x95 -> SM transition 0x133->0x11b -> bDestroyView(247)/
+  pCreateView(229) -> Lua CreateWidgetInstance), the new view landed in the
+  menu-manager slot with the SAME live draw context - but zero widgets
+  painted: idle stayed at exactly 2 glDrawArrays/frame (mixLayers quads),
+  window pixels after the tap identical.
+- Dead ends (measured, probes removed again): bGetStatePath and the LCA /
+  [sm+0x18] / dynamic-stack gates all PASS for the menu transition (SM-DEC
+  page probe); GUI_GL_OpenGL::drawImageTriangle and
+  GUI_GL_OpenGLContext::drawBitmapTriangles never execute - HMI draws come
+  from GUI_GL_OpenGL::drawImage (widget pass) driven by
+  GUI_GL_OpenGL::mixLayers callers inside GUI_DM_DisplayManager::update()
+  (the stale LR 0x1345638 at the libGLESv2 stubs misled for a while).
+- Root cause (update() decompile, 0x133d99c): the per-view render block runs
+  only when isViewDirty(view) AND GUI_DM_EAManager::isBlocked(view) == 0.
+  The live EA record ([ea+0x124] = ea+0xc embedded head) carries state word
+  +8 == 0 while the branch treats 2 ("shown") as pass-through, so isBlocked
+  returns 1 forever once the radio-card EA exists - after that, NO view ever
+  repaints (the visible screen is the last rasterized layer texture, which
+  is why boot paints fine and every later page switch stays invisible).
+- Fix (page-switch paint pump, libs/prochmi.rs VIEW_PAINT_*): on every main
+  view-create (cid>1, t>15 s - the startup/popup phase must stay untouched,
+  A/B proved early invalidation kills the click chain), a beat later the
+  pump (a) calls GUI_GL_OpenGLContext::invalidateAll on each live slot view's
+  draw context ([[slot]+0x28]+0x40, vtable+0x14, guest_call_via_lr with the
+  TOUCH_RETURN register wrap), (b) writes the EA record state -> 2 (faked
+  media-stack lifecycle data, same sanctioned class as the forced app-state
+  gates; all drawing itself stays the engine's), (c) posts the 0x8f internal
+  dispatcher nudge + request_forced_present (r768 recipe).  Opt out with
+  EMU_NO_VIEW_PAINT.
+- Verified: tap at t=60 s -> full MAP OPTIONS page paints (65% window pixel
+  change, icons+labels real), d_paint_120 jumps 240 -> 1454 (drawImage) and
+  glDrawArrays 240 -> 8066; 30 s no-tap run stays clean (pump never arms at
+  boot, milestone-1 popup hide intact).
+- Kept probes (bounded): touch-post-dump + touch-draw-rate counters
+  (HMI_DRAW_CALLS, DRAW_IMAGE_CALLS via drawImage page hook, VDRAW_CALLS),
+  isBlocked observer late-window dump; nav_trace-only SM-DEC/SM-PAGE and
+  viewfac probes document the click->transition->view chain.

@@ -1737,6 +1737,13 @@ static WINDOW_SIZE_LOGS: AtomicU32 = AtomicU32::new(0);
 static WINDOW_RESIZE_EVENT_LOGS: AtomicU32 = AtomicU32::new(0);
 static MOUSE_EVENT_LOGS: AtomicU32 = AtomicU32::new(0);
 static MOUSE_UP_LOGS: AtomicU32 = AtomicU32::new(0);
+/// Guest `glDrawArrays` calls issued against the HMI target (ever).  Lets a
+/// touch probe ask "did the page switch add draw volume?".
+static HMI_DRAW_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn hmi_draw_calls() -> u64 {
+    HMI_DRAW_CALLS.load(Ordering::Relaxed)
+}
 static WINDOW_BLITS: AtomicU32 = AtomicU32::new(0);
 
 // Reproduce a user resize without anyone at the keyboard: `EMU_GPU_TEST_RESIZE`
@@ -4431,6 +4438,14 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
             let mode = ureg(unicorn, RegisterARM::R0);
             let first = ureg(unicorn, RegisterARM::R1) as i32;
             let count = ureg(unicorn, RegisterARM::R2) as i32;
+            if current_gpu_target() == GpuTarget::Hmi {
+                HMI_DRAW_CALLS.fetch_add(1, Ordering::Relaxed);
+                // r779 attribution (measured here, probes since removed):
+                // the LR at these stub entries is STALE, the real painters
+                // are GUI_GL_OpenGL::drawImage (widget pass, see the
+                // DRAW_IMAGE_CALLS counter in libs/prochmi.rs) and mixLayers
+                // composites (idle floor = 2 quads/frame).
+            }
             if current_gpu_target() == GpuTarget::Map
                 && std::env::var_os("EMU_NO_ENGINE_DRAW").is_some()
             {
