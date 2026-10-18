@@ -4144,7 +4144,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 let t_ms = crate::libs::dapi::emu_t0_elapsed_ms();
                 if t_ms >= w0 && t_ms <= w1 {
                     let n = TRI_N.fetch_add(1, Ordering::Relaxed);
-                    if n < 24 {
+                    if n < 400 {
                         let tex = _uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                         let rect = _uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
                         let pos = _uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;

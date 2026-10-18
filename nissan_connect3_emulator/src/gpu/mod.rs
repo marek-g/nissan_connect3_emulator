@@ -1707,8 +1707,7 @@ fn composite_hmi_over_map(backend: &mut Backend, reload_hmi: bool) {
     let count = HMI_COMPOSITE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if count < 20 {
         log::info!(
-            "GPU: HMI composite frame={} enabled={} opaque={} transparent={} mixed={} outside={} map_first_px={}",
-            count,
+            "GPU: HMI composite frame={} enabled={} opaque={} transparent={} mixed={} outside={} map_first_px={}",            count,
             enabled,
             opaque_count,
             transparent_count,
@@ -1726,6 +1725,37 @@ fn composite_hmi_over_map(backend: &mut Backend, reload_hmi: bool) {
                 "<empty>".to_string()
             },
         );
+    }
+    // r781 forensics (MAP SCROLL black body): EMU_MAP_STATS="a:b" (ms) keeps
+    // reporting the alpha mix every ~30 composited frames inside that window,
+    // so an opaque-black page layer (opaque rising, transparent falling) is
+    // distinguishable from a lost map-layer window or a stale map readback.
+    {
+        static WIN: std::sync::OnceLock<(u128, u128)> = std::sync::OnceLock::new();
+        let (w0, w1) = *WIN.get_or_init(|| match std::env::var("EMU_MAP_STATS") {
+            Ok(s) => {
+                let mut it = s.split(':').filter_map(|p| p.parse().ok());
+                (it.next().unwrap_or(0), it.next().unwrap_or(u128::MAX))
+            }
+            Err(_) => (u128::MAX, 0),
+        });
+        let t_ms = crate::libs::dapi::emu_t0_elapsed_ms();
+        if t_ms >= w0 && t_ms <= w1 && count % 30 == 0 {
+            log::warn!(
+                "GPU: map-stats t={t_ms}ms f={count} enabled={enabled} rect=({lx},{ly},{lw}x{lh}) opaque={opaque_count} transparent={transparent_count} mixed={mixed_count} outside={outside_count} map0={}",
+                if backend.map_pixels.len() >= 4 {
+                    format!(
+                        "({},{},{},{})",
+                        backend.map_pixels[0],
+                        backend.map_pixels[1],
+                        backend.map_pixels[2],
+                        backend.map_pixels[3]
+                    )
+                } else {
+                    "<empty>".to_string()
+                },
+            );
+        }
     }
 }
 

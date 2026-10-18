@@ -1112,3 +1112,26 @@ word+0x18 (SEM_LOCK 0x195c8, SYNC_LOCK 0x10a1ec, EV__LOCK 0x1cc, TSK_LOCK
   Next defect to work: touch routing to the map engine (procmapengine
   input path via OSAL queue/registry - investigate its PortControl/
   message loop).
+
+## r782 - MAP SCROLL composites the live map fullscreen; defect = engine paint latency
+- Decisive 235 s run (6 s dumps, scripted tap 165 s): tap at 165 s -> MAP
+  SCROLL opens; engine paint burst arrives at ~194 s; the following dump is
+  the page fully correct: fullscreen land polygons + title bar + 50m scale.
+  So the page DOES composite the live map (HMI publishes the MAP_View1 layer
+  fullscreen - "map layer window published enabled=true rect=(0,0,800,480)" -
+  and the CPU compositor honours it).  All earlier "black body" observations
+  were made on runs whose first engine paint had not happened yet (burst
+  timing is data-driven and varies: 118 s / 194 s / never within 160 s).
+- Two r781 claims RETRACTED: (1) the 163 s "dead tap" - the window-dump
+  thread is capped at 40 dumps, so nothing after that time was ever captured;
+  scripted taps after the paint DO dispatch and open the page.  (2) the
+  implied "touch must route to the engine for the page to open" - the HMI
+  opens MAP SCROLL itself on the background-pane click.
+- REMAINING DEFECT (renamed): first engine paint takes 2-3+ minutes (DAPI
+  map-data query chain), and the engine paints only in rare bursts (9
+  multi-draws then silence).  On the unit the engine repaints every frame.
+  Consequences: fresh runs show a black map area for minutes; panning the
+  map (touch -> engine) is still not wired, so a pan cannot force a repaint.
+  Next work: shorten time-to-first-paint (investigate the DAPI tile-query
+  pacing) and/or keep the map surface republished on every burst (already
+  sticky - the FBO persists), then touch-to-engine routing for pan/zoom.
