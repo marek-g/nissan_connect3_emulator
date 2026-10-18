@@ -1,5 +1,6 @@
 use crate::emulator::context::Context;
 use sdl2::event::Event;
+use sdl2::mouse::MouseButton;
 use sdl2::video::Window;
 use sdl2::{sys, EventPump};
 use std::cell::{Cell, RefCell};
@@ -417,6 +418,9 @@ struct Backend {
     composite_pos_loc: i32,
     current_target: Option<GpuTarget>,
     events: Option<EventPump>,
+    /// Left button currently held in the SDL window = finger down (only then
+    /// mouse motion is a drag; hover motion is not a touch-panel event).
+    touch_dragging: bool,
 }
 
 fn gpu_backend_visible() -> bool {
@@ -590,7 +594,7 @@ fn publish_map_surface_pixels(pixels: &[u8]) {
 
 /// r728: read the SDL window's default framebuffer on the compositor
 /// context (right after `blit_hmi_pixels_to_window` painted the composed
-/// HMI-over-map frame) and dump it as PPM to `EMU_MAP_DUMP_DIR`, every
+/// HMI-over-map frame) and dump it as PPM to `EMU_MAP_DUMP_DIR`, evR`, every
 /// 20th frame for the first 400 swaps.
 fn dump_window_pixels(backend: &mut Backend) {
     let Ok(dir) = std::env::var("EMU_MAP_DUMP_DIR") else {
@@ -1004,7 +1008,22 @@ fn init_backend() -> Result<Backend, String> {
         composite_pos_loc,
         current_target: Some(GpuTarget::Hmi),
         events,
+        touch_dragging: false,
     })
+}
+
+/// Map SDL window (point) coordinates onto the 800x480 panel the window
+/// presents.  A 0-sized window (hidden/headless) passes the raw position
+/// through clamped to the panel.
+fn window_to_panel(window_raw: *mut sys::SDL_Window, x: i32, y: i32) -> (u16, u16) {
+    let (mut win_w, mut win_h) = (0, 0);
+    unsafe { sys::SDL_GetWindowSize(window_raw, &mut win_w, &mut win_h) };
+    if win_w <= 0 || win_h <= 0 {
+        return crate::input::clamp_panel(x, y);
+    }
+    let px = (x as i64 * crate::input::PANEL_WIDTH as i64 / win_w as i64) as i32;
+    let py = (y as i64 * crate::input::PANEL_HEIGHT as i64 / win_h as i64) as i32;
+    crate::input::clamp_panel(px, py)
 }
 
 fn poll_events(backend: &mut Backend) -> bool {
@@ -1016,6 +1035,38 @@ fn poll_events(backend: &mut Backend) -> bool {
         match event {
             Event::Quit { .. } => {
                 std::process::exit(0);
+            }
+            Event::MouseButtonDown { mouse_btn, x, y, .. } => {
+                // Left button = finger touch.  The window shows the 800x480
+                // panel, possibly upscaled; report panel coordinates.
+                let hits = MOUSE_EVENT_LOGS.fetch_add(1, Ordering::Relaxed);
+                if hits < 20 {
+                    log::info!("GPU: SDL mouse button press {mouse_btn:?} at ({x},{y})");
+                }
+                if mouse_btn == MouseButton::Left {
+                    backend.touch_dragging = true;
+                    let (x, y) = window_to_panel(backend.window_raw, x, y);
+                    crate::input::push_touch(crate::input::TouchKind::Press, x, y);
+                }
+            }
+            Event::MouseButtonUp { mouse_btn, x, y, .. } => {
+                let hits = MOUSE_UP_LOGS.fetch_add(1, Ordering::Relaxed);
+                if hits < 20 {
+                    log::info!("GPU: SDL mouse button release {mouse_btn:?} at ({x},{y})");
+                }
+                if mouse_btn == MouseButton::Left {
+                    backend.touch_dragging = false;
+                    let (x, y) = window_to_panel(backend.window_raw, x, y);
+                    crate::input::push_touch(crate::input::TouchKind::Release, x, y);
+                }
+            }
+            Event::MouseMotion { x, y, .. } => {
+                // Only a held left button is a finger drag; hover motion is
+                // nothing on a touch panel (and would flood the queue).
+                if backend.touch_dragging {
+                    let (x, y) = window_to_panel(backend.window_raw, x, y);
+                    crate::input::push_touch(crate::input::TouchKind::Motion, x, y);
+                }
             }
             Event::Window { win_event, .. } => {
                 if let sdl2::event::WindowEvent::Resized(width, height) = win_event {
@@ -1684,6 +1735,8 @@ fn composite_hmi_over_map(backend: &mut Backend, reload_hmi: bool) {
 static WINDOW_SIZE_SIGNATURE: AtomicU64 = AtomicU64::new(u64::MAX);
 static WINDOW_SIZE_LOGS: AtomicU32 = AtomicU32::new(0);
 static WINDOW_RESIZE_EVENT_LOGS: AtomicU32 = AtomicU32::new(0);
+static MOUSE_EVENT_LOGS: AtomicU32 = AtomicU32::new(0);
+static MOUSE_UP_LOGS: AtomicU32 = AtomicU32::new(0);
 static WINDOW_BLITS: AtomicU32 = AtomicU32::new(0);
 
 // Reproduce a user resize without anyone at the keyboard: `EMU_GPU_TEST_RESIZE`

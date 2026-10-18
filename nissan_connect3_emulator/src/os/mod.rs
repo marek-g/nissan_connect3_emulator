@@ -73,8 +73,62 @@ fn install_memory_watch(unicorn: &mut Unicorn<'_, Context>) {
     }
 }
 
+/// `EMU_MEMPROT_TRACE=1`: log the exact address/pc of any protection-violating
+/// access before the scheduler tears the thread down.  The blanket-range
+/// MEM_*_PROT hooks in `emulator::thread::add_mem_fault_hooks` are documented
+/// as never matching; this observer registers an explicit full address-space
+/// range and only ever runs on a violation (zero cost otherwise).  It returns
+/// false, i.e. behavior stays identical, just with the fault address logged.
+fn install_memprot_trace(unicorn: &mut Unicorn<'_, Context>) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use unicorn_engine::unicorn_const::HookType;
+    use unicorn_engine::RegisterARM;
+
+    static INSTALLED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    static HITS: AtomicU32 = AtomicU32::new(0);
+    if std::env::var("EMU_MEMPROT_TRACE").is_err() {
+        return;
+    }
+    let elf_path = unicorn.get_data().elf_path.clone();
+    {
+        let mut seen = INSTALLED.lock().unwrap();
+        if !seen.insert(elf_path.clone()) {
+            return;
+        }
+    }
+    for hook_type in [
+        HookType::MEM_WRITE_PROT,
+        HookType::MEM_READ_PROT,
+        HookType::MEM_FETCH_PROT,
+    ] {
+        let result = unicorn.add_mem_hook(hook_type, 0, u64::MAX, move |uc, memtype, address, size, value| {
+            if HITS.fetch_add(1, Ordering::Relaxed) < 40 {
+                log::error!(
+                    "MEMPROT [{}] {} {:?} write? addr={:#x} size={} value={:#x} pc={:#x} lr={:#x} sp={:#x}",
+                    uc.get_data().inner.thread_id(),
+                    uc.get_data().elf_path,
+                    memtype,
+                    address,
+                    size,
+                    value,
+                    uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                    uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32,
+                );
+            }
+            false
+        });
+        if let Err(err) = result {
+            log::warn!("MEMPROT: failed to register {hook_type:?} observer: {err}");
+        }
+    }
+    log::info!("MEMPROT: full-range protection-violation observer installed for {elf_path}");
+}
+
 pub fn add_library_hook(unicorn: &mut Unicorn<'_, Context>, library: &str, base_address: u32) {
     install_memory_watch(unicorn);
+    install_memprot_trace(unicorn);
     // Code hooks change guest behavior (stubbed bodies are skipped), so they
     // are enabled by default and can be turned off with EMU_CODE_HOOKS_DISABLED=1.
     if std::env::var("EMU_CODE_HOOKS_DISABLED")

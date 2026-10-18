@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 mod common;
 mod emulator;
 mod gpu;
+mod input;
 mod libs;
 mod os;
 mod rtos;

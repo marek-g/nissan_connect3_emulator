@@ -96,6 +96,15 @@ const GUI_DM_DISPLAY_MANAGER_UPDATE: u32 = 0x0133_d99c - ORIGINAL_BASE;
 const GUI_DISPLAY_MANAGER_THREAD: u32 = 0x0133_be70 - ORIGINAL_BASE;
 const GUI_MAINLOOP_TRACE_START: u32 = 0x0133_be70 - ORIGINAL_BASE;
 const GUI_MAINLOOP_TRACE_END: u32 = 0x0133_c07c - ORIGINAL_BASE;
+// Exported widget-engine touch entry points (GUI_TouchPad_vPressed/vMoved/
+// vReleased, both u16 args): the exact functions
+// clHSI_CMKeyboard::bExecuteMessage drives from real touch-controller
+// samples (sMsg+0x08/+0x0c).  Their timers are created by
+// GUI_TouchPad_vInit (bl 0x136e5d4 from the widget-engine init), which runs
+// during normal startup, so calling them once the GUI engine exists is safe.
+const TOUCH_PAD_V_PRESSED: u32 = 0x0136_e418 - ORIGINAL_BASE;
+const TOUCH_PAD_V_MOVED: u32 = 0x0136_e328 - ORIGINAL_BASE;
+const TOUCH_PAD_V_RELEASED: u32 = 0x0136_e278 - ORIGINAL_BASE;
 const GUI_GL_CONTEXT_INITIALIZE: u32 = 0x0134_8b04 - ORIGINAL_BASE;
 const CL_LUA_DEBUGGER_S_INITIALIZE: u32 = 0x0133_ae10 - ORIGINAL_BASE;
 const GUI_DISPLAY_WIDTH: u32 = 800;
@@ -176,6 +185,21 @@ fn gui_startup_anim_enabled() -> bool {
 }
 static GUI_UTIL_MSGBOX_QUEUE: AtomicU32 = AtomicU32::new(0);
 static GUI_ENGINE_ADDRESS: AtomicU32 = AtomicU32::new(0);
+static TOUCH_EVENTS_DELIVERED: AtomicU32 = AtomicU32::new(0);
+// `guest_call_via_lr` clobbers r0-r3/lr and, via `sp_slack`, r13: a touch
+// call returning onto the bGUIMainloop trap site re-enters its handler with
+// those entry values gone.  r1-r3/r12 must come back too - bGUIMainloop's
+// prologue spills them and later code (fault at 0x133bf04) reloads them.
+static TOUCH_RETURN_PENDING: AtomicU32 = AtomicU32::new(0);
+static TOUCH_RETURN_REGS: [AtomicU32; 7] = [
+    AtomicU32::new(0), // r0
+    AtomicU32::new(0), // r1
+    AtomicU32::new(0), // r2
+    AtomicU32::new(0), // r3
+    AtomicU32::new(0), // r12
+    AtomicU32::new(0), // r13
+    AtomicU32::new(0), // r14
+];
 static HMI_EVENT_OBJECT: AtomicU32 = AtomicU32::new(0);
 static HMI_MAIN_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static HMI_GUI_FORCE_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -856,6 +880,25 @@ crate::os::code_stub::trap_site(unicorn, lua_prepare_call, crate::os::code_stub:
     let gui_mainloop = base_address + CL_GUI_MAINLOOP;
     crate::os::code_stub::trap_site(unicorn, gui_mainloop, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:606", move |uc: &mut Unicorn<'_, Context>| {
             let address = gui_mainloop;
+            // A `drain_gui_touch_event` guest call just returned here: put
+            // back the entry register state before anything reads it again.
+            if TOUCH_RETURN_PENDING.swap(0, Ordering::Relaxed) == 1 {
+                for (index, register) in [
+                    RegisterARM::R0,
+                    RegisterARM::R1,
+                    RegisterARM::R2,
+                    RegisterARM::R3,
+                    RegisterARM::R12,
+                    RegisterARM::R13,
+                    RegisterARM::R14,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let saved = TOUCH_RETURN_REGS[index].load(Ordering::Relaxed);
+                    let _ = uc.reg_write(register, saved as u64);
+                }
+            }
             // r751: merged with the old same-address narrow hook
             // (`GUI_DM_DisplayManager thread entry`): legacy hooks stacked,
             // trap sites do not, so the thread-entry logic runs here after
@@ -907,6 +950,7 @@ crate::os::code_stub::trap_site(unicorn, lua_prepare_call, crate::os::code_stub:
                 gui,
                 mode
             );
+            drain_gui_touch_event(uc, address);
             }
             force_hmi_mainloop_display_update(uc);
             0
@@ -5767,6 +5811,128 @@ fn force_display_manager_dirty(unicorn: &mut Unicorn<'_, Context>, base_address:
 }
 
 
+
+/// Host mouse -> guest touch: pop at most one pending panel event and drive
+/// the guest's own `GUI_TouchPad_v*` entry points, the same functions the
+/// device's `clHSI_CMKeyboard::bExecuteMessage` calls for touch-controller
+/// samples.  Runs on the GUI mainloop thread at `bGUIMainloop` entry via
+/// `guest_call_via_lr` (the stub-based `call_guest_function` mis-executes its
+/// synthetic return on current Unicorn - fix144..155), so the callee returns
+/// straight onto this same trap site; `TOUCH_RETURN_PENDING` below restores
+/// the entry r0/lr that the call clobbered.  Deliberately skipped on the
+/// `forced` branches, which already arm their own guest call.
+fn drain_gui_touch_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
+    inject_scripted_touch_test();
+    if GUI_ENGINE_ADDRESS.load(Ordering::Relaxed) == 0 {
+        // Widget engine (and with it the GUI_TouchPad timers) not up yet.
+        return;
+    }
+    let Some(event) = crate::input::pop_touch() else {
+        return;
+    };
+    let base = PROCHMI_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    let (offset, name) = match event.kind {
+        crate::input::TouchKind::Press => (TOUCH_PAD_V_PRESSED, "vPressed"),
+        crate::input::TouchKind::Motion => (TOUCH_PAD_V_MOVED, "vMoved"),
+        crate::input::TouchKind::Release => (TOUCH_PAD_V_RELEASED, "vReleased"),
+    };
+    // `guest_call_via_lr` overwrites r0-r3/lr (and r13 via the slack):
+    // remember the mainloop's entry values and restore them when the callee
+    // returns onto this trap site.
+    for (index, register) in [
+        RegisterARM::R0,
+        RegisterARM::R1,
+        RegisterARM::R2,
+        RegisterARM::R3,
+        RegisterARM::R12,
+        RegisterARM::R13,
+        RegisterARM::R14,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        TOUCH_RETURN_REGS[index].store(
+            unicorn.reg_read(register).unwrap_or(0) as u32,
+            Ordering::Relaxed,
+        );
+    }
+    TOUCH_RETURN_PENDING.store(1, Ordering::Relaxed);
+    let delivered = guest_call_via_lr(
+        unicorn,
+        resume_pc,
+        base + offset,
+        [event.x as u32, event.y as u32, 0, 0],
+        64,
+    );
+    if !delivered {
+        TOUCH_RETURN_PENDING.store(0, Ordering::Relaxed);
+    }
+    let seen = TOUCH_EVENTS_DELIVERED.fetch_add(1, Ordering::Relaxed);
+    if delivered {
+        if seen < 40 || seen % 200 == 0 {
+            log::info!(
+                "PROCHMI: touch #{seen} {name} ({},{}) t={}ms",
+                event.x,
+                event.y,
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+            );
+        }
+    } else if seen < 40 {
+        log::warn!(
+            "PROCHMI: touch {name} ({},{}) guest call refused",
+            event.x,
+            event.y
+        );
+    }
+}
+
+/// Headless verification path (`EMU_TOUCH_TEST="168:400:240,172:100:60"`):
+/// scripted taps at wall-t seconds after emulator t0, injected through the
+/// very same queue the SDL producer feeds, so the guest-side delivery path is
+/// identical with and without a display.  Each tap is a Press+Release pair
+/// consumed on two consecutive mainloop iterations (~35 ms apart).
+fn inject_scripted_touch_test() {
+    static SPEC: std::sync::OnceLock<Vec<(u64, u16, u16)>> = std::sync::OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        std::env::var("EMU_TOUCH_TEST")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|entry| {
+                let parts: Vec<&str> = entry.trim().split(':').collect();
+                if parts.len() != 3 {
+                    return None;
+                }
+                let secs = parts[0].trim().parse::<f64>().ok()?;
+                let x = parts[1].trim().parse::<i32>().ok()?;
+                let y = parts[2].trim().parse::<i32>().ok()?;
+                let (x, y) = crate::input::clamp_panel(x, y);
+                Some(((secs * 1000.0) as u64, x, y))
+            })
+            .collect()
+    });
+    if spec.is_empty() {
+        return;
+    }
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let index = NEXT.load(std::sync::atomic::Ordering::Relaxed);
+    if index >= spec.len() {
+        return;
+    }
+    let (due_ms, x, y) = spec[index];
+    let now = crate::libs::dapi::emu_t0_elapsed_ms() as u64;
+    if now < due_ms {
+        return;
+    }
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::input::push_touch(crate::input::TouchKind::Press, x, y);
+    crate::input::push_touch(crate::input::TouchKind::Release, x, y);
+    log::info!(
+        "PROCHMI: touch-test tap #{index} scheduled ({x},{y}) at {due_ms}ms (now {now}ms)"
+    );
+}
 
 fn force_hmi_mainloop_display_update(unicorn: &mut Unicorn<'_, Context>) {
     let base = PROCHMI_BASE.load(Ordering::Relaxed);
