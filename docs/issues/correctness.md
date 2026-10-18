@@ -908,3 +908,9 @@ Findings (runs fix278..fix287, semtrack + EMU_WATCH forensics):
   yet (2 flat colors); roads/labels blocks still not harvested; engine
   power-on demo camera still writes its 65deg-tilted literals (lr 0x4d7518)
   once, corrected by the next nudge within 700 ms.
+- r775b follow-up (run_fix298): with the top-down elevation the delivered
+  frames now show the real ROAD network over Krakow (dark road strips, ring
+  + radials) - the grazing-camera geometry had been shrinking the harvested
+  MO classes; the landcover-only look of fix297 was the usual harvest-lottery
+  variance, not a regression.  Styling is still the untextured 2-color
+  palette (no labels/textures yet).

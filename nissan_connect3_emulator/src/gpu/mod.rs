@@ -607,25 +607,7 @@ fn dump_window_pixels(backend: &mut Backend) {
     };
     static DUMP_CALLS: AtomicU32 = AtomicU32::new(0);
     let c = DUMP_CALLS.fetch_add(1, Ordering::Relaxed);
-    if c % 100 == 0 || c < 3 {
-        static START: std::sync::LazyLock<std::time::Instant> =
-            std::sync::LazyLock::new(std::time::Instant::now);
-        let now = std::time::Instant::now();
-        let delta: i64 = if due {
-            now.checked_duration_since(*WINDOW_NEXT.lock().unwrap()).map(|d| d.as_secs() as i64)
-                .unwrap_or(0)
-        } else {
-            -(WINDOW_NEXT.lock().unwrap().checked_duration_since(now).map(|d| d.as_secs() as i64)
-                .unwrap_or(0))
-        };
-        log::info!(
-            "GPU: TEMP dump_window_pixels call={} due={} t_rel={}s next_in={}s",
-            c,
-            due,
-            (now - *START).as_secs(),
-            delta
-        );
-    }
+    let _ = c;
     if !due {
         return;
     }
@@ -1459,16 +1441,6 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
             unsafe {
                 gl::Finish();
             }
-            static HMI_SWAPS: AtomicU32 = AtomicU32::new(0);
-            let n = HMI_SWAPS.fetch_add(1, Ordering::Relaxed);
-            if n % 200 == 0 || n < 3 {
-                log::info!(
-                    "GPU: TEMP backend hmi-swap n={} hmi_fbo={} visible={}",
-                    n,
-                    backend.hmi_framebuffer,
-                    gpu_backend_visible()
-                );
-            }
             probe_layer_alphas(backend);
             gpu_resource_telemetry();
             if backend.hmi_framebuffer != 0 {
@@ -1537,36 +1509,6 @@ fn handle_surface_swap(backend: &mut Backend, target: GpuTarget) {
                 backend.map_pixels.copy_from_slice(&fresh);
             }
             publish_map_surface_pixels(&backend.map_pixels);
-            // TEMP r750: classify what the pinned published map pixels hold
-            // at publish time (the map_pub PPM files proved orange).
-            {
-                static PUB_TEL: AtomicU32 = AtomicU32::new(0);
-                let tel = PUB_TEL.fetch_add(1, Ordering::Relaxed);
-                if tel % 3 == 0 {
-                    let (mut orange, mut bg, mut other) = (0u32, 0u32, 0u32);
-                    for px in backend.map_pixels.chunks_exact(4) {
-                        let (r, g, b) = (px[0], px[1], px[2]);
-                        if r.abs_diff(217) < 24 && g.abs_diff(140) < 24 && b < 60 {
-                            orange += 1;
-                        } else if r.abs_diff(204) < 8
-                            && g.abs_diff(206) < 8
-                            && b.abs_diff(217) < 8
-                        {
-                            bg += 1;
-                        } else {
-                            other += 1;
-                        }
-                    }
-                    log::info!(
-                        "GPU: TEMP publish tel n={} flat={} pinned orange={} bg={} other={}",
-                        tel,
-                        flat,
-                        orange,
-                        bg,
-                        other
-                    );
-                }
-            }
             // r750: DPU-style rescan. The guest HMI compositor can freeze
             // (its AIL tick threads park at t~56 s while the map engine
             // keeps publishing frames); on the unit the LCD still shows the
@@ -1708,47 +1650,6 @@ fn composite_hmi_over_map(backend: &mut Backend, reload_hmi: bool) {
                 "GPU: HMI layer has {} transparent pixels but no map layer is enabled (window {:#x})",
                 transparent_count,
                 MAP_LAYER_SIGNATURE.load(Ordering::Relaxed)
-            );
-        }
-    }
-    // TEMP r750: the window keeps showing a flat background even though the
-    // pinned map content provably carries road pixels - classify every
-    // composited pixel by source so the loss point is pinned down.
-    {
-        static COMP_TEL: AtomicU32 = AtomicU32::new(0);
-        let tel = COMP_TEL.fetch_add(1, Ordering::Relaxed);
-        if tel % 10 == 0 {
-            let mut orange = 0u32;
-            let mut bg = 0u32;
-            let mut dark = 0u32;
-            let mut black = 0u32;
-            let mut other = 0u32;
-            for px in backend.hmi_pixels.chunks_exact(4) {
-                let (r, g, b) = (px[0], px[1], px[2]);
-                if r.abs_diff(217) < 24 && g.abs_diff(140) < 24 && b < 60 {
-                    orange += 1;
-                } else if r.abs_diff(204) < 8 && g.abs_diff(206) < 8 && b.abs_diff(217) < 8 {
-                    bg += 1;
-                } else if (r | g | b) < 8 {
-                    black += 1;
-                } else if r < 64 && g < 64 && b < 64 {
-                    dark += 1;
-                } else {
-                    other += 1;
-                }
-            }
-            log::info!(
-                "GPU: TEMP composite tel n={} orange={} bg={} dark={} black={} other={} alpha(opaque={} trans={} mixed={} outside={})",
-                tel,
-                orange,
-                bg,
-                dark,
-                black,
-                other,
-                opaque_count,
-                transparent_count,
-                mixed_count,
-                outside_count
             );
         }
     }
@@ -3181,57 +3082,6 @@ fn route_uniform_matrix(unicorn: &mut Unicorn<'_, Context>, components: usize) -
 /// and `u_matViewProj` (loc 1) exactly as the synth shader does, and logs the
 /// resulting clip-space vertices.  Tells whether the draws land outside the
 /// clip volume (rasteriser drops them silently, no GL error).
-/// TEMP r750: read a row back from the framebuffer bound *right now* (the one
-/// the just-finished map draw targeted) and log its non-background pixels
-/// with the gating GL state, to tell rasterisation failure apart from a wrong
-/// readback target at swap time.
-unsafe fn temp_map_draw_readback(tag: &str, program: i32, forced: bool) {
-    static RB_LOGS: AtomicU32 = AtomicU32::new(0);
-    if RB_LOGS.fetch_add(1, Ordering::Relaxed) >= 12 {
-        return;
-    }
-    let mut row = vec![0u8; 800 * 4];
-    gl::ReadPixels(
-        0,
-        235,
-        800,
-        1,
-        gl::RGBA,
-        gl::UNSIGNED_BYTE,
-        row.as_mut_ptr() as *mut _,
-    );
-    let mut nonbg = 0usize;
-    let mut first_px = [0u8; 4];
-    for px in row.chunks_exact(4) {
-        let bg = (px[0] == 204 && px[1] == 206 && px[2] == 217)
-            || (px[0] == 255 && px[1] == 255 && px[2] == 255)
-            || (px[0] | px[1] | px[2]) < 8;
-        if !bg {
-            if nonbg == 0 {
-                first_px = [px[0], px[1], px[2], px[3]];
-            }
-            nonbg += 1;
-        }
-    }
-    let mut fb = 0i32;
-    gl::GetIntegerv(gl::FRAMEBUFFER_BINDING, &mut fb);
-    let mut depth = 0i32;
-    gl::GetIntegerv(gl::DEPTH_TEST, &mut depth);
-    let mut scissor = 0i32;
-    gl::GetIntegerv(gl::SCISSOR_TEST, &mut scissor);
-    let mut blend = 0i32;
-    gl::GetIntegerv(gl::BLEND, &mut blend);
-    let mut cmask = [0i32; 4];
-    gl::GetIntegerv(gl::COLOR_WRITEMASK, cmask.as_mut_ptr());
-    let mut vp = [0i32; 4];
-    gl::GetIntegerv(gl::VIEWPORT, vp.as_mut_ptr());
-    let mut lw = 0f32;
-    gl::GetFloatv(gl::LINE_WIDTH, &mut lw);
-    log::info!(
-        "GPU: TEMP road readback[{tag}] program={program} forced={forced} fbo={fb} row235 nonbg={nonbg} first={first_px:?} depth={depth} scissor={scissor} blend={blend} cmask={cmask:?} viewport={vp:?} lw={lw:.3}",
-    );
-}
-
 unsafe fn probe_map_draw_vertices(mode: u32, first: i32, count: i32) {
     static PROBES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     // Probe a whole frame's worth of draws: the first draws of a frame belong
@@ -4602,9 +4452,6 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
                             );
                         }
                     }
-                    if count >= 1000 {
-                        temp_map_draw_readback("single", program, forced);
-                    }
                 })
             } else {
                 gpu_void_v3(gl::DrawArrays, mode, first, count)
@@ -5213,7 +5060,6 @@ fn gl_backend_api_inner(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Optio
                         gl::DrawArrays(mode as u32, first, count);
                     }
                     drain_host_gl_errors();
-                    temp_map_draw_readback("multi", program, forced);
                 });
                 if drew {
                     note_real_gl_output(unicorn, "draw");
