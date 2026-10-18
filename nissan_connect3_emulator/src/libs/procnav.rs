@@ -2128,7 +2128,30 @@ fn spawn_renfi_camera_driver(unicorn: &mut Unicorn<'_, Context>) {
                 // per 40 s) continues.
                 let deadline = std::time::Instant::now()
                     + crate::emulator::vtime::host_interval(std::time::Duration::from_millis(
-                        40_000,
+                        // r783: adaptive cadence.  The 40 s window (r651) exists
+                        // so a wire block-load round gets quiet to drain; once
+                        // local blocks have settled for 10 s a re-arm hits the
+                        // "Rect matches -> idle" short-circuit (r611) instead of
+                        // restarting a round, so only the MOUpd state-2 lottery
+                        // tickets are being issued - tighten to the proven
+                        // 10 s cadence (r611/r612) until the copy-to-active
+                        // lands.  After copy-done the pure-kick
+                        // render loop self-sustains, relax back to 40 s.
+                        if crate::libs::procmapengine::MAP_MO_COPY_DONE
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            40_000
+                        } else {
+                            let last_load = crate::libs::procmapengine::MAP_LAST_BLOCK_LOAD_MS
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            let quiet_ms = crate::libs::dapi::emu_t0_elapsed_ms()
+                                .saturating_sub(last_load as u128);
+                            if last_load != 0 && quiet_ms >= 10_000 {
+                                10_000
+                            } else {
+                                40_000
+                            }
+                        },
                     ));
                 loop {
                     let now = std::time::Instant::now();

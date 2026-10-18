@@ -1135,3 +1135,39 @@ word+0x18 (SEM_LOCK 0x195c8, SYNC_LOCK 0x10a1ec, EV__LOCK 0x1cc, TSK_LOCK
   Next work: shorten time-to-first-paint (investigate the DAPI tile-query
   pacing) and/or keep the map surface republished on every burst (already
   sticky - the FBO persists), then touch-to-engine routing for pan/zoom.
+
+## r783 - time-to-first-map-paint: adaptive renfi cadence + post-copy render wake
+- Latency forensics (235 s run, host-ts buckets): the whole request chain
+  IS alive from t=15 s - CCA requests, DAPI answers, navdata reads and 14
+  AddNewRawDataBlocks all happen within the first 60 s.  What fails to
+  happen is the MOUpd state-2 capture: every early MOUpd job executes while
+  the request machine churns (job-lag lottery, cf. r646/r651), so
+  copy-to-active first fires only after a long quiet window (t=150 s), and
+  the pure render kick then waits for the `tick % 20` coincidence at the
+  engine's wait-skip sites - another 37 s wall time before the first
+  glMultiDrawArraysEXT (t=188 s in that run; 118-190 s across runs).
+- Fix (emulator-side pacing only, no guest logic touched):
+  * procmapengine exports MAP_LAST_BLOCK_LOAD_MS (stamped at every
+    AddNewRawDataBlock) and MAP_MO_COPY_DONE becomes pub.
+  * procnav renfi camera driver: adaptive cadence (r783) - while blocks are
+    still landing (or none ever landed) keep r651's 40 s quiet window; once
+    loads have been quiet 10 s and copy-to-active has NOT happened, tighten
+    to the proven 10 s nudge (r611/r612 cadence): with all blocks local the
+    re-arm hits the "Rect matches -> idle" short-circuit instead of
+    restarting a wire round, so extra nudges only buy more MOUpd lottery
+    tickets.  After copy-done relax back to 40 s.
+  * all four engine wait-skip gates now honour a shared 1-per-wall-second
+    throttle (render_wake_now()) once MAP_MO_COPY_DONE is set, so the pure
+    render kick loop starts within ~1 s instead of waiting for a
+    `tick % 20` coincidence; the throttle keeps idle engine threads blocked
+    (no hot spin on the serialized host).
+- Measured: copy-active T=103.4 s, first multi-draw +3 ms (was +37 s),
+  window dump 0026 (~106 s) already shows the painted fullscreen map with
+  the radio card/Menu/compass/scale overlay intact.  Two runs: painted at
+  ~101 s and ~128 s (vs 120-190+ s before; runs <130 s used to show nothing).
+- REMAINING: a ~50 s dead zone between the first partial block load (t~50 s,
+  14/34 blocks) and the flush round that delivers the rest (~110-120 s);
+  it appears on every run and looks like DAPI/CCA answer pacing for the
+  missing-block rect.  Next lever: why does the re-arm at t=50 s not flush
+  the remaining 20 blocks for 60 s (DAPI service scan cycle vs the engine's
+  wire-round serialization).

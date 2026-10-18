@@ -1,7 +1,7 @@
 use crate::emulator::context::Context;
 use crate::gpu;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::{RegisterARM, Unicorn};
 
@@ -267,7 +267,28 @@ static MAP_INITIAL_RENDER_TRIGGERED: AtomicBool = AtomicBool::new(false);
 /// (`CreateRCJobRenderPixmapView` + `AddJobToRenderControlQueue`) instead of
 /// the canned `MapEngine_TriggerPixmapViewRender`, whose answer chain makes
 /// the HMI re-arm the Flint demo camera.
-static MAP_MO_COPY_DONE: AtomicBool = AtomicBool::new(false);
+pub static MAP_MO_COPY_DONE: AtomicBool = AtomicBool::new(false);
+/// Wall-clock ms (`emu_t0_elapsed_ms`) when the last raw map data block
+/// landed (`AddNewRawDataBlock`).  The renfi camera driver reads this to
+/// tell an in-flight wire block-load round from a settled engine: only
+/// while a round can still be running does a camera re-arm restart it, so
+/// once loads have been quiet for 10 s the re-arm cadence may tighten
+/// (r783 adaptive cadence).  0 = no block ever loaded (stay at r651's
+/// conservative 40 s window).
+pub static MAP_LAST_BLOCK_LOAD_MS: AtomicU64 = AtomicU64::new(0);
+/// r783: rate-limiter for the post-copy-done render wake-up.  With the
+/// active MO lists filled, the engine on the unit repaints continuously;
+/// here its render path only advances at guest-tick coincidences, so the
+/// first painted frame trails the copy-to-active by tens of seconds.  The
+/// wait-skip hooks call this after `MAP_MO_COPY_DONE` to allow at most one
+/// extra render-loop advance per wall second; between advances the engine
+/// threads keep blocking normally (no hot spin on the serialized host).
+static RENDER_WAKE_LAST_MS: AtomicU64 = AtomicU64::new(0);
+fn render_wake_now() -> bool {
+    let now = crate::libs::dapi::emu_t0_elapsed_ms() as u64;
+    let last = RENDER_WAKE_LAST_MS.swap(now, Ordering::Relaxed);
+    now.saturating_sub(last) >= 1000
+}
 static MAP_RENDER_KICK_CAPTURING: AtomicBool = AtomicBool::new(false);
 static MAP_RENDER_KICK_ENQUEUE_PENDING: AtomicBool = AtomicBool::new(false);
 static MAP_RENDER_KICK_JOB: AtomicU32 = AtomicU32::new(0);
@@ -1453,7 +1474,10 @@ crate::os::code_stub::trap_site(unicorn, render_hook_addr, crate::os::code_stub:
                     }
 
                     let tick = MAP_RENDER_LOOP_TRIGGER_TICK.fetch_add(1, Ordering::Relaxed) + 1;
-                    if tick == 1 || tick % MAP_RENDER_TRIGGER_INTERVAL == 0 {
+                    if tick == 1
+                        || tick % MAP_RENDER_TRIGGER_INTERVAL == 0
+                        || (MAP_MO_COPY_DONE.load(Ordering::Relaxed) && render_wake_now())
+                    {
                         trigger_pending_map_render(uc, render_hook_addr, tick != 1);
                     }
                 
@@ -2219,7 +2243,10 @@ crate::os::code_stub::trap_site(unicorn, map_mainloop, crate::os::code_stub::Tra
         let return_addr = base_address + return_offset;
         crate::os::code_stub::trap_site(unicorn, call_addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2159", move |uc: &mut Unicorn<'_, Context>| {
                     let tick = MAP_JOB_WAIT_SKIP_TICK.fetch_add(1, Ordering::Relaxed) + 1;
-                    if tick > 100 && tick % MAP_RENDER_TRIGGER_INTERVAL != 1 {
+                    if tick > 100
+                        && tick % MAP_RENDER_TRIGGER_INTERVAL != 1
+                        && !(MAP_MO_COPY_DONE.load(Ordering::Relaxed) && render_wake_now())
+                    {
                         return 0;
                     }
 
@@ -2302,7 +2329,10 @@ fn add_render_job_queue_wait_skip_hook(unicorn: &mut Unicorn<'_, Context>, base_
             return 0;
         };
 
-        if tick > 1 && tick % MAP_RENDER_TRIGGER_INTERVAL != 1 {
+        if tick > 1
+            && tick % MAP_RENDER_TRIGGER_INTERVAL != 1
+            && !(MAP_MO_COPY_DONE.load(Ordering::Relaxed) && render_wake_now())
+        {
             return 0;
         }
 
@@ -3310,7 +3340,10 @@ fn add_job_queue_wait_skip_hook(unicorn: &mut Unicorn<'_, Context>, base_address
             }
 
             let tick = MAP_OSAL_WAIT_SKIP_TICK.fetch_add(1, Ordering::Relaxed) + 1;
-            if tick > 100 && tick % MAP_RENDER_TRIGGER_INTERVAL != 1 {
+            if tick > 100
+                && tick % MAP_RENDER_TRIGGER_INTERVAL != 1
+                && !(MAP_MO_COPY_DONE.load(Ordering::Relaxed) && render_wake_now())
+            {
                 return 0;
             }
 
@@ -7296,6 +7329,10 @@ crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::A
             let addr = base_address + 0x0051_64e0u32 - ORIGINAL_BASE;
             
 crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:6772", move |uc: &mut Unicorn<'_, Context>| {
+                    MAP_LAST_BLOCK_LOAD_MS.store(
+                        crate::libs::dapi::emu_t0_elapsed_ms() as u64,
+                        Ordering::Relaxed,
+                    );
                     let count = add.fetch_add(1, Ordering::Relaxed);
                     if count >= 40 {
                         return 0;
