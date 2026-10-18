@@ -5225,6 +5225,101 @@ fn call_guest_function(
     true
 }
 
+/// r784: [`call_guest_function`] variant that never trusts the live R13.
+/// The bGUIMainloop trap site can fire while the caller code is mid-trick
+/// with r13 (0x133xxxxx static-base values observed), where the plain
+/// variant wrote its save frame into the code segment and killed prochmi
+/// (f1 run: [52] exited(1) right after a touch injection).  This variant
+/// keeps a private scratch stack page for the save/restore frame and
+/// restores the real r13/r14 through the literal-slot return stub.
+/// (r784: currently unused - the stub return path itself mis-restores, see
+/// the view-pump comment in the mainloop hook; kept for the follow-up fix.)
+#[allow(dead_code)]
+fn call_guest_function_scratch(
+    unicorn: &mut Unicorn<'_, Context>,
+    original_pc: u32,
+    function: u32,
+    args: [u32; 4],
+) -> bool {
+    if original_pc == 0 || function == 0 {
+        return false;
+    }
+    let Some(stub) = ensure_guest_call_stub(unicorn) else {
+        return false;
+    };
+    static SCRATCH_SP: AtomicU32 = AtomicU32::new(0);
+    let sp_scratch = {
+        let current = SCRATCH_SP.load(Ordering::Relaxed);
+        if current != 0 {
+            current
+        } else {
+            let mmu_arc = {
+                let data = unicorn.get_data();
+                data.mmu.clone()
+            };
+            let page = mmu_arc.lock().unwrap().heap_alloc(
+                unicorn,
+                0x1000,
+                Prot::READ | Prot::WRITE,
+                "[prochmi-scratch-stack]",
+            );
+            let sp = page + 0xf00;
+            if page == 0 {
+                return false;
+            }
+            SCRATCH_SP.store(sp, Ordering::Relaxed);
+            sp
+        }
+    };
+
+    let original_sp = unicorn.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+    let saved: [u32; 13] = [
+        unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R3).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R4).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R5).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R6).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R7).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R8).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R9).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R10).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R11).unwrap_or(0) as u32,
+        unicorn.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+    ];
+    // The return stub pops {r0-r11,lr} (13 words) off the live sp, then
+    // reloads sp/pc from its literal slots.  Lay exactly that frame on the
+    // scratch page, point r13 at its base, and stash the real sp/pc in the
+    // stub slots (+0x10 / +0x14), which also restores r13 itself.
+    let frame = sp_scratch - (saved.len() as u32 * 4);
+    if !saved
+        .iter()
+        .enumerate()
+        .all(|(index, value)| write_u32(unicorn, frame + (index as u32 * 4), *value))
+    {
+        log::warn!("PROCHMI: failed to write scratch frame at {frame:#x}");
+        return false;
+    }
+    if !write_u32(unicorn, stub + 0x10, original_sp) || !write_u32(unicorn, stub + 0x14, original_pc)
+    {
+        log::warn!("PROCHMI: failed to fill scratch-call stub slots at {stub:#x}");
+        return false;
+    }
+    let _ = unicorn.reg_write(RegisterARM::R13, frame as u64);
+    for (register, value) in [
+        (RegisterARM::R0, args[0]),
+        (RegisterARM::R1, args[1]),
+        (RegisterARM::R2, args[2]),
+        (RegisterARM::R3, args[3]),
+        (RegisterARM::R14, stub),
+        (RegisterARM::PC, function),
+    ] {
+        let _ = unicorn.reg_write(register, value as u64);
+    }
+    true
+}
+
 /// r761: stub-free guest call: load the arguments, point LR at `return_site`
 /// (a trapped instruction, i.e. an `svc #0` the dispatcher owns) and redirect
 /// the PC to `function`.  The callee returns straight onto the trap site,
@@ -6567,6 +6662,15 @@ fn drain_gui_touch_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
                 // Same register-wrap contract as the touch injection: the
                 // callee returns onto this trap site and the entry state is
                 // restored by the TOUCH_RETURN_PENDING branch in site 606.
+                // r784 note: two safer-looking replacements were tried and
+                // both killed prochmi (mainloop exit(1)): call_guest_function
+                // writes its frame at live r13, which this site sometimes
+                // sees mid-r13-trick (f1: frame landed in the code segment),
+                // and call_guest_function_scratch reached the return stub
+                // with the frame ignored (f2: stub-entry lr=0x47, pop read
+                // the app stack).  The PENDING restore can additionally be
+                // consumed by an unrelated site re-fire (c6-era this=0x0 x6).
+                // Kept as-is; defect filed in docs/issues/correctness.md.
                 for (index, register) in [
                     RegisterARM::R0,
                     RegisterARM::R1,
@@ -6642,10 +6746,20 @@ fn drain_gui_touch_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
             // r784: multi-round pump.  A destination-entry page finishes
             // building its widgets only after the RNW/country lookups land
             // (~2 s after the view-create that armed this pump), so a single
-            // invalidate pass runs too early.  Re-arm the (idempotent) pass a
-            // few times spaced a few seconds apart.
+            // invalidate pass runs too early.  Re-arm the (idempotent) pass
+            // a few times spaced ~2 s apart.  Default 1 (= r783 behaviour);
+            // EMU_VIEW_PAINT_ROUNDS=N enables the extra rounds for forensics
+            // (the extra injected calls hit the TOUCH_RETURN_PENDING restore
+            // race documented above, so it is not on by default yet).
+            static ROUNDS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let cap = *ROUNDS.get_or_init(|| {
+                std::env::var("EMU_VIEW_PAINT_ROUNDS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1u32)
+            });
             let round = VIEW_PAINT_ROUND.load(Ordering::Relaxed);
-            if round < 4 {
+            if round < cap {
                 VIEW_PAINT_ROUND.store(round + 1, Ordering::Relaxed);
                 VIEW_PAINT_CD.store(60, Ordering::Relaxed);
                 VIEW_PAINT_STATE.store(1, Ordering::Relaxed);
@@ -6673,7 +6787,8 @@ fn drain_gui_touch_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
     };
     // `guest_call_via_lr` overwrites r0-r3/lr (and r13 via the slack):
     // remember the mainloop's entry values and restore them when the callee
-    // returns onto this trap site.
+    // returns onto this trap site.  (r784: stub-based variants regress here,
+    // see the view-paint comment above.)
     for (index, register) in [
         RegisterARM::R0,
         RegisterARM::R1,

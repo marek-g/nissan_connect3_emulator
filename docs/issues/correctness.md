@@ -1216,3 +1216,33 @@ word+0x18 (SEM_LOCK 0x195c8, SYNC_LOCK 0x10a1ec, EV__LOCK 0x1cc, TSK_LOCK
   validation (u16SendAndWaitWithValidLanguage).  The HMI side is healthy:
   page-open SMs run (state 0x5da, trans 0x182a), the category page paints,
   companion cid 653 animates.
+
+## r785 - pump round knob env-gated; injected-call register restore is fragile (filed)
+- r784's always-on 5-round view paint pump killed prochmi: with more injected
+  vInvalidate calls per second, the TOUCH_RETURN_PENDING restore of the
+  bGUIMainloop site lost a race (an unrelated site re-fire consumed the flag)
+  and the real `clGUIWidgetEngine::bGUIMainloop` ran once with r0(this)=0 -
+  prochmi main() then exited(1) at t~20-31 s (f1/f2 runs; the 6 this=0x0 log
+  lines in every c6/c7-era run show the same race pre-r784, just lucky).
+- Two "safe" replacements were A/B'd and both regress WORSE (kept the old
+  path): (a) call_guest_function writes its save frame at the live r13, but
+  this site sometimes fires while caller code parks a GOT/static base in r13
+  (f1: frame written into the code segment at 0x133be70, guest died);
+  (b) new call_guest_function_scratch (private scratch stack page + the
+  literal-slot return stub) reached the stub with the app's own sp
+  (stub-entry lr=0x47) - the vReleased callee does not return through the
+  frame we laid, so the pop loaded garbage registers and main() exited(1).
+  The helper stays #[allow(dead_code)] for the eventual fix (next idea:
+  instruction-step trace of vReleased's epilogue to see what it returns
+  through, then align the frame contract to it).
+- Pump multi-round is now EMU_VIEW_PAINT_ROUNDS=N (default 1 = r783
+  behaviour).  F3 verification (default): all 3 taps land, full view
+  lifecycle intact (tap2: destroy 229 -> create 294; tap3: destroy 607 ->
+  create cid0 -> destroy 0 -> create 653), no thread exits, screen stays on
+  the category page while the waypoint-circle companion animates.
+- Refined milestone-C statement (from f3): the tap on New Address IS accepted
+  (companion re-registration 607->653 + cid-0 placeholder), but no MAIN-view
+  transition is ever initiated - the app waits for the destination-entry
+  input session (dynamic-list config `dynlistconf_NAVI__DESTENTRY_LIST2`
+  / input-method list) that no emulator service ever answers.  That answer,
+  not painting, is the milestone-C gate.
