@@ -1171,3 +1171,48 @@ word+0x18 (SEM_LOCK 0x195c8, SYNC_LOCK 0x10a1ec, EV__LOCK 0x1cc, TSK_LOCK
   missing-block rect.  Next lever: why does the re-arm at t=50 s not flush
   the remaining 20 blocks for 60 s (DAPI service scan cycle vs the engine's
   wire-round serialization).
+
+## r784 - destination-entry (keyboard) page forensics; pump multi-round; probes
+- Repro (EMU_TOUCH_TEST, deterministic across c6/d5/d6/d9 runs): Menu tap
+  (67,335) opens the menu (MAP OPTIONS p1, view cid 229); a tap at
+  (205,165) hits Enter Destination -> cid 229 destroyed (view-destroy
+  t=26.1), MAIN view cid 294 created, and the HMI render pass then blits a
+  full six-button "NAVIGATION" page every frame (header 799x83 + 6x 359x104
+  buttons + 6x 89x76 icons, EMU_DRAWTRI_LOG 29-30 s).  So cid 294 *renders
+  fine* - Enter Destination opens a category page that reuses the menu page
+  template.  A further tap (205,165) on it (= New Address) does NOT
+  destroy/replace 294: instead a cid **0** main-ish view (lr 0x1364940) and
+  the map companion cid 653 (waypoint circles) appear.  cid 0 = failed page
+  creation: the destination-entry/keyboard page's view is created empty, so
+  the screen stays on the category page forever.  This is where milestone C
+  blocks - not a paint problem (pump invalidates view 294/607 every round,
+  EA state is 2, swaps run, ~854 swaps after the tap).
+- Keyboard plumbing audited (EMU_PROCHMI_KEYB_TRACE probes, kept):
+  * clFi_KEYBRD ("FI_KeyBoard") IS instantiated at t=2.19 s via
+    clFiFactory::CreateFi (id 51), and clHSI_CMKeyboard::bExecuteMessage
+    (0x1812de4) executes 8 boot messages (sMsg ids 0x2b09-0x2b0b, unhandled
+    -> default).  The handled id family in the decompile is 0x29db-0x29eb
+    and maps to GUI_KeyInjector_vKeyPressed/vKeyReleased(keycode) - i.e.
+    CMKeyboard = physical/remote KEY events routed into the GUI KeyInjector,
+    not a "show keyboard" message.  clFi_KEYBRD SendEvents/ReceiveEvents
+    (EvtEn path) never fire (evt-in/evt-out 0 hits).
+  * After the tap DAPI srvctrl jobs churn at ~2/s forever: type=4
+    (dap_map_tclManager) fct 0x101/0x103/0x104/0x401 and type=6 (rnw = road
+    network, rnw_tclManager) fct 0x80/0x81 - all matched to workers and
+    processed; the RNW country files (/dev/cryptnav/data/data/rnw/CCP/POL/
+    NAV*.DAT) open and load fine.  This churn is a symptom, not the block.
+- Tools kept this revision: per-pending-pointer SM stuck deep-dump (was a
+  global 40-slot budget eaten by boot transitions - the destination churn
+  pending=0x25b3198 decoded as the benign sysdlg 0x1e6->0x1e6 self-transition
+  after the fix); keyb path probes; srvctrl job-dump (type/fct/payload once
+  per key, log after t=15 s); view-paint slot+word dumps; pump now re-arms
+  its invalidate/EA-force/kick pass up to 5 times (~2 s apart) since pages
+  finish building widgets after the RNW lookups land.
+- Open question (next): what data source must answer so pCreateView for the
+  keyboard page yields a real cid instead of 0.  Candidates: a NAVI AMT/FI
+  dynamic-list config (rodata has dynlistconf_NAVI__DESTENTRY_LIST2 /
+  _row_entries; similar MEDIAPLAYER__QSEARCH_KEYBOARD_LIST exists for the
+  media keyboard, fed by its CCA service), or dap_li_userif dataset/language
+  validation (u16SendAndWaitWithValidLanguage).  The HMI side is healthy:
+  page-open SMs run (state 0x5da, trans 0x182a), the category page paints,
+  companion cid 653 animates.

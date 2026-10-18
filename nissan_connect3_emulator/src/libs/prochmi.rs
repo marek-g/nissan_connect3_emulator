@@ -205,6 +205,9 @@ static TOUCH_POST_COUNTDOWN: AtomicU32 = AtomicU32::new(0);
 // nudge + forced present; run it a beat after the view switches, one guest
 // call per mainloop iteration through guest_call_via_lr.
 static VIEW_PAINT_STATE: AtomicU32 = AtomicU32::new(0);
+// r784: how many invalidate rounds the page-switch pump has run for the
+// current page switch (see the pump in the mainloop hook).
+static VIEW_PAINT_ROUND: AtomicU32 = AtomicU32::new(0);
 static VIEW_PAINT_CD: AtomicU32 = AtomicU32::new(0);
 static VIEW_PAINT_I: AtomicU32 = AtomicU32::new(0);
 static VIEW_PAINT_FNS: [AtomicU32; 4] = [
@@ -575,6 +578,12 @@ const NAV_STATE_TRACE_LIMIT: u32 = 128;
 fn nav_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("EMU_PROCHMI_NAV_TRACE").is_some())
+}
+
+// r784: on-screen keyboard (clFi_KEYBRD / clHSI_CMKeyboard) path probes.
+fn keyb_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("EMU_PROCHMI_KEYB_TRACE").is_some())
 }
 
 fn prochmi_internal_events_enabled() -> bool {
@@ -3425,8 +3434,31 @@ crate::os::code_stub::trap_site(unicorn, state_do_transition, crate::os::code_st
                         // Which state machine is stuck: dump its header
                         // (vtable + candidate name/descriptor pointers) once
                         // per pending pointer so the strings resolve offline.
-                        static STUCK: AtomicU32 = AtomicU32::new(0);
-                        if STUCK.fetch_add(1, Ordering::Relaxed) < 40 {
+                        // r784: cap per pending pointer, not globally - the
+                        // boot-time transitions used to consume all 40 slots
+                        // so post-menu stuck machines (cid 653 destination
+                        // entry churn) never got decoded at all.
+                        static STUCK: std::sync::Mutex<Vec<(u32, u32)>> =
+                            std::sync::Mutex::new(Vec::new());
+                        let seen = {
+                            let mut v = STUCK.lock().unwrap_or_else(|e| e.into_inner());
+                            let slot = v.iter_mut().find(|(p, _)| *p == transition);
+                            match slot {
+                                Some(e) => {
+                                    e.1 += 1;
+                                    e.1
+                                }
+                                None => {
+                                    if v.len() < 64 {
+                                        v.push((transition, 1));
+                                        1
+                                    } else {
+                                        u32::MAX
+                                    }
+                                }
+                            }
+                        };
+                        if seen <= 6 {
                             let words: Vec<u32> =
                                 (0..12u32).map(|i| read_u32(uc, sm + i * 4)).collect();
                             // Record layout (GUI_StateMachine::vPerformTransition):
@@ -4204,6 +4236,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     {
                         VIEW_PAINT_CD.store(30, Ordering::Relaxed);
                         VIEW_PAINT_STATE.store(1, Ordering::Relaxed);
+                        VIEW_PAINT_ROUND.store(1, Ordering::Relaxed);
                     }
                 }
                 if !nav_trace_enabled() {
@@ -4222,6 +4255,87 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 );
                 0
             });
+        }
+        // r784: on-screen keyboard path.  `clFi_KEYBRD` (rodata name
+        // "FI_KeyBoard", RTTI 11clFi_KEYBRD) is the HSI FI that receives
+        // CMKeyboard events from the HSI EventEngine and drives the keyboard
+        // page; it is only alive if clFiFactory::CreateFi instantiated it.
+        // These probes answer: (a) was the FI created (bl into its ctor at
+        // 0x13d18dc inside CreateFi), (b) which FI ids the factory is asked
+        // for, (c) service-state transitions of the KEYBRD FI (0x13e7124),
+        // (d) events entering/leaving it (0x13e735c/0x13e756c), (e) whether
+        // clHSI_CMKeyboard::bExecuteMessage(sMsg&) ever runs (0x1812de4).
+        // All function-entry sites, gated behind EMU_PROCHMI_KEYB_TRACE.
+        if keyb_trace_enabled() {
+            let create_fi = base_address + 0x013d_15e4u32 - ORIGINAL_BASE;
+            crate::os::code_stub::trap_site(unicorn, create_fi, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:keyb-createfi", move |uc: &mut Unicorn<'_, Context>| {
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, Ordering::Relaxed) < 128 {
+                    let id = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xff;
+                    let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCHMI keyb: CreateFi t={}ms id={id} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                    );
+                }
+                0
+            });
+            let keybr_ctor = base_address + 0x013d_18dcu32 - ORIGINAL_BASE;
+            crate::os::code_stub::trap_site(unicorn, keybr_ctor, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:keyb-ctor", |_uc: &mut Unicorn<'_, Context>| {
+                static ONCE: AtomicU32 = AtomicU32::new(0);
+                if ONCE.fetch_add(1, Ordering::Relaxed) == 0 {
+                    log::info!(
+                        "PROCHMI keyb: clFi_KEYBRD CONSTRUCTED t={}ms",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                    );
+                }
+                0
+            });
+            for (offset, name, cap) in [
+                (0x013e_7124u32 - ORIGINAL_BASE, "svc-state", 40u32),
+                (0x013e_735cu32 - ORIGINAL_BASE, "evt-in", 80),
+                (0x013e_756cu32 - ORIGINAL_BASE, "evt-out", 80),
+                (0x0181_2de4u32 - ORIGINAL_BASE, "cmkbd-exec", 40),
+            ] {
+                let address = base_address + offset;
+                crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:keyb-trace", move |uc: &mut Unicorn<'_, Context>| {
+                    static HITS: [AtomicU32; 4] = [
+                        AtomicU32::new(0),
+                        AtomicU32::new(0),
+                        AtomicU32::new(0),
+                        AtomicU32::new(0),
+                    ];
+                    let idx = match name {
+                        "svc-state" => 0usize,
+                        "evt-in" => 1,
+                        "evt-out" => 2,
+                        _ => 3,
+                    };
+                    if HITS[idx].fetch_add(1, Ordering::Relaxed) < cap {
+                        let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                        let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                        let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                        if name == "cmkbd-exec" {
+                            // sMsg payload (per bExecuteMessage decompile):
+                            // msg+0x00 sender, +0x04 message id (0x29xx),
+                            // +0x08 data.  Log the decoded triple.
+                            let id = read_u32(uc, r1 + 4);
+                            let data = read_u32(uc, r1 + 8);
+                            log::info!(
+                                "PROCHMI keyb: {name} t={}ms fi={r0:#x} msg={r1:#x} id={id:#x} data={data:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                            );
+                        } else {
+                            log::info!(
+                                "PROCHMI keyb: {name} t={}ms r0={r0:#x} r1={r1:#x} r2={r2:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                            );
+                        }
+                    }
+                    0
+                });
+            }
+            log::info!("PROCHMI keyboard-path probes installed");
         }
         // r767: skip GUI_StateMachine::vFocusGained while the injected view
         // rebuild runs (see SM_HIDE_FOCUS_SKIP).  Returning LR from the site
@@ -6406,6 +6520,43 @@ fn drain_gui_touch_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
                     "PROCHMI view-paint: collected {n} invalidate targets t={}ms",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                 );
+                // r784: which menu-manager slots/views are these?  cids tell
+                // whether the destination-entry view (294/653) is even
+                // installed in a slot the pump can invalidate.
+                if nav_trace_enabled() {
+                    for i in 0..4u32 {
+                        let obj = if mm != 0 { read_u32(unicorn, mm + i * 4) } else { 0 };
+                        let view = if obj != 0 { read_u32(unicorn, obj + 0x28) } else { 0 };
+                        let cid = if obj != 0 {
+                            read_u32(unicorn, mm + 0x10 + i * 2) & 0xffff
+                        } else {
+                            0xffff
+                        };
+                        log::warn!(
+                            "PROCHMI view-paint: slot{i} obj={obj:#x} view={view:#x} cid={cid}"
+                        );
+                        // r784: word-level layout diff between a page that
+                        // paints (menu cid) and the invisible destination
+                        // page - compare object/view/draw-context bodies.
+                        if VIEW_PAINT_ROUND.load(Ordering::Relaxed) <= 1 {
+                        for (tag, objaddr) in [
+                            ("wid", obj),
+                            ("view", view),
+                            ("ctx", if view != 0 { read_u32(unicorn, view + 0x40) } else { 0 }),
+                        ] {
+                            if objaddr == 0 {
+                                continue;
+                            }
+                            let words: Vec<u32> = (0..24u32)
+                                .map(|k| read_u32(unicorn, objaddr + k * 4))
+                                .collect();
+                            log::warn!(
+                                "PROCHMI view-paint: slot{i} {tag} {objaddr:#x} w={words:08x?}"
+                            );
+                        }
+                        }
+                    }
+                }
             }
         }
         2 => {
@@ -6488,7 +6639,20 @@ fn drain_gui_touch_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
                 }
             }
             crate::gpu::request_forced_present();
-            VIEW_PAINT_STATE.store(0, Ordering::Relaxed);
+            // r784: multi-round pump.  A destination-entry page finishes
+            // building its widgets only after the RNW/country lookups land
+            // (~2 s after the view-create that armed this pump), so a single
+            // invalidate pass runs too early.  Re-arm the (idempotent) pass a
+            // few times spaced a few seconds apart.
+            let round = VIEW_PAINT_ROUND.load(Ordering::Relaxed);
+            if round < 4 {
+                VIEW_PAINT_ROUND.store(round + 1, Ordering::Relaxed);
+                VIEW_PAINT_CD.store(60, Ordering::Relaxed);
+                VIEW_PAINT_STATE.store(1, Ordering::Relaxed);
+            } else {
+                VIEW_PAINT_ROUND.store(0, Ordering::Relaxed);
+                VIEW_PAINT_STATE.store(0, Ordering::Relaxed);
+            }
         }
     }
     if GUI_ENGINE_ADDRESS.load(Ordering::Relaxed) == 0 {

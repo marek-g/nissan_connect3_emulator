@@ -1746,13 +1746,52 @@ fn hook_srvctrl_worker_lookup(unicorn: &mut Unicorn<'_, Context>, base_address: 
 crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:1674", move |uc: &mut Unicorn<'_, Context>| {
             static HITS: AtomicU32 = AtomicU32::new(0);
             let hits = HITS.fetch_add(1, Ordering::Relaxed);
-            if hits >= 48 {
+            if hits >= 4096 {
                 return 0;
             }
             let srvctrl = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let job_slot = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let job = read_u32_at(uc, job_slot);
             let message_type = read_u32_at(uc, job + 0x20);
+            // r784: after a destination-entry tap the same two job shapes
+            // (type 4 fct 0x103/0x104, type 6 fct 0x80/0x81) cycle at ~400 ms
+            // forever - dump their payload words once per (type,fct) so the
+            // CL request can be identified in DAPIAPP's rodata.
+            {
+                static SEEN: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+                let fct = read_u32_at(uc, job + 0x0a) & 0xffff;
+                let key = (message_type, fct);
+                let first = {
+                    let mut v = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                    if v.contains(&key) {
+                        false
+                    } else {
+                        v.push(key);
+                        v.len() <= 12
+                    }
+                };
+                if first {
+                    let words: Vec<u32> = (0..16u32)
+                        .map(|i| read_u32_at(uc, job + i * 4))
+                        .collect();
+                    log::warn!(
+                        "DAPI srvctrl job-dump t={}ms type={:#x} fct={:#x} job={:#x} w={:08x?}",
+                        emu_t0_elapsed_ms(),
+                        message_type,
+                        fct,
+                        job,
+                        words,
+                    );
+                    // word at +0x24 looks like the message/data pointer: dump it too.
+                    let msg = words[9];
+                    if (0x1000..0x6000_0000).contains(&msg) {
+                        let body: Vec<u32> = (0..12u32)
+                            .map(|i| read_u32_at(uc, msg + i * 4))
+                            .collect();
+                        log::warn!("DAPI srvctrl job-body msg={msg:#x} w={:08x?}", body);
+                    }
+                }
+            }
             let count = u16::try_from(
                 read_u32_at(uc, srvctrl + 0x40) & 0xffff,
             )
@@ -1779,7 +1818,12 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     .join(" ");
                 matched = format!("worker={:#x} vtable={:#x} vt=[{}]", worker, vtable, slots);
             }
-            let _ = &types;
+            let _ = hits;
+            static POST: AtomicU32 = AtomicU32::new(0);
+            let t_ms = emu_t0_elapsed_ms();
+            if t_ms < 15_000 || POST.fetch_add(1, Ordering::Relaxed) >= 80 {
+                return 0;
+            }
             log::warn!(
                 "DAPI srvctrl worker lookup t={}ms thread=[{}] srvctrl={:#x} count={} types=[{}] job={:#x} type={:#x} fct={:#x} {matched} lr={:#x}",
                 emu_t0_elapsed_ms(),
