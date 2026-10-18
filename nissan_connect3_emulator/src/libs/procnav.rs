@@ -1929,7 +1929,9 @@ pub(crate) fn extrapolated_positions_message(seq: u16) -> Vec<u8> {
 ///   0  u8   viewId            (0 = the only view the HMI owns)
 ///   1  u8   mode              (camera mode; 0 = as-is)
 ///   2  u32  meter             (requested scale class)
-///   6  u16  pitch             (degrees * 10, 0 = north/up flat)
+///   6  u16  elevation        (raw `ren_trCameraParameters+0x08`: 0xffff =
+///                            straight down / top-down, 0 = horizontal;
+///                            see r775 note in the body)
 ///   8  u16  heading           (degrees * 10)
 ///  10  u16  screen x          (where the position is anchored on screen)
 ///  12  u16  screen y
@@ -1966,7 +1968,14 @@ pub(crate) fn renfi_set_camera_parameters_message(
     // view+0x84 at Krakow without touching the request machine.
     body.push(mode); // mode
     body.extend_from_slice(&meter.to_le_bytes()); // meter
-    body.extend_from_slice(&0u16.to_le_bytes()); // pitch
+    // r775: this u16 lands in `ren_trCameraParameters + 0x08` verbatim and is
+    // copied to `view + 0x74` (u32SetCameraParameters stores params[0..0x20]
+    // -> view+0x6c..0x8b at 0x524a4c).  `Render` turns it into euler angle 1
+    // as `(0xffff - field) * pi/131072`: 0 = looking along the ground (the
+    // picture became a tilted "horizon" view) while 0xffff = 0 tilt = the
+    // normal top-down map view - the value the view constructor itself
+    // bakes.  Heading stays 0 = north-up.
+    body.extend_from_slice(&0xffffu16.to_le_bytes()); // elevation (0xffff = top-down)
     body.extend_from_slice(&0u16.to_le_bytes()); // heading
     body.extend_from_slice(&400u16.to_le_bytes()); // screen x (centre of 800x480)
     body.extend_from_slice(&240u16.to_le_bytes()); // screen y

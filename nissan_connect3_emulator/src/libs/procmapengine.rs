@@ -51,6 +51,13 @@ const MAP_VIEW_WAIT_RETURN: u32 = 0x0052_28b0 - ORIGINAL_BASE;
 const RENDER_JOB_QUEUE_WAIT_ENABLED_ENTRY: u32 = 0x004a_45b8 - ORIGINAL_BASE;
 const RENDER_JOB_QUEUE_WAIT_RC_RETURN: u32 = 0x003a_8b88 - ORIGINAL_BASE;
 const MAP_VIEW_JOB_QUEUE_WAIT_RETURN: u32 = 0x0052_28a0 - ORIGINAL_BASE;
+/// The two `map_tclMapUtil::GetTransformationForView{2D,3D}` (0x44eaf8 resp.
+/// 0x44ece8).  The Draw pass composes the frame transform through exactly one
+/// of them; the 3D variant rotates by the MCP euler pose at `mcp+0x58/0x5c/
+/// 0x60` (fed every frame from the view's u16 camera triple `+0x70/+0x74/
+/// +0x76`), which is what tilts the picture toward the horizon.
+const MAP_UTIL_VIEW2D_TRANSFORM: u32 = 0x0044_eaf8 - ORIGINAL_BASE;
+const MAP_UTIL_VIEW3D_TRANSFORM: u32 = 0x0044_ece8 - ORIGINAL_BASE;
 const RENDER_CONTROL_ADD_JOB: u32 = 0x003a_79b8 - ORIGINAL_BASE;
 /// `map_tclJobRC::CreateRCJobRenderPixmapView(view_id_byte*, answer_info*)`
 /// (0x4c5b0c): thin wrapper over `Create` producing the render job that runs
@@ -246,6 +253,12 @@ static MAP_VIEW_CREATE_PENDING: AtomicBool = AtomicBool::new(false);
 static MAP_VIEW_CREATE_ENQUEUE_PENDING: AtomicBool = AtomicBool::new(false);
 static MAP_VIEW_CREATE_JOB_ADDRESS: AtomicU32 = AtomicU32::new(0);
 static MAP_VIEW_READY: AtomicBool = AtomicBool::new(false);
+/// r775: runtime VA of the rendered map view (`MAP_RENDER_VIEW_ID`), captured
+/// from the `RenderControl::GetView` result.  0 until the view exists.
+static MAP_VIEW_OBJECT: AtomicU32 = AtomicU32::new(0);
+static VIEW_POSE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+static VIEW2D_TRANSFORM_HITS: AtomicU32 = AtomicU32::new(0);
+static VIEW3D_TRANSFORM_HITS: AtomicU32 = AtomicU32::new(0);
 static MAP_RENDER_TRIGGER_PENDING: AtomicBool = AtomicBool::new(false);
 static MAP_INITIAL_RENDER_TRIGGERED: AtomicBool = AtomicBool::new(false);
 /// r655: set once the SceneManager copy-to-active branch has run with a
@@ -1938,6 +1951,46 @@ fn queue_view_creation_job(unicorn: &mut Unicorn<'_, Context>, original_pc: u32)
 /// Both stages are injected through the ordinary guest-call stub from the
 /// engine's own wait-skip tick, so nothing outside the engine's address space
 /// is touched.
+/// r775: log the rendered view's camera triple and the MCP floats derived
+/// from it.  `Render Control` composes each frame from the view u16 fields
+/// `+0x70` (eye height, integer cm -> `mcp+0x68` float metres), `+0x74`
+/// (elevation, u16 turns -> euler angle 1 = the tilt) and `+0x76` (bearing ->
+/// euler 3); the constructor bakes elevation `0xFFFF` = "unset".  Sampling
+/// these tells which field carries the unwanted horizon pitch.
+fn log_view_pose(unicorn: &mut Unicorn<'_, Context>, view: u32, count: u32) {
+    let view_type = read_u16_or_invalid(unicorn, view + 0x48);
+    let light = read_u32_or_invalid(unicorn, view + 0x58);
+    let fimode = read_u32_or_invalid(unicorn, view + 0x5c);
+    let height = read_u32_or_invalid(unicorn, view + 0x70);
+    let elev = read_u16_or_invalid(unicorn, view + 0x74);
+    let bearing = read_u16_or_invalid(unicorn, view + 0x76);
+    let lon = read_u32_or_invalid(unicorn, view + 0x84);
+    let lat = read_u32_or_invalid(unicorn, view + 0x88);
+    let e1 = read_u32_or_invalid(unicorn, view + 0x2d8);
+    let e2 = read_u32_or_invalid(unicorn, view + 0x2dc);
+    let e3 = read_u32_or_invalid(unicorn, view + 0x2e0);
+    let eye = read_u32_or_invalid(unicorn, view + 0x2e8);
+    log::info!(
+        "PROCMAPENGINE r775 view pose t={}ms thread=[{}] view={:#x} type={:#x} light={:#x} fimode={:#x} h={:#x} elev={:#x} bearing={:#x} lon={:#x} lat={:#x} euler=[{},{},{}] eye={} n={}",
+        crate::libs::dapi::emu_t0_elapsed_ms(),
+        unicorn.get_data().inner.thread_id(),
+        view,
+        view_type,
+        light,
+        fimode,
+        height,
+        elev,
+        bearing,
+        lon,
+        lat,
+        f32::from_bits(e1),
+        f32::from_bits(e2),
+        f32::from_bits(e3),
+        f32::from_bits(eye),
+        count,
+    );
+}
+
 fn kick_pixmap_render(
     unicorn: &mut Unicorn<'_, Context>,
     original_pc: u32,
@@ -1981,6 +2034,14 @@ fn kick_pixmap_render(
     let map_state = read_u32_or_invalid(unicorn, base_address + MAP_ENGINE_STATE_VAR);
     if map_state == 0 || map_state == u32::MAX || map_state == 4 || map_state == 5 {
         return false;
+    }
+
+    let view = MAP_VIEW_OBJECT.load(Ordering::Relaxed);
+    if view != 0 {
+        let pose_n = VIEW_POSE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if pose_n < 20 || pose_n % 64 == 63 {
+            log_view_pose(unicorn, view, pose_n);
+        }
     }
 
     let Some(scratch) = ensure_answer_scratch(unicorn) else {
@@ -5343,6 +5404,11 @@ crate::os::code_stub::trap_site(unicorn, get_view_result, crate::os::code_stub::
             if view_id != MAP_RENDER_VIEW_ID || view == 0 {
                 return 0;
             }
+            MAP_VIEW_OBJECT.store(view, Ordering::Relaxed);
+            let pose_n = VIEW_POSE_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if pose_n < 20 || pose_n % 64 == 63 {
+                log_view_pose(uc, view, pose_n);
+            }
 
             let surface_state = read_u32_or_invalid(uc, view + 0xf50);
             let surface = read_u32_or_invalid(uc, view + 0x40);
@@ -5376,6 +5442,225 @@ crate::os::code_stub::trap_site(unicorn, get_view_result, crate::os::code_stub::
         
             0
         });
+
+    // r775: which projection does the delivered frame actually use?  The 3D
+    // variant rotates the world by the MCP euler pose (that is the tilt); if
+    // it never fires the horizon look comes from somewhere else.  These are
+    // function-entry addresses (TB starts), so narrow traps are safe here.
+    {
+        let probe = base_address + MAP_UTIL_VIEW3D_TRANSFORM;
+        crate::os::code_stub::trap_site(unicorn, probe, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:r775-view3d", move |uc: &mut Unicorn<'_, Context>| {
+            let n = VIEW3D_TRANSFORM_HITS.fetch_add(1, Ordering::Relaxed);
+            if n < 10 || n % 512 == 511 {
+                let mcp = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let e1 = read_u32_or_invalid(uc, mcp + 0x58);
+                let e2 = read_u32_or_invalid(uc, mcp + 0x5c);
+                let e3 = read_u32_or_invalid(uc, mcp + 0x60);
+                let eye = read_u32_or_invalid(uc, mcp + 0x68);
+                log::info!(
+                    "PROCMAPENGINE r775 View3D transform t={}ms thread=[{}] n={} mcp={:#x} euler=[{},{},{}] eye={} lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    n,
+                    mcp,
+                    f32::from_bits(e1),
+                    f32::from_bits(e2),
+                    f32::from_bits(e3),
+                    f32::from_bits(eye),
+                    ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                        .wrapping_sub(base_address)
+                        .wrapping_add(ORIGINAL_BASE),
+                );
+            }
+            0
+        });
+    }
+    {
+        let probe = base_address + MAP_UTIL_VIEW2D_TRANSFORM;
+        crate::os::code_stub::trap_site(unicorn, probe, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:r775-view2d", move |uc: &mut Unicorn<'_, Context>| {
+            let n = VIEW2D_TRANSFORM_HITS.fetch_add(1, Ordering::Relaxed);
+            if n < 10 || n % 512 == 511 {
+                log::info!(
+                    "PROCMAPENGINE r775 View2D transform t={}ms thread=[{}] n={} mcp={:#x} lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    n,
+                    uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                    ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                        .wrapping_sub(base_address)
+                        .wrapping_add(ORIGINAL_BASE),
+                );
+            }
+            0
+        });
+    }
+    // r775: post-call dump of `bSetupMatrices`' 0x44ece8 result: matrix A at
+    // `view3D+0xe8` (the builder was fed identity + zero euler), the second
+    // 3x3 at `sp+0x1c`, the eye vector at `sp+0x40`, and the scale floats the
+    // transform multiplied by.  This settles whether the 31deg tilt in the
+    // frustum view matrix is born inside GetTransformationForView3D.
+    {
+        let probe = base_address + (0x0052_be14u32 - ORIGINAL_BASE);
+        crate::os::code_stub::trap_site(unicorn, probe, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:r775-setup3d", move |uc: &mut Unicorn<'_, Context>| {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n >= 12 && n % 256 != 255 {
+                return 0;
+            }
+            let view = MAP_VIEW_OBJECT.load(Ordering::Relaxed);
+            let view3d = view.wrapping_add(0x32c);
+            let mcp = view.wrapping_add(0x280);
+            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+            let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+            let mat = |uc: &mut Unicorn<'_, Context>, base: u32| -> String {
+                [0u32, 4, 8, 12, 16, 20, 24, 28, 32]
+                    .iter()
+                    .map(|o| format!("{:.3}", f32::from_bits(read_u32_or_invalid(uc, base.wrapping_add(*o)))))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let surface = read_u32_or_invalid(uc, mcp + 0x84);
+            let inner = read_u32_or_invalid(uc, surface.wrapping_add(0x14));
+            let s14 = read_u32_or_invalid(uc, inner.wrapping_add(8));
+            let a = mat(uc, view3d.wrapping_add(0xe8));
+            let b = mat(uc, sp.wrapping_add(0x1c));
+            log::info!(
+                "PROCMAPENGINE r775 bSetupMatrices post t={}ms thread=[{}] n={} r7={:#x} mcp={:#x} euler=[{},{},{}] eye={} m70={} m8c={} surf={:#x}->{:#x} s14={} A=[{}] B=[{}] v40=[{},{},{}] f4c={} lr={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                n,
+                r7,
+                mcp,
+                f32::from_bits(read_u32_or_invalid(uc, mcp + 0x58)),
+                f32::from_bits(read_u32_or_invalid(uc, mcp + 0x5c)),
+                f32::from_bits(read_u32_or_invalid(uc, mcp + 0x60)),
+                f32::from_bits(read_u32_or_invalid(uc, mcp + 0x68)),
+                f32::from_bits(read_u32_or_invalid(uc, mcp + 0x70)),
+                f32::from_bits(read_u32_or_invalid(uc, mcp + 0x8c)),
+                surface,
+                inner,
+                f32::from_bits(s14),
+                a,
+                b,
+                f32::from_bits(read_u32_or_invalid(uc, sp + 0x40)),
+                f32::from_bits(read_u32_or_invalid(uc, sp + 0x44)),
+                f32::from_bits(read_u32_or_invalid(uc, sp + 0x48)),
+                f32::from_bits(read_u32_or_invalid(uc, sp + 0x4c)),
+                ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                    .wrapping_sub(base_address)
+                    .wrapping_add(ORIGINAL_BASE),
+            );
+            0
+        });
+    }
+    // r775: catch the writer of the elevation word (the view's u16 pitch at
+    // +0x74, same stable heap VA the r62x hooks assume for the view).  The
+    // window also covers the bearing u16 at +0x76; `off` tells them apart.
+    {
+        use unicorn_engine::unicorn_const::HookType;
+        let elev_c = 0xda0c38u32; // 0xda0bc4 + 0x74
+        let _ = unicorn.add_mem_hook(
+            HookType::MEM_WRITE,
+            elev_c as u64,
+            elev_c as u64 + 3,
+            move |uc, _t, address, size, value| {
+                static COUNT: AtomicU32 = AtomicU32::new(0);
+                static LAST: AtomicU32 = AtomicU32::new(0);
+                if LAST.swap(value as u32, Ordering::Relaxed) == value as u32 {
+                    return true;
+                }
+                if COUNT.fetch_add(1, Ordering::Relaxed) >= 200 {
+                    return true;
+                }
+                let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCMAPENGINE r775 VIEW-ELEV/BEAR WRITE t={}ms thread=[{}] off=+{:#x} size={} value={:#x} pc={:#x} lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    address.wrapping_sub(elev_c as u64),
+                    size,
+                    value,
+                    pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                    lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE) & !1,
+                );
+                true
+            },
+        );
+    }
+
+    // r775: the MCP pose is identity (r775 View3D probe above) yet the
+    // delivered pixels show a grazing/horizon perspective, so the real
+    // camera lives in the render layer.  Dump both 4x4 matrices handed to
+    // `ren_tclViewFrustum::vUpdateFrustum` - the projection matrix will show
+    // the tilt directly.
+    {
+        let probe = base_address + (0x0043_af68u32 - ORIGINAL_BASE);
+        crate::os::code_stub::trap_site(unicorn, probe, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:r775-frustum", move |uc: &mut Unicorn<'_, Context>| {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 4 || n % 256 == 255 {
+                let m1 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let m2 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let lr = ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                    .wrapping_sub(base_address)
+                    .wrapping_add(ORIGINAL_BASE);
+                let mut fmt = |uc: &mut Unicorn<'_, Context>, m: u32| -> String {
+                    (0..16u32)
+                        .map(|i| format!("{:.3}", f32::from_bits(read_u32_or_invalid(uc, m + i * 4))))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                let s1 = fmt(uc, m1);
+                let s2 = fmt(uc, m2);
+                log::info!(
+                    "PROCMAPENGINE r775 vUpdateFrustum t={}ms thread=[{}] n={} m1=[{}] m2=[{}] lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    n,
+                    s1,
+                    s2,
+                    lr,
+                );
+            }
+            0
+        });
+    }
+    // r775: `rl_tclSurface::ProjectPoint` is the per-vertex projector - its
+    // surface object (r0) carries the camera that turns Krakow into that
+    // tilted picture.  Dump its head and the incoming world point.
+    {
+        let probe = base_address + (0x0055_02f0u32 - ORIGINAL_BASE);
+        crate::os::code_stub::trap_site(unicorn, probe, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:r775-project", move |uc: &mut Unicorn<'_, Context>| {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 4 || n % 1024 == 1023 {
+                let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let pin = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let words: Vec<u32> =
+                    (0..12u32).map(|i| read_u32_or_invalid(uc, this + i * 4)).collect();
+                log::info!(
+                    "PROCMAPENGINE r775 ProjectPoint t={}ms thread=[{}] n={} this={:#x} words=[{}] in=[{},{},{}] lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    n,
+                    this,
+                    words
+                        .iter()
+                        .map(|w| format!("{w:#x}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    f32::from_bits(read_u32_or_invalid(uc, pin)),
+                    f32::from_bits(read_u32_or_invalid(uc, pin + 4)),
+                    f32::from_bits(read_u32_or_invalid(uc, pin + 8)),
+                    ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1)
+                        .wrapping_sub(base_address)
+                        .wrapping_add(ORIGINAL_BASE),
+                );
+            }
+            0
+        });
+    }
 }
 
 fn add_map_data_main_loop_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {

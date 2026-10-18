@@ -885,3 +885,26 @@ Findings (runs fix278..fix287, semtrack + EMU_WATCH forensics):
   each process maps its own VA.  Verify against the DAPI SPM client's
   use-after-free pattern first (it would fault - gate the unmap behind
   EMU_IOSC_STRICT_FREE until the client behaviour is understood).
+
+## r775 - horizon/tilted map view: injected camera elevation was 0 (horizontal)
+- Symptom: delivered map pixels showed a grazing 3D "horizon" view (orange
+  void + extruded building prisms) instead of the normal top-down map.
+- Root cause chain (all runtime-proven, probes kept in procmapengine.rs):
+  `ren_trCameraParameters` is copied verbatim (u32SetCameraParameters
+  0x524a4c) to `view+0x6c..0x8b`; the u16 at params+0x08 -> `view+0x74` is
+  NOT "pitch*10" but the elevation field `Render` converts to euler angle 1
+  as `(0xffff - field) * pi/131072` (0 = look along the ground,
+  0xffff = straight down = the normal top-down view the view constructor
+  itself bakes).  The renfi camera driver (procnav.rs) sent `0` there, so
+  every applied camera laid the camera flat and the picture became the
+  tilted horizon (and with it the orange off-map void fill + demo artifacts
+  that dominate a grazing view).
+- Fix: the serializer now puts `0xffffu16` in the elevation slot (heading
+  stays 0 = north-up).  Verified (fix297): euler triple reaches `[0,0,0]`
+  and published frames are a clean top-down white base + Krakow landcover
+  polygons, no horizon, no orange-void flicker (that flicker was the
+  Milwaukee demo camera showing off-map void half the time).
+- Remaining (unchanged, milestone-2): only the landcover layer is delivered
+  yet (2 flat colors); roads/labels blocks still not harvested; engine
+  power-on demo camera still writes its 65deg-tilted literals (lr 0x4d7518)
+  once, corrected by the next nudge within 700 ms.
