@@ -279,6 +279,84 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
 pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     // Stubbed functions are patched to `svc #0` and dispatched from the single
     // intr hook, so no per-instruction Unicorn code hooks are registered.
+    // r789d: message-pool subsystem census.  enavi NavIF creation dies when
+    // OSAL_s32MessagePoolOpen takes its -1 exit (pool resources [S+8] == 0,
+    // "not initialised"); the whole NavIF/CCA service gate downstream of
+    // STARTUP case 4 hangs on this.  Log entry, both exits, the pool-create
+    // helper and the two init entry points to see whether init is never
+    // called or called-and-failing.
+    {
+        let sites: [(u32, &str); 6] = [
+            (0x4851_1f18, "pool-open-ok"),
+            (0x4851_1fa4, "pool-open-failpath"),
+            (0x4851_1c34, "pool-create"),
+            (0x4851_4008, "iosc-registry-init"),
+            (0x4850_754c, "vinit-msgpool"),
+            (0x4851_1f38, "pool-open-notopen"),
+        ];
+        for (va, label) in sites {
+            let address = base_address + (va - 0x484d_8000);
+            let label = label.to_string();
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/mod.rs:pool-diag", move |uc: &mut Unicorn<'_, Context>| {
+                static HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                use std::sync::atomic::Ordering;
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 30 {
+                    return 0;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::warn!(
+                    "LIBOSAL pool-diag {label} t={}ms tid=[{}] r0={r0:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                );
+                0
+            });
+        }
+        // r790: message-pool open fix.  The real kernel-side IOSC master
+        // sets the pool-init flag (+0x1ac) in the shared IOSC data block, so
+        // every process' vInitMessagePool creates its local pool object before
+        // OSAL_s32MessagePoolOpen runs; in the emulator only procbaselx
+        // (vGetGlobalIoscData -> 0x9007b000) gets a live block, the rest see
+        // the zero static placeholder (0x4856d820), skip PoolCreate and their
+        // PoolOpen takes the -1 exit.  That -1 cascades: enavi's
+        // enActivateCommunication returns 0x80010001, enNavIFCreate fails,
+        // bStartupNavIF fails and the whole CL/CCA nav service gate dies.
+        // Fabricate the "pool created" state (same as procbaselx reaches via
+        // PoolCreate: object state 3, G+8/G+0xc set) at PoolOpen entry when
+        // the object is still unopened, so the library's own refcount path
+        // continues and returns 0.  This emulates the kernel IOSC pool
+        // subsystem, like the mbx queue / event emulation already does; no
+        // application answer is fabricated.
+        {
+            let address = base_address + (0x4851_1ecc - 0x484d_8000);
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/mod.rs:pool-open-fix", move |uc: &mut Unicorn<'_, Context>| {
+                let mut rd = |a: u32| -> u32 {
+                    let mut w = [0u8; 4];
+                    if uc.mem_read(a as u64, &mut w).is_ok() {
+                        u32::from_le_bytes(w)
+                    } else {
+                        0xdead_beef
+                    }
+                };
+                let p = rd(0x4856_f7f8); // G + 4: pool object
+                if p != 0 && p != 0xdead_beef && rd(p.wrapping_add(0x10)) == 0xffff_ffff {
+                    let mut wr = |a: u32, v: u32| {
+                        let _ = uc.mem_write(a as u64, &v.to_le_bytes());
+                    };
+                    wr(p.wrapping_add(0x10), 3); // state: created+open
+                    wr(0x4856_f7fc, p); // G + 8: pool handle
+                    wr(0x4856_f800, 1); // G + 0xc: opened
+                    log::info!(
+                        "LIBOSAL: pool-open fabricating created-state for unopened pool {p:#x} (t={}ms tid=[{}]) - kernel IOSC pool subsystem emulation",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                }
+                0
+            });
+        }
+    }
     const EXIT_EXCEPTION_HANDLER: u32 = 0x4851_f044 - 0x484d_8000;
     add_code_stub(
         unicorn,

@@ -1473,3 +1473,56 @@ Evidence: /home/marek/Temp/f66..f78.log (golden triple-tap recipe).
 - Side effects of the event-mode fix not yet visually verified: engine
   processes now run at boot, so the "Starting navigation" popup behaviour
   may have changed - needs one user-visible golden run.
+
+## r790-r791 (2026-10-19): navif CL registrations now succeed - bStartupNavIF returns 1
+
+Fixed (all emulator-side, no guest patching):
+
+- `OSAL_s32MessagePoolOpen` returned -1 in every process except procbaselx:
+  the pool "created" flag at IOSC-data+0x1ac is per-process, so only the
+  creator could open (`enNavIFCreate` -> 0x80010001).  The kernel-IOSC pool
+  object is *shared* state; the emulation now fabricates created-state at
+  `PoolOpen` entry when the pool object is unopened (`pool-open` in
+  `libs/libosal_linux/mod.rs`).  All processes reach pool-open-ok and
+  `enNavIFCreate` returns 0 (f83+).
+- The scd client library in every Linux process flips itself into SCD
+  queue-mode (`scd_bTestLookupIoControl` 0xfbed38 probes ioctl 10 on the scd
+  queue handle; our layer acked it) but nothing answered the lookup ioctl
+  0xb, so every service resolved to nothing: registrations went to the
+  client's own queue and `ProxyOutCCA::enConnect` died with 0x8000000b.
+  Trap `OSAL_s32IOControl` (0x484f0da4): request 10 keeps its native body
+  (suppressing it stalls bring-up - f95/f96), request 0xb is answered from
+  the shared registry (`find_key_by_u32_value("SERVICEID")` -> the owning
+  app's APPID; svc 0xa/0x1e -> 0x15 SENSORFI, else fail).  This mirrors the
+  kernel SCD channel on the unit (logged per lookup).
+- Generalized the cca-server register answer: RegisterConf+ServiceStatus now
+  go to `mbx_<client>` (was hardcoded `mbx_265`/client 0x0109 only), with a
+  HOSTED_SERVER_APPS guard (0x0001/0x0007/0x0109): registrations landing on
+  an emulated process are never fabricated here (AGENTS rule 1).  Missed
+  live deliveries ride a per-client `SCD_REG_SPOOL`, flushed at that
+  client's next bridged Wait.
+- registry_compat.reg: publish the 14 remaining FI CL service ids
+  (0x2c,0x1f,0x18,0x0d,0x06,0x152,0x3c,0x07,0x37,0x32,0x300,0x56,0x7e,0x7d)
+  under `FUNCTIONAL_COMPONENT\HMINAVSERVER` (app 0x24, not emulated - its
+  registrations are answered by the cca-server emulation like the HMI-side
+  ones since milestone 1).  The unit publishes them from the encrypted
+  NAVAPP hive.  The C1 loop's required/skip decision still comes from the
+  genuine USE_CCA_SRV_* values (indices 7,8,10,11 skipped in f99).
+
+Result (f98/f99): every required registration in
+`enavi_tclCCACommandSubscriber::C1` returns 0,
+`bStartupNavIF` returns **1** for the first time, the enavi SM retry at
++15s now re-checks service availability instead of re-registering, and the
+third golden tap fires the SM-PAGE transition cascade.
+
+Open / next:
+
+- The state word of the STARTUP process still shows no a1=5 transition in
+  the probes (enavi-setstate only fired with a1=1) - verify where
+  `bRunWhenRunning` goes after `bStartupNavIF`==1 (lr 0x1c7c554 retry loop
+  does bIsServiceAvailable checks, lr 0x17c7634) and what gates state 5.
+- The address-database gate (popup persistence, DAPI DAPDATAS) stands
+  between the case-5 gate and the keyboard page (milestone C).
+- Probe hygiene: several r790 probe budgets/timers (`allocmsg`,
+  `enconnect-*`, `cmdsub-res`) are still compiled in behind
+  `EMU_PROCHMI_NAV_TRACE`; trim to what milestone C still needs.

@@ -1203,6 +1203,13 @@ fn osal_state() -> &'static Mutex<OsalState> {
     STATE.get_or_init(|| Mutex::new(OsalState::default()))
 }
 
+/// Record the monitor last-error a failing service leaves behind, so the
+/// following get-last-error command (`0x20`) hands it back.  Also used by the
+/// libosal traps that deny a service outside the monitor (r791).
+pub fn note_osal_last_error(thread: u32, code: u32) {
+    osal_state().lock().unwrap().last_error.insert(thread, code);
+}
+
 /// The `OSAL_NOT_SET` sentinel the context leaf (`0x288c8`) hands back when the task has no
 /// context stored: a null pointer is the value PROCNAV's callers already branch on.
 const OSAL_CONTEXT_UNSET: u32 = 0;
@@ -3005,7 +3012,7 @@ fn complete_registry_set(unicorn: &mut Unicorn<'_, Context>, path: &str, buffer:
 /// Read a NUL-terminated printable string from guest memory (device paths and value names
 /// start with `/` or are arbitrary ASCII, so the identifier filter in [`describe`] is too
 /// strict here). Returns `None` only when the memory cannot be read at all.
-fn read_c_string(unicorn: &mut Unicorn<'_, Context>, address: u32) -> Option<String> {
+pub(crate) fn read_c_string(unicorn: &mut Unicorn<'_, Context>, address: u32) -> Option<String> {
     if address < 0x1_0000 {
         return None;
     }

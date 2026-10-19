@@ -726,6 +726,85 @@ thread_local! {
 
 pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     PROCHMI_BASE.store(base_address, Ordering::Relaxed);
+    // r789d one-shot diagnostic (EMU_PROCHMI_XREF_SCAN=1).  prochmi is
+    // prelinked: callers of the exported navif/enavi glue (enActivate,
+    // IFMediator::enActivate, bInitialise, bNavIFCreate) bind through
+    // GOT-style slots and Ghidra carries no xrefs for them - the navif
+    // bring-up caller hunt on the engine service gate is statically blind.
+    // Walk every mapped RW region for words equal to the runtime VAs (and
+    // the vtable constants, stored relocated as base + 8) and dump the
+    // relocated vtable heads, so the pointer owners become identifiable.
+    if std::env::var("EMU_PROCHMI_XREF_SCAN").is_ok() {
+        const TARGETS: [(&str, u32); 8] = [
+            ("enavi_enActivate", 0x017c_1bf8),
+            ("ifmed_enActivate", 0x01c7_d3c8),
+            ("navif_bInitialise", 0x01c7_b44c),
+            ("navif_enNavIFCreate", 0x01c7_b4bc),
+            ("ennavi_bNavIFCreate", 0x017c_1e80),
+            ("fi_navi_vSetRegisterID", 0x014b_b224),
+            ("enavi_navif_vtable", 0x0523_8558),
+            ("navif_svcman_vtable", 0x0533_65a8),
+        ];
+        let mut needles: Vec<(&str, u32)> = Vec::new();
+        for (name, va) in TARGETS {
+            needles.push((name, base_address + va - ORIGINAL_BASE));
+            if va >= ORIGINAL_BASE {
+                // vtable constants are stored as `vtable + 8` and get
+                // relocated the same base delta as code.
+                needles.push((name, base_address + va + 8 - ORIGINAL_BASE));
+            }
+        }
+        let regions: Vec<(u32, u32)> = match unicorn.mem_regions() {
+            Ok(rs) => rs.iter().map(|r| (r.begin as u32, r.end as u32)).collect(),
+            Err(_) => Vec::new(),
+        };
+        let mut buf = vec![0u8; 0x10000];
+        let mut total_hits = 0usize;
+        for (b, e) in &regions {
+            let size = e.wrapping_sub(*b);
+            if size > 0x600_0000 || size == 0 {
+                continue;
+            }
+            let mut off = 0u32;
+            while off < size && total_hits < 200 {
+                let len = std::cmp::min(0x10000, size - off) as usize;
+                if unicorn.mem_read((b + off) as u64, &mut buf[..len]).is_err() {
+                    off += 0x10000;
+                    continue;
+                }
+                for i in 0..len / 4 {
+                    let w = i * 4;
+                    let word = u32::from_le_bytes([buf[w], buf[w + 1], buf[w + 2], buf[w + 3]]);
+                    for (name, needle) in &needles {
+                        if word == *needle {
+                            total_hits += 1;
+                            log::warn!(
+                                "PROCHMI xref-scan {name}: slot={:#x} region={b:#x}+{off:#x}+{w:#x} value={word:#x}",
+                                b + off + w as u32,
+                            );
+                        }
+                    }
+                }
+                off += 0x10000;
+            }
+        }
+        log::warn!("PROCHMI xref-scan complete: {total_hits} hits");
+        for (name, va) in [
+            ("enavi_navif_vtable", 0x0523_8558u32),
+            ("navif_svcman_vtable", 0x0533_65a8u32),
+        ] {
+            let rt = base_address + va - ORIGINAL_BASE;
+            let mut dump = String::new();
+            for i in 0..14u32 {
+                let mut w = [0u8; 4];
+                if unicorn.mem_read((rt + i * 4) as u64, &mut w).is_ok() {
+                    let v = u32::from_le_bytes(w);
+                    dump.push_str(&format!(" {:x}", v.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE)));
+                }
+            }
+            log::warn!("PROCHMI xref-scan {name}@{rt:#x}:{dump}");
+        }
+    }
     install_hmi_mngr_initialize_before_v_start_thread(unicorn, base_address);
     force_hmi_thread_running_true(unicorn);
 
@@ -5195,6 +5274,372 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             "PROCHMI enavi-flag64 write-watch installed: {}",
             result.is_ok()
         );
+    }
+
+    // r789b: FI-8 bring-up census.  The framework hands a CCA register-id to
+    // an FI proxy (clFi_Navi::vSetRegisterID, navifi-setregid probe, zero
+    // hits) only if the FI is registered with the CCA app layer -
+    // hmicca_tclApp::bRegisterForFID(fiId) is that registration, and
+    // clFiFactory::CreateFi(fiId) is the creation.  Log both id censuses:
+    // if 8 is created but never registered-for-FID, the framework config
+    // that enumerates FIs is the missing precondition (registry-provisioned,
+    // fixable in data/registry_compat.reg).
+    {
+        for (offset, name) in [
+            (0x00fc_92b8u32, "reg-for-fid"),
+            (0x013d_15e4u32, "create-fi"),
+        ] {
+            let address = base_address + offset - ORIGINAL_BASE;
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:fi-census", move |uc: &mut Unicorn<'_, Context>| {
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 60 {
+                    return 0;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCHMI fi-census {name} t={}ms tid=[{}] r0={r0:#x} r1={r1:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                );
+                0
+            });
+        }
+    }
+    {
+        // bDefaultSvcDataHandler matched-entry dispatch (blx ip at
+        // 0x1e82440 preceded by the pFindMsgEntry result test): the gw feeds
+        // svc 0x27 ServiceData(0x45) to a clDispSet_CCAhandler work object
+        // (0x38feab0, f78 gw-deliver); this site says whether its msg map
+        // (0x521d610) has a 0x27 handler and what the handler address is.
+        let address = base_address + 0x01e8_2418u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:svcmgr-dispatch", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 40 {
+                return 0;
+            }
+            let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+            let entry = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            // svcData wrapper r6 -> body -> svc u16 @ +0x18
+            let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+            let body = read_u32(uc, r6.wrapping_add(4));
+            let svc = (read_u32(uc, body.wrapping_add(0x18)) & 0xffff) as u16;
+            let (handler, off) = if entry != 0 {
+                (read_u32(uc, entry), read_u32(uc, entry.wrapping_add(4)))
+            } else {
+                (0, 0)
+            };
+            log::warn!(
+                "PROCHMI svcmgr-dispatch t={}ms tid=[{}] work={r5:#x} svc={svc:#06x} entry={entry:#x} handler={handler:#x} off={off:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+
+    // r789c: STARTUP case-4/5 chain instrumentation.  f77 shows state 4 at
+    // t=20.1 s and a retry to state 1 at t=35.6 s; the navif/routecca probes
+    // cannot tell whether bStartupNavIF/bNavIFCreate ran at all (enActivate
+    // is downstream of them).  Log the state machine entry state, the
+    // bStartupNavIF result (beq site after bl 0x17be644), bNavIFCreate entry,
+    // the NAVIF_APPID registry read and the enNavIFCreate result.
+    {
+        let address = base_address + 0x017c_73c0u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:startup-step", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 30 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let state = read_u32(uc, r0.wrapping_add(0xc));
+            log::warn!(
+                "PROCHMI startup-step t={}ms tid=[{}] proc={r0:#x} state={state}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    for (offset, label) in [
+        (0x017c_75a8u32, "startup-navif-result"),
+        (0x017c_1e80u32, "navif-create"),
+        (0x017c_1ef0u32, "navif-appid"),
+        (0x017c_1f1cu32, "ennavif-create-result"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:navif-chain", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 20 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            log::warn!(
+                "PROCHMI navif-chain {label} t={}ms tid=[{}] r0={r0:#x} lr={lr:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r790b: after the pool fix bNavIFCreate succeeds but bStartupNavIF still
+    // fails - the CCACommandSubscriber construction path is the suspect.
+    // Log enActivate args + navif fields, the subscriber ctor args, and every
+    // poNavIFGetControl request.
+    for (offset, label) in [
+        (0x017b_e644u32, "startup-navif-entry"),
+        (0x017c_1bf8u32, "navif-activate"),
+        (0x017b_9954u32, "cmdsub-ctor"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:navif-subs", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 20 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            let (obj, f8, fc) = if label == "cmdsub-ctor" {
+                (r1, read_u32(uc, r1.wrapping_add(8)), read_u32(uc, r1.wrapping_add(0xc)))
+            } else {
+                (r0, read_u32(uc, r0.wrapping_add(8)), read_u32(uc, r0.wrapping_add(0xc)))
+            };
+            log::warn!(
+                "PROCHMI navif-subs {label} t={}ms tid=[{}] r0={r0:#x} r1={r1:#x} obj={obj:#x} +8={f8:#x} +0xc={fc:#x} lr={lr:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    {
+        // enavi_tclNavIF::poNavIFGetControl: r0=navif, r1=control type.
+        let address = base_address + 0x017c_1ce0u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:getcontrol", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 30 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            let f8 = read_u32(uc, r0.wrapping_add(8));
+            log::warn!(
+                "PROCHMI getcontrol t={}ms tid=[{}] navif={r0:#x} type={r1:#x} +8={f8:#x} lr={lr:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r790c: CmdSubscriber::C1 decision points (0x17b9714): the control
+    // attach vfn+0xc (result site 0x17b980c), the bIsCCAServiceRequired
+    // filter (0x169e308, result site 0x17b9840, loop index over the 16-entry
+    // table {0a,2c,1f,1e,18,0d,06,152,3c,07,37,32,300,56,7e,7d}) and the
+    // per-svc registration vfn+0x14 (result site 0x17b9878).
+    {
+        let address = base_address + 0x017b_97c8u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:cmdsub-step", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 10 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let vt = read_u32(uc, r0);
+            log::warn!(
+                "PROCHMI cmdsub-step t={}ms tid=[{}] control={r0:#x} vt={vt:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r790g: write-watch on the scd dynamic-mode flag (0x02ab44b9): log every
+    // guest store to it with the program counter, to learn who turns the
+    // client's SCD lookup into queue mode (which the monitor then refuses).
+    {
+        let watch_res_scdflag = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            (base_address + 0x02ab_44b9u32 - ORIGINAL_BASE) as u64,
+            (base_address + 0x02ab_44b9u32 - ORIGINAL_BASE) as u64 + 3,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, Ordering::Relaxed) < 10 {
+                    let pc = uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                    let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI scd-flag WRITE t={}ms tid=[{}] addr={address:#x} size={size} value={value:#x} pc={pc:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                }
+                true
+            },
+        );
+        log::info!(
+            "PROCHMI scd-flag write-watch installed: {}",
+            watch_res_scdflag.is_ok()
+        );
+    }
+    // r790f: ProxyOutCCA::enConnect service-resolution outcomes.  After
+    // scd_bGetAppIdFromServiceId (call at 0x1c836d0, out1=[sp+0x34] count,
+    // out2=[sp+0x20] server app id) and after scd_OpenQueue (call at
+    // 0x1c835d0, r0 = queue handle): log what the client learned and which
+    // queue handle it got, plus the app id it asked about ([r5+0xc]).
+    for (offset, label) in [
+        (0x01c8_36d4u32, "scd-lookup"),
+        (0x01c8_35d4u32, "scd-openq"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:enconnect-scd", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 20_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 12
+            {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+            let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+            let svc = read_u32(uc, r5.wrapping_add(0xc)) & 0xffff;
+            let cnt = read_u32(uc, sp.wrapping_add(0x34));
+            let app = read_u32(uc, sp.wrapping_add(0x20)) & 0xffff;
+            // scd_bGetAppIdFromServiceId globals: static-mode flag (byte, 0 =
+            // walk the registry map) and the SCD queue handle (-1 forces the
+            // early-fail branch that skips the map entirely).
+            let mode = read_u32(uc, 0x02ab_44b9) & 0xff;
+            let qh = read_u32(uc, 0x02a1_e41c);
+            log::warn!(
+                "PROCHMI enconnect-{label} t={}ms tid=[{}] proxy={r5:#x} svc={svc:#x} r0={r0:#x} cnt={cnt:#x} app={app:#x} mode={mode:#x} scdq={qh:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r790e: amt_tclMappableMessage::bAllocateMessage (0xfbeaf4): the
+    // ServiceRegister message allocation goes through prochmi import thunks
+    // (MessageCreate via 0xfb64e8, ContentGet via 0xfb68fc).  Log both result
+    // sites and the runtime-resolved GOT slots so we can see which step
+    // fails (nonzero create return, or NULL content) and where the thunks
+    // actually land.
+    {
+        let address = base_address + 0x00fb_eb18u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:allocmsg", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 20_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 12
+            {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            let h = read_u32(uc, r4);
+            let c = read_u32(uc, r4.wrapping_add(4));
+            let slot = read_u32(uc, 0x0775_68a0);
+            log::warn!(
+                "PROCHMI allocmsg-create t={}ms tid=[{}] r0={r0:#x} handle={h:#x} content={c:#x} got={slot:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    {
+        let address = base_address + 0x00fb_eb34u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:allocmsg", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 20_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 12
+            {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let slot = read_u32(uc, 0x0776_9104);
+            log::warn!(
+                "PROCHMI allocmsg-content t={}ms tid=[{}] r0(content)={r0:#x} got={slot:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r790d: ProxyOutCCA::enConnect (0x1c83520) returns 0x8000000b either from
+    // the entry guard ([proxy+0x1c] == 0, i.e. the critical section object was
+    // never created -> pCreate/bEnter failure) or from bEnter != 1.  Log the
+    // proxy fields at entry, plus which of the two exits is taken.
+    {
+        let address = base_address + 0x01c8_3520u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:enconnect", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 12 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            let cs = read_u32(uc, r0.wrapping_add(0x1c));
+            let q = read_u32(uc, r0.wrapping_add(4));
+            let svc = read_u32(uc, r0.wrapping_add(2)) & 0xffff;
+            let app = read_u32(uc, r0.wrapping_add(0xa)) & 0xffff;
+            log::warn!(
+                "PROCHMI enconnect-entry t={}ms tid=[{}] proxy={r0:#x} svc={svc:#x} +0x1c(cs)={cs:#x} q={q:#x} app={app:#x} lr={lr:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    for (offset, label) in [
+        (0x01c8_356cu32, "enconnect-fail"),
+        (0x01c8_357cu32, "enconnect-cont"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:enconnect-exit", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 24 {
+                return 0;
+            }
+            let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+            let cs = read_u32(uc, r5.wrapping_add(0x1c));
+            let handle = if cs != 0 && cs < 0x8000_0000 {
+                read_u32(uc, cs)
+            } else {
+                0xdead_beef
+            };
+            log::warn!(
+                "PROCHMI enconnect-{label} t={}ms tid=[{}] proxy={r5:#x} cs={cs:#x} semh={handle:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    for (offset, label) in [
+        (0x017b_980cu32, "attach-vfn0c"),
+        (0x017b_9840u32, "cca-required"),
+        (0x017b_9878u32, "reg-vfn14"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:cmdsub-res", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 40 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+            let sl = uc.reg_read(RegisterARM::SL).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            log::warn!(
+                "PROCHMI cmdsub-res {label} t={}ms tid=[{}] r0={r0:#x} r4={r4:#x} svc={r5:#x} tgt={sl:#x} lr={lr:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
     }
 
     // r788c: enavi NavIF CCA input path.  STARTUP case 5 (bRunWhenRunning)

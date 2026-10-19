@@ -375,6 +375,108 @@ suppress_synthetic_message_delete(uc, addr as u32, base_address);
             0
         });
 
+    // r791: the scd client library in every Linux process probes its SCD
+    // queue handle with `OSAL_s32IOControl(handle, 10/0xb, buf)`
+    // (`scd_bTestLookupIoControl` 0xfbed38) and, when the probe seems
+    // answered, flips the whole library into SCD-queue mode
+    // (flag 0x02ab44b9=1) where every service->app lookup must come back in
+    // the ioctl buffer.  Nothing here answers the buffer, so every lookup
+    // resolves to nothing and the navif `ProxyOutCCA::enConnect` registrations
+    // die with 0x8000000b.  Deny the probe exactly the way the monitor denies
+    // it on the registry path (`complete_io_control`): -1 with last-error
+    // 0x72011, which `scd_bTestLookupIoControl` classifies as "no SCD server
+    // here" and keeps the client in static registry-map mode - the mode the
+    // emulated registry answers natively (and the mode PROCNAV stays in).
+    const IOCONTROL: u32 = 0x484f_0da4 - 0x484d_8000;
+    crate::os::code_stub::trap_site(unicorn, (base_address + IOCONTROL), crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/message.rs:iocontrol-scd", move |uc: &mut Unicorn<'_, Context>| {
+        let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+        let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+        {
+            static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+                std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
+            if let Ok(mut s) = SEEN.lock() {
+                if s.len() < 40 && s.insert(r1) {
+                    let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                    log::info!(
+                        "LIBOSAL iocontrol-enter req={r1:#x} handle={r0:#x} lr={lr:#x} tid=[{}]",
+                        uc.get_data().inner.thread_id(),
+                    );
+                }
+            }
+        }
+        if !matches!(r1, 10 | 0xb) {
+            return 0;
+        }
+        // Registry handles must keep flowing to the monitor (which answers
+        // real queries); they open with a "/dev/registry/..." path stored at
+        // handle+0x20 - the same field the monitor reads.
+        if let Some(path) = crate::rtos::monitor::read_c_string(uc, r0.wrapping_add(0x20)) {
+            if path.starts_with("/dev/registry") {
+                return 0;
+            }
+        }
+        // r791: this is the scd client channel (`scd_bCreateQueue` opened the
+        // scd key's value path).  On the real unit the kernel SCD answers it;
+        // here no real channel exists, and an unanswered probe leaves the
+        // whole client library in queue mode with empty answers, so every
+        // service lookup resolves to nothing and the navif registrations die
+        // with 0x8000000b.  Serve the two lookup requests from the shared
+        // registry: 0xa is the capability probe (answered "server present"),
+        // 0xb carries the service id in the request block at buf+0x100
+        // (`uStack_224` in `scd_bGetAppIdFromServiceId` 0xfc1378) and the
+        // kernel overwrites it with the provider app id on success.
+        // r791b: request 10 keeps its native body.  It has queue side
+        // effects (the library messages the SCD about the caller), and
+        // suppressing it stalls the caller's bring-up (r791 f95/f96: prochmi
+        // main init slept at t~2.1s and never reached the enavi chain).  It
+        // already "succeeds" natively, which is what sets the library into
+        // queue mode; only request 0xb (the service lookup) is unanswered.
+        let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+        if r1 == 10 {
+            return 0;
+        }
+        let mut w = [0u8; 4];
+        if uc.mem_read(r2.wrapping_add(0x100) as u64, &mut w).is_err() {
+            return_to_caller(uc, u32::MAX);
+            return 0;
+        }
+        let svc = u16::from_le_bytes([w[0], w[1]]);
+        let namespace = uc.get_data().namespace.clone();
+        let resolved: Option<u16> = {
+            let state = namespace.lock().unwrap();
+            state
+                .registry
+                .find_key_by_u32_value("SERVICEID", u32::from(svc))
+                .and_then(|key| {
+                    // .../PROCESS/<group>/<app>/SERVICES/<svc> -> the app key
+                    let services = key.rsplit_once('/')?.0;
+                    let app = services.rsplit_once('/')?.0;
+                    state.registry.query_u32(app, "APPID").map(|a| a as u16)
+                })
+        };
+        match resolved {
+            Some(app) => {
+                let _ = uc.mem_write(r2.wrapping_add(0x100) as u64, &app.to_le_bytes());
+                log::info!(
+                    "LIBOSAL: scd lookup (0xb): service {svc:#x} -> app {app:#x} ({})",
+                    if matches!(app, 0x0001 | 0x0007 | 0x0109) {
+                        "emulated process must answer"
+                    } else {
+                        "external provider"
+                    }
+                );
+                return_to_caller(uc, 0);
+            }
+            None => {
+                log::info!(
+                    "LIBOSAL: scd lookup (0xb): no registry entry publishes service {svc:#x}, lookup fails"
+                );
+                return_to_caller(uc, u32::MAX);
+            }
+        }
+        0
+    });
+
     // r755-diag: OSAL_vAssertFunction(expr, file, line).  The d02 errmem
     // storms report only the record; this names the assert text, its source
     // file/line and the first return addresses still on the stack, so a
@@ -2162,6 +2264,48 @@ fn observe_cca_directory(    unicorn: &mut Unicorn<'_, Context>,
 /// same as the directory's: both classes need admin state RUNNING, so the
 /// spool rides `DIR_REPLY_CACHE` until the pump reaches a bridged Wait
 /// after promotion.
+/// r791: RegisterConf/ServiceStatus bodies that missed their live delivery
+/// window, tagged with the client queue they belong to.  Flushed when that
+/// queue next appears in a bridged Wait.
+static SCD_REG_SPOOL: std::sync::LazyLock<std::sync::Mutex<Vec<(String, Vec<u8>)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
+
+fn scd_reg_spool_flush(unicorn: &mut Unicorn<'_, Context>, queue: &str) {
+    let owned: Vec<Vec<u8>> = match SCD_REG_SPOOL.lock() {
+        Ok(mut c) => {
+            let take: Vec<usize> = c
+                .iter()
+                .enumerate()
+                .filter(|(_, (q, _))| q == queue)
+                .map(|(i, _)| i)
+                .collect();
+            if take.is_empty() {
+                return;
+            }
+            take.into_iter().rev().map(|i| c.remove(i).1).collect()
+        }
+        Err(_) => return,
+    };
+    let mut posted = 0usize;
+    for body in owned {
+        let mut blob = Vec::with_capacity(8 + body.len());
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&body);
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
+        if let Some(q) = state.mq.queue_id_for_name(queue) {
+            state.mq.grow_msgsize(q, blob.len() as i64);
+            if OsalQueueService::guest_post(&mut state.mq, queue, blob, 0) {
+                posted += 1;
+                state.notify_waiters();
+            }
+        }
+    }
+    if posted > 0 {
+        log::info!("[LIBOSAL-MBX] cca server: flushed {posted} spooled registrations to {queue}");
+    }
+}
+
 fn cca_server_answer_register(
     unicorn: &mut Unicorn<'_, Context>,
     server_app: u16,
@@ -2169,6 +2313,10 @@ fn cca_server_answer_register(
     service: u16,
 ) {
     static MSG_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x3000);
+    // r791: answers go to the client's own app queue (mbx_<client>): that is
+    // the queue `scd_bCreateQueue` hands the client and where its AIL pump
+    // waits (HMI: mbx_265 = mbx_<0x109>, navif server: mbx_289 = mbx_<0x121>).
+    let target = format!("mbx_{client}");
     let mut answers: Vec<Vec<u8>> = Vec::with_capacity(2);
     for class in [0x43u8, 0x44] {
         let mut body = vec![0u8; 0x20];
@@ -2191,7 +2339,7 @@ fn cca_server_answer_register(
             // id; the nav service needs state 1 to reach the startup case.
             body[0x18] = 1; // ServiceStatus: state 1 for the NAVI service
         } // else ServiceStatus: state byte 0 = ACTIVE (fastmap precedent)
-        stamp_registration_id("mbx_265", &mut body);
+        stamp_registration_id(&target, &mut body);
         answers.push(body);
     }
     let mut kept: Vec<Vec<u8>> = Vec::new();
@@ -2202,10 +2350,10 @@ fn cca_server_answer_register(
         blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
         blob.extend_from_slice(&body);
         let mut state = unicorn.get_data().namespace.lock().unwrap();
-        let delivered = match state.mq.queue_id_for_name("mbx_265") {
+        let delivered = match state.mq.queue_id_for_name(&target) {
             Some(q) if pwr_proxy::app_state_change_delivered(client) => {
                 state.mq.grow_msgsize(q, blob.len() as i64);
-                let ok = OsalQueueService::guest_post(&mut state.mq, "mbx_265", blob, 0);
+                let ok = OsalQueueService::guest_post(&mut state.mq, &target, blob, 0);
                 if ok {
                     state.notify_waiters();
                 }
@@ -2220,10 +2368,23 @@ fn cca_server_answer_register(
         }
     }
     if !kept.is_empty() {
-        if let Ok(mut c) = DIR_REPLY_CACHE.lock() {
-            for body in kept {
-                if c.len() < 96 {
-                    c.push(body);
+        if client == 0x0109 {
+            if let Ok(mut c) = DIR_REPLY_CACHE.lock() {
+                for body in kept {
+                    if c.len() < 96 {
+                        c.push(body);
+                    }
+                }
+            }
+        } else {
+            // r791: other clients (the navif server, app 0x0121) ride their
+            // own spool: the answers are replayed at that client's next
+            // bridged queue Wait, not the HMI directory pump's.
+            if let Ok(mut c) = SCD_REG_SPOOL.lock() {
+                for body in kept {
+                    if c.len() < 96 {
+                        c.push((target.clone(), body));
+                    }
                 }
             }
         }
@@ -2408,6 +2569,12 @@ fn bridge_guest_osal_queue(
     prio_ptr: u32,
     timeout: u32,
 ) -> bool {
+    if matches!(
+        api_name,
+        "OSAL_s32MessageQueueWait" | "OSAL_s32MessageQueuePriorityWait"
+    ) {
+        scd_reg_spool_flush(unicorn, name);
+    }
     match api_name {
         "OSAL_s32MessageQueuePost" => {
             if !OsalQueueService::is_rtos_intercepted_queue(name) {
@@ -2815,10 +2982,18 @@ fn bridge_mbx_queue(
             // `cca_server_answer_register`.
             if body.len() >= 0x18 && body[0xb] == 0x41 {
                 let client = u16::from_le_bytes([body[0], body[1]]);
-                if client == 0x0109 && name != "mbx_265" && name != "mbx_0" {
+                if name != "mbx_265" && name != "mbx_0" && name != &format!("mbx_{client}") {
                     if let Some(dec) = name.strip_prefix("mbx_") {
                         if let Ok(server) = dec.parse::<u32>() {
-                            if (1..=0xffff).contains(&server) {
+                            // r791: only answer for providers that are NOT
+                            // among the emulated processes - a registration
+                            // landing on PROCNAV (0x0001), DAPI (0x0007) or
+                            // the HMI itself must be answered by that guest,
+                            // never fabricated here (fidelity rule).
+                            const HOSTED_SERVER_APPS: [u32; 3] = [0x0001, 0x0007, 0x0109];
+                            if (1..=0xffff).contains(&server)
+                                && !HOSTED_SERVER_APPS.contains(&server)
+                            {
                                 cca_server_answer_register(
                                     unicorn,
                                     server as u16,
