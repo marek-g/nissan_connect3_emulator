@@ -1285,3 +1285,54 @@ word+0x18 (SEM_LOCK 0x195c8, SYNC_LOCK 0x10a1ec, EV__LOCK 0x1cc, TSK_LOCK
   service state), NOT an injected answer.
 - Working reference for a healthy dynamic popup: waypoint companion 653
   (0x28d) requested via the same vEnter->vSetView path at t=33605.
+
+## r787 - correction + deepening of r786: popup 0x636 DOES open; the wait is mediator 0x90000206
+
+Full-run forensics (f15..f20, probes: dynstack-op dedup+child dump,
+GUI_StateMachine::vEnter/vLeave, dynsm-flag MEM_WRITE,
+GUI_StatePseudoMediatorSync::vStart/bCheckState, f17 map-dump screenshots):
+
+- r786's "view cid 0 + no vEnter" reading was wrong: the cid-0 companion at
+  tap3+8ms is the transient left by the vLeave pair (pending=0 armed the
+  switch before the new enter came).  The dedup'd dynstack-op timeline shows
+  popup 0x636 inserted at tap3 (prio 0x12c) WITH a compiled GUI_StateView
+  child (record 0x39fa2d8+0x50 = 0x39fa328, id 0x40003d7a, view cid 0x28d),
+  which enters ~0.5 s later (dynsm flag 1, lr 0x136e09c) and creates the
+  companion cid=653.  Screenshots confirm what 607/653 actually are: the
+  dotted busy spinner - it appears after tap2 (Enter Destination) and never
+  clears; tap3 (New Address) re-arms it (607 -> 653).  The HMI-side state
+  machine machinery is fully functional; milestone C is NOT a paint bug and
+  NOT a dynsm-gate bug (dynsm flag toggles are consequences of enter/leave,
+  writers 0x47dc4f8c set / 0x139e8c4 clear).
+- The real wait: opening the dialog starts (mediator-sync probe, f20) a
+  GUI_StatePseudoMediatorSync at 0x39fcd88, state id 0x40001b5a, vStart lr
+  0x13716ec (inside GUI_StateMachine::vPerformTransition).  Its descriptor
+  0x025ad8d8 is a row of a static ROM table at ~0x025ad600, 20-byte rows
+  {stateId, fnptr, mediatorId, runtime-count u32, view-cid u32}: 13+ rows,
+  all bound to mediator content 0x90000206 (kind 9), rows waiting on it
+  target views 0x277..0x2A6 (the keyboard/dest-entry dialog page cids).
+- bCheckState (0x137586c, f14/f20: called exactly once at tap3): passes only
+  when `[desc+0x10] != 0` (runtime registration count, still 0) and the kind-9
+  mediator handler count (registry [0x5972a30 + 9*4], vtable+4) matches the
+  wait polarity.  It never passes -> the transition to the dialog page (view
+  645/0x285 area) never fires -> spinner forever.  mediator-check probe keeps
+  logging handler+countfn; bCheckState hits are rare = the SM polls via
+  vOnDataUpdate, not a free-running timer.
+- Producer identity: the HMI resolves interface/peer apps through registry
+  PROCESS/* APPID values (log).  0x0107/0x0108/0x010f/... are audio/tuner/
+  smartphone FIs (legitimate fabrications); svc 0x0027 @ app 0x0024 =
+  FUNCTIONAL_COMPONENT/HMINAVSERVER, whose strings + HMINAVSRV CL thread +
+  D605_registry/ni2k_*/hminavserver.reg all exist - the nav server interface
+  the keyboard waits on (NAVIF, NAVIF_APPID 0x121 commented in reg).  The
+  kind-9 mediator handler is fed from that CL interface (clHmiNavServer
+  client layer inside prochmi); no CL data ever arrives because the nav-side
+  endpoint (PROCNAV/srvctrl RNW session) stalls: after each nav tap PROCNAV
+  opens an IOSC session (MQB_1/MQB_3 via monitor svc 0x280664 obj 100), posts
+  one {1, shm_ptr} event and then its worker threads (75/78/79) poll in
+  0.3 s loops without completing the session (f18/f20).
+- Next fix target (AGENTS.md rule 1): complete PROCNAV's dest-entry CL
+  session so prochmi's mediator gets fed and bCheckState passes by itself.
+  Investigation points: monitor svc 0x280664 session semantics (who is the
+  peer of MQB_1/MQB_3 - find the second opener/receiver), the wait-stack
+  word 0x0032b710 shared by all PROCNAV srvctrl-thread waits, and
+  hminavserver.reg NAVIF registration expectations vs our CCA directory.

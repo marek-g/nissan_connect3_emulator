@@ -4041,7 +4041,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // resolves (GUI_StateBase slots at *(sm+4)[op] and *(sm+4)[popup])
             // and the popup state object's head - the slot whose +0x30 u16 is
             // the view cid the companion block later instantiates.
-            let slots = if r3 == 0 {
+            let slots = if true {
                 let tb = read_u32(uc, r0 + 4);
                 let sop = read_u32(uc, tb.wrapping_add(r1 * 4));
                 let spo = read_u32(uc, tb.wrapping_add(r2 * 4));
@@ -4213,6 +4213,84 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 0
             });
         }
+    }
+
+    // r787: GUI_StatePseudoMediatorSync::vStart (0x13756ec) - every compiled
+    // mediator-sync state logs its mediator descriptor here when its machine
+    // starts.  The descriptor identifies the CL data source (mediator content
+    // id + registry kind) a dialog waits on; which ones never report
+    // data-ready is the milestone-C blocker list.
+    {
+        let address = base_address + 0x0137_56ecu32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:mediator-sync", move |uc: &mut Unicorn<'_, Context>| {
+            if !nav_trace_enabled() {
+                return 0;
+            }
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 400 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            let id = read_u32(uc, r0 + 8);
+            let desc = read_u32(uc, r0 + 0x20);
+            let (d8, dc, d10) = if desc != 0 && desc < 0x0f00_0000 {
+                (read_u32(uc, desc + 8), read_u32(uc, desc + 0xc), read_u16(uc, desc + 0x10))
+            } else {
+                (0, 0, 0)
+            };
+            log::warn!(
+                "PROCHMI mediator-sync t={}ms this={r0:#x} id={id:#x} flags={:#x} desc={desc:#x} d+8={d8:#x} d+c={dc:#x} d+10={d10:#x} lr={lr:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                read_u32(uc, r0 + 0x28),
+            );
+            0
+        });
+    }
+
+    // r787: GUI_StatePseudoMediatorSync::bCheckState (0x137586c) - polled by
+    // the state's own timer; the return value says whether the bound
+    // mediator's data count matches the wait polarity.  Dedup per (this,
+    // result) so the periodic poll does not flood.
+    {
+        let address = base_address + 0x0137_586cu32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:mediator-check", move |uc: &mut Unicorn<'_, Context>| {
+            if !nav_trace_enabled() {
+                return 0;
+            }
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 4000 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let desc = read_u32(uc, r0 + 0x20);
+            let (dmc, handlers, vfn) = if desc != 0 && desc < 0x0f00_0000 {
+                let dmc = read_u32(uc, desc + 0xc);
+                // Same handler lookup bCheckState itself does: kind-indexed
+                // mediator registry, handler vtable slot +4 = count query.
+                let handlers = read_u32(uc, 0x0597_2a30u32.wrapping_add((dmc >> 28) * 4));
+                let vfn = read_u32(uc, read_u32(uc, handlers).wrapping_add(4));
+                (dmc, handlers, vfn)
+            } else {
+                (0, 0, 0)
+            };
+            static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(u32, u32), u32>>> =
+                std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+            let mut show = true;
+            if let Ok(mut m) = SEEN.lock() {
+                let c = m.entry((r0, vfn)).or_insert(0);
+                *c += 1;
+                show = *c <= 2;
+            }
+            if show {
+                log::warn!(
+                    "PROCHMI mediator-check t={}ms this={r0:#x} flags={:#x} mediator={dmc:#x} handler={handlers:#x} countfn={vfn:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    read_u32(uc, r0 + 0x28),
+                );
+            }
+            0
+        });
     }
 
     // r786: who flips bIsDynamicStateMachineActivated (SuperSM 0x39e1cb0
