@@ -1336,3 +1336,29 @@ GUI_StatePseudoMediatorSync::vStart/bCheckState, f17 map-dump screenshots):
   peer of MQB_1/MQB_3 - find the second opener/receiver), the wait-stack
   word 0x0032b710 shared by all PROCNAV srvctrl-thread waits, and
   hminavserver.reg NAVIF registration expectations vs our CCA directory.
+
+## r788 - the wait bottomed out: content-function 0x206 getter slot is empty
+
+- Corrected the mediator registry address: it is NOT the prelinked Ghidra
+  constant 0x05972a30 but GOT [0x02a13300] -> 0x02cb9518 at runtime.  All ten
+  kind handlers ARE installed (k9 handler 0x391a250, vtable
+  0x029087f8 = GUI_ContentFunction).  The "mediator count" is
+  GUI_ContentFunction::nToInteger(id): the getter table (s_pGetData, ids <
+  0xeac, runtime base 0x05202510) holds {fnptr, raw, type} per content id.
+- Entry 0x206 (mediator 0x90000206) = {getter=0, raw=0, type=0}: the dest-
+  entry data getter is NEVER registered.  The dialog's wait is bound to a
+  content function whose provider (the CL/FI proxy of the destination-entry
+  session) does not exist in the emulator - so not even a data-update event
+  could ever be delivered: vCheckFire runs only at SM compile (51 rows,
+  t=13.4 s) and at dialog open; evtqm shows no CL event at tap time ever
+  (only the 0x8100801a action event).
+- Ruled out as the feed path: enavi_tcl (prochmi's only CL thread,
+  enavi_tclEnaviThread = external-nav/HMINAVSRV, no navif_tclIFMediator
+  instances), AIL service requests (HMI sent 423 boot requests, none ever
+  to a NAVI-family app; zero inbound class-0x45 pushes to mbx_265), and the
+  IOSC ringbuffer ioctl (never called; MQB_1/MQB_3 = PROCNAV monitor-queue
+  session bodies with one {1,shm_ptr} post each after tap1/tap2, unrouted).
+- Fix target stands: PROCNAV's dest-entry CL session must come up (srvctrl/
+  RNW worker threads 75/78/79 poll in 0.3 s loops, main thread 17 blocks
+  forever on a monitor queue svc 0x350564), which would register getter
+  0x206 and push the data event that fires the mediator-sync state.

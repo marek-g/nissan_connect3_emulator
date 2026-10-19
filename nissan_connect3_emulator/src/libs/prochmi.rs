@@ -4312,6 +4312,17 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     line.push_str(&format!(" k{kind}={h:#x}/{hv:#x}"));
                 }
                 log::warn!("PROCHMI cid-reg-dump{line}");
+                // The wait's actual data source: GUI_ContentFunction entry
+                // 0x206 (mediator 0x90000206) in the static getter table
+                // (prelinked 0x05202510, 8-byte {fnptr, +4 raw, +6 type}).
+                // fnptr names the producer class that must feed the dialog.
+                let entry = 0x0520_2510u32.wrapping_add(0x206 * 8);
+                let fnp = read_u32(uc, entry);
+                let raw = read_u32(uc, entry + 4);
+                log::warn!(
+                    "PROCHMI cid-fn206 entry={entry:#x} getter={fnp:#x} raw={raw:#x} type={}",
+                    read_u32(uc, entry + 6) & 0xff,
+                );
             }
             0
         });
