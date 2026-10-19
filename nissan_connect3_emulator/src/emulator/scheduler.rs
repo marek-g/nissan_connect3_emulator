@@ -538,7 +538,7 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
                                     // registered and re-arm the window: the
                                     // design-faithful sleep until a peer posts.
                                     let parked = ns
-                                        .futex_peek_shared(id)
+                                        .futex_peek_shared(id, unicorn.get_data().inner.process_id)
                                         .map(|uaddr| {
                                             let mut b = [0u8; 4];
                                             unicorn
@@ -552,7 +552,12 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
                                         rearm_shared_watchdog(&threads, tid);
                                         None
                                     } else {
-                                        ns.futex_steal_shared(id).map(Err).or(Some(Ok(0u32)))
+                                        ns.futex_steal_shared(
+                                            id,
+                                            unicorn.get_data().inner.process_id,
+                                        )
+                                        .map(Err)
+                                        .or(Some(Ok(0u32)))
                                     }
                                 } else {
                                     ns.futex_remove_shared(id);

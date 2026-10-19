@@ -21,7 +21,10 @@ struct SharedFutexWaiter {
     key: (String, u32),
     /// Guest virtual address of the futex word (used by the deadlock-break
     /// watchdog to zero a mutex whose owner died - robust-futex semantics).
+    /// Only meaningful inside the VM that registered it (see
+    /// `crate::common::gva`): the id of that process is kept alongside.
     uaddr: u32,
+    owner_pid: u32,
     signaled: bool,
 }
 
@@ -76,7 +79,12 @@ impl SystemNamespace {
 
     /// Enqueue a wait on a shared-memory futex word; returns the waiter id that
     /// the caller records in the thread's `BlockReason::FutexWaitShared`.
-    pub fn futex_wait_shared(&mut self, key: (String, u32), uaddr: u32) -> usize {
+    pub fn futex_wait_shared(
+        &mut self,
+        key: (String, u32),
+        uaddr: u32,
+        owner_pid: u32,
+    ) -> usize {
         let id = self.next_futex_waiter;
         self.next_futex_waiter += 1;
         self.futex_slab.insert(
@@ -84,6 +92,7 @@ impl SystemNamespace {
             SharedFutexWaiter {
                 key: key.clone(),
                 uaddr,
+                owner_pid,
                 signaled: false,
             },
         );
@@ -96,9 +105,23 @@ impl SystemNamespace {
     /// word through its own address space) can zero it and let the waiter
     /// re-acquire a mutex whose holder never returns (dead-owner repair -
     /// Linux does this via robust lists, which this guest never populated).
-    pub fn futex_steal_shared(&mut self, id: usize) -> Option<u32> {
+    pub fn futex_steal_shared(&mut self, id: usize, owner_pid: u32) -> Option<u32> {
         let waiter = self.futex_slab.remove(&id);
         let waiter = waiter?;
+        if waiter.owner_pid != owner_pid {
+            // Re-insert: the word belongs to another VM's address space,
+            // zeroing it here would corrupt that peer's memory (see
+            // `crate::common::gva`).  Should never happen - waiter ids only
+            // reach the owning process' scheduler.
+            log::warn!(
+                "GVA-OWNER: shared-futex steal of waiter {id} attempted by process {}, \
+                 word belongs to {}; refusing",
+                owner_pid,
+                waiter.owner_pid,
+            );
+            self.futex_slab.insert(id, waiter);
+            return None;
+        }
         if let Some(queue) = self.futex_by_key.get_mut(&waiter.key) {
             queue.retain(|&x| x != id);
             if queue.is_empty() {
@@ -111,8 +134,18 @@ impl SystemNamespace {
     /// r777: peek the owner VA of a registered shared-futex wait without
     /// deregistering it - the watchdog inspects the word before deciding
     /// whether the waiter may be touched at all.
-    pub fn futex_peek_shared(&self, id: usize) -> Option<u32> {
-        self.futex_slab.get(&id).map(|waiter| waiter.uaddr)
+    pub fn futex_peek_shared(&self, id: usize, owner_pid: u32) -> Option<u32> {
+        let waiter = self.futex_slab.get(&id)?;
+        if waiter.owner_pid != owner_pid {
+            log::warn!(
+                "GVA-OWNER: shared-futex waiter {id} word {:#x} belongs to process {}, \
+                 not to the peeking process {owner_pid}; ignoring it",
+                waiter.uaddr,
+                waiter.owner_pid,
+            );
+            return None;
+        }
+        Some(waiter.uaddr)
     }
 
     /// Signal up to `val` pending waiters of a shared futex word. Returns how

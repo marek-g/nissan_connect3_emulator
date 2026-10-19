@@ -5484,6 +5484,441 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             watch_res_scdflag.is_ok()
         );
     }
+    // r791p: write-watch on the dangling media-action object and the IDAPI
+    // vector's element slot, from t=0, to learn who first installs the
+    // action's vtable word and who later overwrites it.
+    for (addr, what) in [
+        (0x3a2a990u32, "idapi+18"),
+        (0x3a2a994u32, "idapi+1c"),
+        (0x907bf020u32, "action+00"),
+        (0x907bf100u32, "vec[0]"),
+    ] {
+        let res = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            addr as u64,
+            (addr + 3) as u64,
+            Box::new(move |uc: &mut Unicorn<'_, Context>, access, address, size, value| {
+                let _ = access;
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 80 {
+                    return true;
+                }
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                let pc = uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCHMI actionmem WRITE {what} t={}ms tid=[{tid}] addr={address:#x} size={size} value={value:#x} pc={pc:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    tid = uc.get_data().inner.thread_id(),
+                );
+                true
+            }),
+        );
+        let _ = (res, what);
+    }
+    // r791o: who writes the enavi server's IDAPI slot and the IDAPI
+    // action-vector fields.  The singleton addresses are stable across runs
+    // (server 0x3a23eb8, IDAPI 0x3a2a978 in r791n runs); watch the three
+    // fields the svc-6 media branch reads.
+    for (addr, what) in [
+        (0x3a23edcu32, "server+24"),
+        (0x3a2a990u32, "idapi+18"),
+        (0x3a2a994u32, "idapi+1c"),
+    ] {
+        let res = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            addr as u64,
+            (addr + 3) as u64,
+            Box::new(move |uc: &mut Unicorn<'_, Context>, access, address, size, value| {
+                let _ = access;
+                if crate::libs::dapi::emu_t0_elapsed_ms() < 10_000 {
+                    return true;
+                }
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                let pc = uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCHMI mediafield WRITE {what} t={}ms tid=[{tid}] addr={address:#x} size={size} value={value:#x} pc={pc:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    tid = uc.get_data().inner.thread_id(),
+                );
+                true
+            }),
+        );
+        let _ = (res, what);
+    }
+    // r791r: the media chain continues into MarkUnknown's tail helper
+    // 0x1614f14 and then enavi_tclRegistry::vSetMediaDescription, whose
+    // string argument carried a bad vtable (READ_UNMAPPED at 0x169dcf8,
+    // run f119).  Log both entries to identify the broken object.
+    {
+        let address = base_address + 0x01614f14u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:media-tail", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 15_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 4
+            {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let vt = read_u32(uc, r0);
+            log::warn!(
+                "PROCHMI media-tail t={}ms tid=[{}] r0={r0:#x} vt0={vt:#x} r1={r1:#x} r2={r2:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    {
+        let address = base_address + 0x0169dbf4u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:setmediadesc", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 15_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 4
+            {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let vt = read_u32(uc, r1);
+            let s = read_u32(uc, r1.wrapping_add(4));
+            log::warn!(
+                "PROCHMI setmediadesc t={}ms tid=[{}] idx={r0:#x} str={r1:#x} vt={vt:#x} chars={s:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r791n: the svc-6 media-state branch that killed the SM pump with a
+    // null vtable slot.  Log the enavi_tclIDAPI object at the virtual entry
+    // and the action object + vtable slot +0x38 inside the action method.
+    {
+        let address = base_address + 0x01615ea0u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:idapi-unk", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 4 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let vt = read_u32(uc, r0);
+            let f18 = read_u32(uc, r0.wrapping_add(0x18));
+            let f1c = read_u32(uc, r0.wrapping_add(0x1c));
+            let e0 = read_u32(uc, f18);
+            log::warn!(
+                "PROCHMI idapi-unk t={}ms tid=[{}] idapi={r0:#x} vt={vt:#x} begin={f18:#x} end={f1c:#x} elem0={e0:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    {
+        let address = base_address + 0x01720458u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:media-unk", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 4 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let vt = read_u32(uc, r0);
+            let s38 = read_u32(uc, vt.wrapping_add(0x38));
+            let s34 = read_u32(uc, vt.wrapping_add(0x34));
+            log::warn!(
+                "PROCHMI media-unk t={}ms tid=[{}] action={r0:#x} vt={vt:#x} vfn34={s34:#x} vfn38={s38:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r791m: the bRunWhenRunning service-availability chain outcomes.  The
+    // chain (0x17c7604 case body) checks bIsServiceAvailable for
+    // {0x0a,0x2c,0x1f,0x1e,0x06,0x300,0x3c,0x37,0x56}; an unavailable
+    // *required* service exits at 0x17c745c, 0x56 exits at 0x17c7cec, and
+    // passing all of them falls through to 0x17c7774 (the state advance).
+    for (offset, label) in [
+        (0x017c_7774u32, "case5-pass"),
+        (0x017c_745cu32, "case5-fail"),
+        (0x017c_7cecu32, "case5-56fail"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:case5", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 15_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 250
+            {
+                return 0;
+            }
+            log::warn!(
+                "PROCHMI {label} t={}ms tid=[{}]",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r791k: vMainLoop's wait outcome.  0x1c7f34c: r0 = bMessageWait result
+    // (1 = message delivered); 0x1c7f2f0: failure-path loop check;
+    // 0x1c7f38c: the loop-exit tail (active or in-object gone).
+    for (offset, label) in [
+        (0x01c7_f34cu32, "wait-res"),
+        (0x01c7_f2f0u32, "loopcheck"),
+        (0x01c7_f38cu32, "loop-exit"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:ifm-loop", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 20_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 12
+            {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            let active = read_u32(uc, r4.wrapping_add(0x44)) & 0xff;
+            let inbox = read_u32(uc, r4.wrapping_add(0x3c));
+            log::warn!(
+                "PROCHMI ifm-{label} t={}ms tid=[{}] r0={r0:#x} sm={r4:#x} active={active:#x} inbox={inbox:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r791j: the ServiceManager pump's dispatch of our CL answers.
+    // bDispatchMessage (0x1c7f0cc): r1 = base message, [r1+4] = content,
+    // class byte at content+0xb.  Then the 0x43/0x44 handlers.
+    {
+        let address = base_address + 0x01c7_f0ccu32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:smdisp", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 30 {
+                return 0;
+            }
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let content = read_u32(uc, r1.wrapping_add(4));
+            let cls = read_u32(uc, content.wrapping_add(0xb)) & 0xff;
+            let src = read_u32(uc, content) & 0xffff;
+            let svc = read_u32(uc, content.wrapping_add(0x14)) & 0xffff;
+            log::warn!(
+                "PROCHMI sm-dispatch t={}ms tid=[{}] msg={r1:#x} content={content:#x} class={cls:#x} src={src:#x} svc={svc:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    for (offset, label) in [
+        (0x01c7_edacu32, "svc-regconf"),
+        (0x01c7_ef34u32, "svc-status"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:smhandlers", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 30 {
+                return 0;
+            }
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let content = read_u32(uc, r1.wrapping_add(4));
+            let svc = read_u32(uc, content.wrapping_add(0x14)) & 0xffff;
+            log::warn!(
+                "PROCHMI sm-{label} t={}ms tid=[{}] svc={svc:#x} content={content:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r791i: tclBaseThread::vMainLoopHelper (0x1c80674) dispatches the
+    // thread's virtual vMainLoop (*obj+0xc).  Log the thread object and the
+    // resolved main-loop target (the NAV_IFM pump body).
+    {
+        let address = base_address + 0x01c8_0698u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:ifm-main", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 4 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            let vt = read_u32(uc, r0);
+            let target = read_u32(uc, vt.wrapping_add(0xc));
+            log::warn!(
+                "PROCHMI ifm-mainloop t={}ms tid=[{}] obj={r0:#x} vt={vt:#x} main={target:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r791h: ProxyManager::bSetState (0x1c82814 6-arg, 0x1c8292c 8-arg) and
+    // ProxyOutCCA::bSetState (0x1c830c4) - fed by the ServiceStatus(0x44)
+    // dispatch.  Log args to learn whether our answers reach the state
+    // machine and with which state value.
+    for (offset, label) in [
+        (0x01c8_2814u32, "pm-setstate6"),
+        (0x01c8_292cu32, "pm-setstate8"),
+        (0x01c8_30c4u32, "cca-setstate"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:setstate", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 20_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 80
+            {
+                return 0;
+            }
+            let regs: Vec<u32> = [
+                RegisterARM::R0,
+                RegisterARM::R1,
+                RegisterARM::R2,
+                RegisterARM::R3,
+            ]
+            .iter()
+            .map(|r| uc.reg_read(*r).unwrap_or(0) as u32)
+            .collect();
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            log::warn!(
+                "PROCHMI {label} t={}ms tid=[{}] r0={:#x} r1={:#x} r2={:#x} r3={:#x} lr={lr:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                regs[0],
+                regs[1],
+                regs[2],
+                regs[3],
+            );
+            0
+        });
+    }
+    // r791g2: did the map search find a proxy (bGetCurrentProxyInfo entry
+    // 0x1c82ff4: r0 = proxy, [proxy+0x1c] = CS that gates the info copy)?
+    {
+        let address = base_address + 0x01c8_2ff4u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:curproxyinfo", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 25_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 12
+            {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let cs = read_u32(uc, r0.wrapping_add(0x1c));
+            let svc = read_u32(uc, r0.wrapping_add(8)) & 0xffff;
+            log::warn!(
+                "PROCHMI curproxyinfo t={}ms tid=[{}] proxy={r0:#x} svc={svc:#x} cs={cs:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r791f: the getService pointer chain hops.  0x1c7cf8c: r0 = the
+    // navif_tclIFMediator, [r0+4] = the ServiceManager; 0x1c7ecc0: r0 = the
+    // ServiceManager, [r0+0x30] = the ProxyManager; 0x1c82720: r0 = the
+    // ProxyManager (reached only when no hop is null).
+    for (offset, label, field) in [
+        (0x01c7_cf8cu32, "hop-mediator", 4u32),
+        (0x01c7_ecc0u32, "hop-smgr", 0x30u32),
+        (0x01c8_2720u32, "hop-pmgr", 0u32),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:getsvc-chain", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 25_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 12
+            {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let next = if field == 0 { 0 } else { read_u32(uc, r0.wrapping_add(field)) };
+            let (map_head, cs) = if label == "hop-pmgr" {
+                (read_u32(uc, r0.wrapping_add(8)), read_u32(uc, r0.wrapping_add(0x18)))
+            } else {
+                (0, 0)
+            };
+            log::warn!(
+                "PROCHMI getsvc-{label} t={}ms tid=[{}] obj={r0:#x} next={next:#x} map={map_head:#x} cs={cs:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r791e: navif_tclCriticalSection::bEnter (0x1c7b6e0) - the CS gate used
+    // by ProxyManager::bGetServiceInfo / bGetCurrentProxyInfo.  Logs the
+    // semaphore handle (from [cs]) and the raw OSAL_s32SemaphoreWait return
+    // (0 = entered; bEnter maps 1-x, >1 -> 0).
+    for (offset, label) in [
+        (0x01c7_b6ecu32, "benter-enter"),
+        (0x01c7_b6f0u32, "benter-ret"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:benter", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 15_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 24
+            {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            log::warn!(
+                "PROCHMI {label} t={}ms tid=[{}] r0={r0:#x} lr={lr:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r791d: the post-registration availability gate.  bRunWhenRunning's
+    // case-body walks every required service through
+    // enavi_tclCCAStatusSubscriber::bIsServiceAvailable (0x17ba0a0:
+    // ([sub+8] vtable +0x1c)(out_byte, svc)); a zero result for a required
+    // service aborts before the state-5 transition.  Log the subscriber,
+    // the CL status object behind it, its vtable and the +0x1c target.
+    {
+        let address = base_address + 0x017b_a0a0u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:isavail", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 15_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 24
+            {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let cache = read_u32(uc, r0.wrapping_add(8));
+            let vt = read_u32(uc, cache);
+            let vfn = read_u32(uc, vt.wrapping_add(0x1c));
+            log::warn!(
+                "PROCHMI isavail-enter t={}ms tid=[{}] sub={r0:#x} svc={r1:#x} cache={cache:#x} vt={vt:#x} vfn14={vfn:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    {
+        let address = base_address + 0x017b_a0dcu32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:isavail-ret", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 15_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 24
+            {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+            let outb = read_u32(uc, sp.wrapping_add(0x10)) & 0xff;
+            log::warn!(
+                "PROCHMI isavail-ret t={}ms tid=[{}] r0={r0:#x} outbyte={outb:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
     // r790f: ProxyOutCCA::enConnect service-resolution outcomes.  After
     // scd_bGetAppIdFromServiceId (call at 0x1c836d0, out1=[sp+0x34] count,
     // out2=[sp+0x20] server app id) and after scd_OpenQueue (call at
@@ -7711,8 +8146,25 @@ fn fake_cryptcard_into_idapi(unicorn: &mut Unicorn<'_, Context>) {
     // [vtable+0x24]), +0x80 status must be 0 or 2 for 0x171fcf4 to scan the
     // record vector (2 = the "answered" state), +0x88 state enum 0 (the
     // 0x171fd7c table returns 1 for it), +0x98/+0x9c record vector.
+    // r791q: the idapi media broadcast (svc-0x06 ServiceStatus -> IDAPI
+    // media branch -> ActionReq::vMarkMediaStateOfDeviceUnknown 0x1720458)
+    // virtually calls vtable slot +0x38 on every vector entry and feeds the
+    // result into a trace line only; a `bx lr` gadget returns the entry
+    // pointer unchanged and the method then exits through the entry's
+    // +0x3c == 0 early-return.  Without this slot the SM pump branched to a
+    // null vtable entry and died (runs f114..f118), starving the
+    // availability chain of the svc-0x06 status.
+    // r791s: IDAPI::vRequestMediaStateOfDeviceOnce (0x16138ec, run f122)
+    // broadcasts slots 0x2c/0x7c/0x24 over the same vector and discards
+    // every return value (each slot reloads the entry first) - the gadget
+    // is a no-op broadcast response for the fabricated card.  0x34 is
+    // seeded defensively (adjacent media-path slot).
     let ok = ok
         && write_u32(unicorn, card, vtbl)
+        && write_u32(unicorn, vtbl + 0x2c, NAME_MATCH)
+        && write_u32(unicorn, vtbl + 0x34, NAME_MATCH)
+        && write_u32(unicorn, vtbl + 0x38, NAME_MATCH)
+        && write_u32(unicorn, vtbl + 0x7c, NAME_MATCH)
         && write_u32(unicorn, card + 0x58, vtbl)
         && write_u32(unicorn, card + 0x80, 2)
         && write_u32(unicorn, card + 0x88, 0)
@@ -7720,9 +8172,31 @@ fn fake_cryptcard_into_idapi(unicorn: &mut Unicorn<'_, Context>) {
         && write_u32(unicorn, card + 0x9c, rec + 24);
     // record: +0x04 = status value reported to the caller (1 = card ready),
     // +0x0c = record kind 2, the ready-status record 0x171fcf4 scans for.
-    let ok = ok
+    let mut ok = ok
         && write_u32(unicorn, rec + 0x04, 1)
-        && write_u32(unicorn, rec + 0x0c, 2)
+        && write_u32(unicorn, rec + 0x0c, 2);
+    // r791r: the svc-0x06 media branch also treats the card as a media
+    // device: IDAPI's MarkUnknown tail (0x1614f14) hands record+0x10 to
+    // enavi_tclRegistry::vSetMediaDescription as a `const fi_tclString&`,
+    // which virtually calls its vtable+0x24 (run f119 faulted on the zero
+    // word there).  Seed record+0x10 with a real string object: the first
+    // vector entry is the guest's own media action (registered moments
+    // before), whose +0x58 device-name string supplies a valid vtable and
+    // character pointer.  The guest's own string methods then run
+    // organically on real text.
+    if count > 0 {
+        let action = read_u32(unicorn, old_begin);
+        let name_vt = read_u32(unicorn, action.wrapping_add(0x58));
+        let name_chars = read_u32(unicorn, action.wrapping_add(0x5c));
+        if name_vt > 0x10000 && name_chars > 0x10000 && name_vt != vtbl {
+            ok = ok
+                && write_u32(unicorn, rec + 0x10, name_vt)
+                && write_u32(unicorn, rec + 0x14, name_chars);
+        } else {
+            log::warn!("PROCHMI cryptcard-fab: no name string on action {action:#x}");
+        }
+    }
+    let ok = ok
         && write_u32(unicorn, idapi + 0x18, vec)
         && write_u32(unicorn, idapi + 0x1c, vec + 4 * (count + 1));
     if !ok {

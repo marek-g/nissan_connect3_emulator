@@ -16,12 +16,14 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use unicorn_engine::unicorn_const::Prot;
+
+use crate::common::gva::GuestAddrCell;
 use unicorn_engine::{RegisterARM, Unicorn};
 
 static SYNTH_PWR_START_CONF_SENT: AtomicBool = AtomicBool::new(false);
-static SYNTH_PWR_START_CONF_CONTENT: AtomicU32 = AtomicU32::new(0);
+static SYNTH_PWR_START_CONF_CONTENT: GuestAddrCell = GuestAddrCell::new();
 static SYNTH_PWR_STATE_REQ_SENT: AtomicBool = AtomicBool::new(false);
-static SYNTH_PWR_STATE_REQ_CONTENT: AtomicU32 = AtomicU32::new(0);
+static SYNTH_PWR_STATE_REQ_CONTENT: GuestAddrCell = GuestAddrCell::new();
 static SYNTH_PWR_CVM_SIGNAL_CHANGED_SENT: AtomicBool = AtomicBool::new(false);
 /// Guest OSAL handle (queue-info pointer) under which any thread has opened
 /// `MQB_1024` (the map engine's body-thread queue).  Captured here because
@@ -250,19 +252,19 @@ fn trace_dapi_map_service_data(queue: &str, body: &[u8]) {    if body.len() <= 0
 
 static UNIQUE_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
-static SYNTH_PWR_CVM_SIGNAL_CHANGED_CONTENT: AtomicU32 = AtomicU32::new(0);
+static SYNTH_PWR_CVM_SIGNAL_CHANGED_CONTENT: GuestAddrCell = GuestAddrCell::new();
 static SYNTH_MAP_PWR_START_CONF_SENT: AtomicBool = AtomicBool::new(false);
-static SYNTH_MAP_PWR_START_CONF_CONTENT: AtomicU32 = AtomicU32::new(0);
+static SYNTH_MAP_PWR_START_CONF_CONTENT: GuestAddrCell = GuestAddrCell::new();
 static SYNTH_MAP_PWR_STATE_REQ_SENT: AtomicBool = AtomicBool::new(false);
-static SYNTH_MAP_PWR_STATE_REQ_CONTENT: AtomicU32 = AtomicU32::new(0);
+static SYNTH_MAP_PWR_STATE_REQ_CONTENT: GuestAddrCell = GuestAddrCell::new();
 static SYNTH_MAP_PWR_CVM_SIGNAL_CHANGED_SENT: AtomicBool = AtomicBool::new(false);
-static SYNTH_MAP_PWR_CVM_SIGNAL_CHANGED_CONTENT: AtomicU32 = AtomicU32::new(0);
+static SYNTH_MAP_PWR_CVM_SIGNAL_CHANGED_CONTENT: GuestAddrCell = GuestAddrCell::new();
 static SYNTH_DAPI_PWR_START_CONF_SENT: AtomicBool = AtomicBool::new(false);
-static SYNTH_DAPI_PWR_START_CONF_CONTENT: AtomicU32 = AtomicU32::new(0);
+static SYNTH_DAPI_PWR_START_CONF_CONTENT: GuestAddrCell = GuestAddrCell::new();
 static SYNTH_DAPI_PWR_STATE_REQ_SENT: AtomicBool = AtomicBool::new(false);
-static SYNTH_DAPI_PWR_STATE_REQ_CONTENT: AtomicU32 = AtomicU32::new(0);
+static SYNTH_DAPI_PWR_STATE_REQ_CONTENT: GuestAddrCell = GuestAddrCell::new();
 static SYNTH_DAPI_PWR_CVM_SIGNAL_CHANGED_SENT: AtomicBool = AtomicBool::new(false);
-static SYNTH_DAPI_PWR_CVM_SIGNAL_CHANGED_CONTENT: AtomicU32 = AtomicU32::new(0);
+static SYNTH_DAPI_PWR_CVM_SIGNAL_CHANGED_CONTENT: GuestAddrCell = GuestAddrCell::new();
 
 
 thread_local! {
@@ -1035,7 +1037,7 @@ fn synthesize_ail_power_startup_sequence(
             0u32,
             "PWR_PROXY_START_CONF" as &str,
             &SYNTH_PWR_START_CONF_SENT as &AtomicBool,
-            &SYNTH_PWR_START_CONF_CONTENT as &AtomicU32,
+            &SYNTH_PWR_START_CONF_CONTENT,
         ),
         (
             0x10,
@@ -1094,7 +1096,7 @@ fn synthesize_ail_power_message(
     power_data2: u32,
     message_name: &str,
     sent: &AtomicBool,
-    content_slot: &AtomicU32,
+    content_slot: &GuestAddrCell,
 ) -> bool {
     const TARGET_QUEUE: &str = "mbx_265";
     const CONTENT_LEN: u32 = 0x20;
@@ -1122,7 +1124,7 @@ fn synthesize_ail_power_message(
         return false;
     }
 
-    let mut content = content_slot.load(Ordering::Relaxed);
+    let mut content = content_slot.load(unicorn);
     if content == 0 || content > 0xf000_0000 {
         let mmu_arc = unicorn.get_data().mmu.clone();
         content = mmu_arc.lock().unwrap().heap_alloc(
@@ -1149,7 +1151,7 @@ fn synthesize_ail_power_message(
             return false;
         }
 
-        content_slot.store(content, Ordering::Relaxed);
+        content_slot.store(unicorn, content);
     }
 
     if unicorn.mem_write(buf as u64, &1u32.to_le_bytes()).is_err()
@@ -1195,7 +1197,7 @@ fn synthesize_periodic_ail_power_state_req(
         return false;
     }
 
-    let mut content = SYNTH_PWR_STATE_REQ_CONTENT.load(Ordering::Relaxed);
+    let mut content = SYNTH_PWR_STATE_REQ_CONTENT.load(unicorn);
     if content == 0 || content > 0xf000_0000 {
         let mmu_arc = unicorn.get_data().mmu.clone();
         content = mmu_arc.lock().unwrap().heap_alloc(
@@ -1221,7 +1223,7 @@ fn synthesize_periodic_ail_power_state_req(
         if unicorn.mem_write(content as u64, &body).is_err() {
             return false;
         }
-        SYNTH_PWR_STATE_REQ_CONTENT.store(content, Ordering::Relaxed);
+        SYNTH_PWR_STATE_REQ_CONTENT.store(unicorn, content);
     }
 
     crate::libs::prochmi::force_hmi_gui_state(unicorn);
@@ -1262,7 +1264,7 @@ fn synthesize_map_power_startup_sequence(
             0u32,
             "MAP PWR_PROXY_START_CONF",
             &SYNTH_MAP_PWR_START_CONF_SENT as &AtomicBool,
-            &SYNTH_MAP_PWR_START_CONF_CONTENT as &AtomicU32,
+            &SYNTH_MAP_PWR_START_CONF_CONTENT,
         ),
         (
             0x10,
@@ -1321,7 +1323,7 @@ fn synthesize_map_power_message(
     power_data2: u32,
     message_name: &str,
     sent: &AtomicBool,
-    content_slot: &AtomicU32,
+    content_slot: &GuestAddrCell,
 ) -> bool {
     const TARGET_QUEUE: &str = "mbx_1024";
     const CONTENT_LEN: u32 = 0x20;
@@ -1349,7 +1351,7 @@ fn synthesize_map_power_message(
         return false;
     }
 
-    let mut content = content_slot.load(Ordering::Relaxed);
+    let mut content = content_slot.load(unicorn);
     if content == 0 || content > 0xf000_0000 {
         let mmu_arc = unicorn.get_data().mmu.clone();
         content = mmu_arc.lock().unwrap().heap_alloc(
@@ -1376,7 +1378,7 @@ fn synthesize_map_power_message(
             return false;
         }
 
-        content_slot.store(content, Ordering::Relaxed);
+        content_slot.store(unicorn, content);
     }
 
     if unicorn.mem_write(buf as u64, &1u32.to_le_bytes()).is_err()
@@ -1422,7 +1424,7 @@ fn synthesize_periodic_map_power_state_req(unicorn: &mut Unicorn<'_, Context>, b
         return false;
     }
 
-    let mut content = SYNTH_MAP_PWR_STATE_REQ_CONTENT.load(Ordering::Relaxed);
+    let mut content = SYNTH_MAP_PWR_STATE_REQ_CONTENT.load(unicorn);
     if content == 0 || content > 0xf000_0000 {
         let mmu_arc = unicorn.get_data().mmu.clone();
         content = mmu_arc.lock().unwrap().heap_alloc(
@@ -1448,7 +1450,7 @@ fn synthesize_periodic_map_power_state_req(unicorn: &mut Unicorn<'_, Context>, b
         if unicorn.mem_write(content as u64, &body).is_err() {
             return false;
         }
-        SYNTH_MAP_PWR_STATE_REQ_CONTENT.store(content, Ordering::Relaxed);
+        SYNTH_MAP_PWR_STATE_REQ_CONTENT.store(unicorn, content);
     }
 
     if unicorn.mem_write(buf as u64, &1u32.to_le_bytes()).is_err()
@@ -1487,7 +1489,7 @@ fn synthesize_dapi_power_startup_sequence(
             0u32,
             "DAPI PWR_PROXY_START_CONF",
             &SYNTH_DAPI_PWR_START_CONF_SENT as &AtomicBool,
-            &SYNTH_DAPI_PWR_START_CONF_CONTENT as &AtomicU32,
+            &SYNTH_DAPI_PWR_START_CONF_CONTENT,
         ),
         (
             0x10,
@@ -1546,7 +1548,7 @@ fn synthesize_dapi_power_message(
     power_data2: u32,
     message_name: &str,
     sent: &AtomicBool,
-    content_slot: &AtomicU32,
+    content_slot: &GuestAddrCell,
 ) -> bool {
     const TARGET_QUEUE: &str = "mbx_7";
     const CONTENT_LEN: u32 = 0x20;
@@ -1574,7 +1576,7 @@ fn synthesize_dapi_power_message(
         return false;
     }
 
-    let mut content = content_slot.load(Ordering::Relaxed);
+    let mut content = content_slot.load(unicorn);
     if content == 0 || content > 0xf000_0000 {
         let mmu_arc = unicorn.get_data().mmu.clone();
         content = mmu_arc.lock().unwrap().heap_alloc(
@@ -1601,7 +1603,7 @@ fn synthesize_dapi_power_message(
             return false;
         }
 
-        content_slot.store(content, Ordering::Relaxed);
+        content_slot.store(unicorn, content);
     }
 
     if unicorn.mem_write(buf as u64, &1u32.to_le_bytes()).is_err()
@@ -1645,7 +1647,7 @@ fn synthesize_periodic_dapi_power_state_req(unicorn: &mut Unicorn<'_, Context>, 
         return false;
     }
 
-    let mut content = SYNTH_DAPI_PWR_STATE_REQ_CONTENT.load(Ordering::Relaxed);
+    let mut content = SYNTH_DAPI_PWR_STATE_REQ_CONTENT.load(unicorn);
     if content == 0 || content > 0xf000_0000 {
         let mmu_arc = unicorn.get_data().mmu.clone();
         content = mmu_arc.lock().unwrap().heap_alloc(
@@ -1671,7 +1673,7 @@ fn synthesize_periodic_dapi_power_state_req(unicorn: &mut Unicorn<'_, Context>, 
         if unicorn.mem_write(content as u64, &body).is_err() {
             return false;
         }
-        SYNTH_DAPI_PWR_STATE_REQ_CONTENT.store(content, Ordering::Relaxed);
+        SYNTH_DAPI_PWR_STATE_REQ_CONTENT.store(unicorn, content);
     }
 
     if unicorn.mem_write(buf as u64, &1u32.to_le_bytes()).is_err()
@@ -1843,14 +1845,6 @@ fn suppress_synthetic_message_delete(
             return;
         }
     }
-    let _synthetic_contents = [
-        SYNTH_PWR_START_CONF_CONTENT.load(Ordering::Relaxed),
-        SYNTH_PWR_STATE_REQ_CONTENT.load(Ordering::Relaxed),
-        SYNTH_PWR_CVM_SIGNAL_CHANGED_CONTENT.load(Ordering::Relaxed),
-        SYNTH_MAP_PWR_START_CONF_CONTENT.load(Ordering::Relaxed),
-        SYNTH_MAP_PWR_STATE_REQ_CONTENT.load(Ordering::Relaxed),
-        SYNTH_MAP_PWR_CVM_SIGNAL_CHANGED_CONTENT.load(Ordering::Relaxed),
-    ];
     // Synthetic power-message injection has been disabled. Never treat a
     // live OSAL message as a synthetic one that should escape deletion.
     return;
@@ -2351,10 +2345,20 @@ fn cca_server_answer_register(
         blob.extend_from_slice(&body);
         let mut state = unicorn.get_data().namespace.lock().unwrap();
         let delivered = match state.mq.queue_id_for_name(&target) {
-            Some(q) if pwr_proxy::app_state_change_delivered(client) => {
+            // r791l: the state-change promotion gate guards the HMI's AIL
+            // admin state (class 0x50 is dropped below RUNNING).  The navif
+            // server-app clients (0x0121) are consumed by plain ProxyInCCA
+            // pumps with no such gate, and no NORMAL state change is ever
+            // handed to those app ids - waiting for it spooled every navif
+            // answer forever (f107: live 0, spooled 2).  Deliver live.
+            Some(q) if client != 0x0109 || pwr_proxy::app_state_change_delivered(client) => {
                 state.mq.grow_msgsize(q, blob.len() as i64);
+                let cls = blob.get(8 + 0xb).copied().unwrap_or(0xff);
                 let ok = OsalQueueService::guest_post(&mut state.mq, &target, blob, 0);
                 if ok {
+                    log::info!(
+                        "[LIBOSAL-MBX] cca answer posted to {target} class={cls:#04x} svc={service:#06x}"
+                    );
                     state.notify_waiters();
                 }
                 ok
@@ -2894,6 +2898,15 @@ fn bridge_mbx_queue(
         return false;
     }
 
+    if matches!(
+        api_name,
+        "OSAL_s32MessageQueueWait" | "OSAL_s32MessageQueuePriorityWait"
+    ) {
+        // r791l: this - not bridge_guest_osal_queue - is the path that
+        // services the navif/SM pumps (mbx_<app> host queues), so the
+        // cca-server registration spool must be flushed here too.
+        scd_reg_spool_flush(unicorn, name);
+    }
     match api_name {
         "OSAL_s32MessageQueuePost" => {
             if msg_ptr == 0 || msg_ptr > 0xf000_0000 || msg_len < 8 {
@@ -3273,8 +3286,14 @@ fn bridge_mbx_queue(
                     return false;
                 };
                 let thread = unicorn.get_data().inner.thread_id();
+                let (cls, svc) = message
+                    .data
+                    .get(8..)
+                    .filter(|b| b.len() >= 0x16)
+                    .map(|b| (b[0xb], u16::from_le_bytes([b[0x14], b[0x15]])))
+                    .unwrap_or((0xff, 0));
                 log::info!(
-                    "[{}] [LIBOSAL-MBX] Wait({}) delivered materialized snapshot blob_len={}",
+                    "[{}] [LIBOSAL-MBX] Wait({}) delivered materialized snapshot blob_len={} class={cls:#04x} svc={svc:#06x}",
                     thread,
                     name,
                     message.data.len()

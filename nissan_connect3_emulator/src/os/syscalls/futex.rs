@@ -104,7 +104,8 @@ pub fn futex(
                     let deadline = deadline
                         .or_else(|| Some(crate::emulator::vtime::deadline(Duration::from_secs(20))));
                     let namespace = data.namespace.clone();
-                    let id = namespace.lock().unwrap().futex_wait_shared(key, uaddr);
+                    let owner_pid = unicorn.get_data().inner.process_id;
+                    let id = namespace.lock().unwrap().futex_wait_shared(key, uaddr, owner_pid);
                     unicorn.get_data().set_action(ThreadAction::Block(
                         BlockReason::FutexWaitShared {
                             id,
