@@ -299,6 +299,7 @@ pub fn dapiapp_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     hook_rs_media_info(unicorn, base_address);
     }
     hook_media_info_vector(unicorn, base_address);
+    hook_nav_accessable_result(unicorn, base_address);
 
     if std::env::var("EMU_PROCHMI_NAV_TRACE").is_ok() {
         hook_media_name_write_watch(unicorn);
@@ -2322,6 +2323,29 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
         
             0
         });
+}
+
+/// r792d: return-value probe of the regionselection "is NAV medium
+/// accessable" check (function at 0x8c4bb8, epilogue 0x8c4c18): logs whether
+/// a name match against the media-info vector was found.  This decides
+/// whether the enavi-visible data medium is registered at all - the upstream
+/// gate of the HMI "No SD card inserted" popup.
+fn hook_nav_accessable_result(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let address = base_address + (0x008c_4c18u32 - ORIGINAL_BASE);
+    crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/dapi.rs:nav-acc-res", move |uc: &mut Unicorn<'_, Context>| {
+        static HITS: AtomicU32 = AtomicU32::new(0);
+        if HITS.fetch_add(1, Ordering::Relaxed) >= 30 {
+            return 0;
+        }
+        log::warn!(
+            "DAPI nav-acc-RESULT t={}ms thread=[{}] r0={:#x}",
+            emu_t0_elapsed_ms(),
+            uc.get_data().inner.thread_id(),
+            uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+        );
+        0
+    });
 }
 
 /// `dap_tclDapiApp::vEvalDeviceConfig` (0x822630) is what transfers the

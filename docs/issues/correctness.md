@@ -1526,3 +1526,76 @@ Open / next:
 - Probe hygiene: several r790 probe budgets/timers (`allocmsg`,
   `enconnect-*`, `cmdsub-res`) are still compiled in behind
   `EMU_PROCHMI_NAV_TRACE`; trim to what milestone C still needs.
+
+## r791 (d-s) + r792: SM-pump survival, cryptcard fabrication completion, and what the "No SD card inserted" popup really is
+
+### r791d-r791s: SM-pump death chain fixed (f123)
+
+The SM pump that died with `READ_UNMAPPED pc=0` was dying on *incomplete
+fabrication*: the fabricated cryptcard's vtable lacked slots 0x2c/0x34/0x38
+and `record+0x10` was not a real `fi_tclString`.  Fixed by extending the
+fabrication with the existing guest gadget `bx lr @0xfb70f0` (NAME_MATCH,
+returns its argument) and copying a real `fi_tclString` {vt, chars} pair from
+the first idapi-vector action's own `+0x58` name - the guest logic then runs
+organically over it.  Result in f123: zero thread deaths, 18/18 conf/status
+delivered to mbx_289, `bSetState` fired for all 9 services, and the
+`case5-pass` continuation at 0x17c776c executed for the first time (+1 s
+later the dynstack swapped popup 0x5da "Starting navigation" for 0x5e2).
+
+GVA audit (same commit): each process has its own Unicorn VM + host thread;
+the shared namespace carries only host bytes/global tids.  Hardened with
+`GuestAddrCell` (cached guest addresses tagged with owning pid, shared-futex
+peek/steal owner-checked); zero live cross-VM corruption found.
+
+### r792: the "No SD card inserted. Please use Nissan SD card only." popup (0x5e2)
+
+User-visible switch from "Starting navigation" to "No SD card" looked like a
+regression.  It is not: **no saved run ever served the card CID** (zero
+`card CID ->` log lines in f90-f124), and r792 probes show
+`dap_dev_tclDeviceTableWorker::bCheckSigniture` (DAPIAPP 0x8b2ee4) and the
+whole libosal SDX chain (`fd_crypt_verify_signaturefile` 0x485313a0,
+`fd_crypt_sdx_xml_verification` 0x485307d8, `fd_crypt_verify_xml_signature`
+0x4853204c, `BPCL_EC_DSA_Verify` 0x48539c50 - traps in io.rs) are *never
+called* in any run.  The SDX crypto chain has never started.  What changed is
+that the availability gate now passes (r791), so the NAV state machine
+advanced one stage and evaluated the data medium for the first time (f121 has
+no dynstack ops after t=18 s; f123+ pushes 0x5e2 exactly ~1 s after
+`case5-pass`).
+
+Decision-path findings (f123-f135):
+
+- The popup swap runs through dynstack `vPerformDynamicStackOperation` from a
+  common GUI-framework caller (lr 0x1364094); the deciding input is the
+  enavi/DAPI media state, not a GUI flag.
+- DAPI's own media pipeline is ALIVE: `vPRMCallBackMediaState` runs,
+  `/dev/cryptnav/MEDIUM.CFG`, `DATASET.CFG` and the map files open through the
+  mounted card image, and the regionselection "is NAV medium accessable"
+  check (0x8c4bb8, result probe `nav-acc-RESULT` at 0x8c4c18) returns
+  **r0=1** at t=2.1 s once the media-info entry has type 6.  The
+  media-info name string that looked garbled ("*devdev/ev/cv/...*") was a
+  probe artifact: the fields are std::string objects / reused heap cells, and
+  the name-match demonstrably succeeds.
+- What is NOT alive: CL service **0x56** (`HMINAVSERVER_CL0056`), the media
+  status service of the FI navigation server.  `isavail(0x56)` = false
+  (`case5-56fail`), both DAPI's status-consumer (0xb3a448 r1=0x56) and
+  prochmi's media action have no server to answer media state, so the media
+  state stays unknown and the dynstack picks 0x5e2.  On the real unit the
+  server of all HMINAVSERVER_* services is the NAVAPP application =
+  **PROCNAV's CL/CCA face** (APPID 0x24; the encrypted NAVAPP hive publishes
+  the service table), which is exactly the responder face still on the
+  backlog (PROCNAV pump parks on mbx_1, threads parked/exited(139)).
+- r792 side-quests, all negative results worth remembering:
+  * narrow trap at the `clFi_Navi::ReceiveEventsFromEvtEngine` dispatch
+    (0x14bcdf4, un-relocatable `ldrcc pc`) never fires even as a page-hook -
+    that dispatch site is simply never fetched (the FI events route through
+    `vHandleEventsForNaviHsiItself`); do not re-add probes there.
+  * the fix-size mempool double-hand-out audit (GetBlock 0x4850d4e8/ret
+    0x4850d63c, RelBlock 0x4850d32c/ret 0x4850d408, host live-set) saw zero
+    blocks in the DAPI heap arena around the "corrupted" cells - those cells
+    are plain allocator reuse, not a double-allocation bug.
+
+Next (milestone D): give PROCNAV its genuine CL responder face (read mbx_1,
+answer CL per body layout) so svc 0x56 - and with it the media state - is
+produced by the guest itself.  The SDX/CID chain then needs only its
+environment (ioctl 0x410 CID + HASH_FILE_LIST files are already served from
+the real card image); no patch of any app binary is needed.
