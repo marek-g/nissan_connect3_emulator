@@ -205,15 +205,46 @@ fn handle_event_wait(
         }
     };
     let requested_mask = if requested == 0 { bits } else { requested };
-    if bits != 0 && (bits & requested_mask) == requested_mask {
-        write_u32(unicorn, event.wrapping_add(EVENT_BITS), 0);
+    // r788c: `mode` selects the Bosch OSAL match rule (OSAL_EVENT_AND = 0,
+    // OSAL_EVENT_OR = 1).  The old check was AND-only for both modes, so a
+    // multi-bit OR wait could only ever be satisfied when *every* requested
+    // bit happened to be set at once.  enavi_tclEnaviThread::vEntry waits
+    // (mask 0x6e = process/CCA/two timer bits, mode 1, infinite) while every
+    // poster posts a single bit - the HMINAVSRV thread slept through its
+    // STARTUP process (posted t=3.0 s, vEntry t=3.0 s) and the whole enavi
+    // server-state machine never left STARTING.  For OR waits only the
+    // matched bits are consumed (the guest loop re-arms and drains the rest
+    // bit by bit) and the matched bits are stored through the out-param, the
+    // fifth AAPCS argument on the stack, which the skipped library body
+    // would have written.
+    let matched = if mode == 1 {
+        bits & requested_mask
+    } else if (bits & requested_mask) == requested_mask {
+        bits
+    } else {
+        0
+    };
+    if matched != 0 {
+        let rest = if mode == 1 {
+            bits & !matched
+        } else {
+            0
+        };
+        write_u32(unicorn, event.wrapping_add(EVENT_BITS), rest);
         write_u32(unicorn, event.wrapping_add(EVENT_IN_WAIT), 0);
+        let sp = r(unicorn, RegisterARM::R13);
+        let result_ptr = try_read_u32(unicorn, sp).unwrap_or(0);
+        if result_ptr != 0 {
+            write_u32(unicorn, result_ptr, matched);
+        }
         remove_thread_waiter(event, unicorn.get_data().thread_id());
         log::info!(
-            "LIBOSAL: OSAL_s32EventWait event={} satisfied bits=0x{:08x} requested=0x{:08x}",
+            "LIBOSAL: OSAL_s32EventWait event={} satisfied bits=0x{:08x} requested=0x{:08x} mode={} matched=0x{:08x}",
             event_name,
             bits,
-            requested_mask
+            requested_mask,
+            mode,
+            matched
         );
         return_result(unicorn, 0);
         return;
