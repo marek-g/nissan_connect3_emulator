@@ -47,21 +47,23 @@ fn seed_dynamic_ffs_recursive(source: &Path, destination: &Path) -> io::Result<(
 /// carries but neither firmware seed nor SD card contains.  Without them
 /// procbaselx's SPM-slave data-pool stack (the home of the CL datapool
 /// elements, e.g. FI 0x8076000 that feeds the HSA_Navigation wait-sync
-/// mediator behind the Enter-Destination keyboard page) and prochmi's
-/// personal-data manager / LUA glue each abort their bring-up on the very
-/// first open.  The files are provisioned EMPTY: the guests open them
-/// read-first and tolerate an empty pool/config (they provision the content
-/// themselves while running), exactly like the unit does on a fresh flash.
+/// mediator behind the Enter-Destination keyboard page) aborts its bring-up
+/// on the very first open.  The files are provisioned EMPTY: the guests
+/// open them read-first and tolerate an empty pool/config (they provision
+/// the content themselves while running).
+///
+/// r788 regression note: this list originally also seeded prochmi's
+/// PDATA_MNGR_LM(_OLD).DAT and LUA_SCRIPTS/MAIN.LUA.  A fresh-flash unit
+/// does NOT have those files - the guest creates them on its first save -
+/// and handing prochmi zero-byte files made its persistence parser treat
+/// the state as corrupt instead of absent: the startup popup and the menu
+/// label/icon textures disappeared (r788, user report).  The entries are
+/// removed; the guests bootstrap those files themselves once rename(2)
+/// works (see the r788 syscall fix).  EMU_SKIP_FFS_PROVISION=1 disables
+/// the remaining (DATAPOOL) seeding for A/B diagnostics.
 fn provision_dynamic_ffs() -> io::Result<()> {
     let root = PathBuf::from("/tmp/opencode/nissan_emu/ffs_dynamic");
-    for path in [
-        "DATAPOOL/001C",
-        "DATAPOOL/FFF0",
-        "datapool/001c",
-        "datapool/fff0",
-        "LUA_Scripts",
-        "LUA_SCRIPTS",
-    ] {
+    for path in ["DATAPOOL/001C", "DATAPOOL/FFF0", "datapool/001c", "datapool/fff0"] {
         std::fs::create_dir_all(root.join(path))?;
     }
     for path in [
@@ -73,12 +75,10 @@ fn provision_dynamic_ffs() -> io::Result<()> {
         "datapool/Dp00000001.dat",
         "datapool/fff0/DpInternData.dat",
         "datapool/generic.reg",
-        "PDATA_MNGR_LM.DAT",
-        "PDATA_MNGR_LM_OLD.DAT",
-        "LUA_Scripts/main.lua",
-        "LUA_SCRIPTS/MAIN.LUA",
     ] {
-        let full = root.join(path);
+        if std::env::var_os("EMU_SKIP_FFS_PROVISION").is_some() {
+            break;
+        }        let full = root.join(path);
         if !full.exists() {
             std::fs::write(&full, b"")?;
             log::info!("provisioned empty dynamic-FFS file {}", full.display());

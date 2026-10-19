@@ -1362,3 +1362,32 @@ GUI_StatePseudoMediatorSync::vStart/bCheckState, f17 map-dump screenshots):
   RNW worker threads 75/78/79 poll in 0.3 s loops, main thread 17 blocks
   forever on a monitor queue svc 0x350564), which would register getter
   0x206 and push the data event that fires the mediator-sync state.
+
+## r788b - GUI regression from empty-file provisioning + missing rename(2)/rmdir(2)
+
+Symptom (user report): buttons render without label text, the start popup
+is gone, console shows `not implemented syscall #38 / #40`.
+
+Root cause chain (bisected g1..g7 runs, /home/marek/Temp/g*.log):
+1. r788's `provision_dynamic_ffs` seeded PDATA_MNGR_LM(_OLD).DAT and
+   MAIN.LUA as EMPTY files.  On a fresh-flash unit these files DO NOT
+   EXIST - the guest creates them on its first save.  prochmi's persistence
+   parser treats a zero-byte file as corrupt state instead of absent state
+   and silently drops the label/icon/popup bring-up paths.
+2. Once the (empty) files existed, the save path became reachable and the
+   guest called rename(2)/rmdir(2) - the dispatch table mapped only 39
+   (mkdir); in Linux 2.6.32 ARM EABI (arch/arm/kernel/calls.S) 38=rename,
+   40=rmdir.  Both returned ENOSYS and aborted the persistence rotation.
+
+Fix (cb9e663 + this commit):
+- implement syscall 38/40 (stat::rename, stat::rmdir), add rename/rmdir to
+  the FileSystem trait, real OsFileSystem rename/rmdir/unlink (unlink used
+  to reject everything), MountFileSystem dispatcher enforcing EXDEV and the
+  read-only flags;
+- provisioning reduced to the DATAPOOL tree (harmless, g5 A/B: DATAPOOL
+  seeded = textures identical); PDATA/LUA entries deleted, EMU_SKIP_FFS_
+  PROVISION=1 disables the rest.
+Verified: no `not implemented` lines; the 710x189 popup texture uploads at
+the NORMAL state transition again; glyph atlas uploads back to 12x512 (8 in
+the broken build).  Icon uploads 90x77/180x182 seen in c9/d8 belong to the
+touch dialogs those runs opened - not part of the untouched baseline.
