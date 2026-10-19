@@ -1599,3 +1599,56 @@ answer CL per body layout) so svc 0x56 - and with it the media state - is
 produced by the guest itself.  The SDX/CID chain then needs only its
 environment (ioctl 0x410 CID + HASH_FILE_LIST files are already served from
 the real card image); no patch of any app binary is needed.
+
+## r793: who hosts HMI_NAVSERVER (0x24) - and FC_LBS finally boots deterministically
+
+The plan was to give PROCNAV a "genuine CL responder face" for the FI/CL
+services the enavi client registers (svc 0x27/0x56...). A systematic search
+shows **no emulated binary ever instantiates an AIL app with id 0x24**:
+
+* PROCNAV's bring-up app set is compiled in and observed as
+  `{1, 3, 0x13, 0x16, 0x17, 0x11c}` (SCD mode-0 walk + `vStartApp` gates at
+  `0x34f14e`); it never reads `FUNCTIONAL_COMPONENT\HMINAVSERVER` at bring-up
+  (every HMINAVSERVER registry query in f135-f141 is a *client* SCD map round
+  at t>=15 s), and the string `HMINAVSERVER` does not exist in the decrypted
+  PROCNAV.OUT at all.
+* procmapengine hosts exactly one app (`0x400`, all its `ail_bIpcMessagePost`
+  lines say `app=0x400`); DAPIAPP opens the FUNCTIONAL_COMPONENT tree at
+  t=04.4 only as part of its SCD map walk (lr `0x8149a8`/`0x98f5cc` are
+  registry value-read helpers); prochmi hosts the `0x109`/`0x10f..0x121`
+  family; no binary's static map resolves any service to `0x24` - the
+  `0x24` clients post to comes from *our* seed (which mirrors the plaintext
+  `ni2k_eur/hminavserver.reg` client config; the real per-service APPIDs live
+  in the encrypted `NAVAPP.ERG`, undecryptable - see
+  `docs/reverse_engineering/erg_registry_crypto.md`).
+* procmapengine already resolves svc `0x06`/`0x26` to **DAPI (0x07)** and the
+  whole register+conf+status+data round trip runs organically (f136:
+  `from-0x0400 q=mbx_7 class=0x41 svc=0x0026` -> DAPI `ServiceRegister
+  after-service-check (r0=1 ok)` -> DAPI posts its conf into mbx_1024).
+  DAPI answers CL natively for its own services; the media-state message
+  classes (`dap_resinffi_tclMsgdap_ri_MediaStateOfDevice*`) are compiled into
+  prochmi (client+server classes) and PROCNAV (`pc_tclMediaStateHandler::
+  s32HandleRegistrationToMediaState`, `vGetDAPIRIMediaStateOfAllDevices`).
+
+Experiment (reverted): re-point `FUNCTIONAL_COMPONENT\HMINAVSERVER` APPID to
+`0x11c` and stop fabricating conf/status for it.  Result (f140): the navif
+registrations land on `mbx_284` (nothing waits there) *and* PROCNAV's own
+FC_LBS bring-up hangs - when `scd_bGetAppIdFromServiceId` resolves a service
+FC_LBS consumes (0x06/0x07/0x1f) to its own pending app ("App 284" vs "App
+36"), the `vStartApp` chain never reaches `FC_LBS\APP_THREAD`.  PROCNAV's map
+must keep these services external, so HMI_NAVSERVER is a host process outside
+the emulated set; per the fidelity rule its conf/status answers are kernel
+fakable (like LPM/GPS), but their **content** must track DAPI's real media
+state (next step).
+
+Side discovery worth keeping: PROCNAV's bring-up was a scheduling lottery
+purely because *every* io-object (`0x6e`) registry op parked its caller 1-5
+ticks; f136 completed the SCD registry walk at t=27 s while f137-f139 were
+still walking top-level `PROCESS` at t=100 s (FC_LBS present in f136 only).
+`monitor::yield` now answers modeled io-object commands in place (they are
+leaf requests the triton side completes in microseconds on the unit; only
+`complete_osal_io`-modeled commands, none of which wait).  With this +
+`ON_TENGINE=1` (seed), `GLS_284` + 8 `mbx_284` + 6 `MQB_284` pumps appeared
+in 2/2 runs at t=22.6/26 s, `case5-pass` moved 25.2s -> 20.2s, and the touch
+smoke test (f142, 3 scheduled taps, popup swap t=21.2s) shows the old
+timeline shifted ~4 s earlier with no regression.

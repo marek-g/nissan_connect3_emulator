@@ -736,6 +736,17 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool 
     // `svc` retire reproduces a non-blocking completion exactly.
     let immediate = if object == TSE_OBJECT {
         complete_tse(unicorn, service, block, true)
+    } else if object == OSAL_IO_OBJECT {
+        // The io-object commands (open/close/create/remove/ioctl/read/write) are the
+        // registry client's leaf calls. On the unit the triton side answers them in
+        // microseconds and never deschedules the caller; parking every one of them for
+        // its nominal 1-5 ticks stretched a ~600-operation SCD registry walk into
+        // minutes of serialized host time, which turned PROCNAV's FC_LBS instantiation
+        // (and every late CCA answer) into a scheduling lottery (f136 completed the
+        // walk at t=27 s, f137-f139 were still walking at t=100 s). Answer in place,
+        // exactly like the monitor's own leaf; commands `complete_osal_io` does not
+        // model still fall through to the deadline path unchanged.
+        complete_osal_io(unicorn, service, block)
     } else if object == OSAL_SERVICE_OBJECT
         && matches!(
             ticks,
