@@ -4001,13 +4001,29 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 return 0;
             }
             static HITS: AtomicU32 = AtomicU32::new(0);
-            if HITS.fetch_add(1, Ordering::Relaxed) >= 500 {
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 4000 {
                 return 0;
             }
+            // The post-tap2 heartbeat re-fires REMOVE popup 0x622 at 15 Hz;
+            // cap each distinct (op, popup, kind) at 3 log lines so the
+            // budget covers the whole run.
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
             let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
             let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+            {
+                static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(u32, u32, u32), u32>>> =
+                    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                let mut show = true;
+                if let Ok(mut m) = SEEN.lock() {
+                    let c = m.entry((r1, r2, r3)).or_insert(0);
+                    *c += 1;
+                    show = *c <= 3;
+                }
+                if !show {
+                    return 0;
+                }
+            }
             let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
             let prio = read_u16(uc, sp);
             // Top of the live dynamic stack after previous ops: begin/end
@@ -4032,10 +4048,16 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 let obj = if spo != 0 && spo < 0x0f00_0000 {
                     let w: Vec<u32> =
                         (0..10u32).map(|i| read_u32(uc, spo + i * 4)).collect();
+                    // The popup's GUI_StateView child sits at record+0x50
+                    // (observed: waypoint 0x39f8a68 -> 0x39f8ab8 view 0x25f).
+                    let child = spo + 0x50;
+                    let cview = read_u16(uc, child + 0x30);
+                    let cidval = read_u16(uc, spo + 0x30);
                     format!(
-                        " cid={:#x} vt={:#x} w={:?}",
-                        read_u16(uc, spo + 0x30),
+                        " cid={cidval:#x} vt={:#x} child{{vt={:#x} id={:#x} view={cview:#x}}} w={:?}",
                         w[0],
+                        read_u32(uc, child),
+                        read_u32(uc, child + 8),
                         w.iter()
                             .skip(1)
                             .map(|v| format!("{v:#x}"))
@@ -4123,7 +4145,109 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         }
     }
 
-    // r779: GUI_Widget::vDraw (0x137af7c) - the per-view render-block entry
+    // r786: GUI_StateView::vEnter (0x1375a4c) is the point where a popup's
+    // compiled view cid (this+0x30) is requested of the MenuManager, gated by
+    // ([parent state]+0x18 || SuperSM+0x18).  Log both gate inputs and the
+    // cid for every enter/leave so the cid-0 dialog request is witnessed.
+    {
+        for (offset, label) in [
+            (0x0137_5a4cu32 - ORIGINAL_BASE, "enter"),
+            (0x0137_5be8u32 - ORIGINAL_BASE, "leave"),
+        ] {
+            let address = base_address + offset;
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:stateview", move |uc: &mut Unicorn<'_, Context>| {
+                if !nav_trace_enabled() {
+                    return 0;
+                }
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 400 {
+                    return 0;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let rec = read_u32(uc, r0 + 0xc);
+                let parent = read_u32(uc, rec + 4);
+                log::warn!(
+                    "PROCHMI stateview {label} t={}ms this={r0:#x} id={:#x} view={:#x} pgate={:#x} dynsm={:#x} layer={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    read_u32(uc, r0 + 8),
+                    read_u16(uc, r0 + 0x30),
+                    read_u32(uc, parent + 0x18) & 0xff,
+                    read_u32(uc, 0x039e_1cb0 + 0x18) & 0xff,
+                    read_u32(uc, parent + 0x21c),
+                );
+                0
+            });
+        }
+    }
+
+    // r786: GUI_StateMachine::vEnter (0x1371a1c) / vLeave (0x1371b9c) - the
+    // sub-SM pointers vShowDynamicState drives per dynamic-stack item
+    // (item+8).  For working popups this is the family's dynsm; witness what
+    // gets entered for popup 0x636 (null?  dynsm without a matching
+    // transition?).
+    {
+        for offset in [0x0137_1a1cu32 - ORIGINAL_BASE, 0x0137_1b9cu32 - ORIGINAL_BASE] {
+            let address = base_address + offset;
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:sm-enterleave", move |uc: &mut Unicorn<'_, Context>| {
+                if !nav_trace_enabled() {
+                    return 0;
+                }
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 400 {
+                    return 0;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let label = if offset == 0x0137_1a1cu32 - ORIGINAL_BASE {
+                    "enter"
+                } else {
+                    "leave"
+                };
+                log::warn!(
+                    "PROCHMI sm-{} t={}ms sm={r0:#x} vt={:#x} dyn={:#x} state={:#x}",
+                    label,
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    read_u32(uc, r0),
+                    read_u32(uc, r0 + 0x18) & 0xff,
+                    read_u32(uc, r0 + 8),
+                );
+                0
+            });
+        }
+    }
+
+    // r786: who flips bIsDynamicStateMachineActivated (SuperSM 0x39e1cb0
+    // byte +0x18)?  vEnter's gate depends on it; at the New Address tap it is
+    // 0 and stays 0, so no dynamic popup state can be entered.
+    {
+        use unicorn_engine::unicorn_const::HookType;
+        let flag = 0x039e_1cb0u32 + 0x18;
+        let res = unicorn.add_mem_hook(
+            HookType::MEM_WRITE,
+            flag as u64,
+            (flag + 3) as u64,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                if !nav_trace_enabled() {
+                    return true;
+                }
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 300 {
+                    return true;
+                }
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCHMI dynsm-flag t={}ms <- {:#x} (size {}) lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    value & 0xff,
+                    size,
+                    lr,
+                );
+                true
+            },
+        );
+        log::debug!("PROCHMI dynsm-flag watch installed: {}", res.is_ok());
+    }
+
+    // r786: GUI_Widget::vDraw (0x137af7c) - the per-view render-block entry
     // the PU fix266 triple calls for a repaint.  Counting it tells whether
     // DisplayManager::update() ran a widget paint pass for the new page at
     // all (startup: hundreds; after a menu switch without the gate open: 0).
