@@ -74,6 +74,17 @@ pub trait FileSystem {
 
     fn unlink(&mut self, file_path: &str) -> Result<(), OpenFileError>;
 
+    /// Move `old_path` onto `new_path`, replacing an existing target
+    /// (rename(2)).  File systems that cannot host renames keep the default.
+    fn rename(&mut self, _old_path: &str, _new_path: &str) -> Result<(), OpenFileError> {
+        Err(OpenFileError::NoPermission)
+    }
+
+    /// Remove an empty directory (rmdir(2)).
+    fn rmdir(&mut self, _file_path: &str) -> Result<(), OpenFileError> {
+        Err(OpenFileError::NoPermission)
+    }
+
     fn get_file_details(&mut self, fd: i32) -> Option<FileDetails>;
 
     /// Get file details for a path without opening the file (stat/lstat).

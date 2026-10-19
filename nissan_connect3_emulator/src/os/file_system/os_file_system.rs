@@ -120,8 +120,37 @@ impl FileSystem for OsFileSystem {
         Err(OpenFileError::NoPermission)
     }
 
-    fn unlink(&mut self, _file_path: &str) -> Result<(), OpenFileError> {
-        Err(OpenFileError::NoPermission)
+    fn unlink(&mut self, file_path: &str) -> Result<(), OpenFileError> {
+        let path = match self.path_transform_to_real(file_path) {
+            Some(path) => path,
+            None => return Err(OpenFileError::NoSuchFileOrDirectory),
+        };
+        std::fs::remove_file(path).map_err(|_| OpenFileError::NoPermission)?;
+        Ok(())
+    }
+
+    fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), OpenFileError> {
+        let old = match self.path_transform_to_real(old_path) {
+            Some(path) => path,
+            None => return Err(OpenFileError::NoSuchFileOrDirectory),
+        };
+        let new = match self.path_transform_to_real(new_path) {
+            Some(path) => path,
+            None => return Err(OpenFileError::NoSuchFileOrDirectory),
+        };
+        // rename(2) creates parent directories nowhere and replaces an existing
+        // target atomically; std::fs::rename has exactly these semantics.
+        std::fs::rename(old, new).map_err(|_| OpenFileError::NoSuchFileOrDirectory)?;
+        Ok(())
+    }
+
+    fn rmdir(&mut self, file_path: &str) -> Result<(), OpenFileError> {
+        let path = match self.path_transform_to_real(file_path) {
+            Some(path) => path,
+            None => return Err(OpenFileError::NoSuchFileOrDirectory),
+        };
+        std::fs::remove_dir(path).map_err(|_| OpenFileError::NoPermission)?;
+        Ok(())
     }
 
     fn get_file_details(&mut self, fd: i32) -> Option<FileDetails> {

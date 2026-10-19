@@ -339,7 +339,60 @@ impl MountFileSystem {
 
     pub fn unlink(&mut self, file_path: &str) -> Result<(), OpenFileError> {
         if let Some((mount_point, file_path)) = self.get_mount_point_from_filepath_mut(file_path) {
+            if mount_point.is_read_only {
+                return Err(OpenFileError::NoPermission);
+            }
             mount_point.file_system.unlink(&file_path)
+        } else {
+            Err(OpenFileError::FileSystemNotMounted)
+        }
+    }
+
+    /// rename(2): both paths must resolve into the same mount (the kernel
+    /// answers EXDEV otherwise, which callers here only ever see as failure);
+    /// a read-only mount refuses either side of the move.
+    pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), OpenFileError> {
+        let old_abs = self.path_convert_to_absolute(old_path);
+        let new_abs = self.path_convert_to_absolute(new_path);
+        let old_mount = self
+            .get_mount_point_from_filepath_mut(&old_abs)
+            .map(|(m, _)| m.mount_point.clone());
+        let new_mount = self
+            .get_mount_point_from_filepath_mut(&new_abs)
+            .map(|(m, _)| m.mount_point.clone());
+        match (old_mount, new_mount) {
+            (Some(a), Some(b)) if a == b => {
+                // re-resolve both sides; the second lookup hands back the
+                // mount-relative destination path
+                let old_inner = match self.get_mount_point_from_filepath_mut(&old_abs) {
+                    Some((mount_point, inner)) => {
+                        if mount_point.is_read_only {
+                            return Err(OpenFileError::NoPermission);
+                        }
+                        inner.to_string()
+                    }
+                    None => return Err(OpenFileError::FileSystemNotMounted),
+                };
+                let new_inner = match self.get_mount_point_from_filepath_mut(&new_abs) {
+                    Some((_, inner)) => inner.to_string(),
+                    None => return Err(OpenFileError::FileSystemNotMounted),
+                };
+                if let Some((mount_point, _)) = self.get_mount_point_from_filepath_mut(&old_abs) {
+                    mount_point.file_system.rename(&old_inner, &new_inner)
+                } else {
+                    Err(OpenFileError::FileSystemNotMounted)
+                }
+            }
+            _ => Err(OpenFileError::NoPermission),
+        }
+    }
+
+    pub fn rmdir(&mut self, file_path: &str) -> Result<(), OpenFileError> {
+        if let Some((mount_point, file_path)) = self.get_mount_point_from_filepath_mut(file_path) {
+            if mount_point.is_read_only {
+                return Err(OpenFileError::NoPermission);
+            }
+            mount_point.file_system.rmdir(&file_path)
         } else {
             Err(OpenFileError::FileSystemNotMounted)
         }

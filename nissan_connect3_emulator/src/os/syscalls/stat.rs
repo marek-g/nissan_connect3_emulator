@@ -253,6 +253,70 @@ pub fn mkdir(unicorn: &mut Unicorn<'_, Context>, path: u32, mode: u32) -> u32 {
     res
 }
 
+// Linux 2.6.32 ARM EABI: __NR_rename = 38, __NR_rmdir = 40 (arch/arm/kernel/
+// calls.S).  The persistence code paths in the Bosch apps save by writing a
+// temp file and renaming it over the target, and clear scratch directories
+// with rmdir; both used to return ENOSYS, which broke the startup popup and
+// the label textures once the (now provisioned) persistence files made those
+// save paths reachable.
+pub fn rename(unicorn: &mut Unicorn<'_, Context>, old_path: u32, new_path: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] rename(old = {:#x}, new = {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id(),
+        old_path,
+        new_path,
+    );
+
+    let oldstr = read_string(unicorn, old_path);
+    let newstr = read_string(unicorn, new_path);
+
+    log::trace!("rename: {} -> {}", oldstr, newstr);
+
+    let file_system = unicorn.get_data().inner.file_system.clone();
+    let res = if file_system.lock().unwrap().rename(&oldstr, &newstr).is_ok() {
+        0
+    } else {
+        -1i32 as u32
+    };
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] rename => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id(),
+        res
+    );
+    res
+}
+
+pub fn rmdir(unicorn: &mut Unicorn<'_, Context>, path: u32) -> u32 {
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] rmdir(path = {:#x}) [IN]",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id(),
+        path,
+    );
+
+    let pathstr = read_string(unicorn, path);
+
+    log::trace!("rmdir: {}", pathstr);
+
+    let file_system = unicorn.get_data().inner.file_system.clone();
+    let res = if file_system.lock().unwrap().rmdir(&pathstr).is_ok() {
+        0
+    } else {
+        -1i32 as u32
+    };
+
+    log::trace!(
+        "{:#x}: [{}] [SYSCALL] rmdir => {:#x}",
+        unicorn.reg_read(RegisterARM::PC).unwrap(),
+        unicorn.get_data().inner.thread_id(),
+        res
+    );
+    res
+}
+
 pub fn umask(unicorn: &mut Unicorn<'_, Context>, mask: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] umask(mask = {:#x}) [IN]",
