@@ -402,7 +402,11 @@ fn lookup_service_path(
         let namespace = unicorn.get_data().namespace.lock().unwrap();
         namespace
             .registry
-            .find_key_by_u32_value("SERVICEID", service_id)
+            .find_key_by_u32_value_prefer(
+                "SERVICEID",
+                service_id,
+                &crate::common::registry::HOSTED_SERVER_APPS,
+            )
     };
 
     let service_path = match service_path {

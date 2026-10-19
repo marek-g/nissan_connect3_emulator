@@ -95,6 +95,12 @@ impl RegistryHandle {
     }
 }
 
+/// App ids of CL/CCA servers owned by the emulated processes (PROCNAV `0x0001`,
+/// DAPIAPP `0x0007`, the HMI `0x0109`): their conf/status answers must be produced
+/// by that guest itself - service resolution prefers them and the kernel CCA
+/// responder never fabricates replies for them (fidelity rule).
+pub const HOSTED_SERVER_APPS: [u32; 3] = [0x0001, 0x0007, 0x0109];
+
 #[derive(Clone, Debug, Default)]
 pub struct Registry {
     root: RegistryNode,
@@ -465,9 +471,44 @@ impl Registry {
     }
 
     pub fn find_key_by_u32_value(&self, value_name: &str, id: u32) -> Option<String> {
+        self.find_key_by_u32_value_prefer(value_name, id, &[])
+    }
+
+    /// Like [`Self::find_key_by_u32_value`], but among duplicate publishers of the
+    /// same id, return the first whose owning app id is listed in `prefer`
+    /// (falling back to the lexicographically smallest path).  A duplicate exists
+    /// where the seed mirrors a service under the external HMINAVSERVER facade and
+    /// the real provider publishes it as well - the true per-service APPIDs live in
+    /// the encrypted `NAVAPP.ERG` and cannot be seeded.  Resolving such a service
+    /// to the hosted provider (e.g. the DAP_RESINF media-state services 0x06/0x07
+    /// to DAPIAPP 0x0007) lets that guest answer the registration itself instead
+    /// of the kernel fabricating the reply (fidelity rule).
+    pub fn find_key_by_u32_value_prefer(
+        &self,
+        value_name: &str,
+        id: u32,
+        prefer: &[u32],
+    ) -> Option<String> {
         let mut matches = Vec::new();
         collect_paths_with_u32(&self.root, "/dev/registry", value_name, id, &mut matches);
         matches.sort();
+        if !prefer.is_empty() {
+            for path in &matches {
+                // .../PROCESS/<group>/<app>/SERVICES/<svc> -> the app key
+                if let Some(app) = path
+                    .rsplit_once('/')
+                    .and_then(|(rest, _)| rest.rsplit_once('/'))
+                    .map(|(rest, _)| format!("{rest}"))
+                {
+                    if self
+                        .query_u32(&app, "APPID")
+                        .is_some_and(|app| prefer.contains(&app))
+                    {
+                        return Some(path.clone());
+                    }
+                }
+            }
+        }
         matches.into_iter().next()
     }
 }

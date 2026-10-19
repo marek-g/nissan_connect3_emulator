@@ -448,7 +448,11 @@ suppress_synthetic_message_delete(uc, addr as u32, base_address);
             let state = namespace.lock().unwrap();
             state
                 .registry
-                .find_key_by_u32_value("SERVICEID", u32::from(svc))
+                .find_key_by_u32_value_prefer(
+                    "SERVICEID",
+                    u32::from(svc),
+                    &crate::common::registry::HOSTED_SERVER_APPS,
+                )
                 .and_then(|key| {
                     // .../PROCESS/<group>/<app>/SERVICES/<svc> -> the app key
                     let services = key.rsplit_once('/')?.0;
@@ -3003,9 +3007,9 @@ fn bridge_mbx_queue(
                             // landing on PROCNAV (0x0001), DAPI (0x0007) or
                             // the HMI itself must be answered by that guest,
                             // never fabricated here (fidelity rule).
-                            const HOSTED_SERVER_APPS: [u32; 3] = [0x0001, 0x0007, 0x0109];
                             if (1..=0xffff).contains(&server)
-                                && !HOSTED_SERVER_APPS.contains(&server)
+                                && !crate::common::registry::HOSTED_SERVER_APPS
+                                    .contains(&(server as u32))
                             {
                                 cca_server_answer_register(
                                     unicorn,

@@ -1652,3 +1652,41 @@ leaf requests the triton side completes in microseconds on the unit; only
 in 2/2 runs at t=22.6/26 s, `case5-pass` moved 25.2s -> 20.2s, and the touch
 smoke test (f142, 3 scheduled taps, popup swap t=21.2s) shows the old
 timeline shifted ~4 s earlier with no regression.
+
+## r794: the media-state chain answers organically - "No SD card inserted" popup no longer surfaces
+
+r793 established that app 0x24 (HMI_NAVSERVER), which the seed made the
+provider of the FI services, is a host process outside the emulated set, so
+the kernel fabricated its conf/status.  But the two services the enavi media
+round actually registers (0x0006/0x0007, `dap_resinffi` media state) belong
+to **DAPIAPP**: procmapengine's compiled map already registers them at
+`0x0007` and DAPI answers natively.  Only the *client-side SCD resolution*
+(kernel ioctl `0xb`, `find_key_by_u32_value`) steered them to the
+HMINAVSERVER mirror, because the emulated registry publishes those SERVICEIDs
+there (alphabetically first among duplicates).
+
+Change: `Registry::find_key_by_u32_value_prefer` (+ shared
+`HOSTED_SERVER_APPS`) lets duplicate publishers be resolved preferring
+providers owned by emulated processes; the seed now publishes SERVICEID
+0x0006/0x0007 under `PROCESS\PROCDAPI\DAPIAPP\SERVICES\DAP_RESINF[2]`
+(key names are guesses - the real ones are in the encrypted
+`ni2k_eur/DAPIAPP.ERG`; only the ids are certain from procmapengine's
+traffic).  The HMINAVSERVER `CL0006`/`CL0007` keys stay (the C1 loop reads
+their SERVICEID values by name) but no longer win resolution.  PROCNAV's
+static map still sees the FUNCTIONAL_COMPONENT match first (alphabetical) and
+keeps treating the services as external - its bring-up stays unaffected.
+
+Result (f143, f144 2/2): during the enavi media round the registrations go to
+`mbx_7`, DAPI's ServiceRegister handler accepts them (`after-service-check
+(r0=1 ok) srcApp=0x121 svc=0x6/0x7`), and its own RegisterConf + ServiceStatus
+arrive in the navif queue (`sm-dispatch ... class=0x43/0x44 src=0x7
+svc=0x6/0x7`).  The media deciders then no longer push the SD popup: with the
+genuine answer the popup `0x5e2` ("No SD card inserted") is *never* put on top
+of the popup stack (`top=0x1e9/0x5e2`: 3 -> 0 operations), while before the
+change it surfaced every run.  This is one less fabricated responder face,
+not one more: the kernel stopped answering for these services.
+
+Not yet done: procmapengine's 17 svc-0x26 class-0x45 map-data requests still
+get no data reply from DAPI (dataset/RNW precondition), and the GUI needs a
+visual confirmation that the popup really stays gone and the keyboard page
+(milestone C) appears on the triple tap.

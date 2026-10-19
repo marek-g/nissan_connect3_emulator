@@ -20,6 +20,26 @@
 "MSG_COUNT_INTERMEDIATE_MBX"=dword:00000050
 "WATCHDOG_INTERVALL"=dword:00000000
 
+; r794: DAPI publishes its DAP_RESINF FI services here.  On the unit the media
+; state an HMI enavi action asks for ("RequestDAPIMediaStateOfDevice", the
+; round that currently ends in the 0x5e2 "No SD card inserted" popup) is
+; answered by the DAP_RESINF FI server of DAPIAPP: procmapengine already
+; registers svc 0x06 with DAPI (0x0007) - its compiled SCD map says so - and
+; DAPI answers that registration natively (f136: ServiceRegister
+; after-service-check ok, conf into mbx_1024).  The clients that route these
+; services through the SCD ioctl used to resolve them to the external
+; HMINAVSERVER mirror (0x24, host not among the emulated binaries), where the
+; kernel had to fabricate conf/status; the resolver now prefers a hosted
+; publisher (HOSTED_SERVER_APPS), so those registrations land on DAPI's live
+; queue and are answered by the guest itself (fidelity rule).  The real
+; service key names live in the encrypted ni2k_eur/DAPIAPP.ERG; only the
+; SERVICEIDs are certain.
+[HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\PROCDAPI\DAPIAPP\SERVICES\DAP_RESINF]
+"SERVICEID"=dword:00000006
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\PROCDAPI\DAPIAPP\SERVICES\DAP_RESINF2]
+"SERVICEID"=dword:00000007
+
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\PROCDAPI\DAPIAPP\APP_CONFIG]
 
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\PROCDAPI\DAPIAPP\APP_THREAD]
