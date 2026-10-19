@@ -4215,6 +4215,60 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         }
     }
 
+    // r788: navif_tclIFMediator (the NAVIF AIL service client that feeds the
+    // GUI mediators, incl. kind-9 0x90000206) - enumerate which service ids
+    // this interface registers/awaits and whether answers arrive.
+    {
+        for (offset, name) in [
+            (0x01c7_cf6cu32, "svc-register"),
+            (0x01c7_d058u32, "svc-available"),
+            (0x01c7_d068u32, "svc-change"),
+            (0x01c7_d248u32, "exec-cmd"),
+        ] {
+            let address = base_address + offset - ORIGINAL_BASE;
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:navif-mediator", move |uc: &mut Unicorn<'_, Context>| {
+                if !nav_trace_enabled() {
+                    return 0;
+                }
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 600 {
+                    return 0;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCHMI navif-{name} t={}ms this={r0:#x} r1={r1:#x} r2={r2:#x} r3={r3:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                );
+                0
+            });
+        }
+    }
+
+    // r788: OSAL_tclThread::vEntryHelper (0x1c83d70) - the entry of every
+    // CL (communication layer) thread prochmi spawns (HMINAVSRV among
+    // them).  Logs tid + the vfn+0x28 thread body so the thread can be
+    // followed in the scheduler/bridge logs (which wait it parks on).
+    {
+        let address = base_address + 0x01c8_3d70u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:tcl-thread", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) < 40 {
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let vt = read_u32(uc, r0);
+                log::warn!(
+                    "PROCHMI tcl-thread tid=[{}] this={r0:#x} vt={vt:#x} body={:#x}",
+                    uc.get_data().inner.thread_id(),
+                    read_u32(uc, vt.wrapping_add(0x28)),
+                );
+            }
+            0
+        });
+    }
+
     // r787: GUI_StatePseudoMediatorSync::vStart (0x13756ec) - every compiled
     // mediator-sync state logs its mediator descriptor here when its machine
     // starts.  The descriptor identifies the CL data source (mediator content
@@ -4244,6 +4298,58 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 crate::libs::dapi::emu_t0_elapsed_ms(),
                 read_u32(uc, r0 + 0x28),
             );
+            // One-shot dump of the kind-indexed content registry the state
+            // consults.  vStart: r4 = 0x1375708 + 0x169d110 = the .got base
+            // 0x02a12818, table = [r4 + 0xae8] = [0x02a13300] (GUI_ContentId
+            // singleton, prelinked at 0x02cb9518).
+            static DUMPED: AtomicU32 = AtomicU32::new(0);
+            if DUMPED.fetch_add(1, Ordering::Relaxed) < 3 {
+                let table = read_u32(uc, 0x02a1_3300u32);
+                let mut line = format!(" table={table:#x}");
+                for kind in 0..10u32 {
+                    let h = read_u32(uc, table.wrapping_add(kind * 4));
+                    let hv = read_u32(uc, h);
+                    line.push_str(&format!(" k{kind}={h:#x}/{hv:#x}"));
+                }
+                log::warn!("PROCHMI cid-reg-dump{line}");
+            }
+            0
+        });
+    }
+
+    // r788: GUI_StatePseudoMediatorSync::vCheckFire (0x13754b0) - the single
+    // funnel of ALL re-evaluation triggers (vOnDataUpdate tail-calls here,
+    // the timer callback tail-calls here, activate calls it).  The lr says
+    // which source re-fired the wait; a data-update lr = the CL feed
+    // arriving.  Dedup per (this, lr).
+    {
+        let address = base_address + 0x0137_54b0u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:mediator-fire", move |uc: &mut Unicorn<'_, Context>| {
+            if !nav_trace_enabled() {
+                return 0;
+            }
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 4000 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(u32, u32), u32>>> =
+                std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+            let mut show = true;
+            if let Ok(mut m) = SEEN.lock() {
+                let c = m.entry((r0, lr)).or_insert(0);
+                *c += 1;
+                show = *c <= 3;
+            }
+            if show {
+                log::warn!(
+                    "PROCHMI mediator-fire t={}ms this={r0:#x} a1={r1:#x} flags={:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    read_u32(uc, r0 + 0x28),
+                );
+            }
             0
         });
     }
@@ -4268,7 +4374,11 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 let dmc = read_u32(uc, desc + 0xc);
                 // Same handler lookup bCheckState itself does: kind-indexed
                 // mediator registry, handler vtable slot +4 = count query.
-                let handlers = read_u32(uc, 0x0597_2a30u32.wrapping_add((dmc >> 28) * 4));
+                let handlers = read_u32(
+                    uc,
+                    read_u32(uc, 0x02a1_3300u32)
+                        .wrapping_add((dmc >> 28) * 4),
+                );
                 let vfn = read_u32(uc, read_u32(uc, handlers).wrapping_add(4));
                 (dmc, handlers, vfn)
             } else {
@@ -4283,8 +4393,16 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 show = *c <= 2;
             }
             if show {
+                // Identify the kind-9 handler object (the mediator content
+                // registry for this family): object head + its three traced
+                // vtable targets' static module location is what we need.
+                let hv = if handlers != 0 && handlers < 0x0f00_0000 {
+                    read_u32(uc, handlers)
+                } else {
+                    0
+                };
                 log::warn!(
-                    "PROCHMI mediator-check t={}ms this={r0:#x} flags={:#x} mediator={dmc:#x} handler={handlers:#x} countfn={vfn:#x}",
+                    "PROCHMI mediator-check t={}ms this={r0:#x} flags={:#x} mediator={dmc:#x} handler={handlers:#x} vt={hv:#x} countfn={vfn:#x}",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     read_u32(uc, r0 + 0x28),
                 );
