@@ -1391,3 +1391,85 @@ Verified: no `not implemented` lines; the 710x189 popup texture uploads at
 the NORMAL state transition again; glyph atlas uploads back to 12x512 (8 in
 the broken build).  Icon uploads 90x77/180x182 seen in c9/d8 belong to the
 touch dialogs those runs opened - not part of the untouched baseline.
+
+## r789 - milestone C: tap chain proven end-to-end; blocker is the enavi engine's service gate (open)
+
+Evidence: /home/marek/Temp/f66..f78.log (golden triple-tap recipe).
+
+- **r788b's "domain 0x80 not mounted" theory was WRONG**: the dest-entry
+  elements are 0x08000000-band (elem 0x08007023/0x08007025/0x0801a0c3/
+  0x0801a0c4, wait element 0x08076000) - the log's hex display dropped the
+  leading zero and every probe filter was written for 0x80xxxxxx.  With the
+  band fixed (commit 7b6e2c7): the writes reach cldp_datapool::u32dp_set,
+  the pool FINDS the elements and notifies (hsa-event ev=0x95 fires from
+  the 0x08076000 write).  No get_podp miss.  The mounted-domain vector is
+  52 boot-configured pools (cldp_Mngr::bConfigure 0x1382ecc, cfg list at
+  heap, lr 0x134f128), indexed by elem>>24 - domain 8 exists.
+- The whole tap-time chain is alive (f67-f73): bEvent2App decision site
+  0x1352930 dispatches 0x81008089 to fi=0x38f9970 (vfn+0x3c=0x14bcd74,
+  clFi_Navi::ReceiveEventsFromEvtEng, guards [+8]/[+0x2c]/[+0x30] pass) ->
+  slot table 0x14bcdfc[idx 0x59] b-stub -> real case body bl 0x15a7228 =
+  clHmiNavServerHandler::vInitDestinationEntry(mode=6): ALL guards pass
+  (trace [+0x160]=0x38ca510, locinput enavi_tclILocationInput proxy
+  [+0x7e8]=0x3a24930) -> vEnableElementListRequest runs and sets the
+  enable flag [li+0xc3]=1.  The request is not sent there; the enavi
+  request ENGINE is supposed to run it as a process.
+- **The engine was frozen by an emulator bug**: enavi_tclEnaviThread
+  (OSAL thread HMINAVSRV, object heap-0x3a31ab0, vEntry 0x17bebec) waits
+  OSAL event ENAVI_EVENT with mask 0x6e **mode 1 = OR-any**; our
+  OSAL_s32EventWait only ever implemented AND-all, so vRunProcess's single
+  bit-4 STARTUP post was never consumable and the thread slept forever
+  (blocked(sleep) = the r753 infinite-wait park).  Fixed in 6826b95 (OR
+  mode consumes matched bits only + writes them through the out-param).
+  This fix changes every multi-bit OR wait in the guest - fidelity win.
+- f77/f78 (fixed build): engine wakes t=3.0 s, STARTUP process runs, case
+  4 of bRunWhenRunning (0x17c73c0) waits the registry HmiNavServerThread-
+  Wait (~17 s), calls bStartupNavIF (creates enavi_tclNavIF + CCA status/
+  command subscribers), case 5 then gates on
+  enavi_tclCCAStatusSubscriber::bIsServiceAvailable for the seven required
+  services {0x0a,0x2c,0x1f,0x1e,0x18,0x06,0x152} (defaults-table matches
+  hminavserver.reg USE_CCA_SRV_* = 1; bIsCCAServiceRequired==0 also passes
+  the check).  All five non-HMI services fail -> state 4 at t=20.1 s,
+  retry loop to state 1 at t=35.6 s -> the server never reaches READY, so
+  every LI/RC request is dropped and the keyboard page (its mediator
+  WaitSyncState on 0x08076000) never completes.
+- **Where the availability must come from**: bIsServiceAvailable delegates
+  to the navif middleware service table (via [navif+8] vfn+0x1c); that
+  table is fed by enavi_tclNavIF's CCA route: enActivate(0x17c1bf8) ->
+  poRouteCCACreate(1) -> bCheckCCAInput/bMessageRead (0x17cb574) poll the
+  route queue for class-'E' (0x45 ServiceData) messages -> TransferMsg-
+  Handler -> service table -> vOnServiceChanged (0x17ba4a8) wakes the
+  engine (vPostEvent 4).  f78 probes: navif-activate, routecca-create,
+  routecca-read = ZERO hits -> enActivate is never called, no route, no
+  feed.  Static analysis: bNavIFCreate/enActivate/navif API (bInitialise,
+  enNavIFCreate, IFMediator/ServiceManager ctor, enServiceRegister) have
+  NO static callers - only .ARM.exidx hits, i.e. invoked through
+  function pointers (FI-framework glue).  bl-literal scans for slot+0x10
+  (vServiceStateChanged) found no direct callers either.
+- Note bStartupNavIF itself does NOT call enActivate (decompiled 0x17be644);
+  the activation belongs to the FI-NAVI proxy side (clFi_Navi, whose
+  vSetRegisterID/vServiceStateChanged/vNewAppState navifi probes are also
+  zero-hit -> FI-8 never got a CCA registration either).
+- Provider identity of the seven services: procmapengine (app 0x0400) only
+  registers 0x26+0x06 toward DAPI (0x0007, answered by DAPIAPP itself,
+  f77 04:34:04); svc 0x27@0x24 (hminavserver) is answered by our
+  cca_server_answer_register fabrication.  GUIDANCE/POSITION/LIM/RC/NAVI
+  (0x1f/0x1e/0x18/0x2c/0x0a) and 0x152 have no provider among the emulated
+  processes - on the unit they come from the TE-side nav core through the
+  CCA.  Per AGENTS rule 1 that makes a *logged, flag-gated* fabrication of
+  their ServiceData/0x45 provider traffic legitimate - but the splice
+  target must be the RouteCCA queue once it exists, so finding/creating the
+  enActivate precondition comes first (rule: fix the environment, not the
+  answer).
+- Next investigation points: (a) FI framework glue that owns
+  navif_tclServiceManager and calls bNavIFCreate - probe the clFiFactory
+  bAfterConfigure/vInit path and the hmicca_tclApp register-arrived tail
+  0x665720 for FI-8; (b) whether FI-8's own ServiceRegister (which service
+  id? svc 0x27? 0x121?) is expected on mbx_36 and merely unanswered because
+  DAPI/procmap never answer for 0x1f/0x1e/... - if the real provider is
+  PROCNAV's RNW side, fix PROCNAV's precondition instead (rule 1);
+  (c) page-hook (not narrow hook) the FI-8 vtable slot+0x14/+0x10 dispatch
+  sites before believing navifi zero-hits (AGENTS mid-TB hook quirk).
+- Side effects of the event-mode fix not yet visually verified: engine
+  processes now run at boot, so the "Starting navigation" popup behaviour
+  may have changed - needs one user-visible golden run.
