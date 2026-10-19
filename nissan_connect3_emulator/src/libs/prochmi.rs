@@ -4204,8 +4204,9 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 String::new()
             };
             log::warn!(
-                "PROCHMI dynstack-op t={}ms sm={r0:#x} op={r1:#x} popup={r2:#x} kind={r3:#x} prio={prio:#x} top={top} slots={slots}",
+                "PROCHMI dynstack-op t={}ms sm={r0:#x} op={r1:#x} popup={r2:#x} kind={r3:#x} prio={prio:#x} top={top} lr={lr:#x} slots={slots}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
+                lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
             );
             0
         });
@@ -5587,6 +5588,86 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 "PROCHMI setmediadesc t={}ms tid=[{}] idx={r0:#x} str={r1:#x} vt={vt:#x} chars={s:#x}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
                 uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r792: clFi_Navi::ReceiveEventsFromEvtEngine indirect dispatch (0x14bcdf4
+    // ldrcc pc,[..]).  Page-range hook (r792 lesson: the narrow legacy hook
+    // on the un-relocatable ldrcc pc never fired).  Logs the resolved table
+    // entry per FI event so we can tell which handler consumed the
+    // 0x81008115 event that swapped the "Starting navigation" popup (0x5da)
+    // for the "No SD card" popup (0x5e2).
+    {
+        let page = (base_address + 0x014b_c000u32 - ORIGINAL_BASE) as u64;
+        let site = (base_address + 0x014b_cdf4u32 - ORIGINAL_BASE) as u64;
+        let base = base_address;
+        let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
+            if addr != site {
+                return;
+            }
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 20_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 40
+            {
+                return;
+            }
+            let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let slot = base + 0x014b_cdfcu32 - ORIGINAL_BASE + r3.wrapping_mul(4);
+            let w = {
+                let mut b = [0u8; 4];
+                if uc.mem_read(slot as u64, &mut b).is_ok() {
+                    u32::from_le_bytes(b)
+                } else {
+                    0
+                }
+            };
+            log::warn!(
+                "PROCHMI fidispatch t={}ms tid=[{}] ev={r1:#x} idx={r3:#x} slot={:#x} word={w:#x} btarget={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                slot,
+                if w >> 26 == 0b1010 {
+                    slot.wrapping_add(8).wrapping_add(((w & 0x03ff_ffff) << 2) as u32)
+                } else {
+                    0
+                },
+            );
+        });
+        match result {
+            Ok(_) => log::info!("PROCHMI: fidispatch page-watch installed"),
+            Err(e) => log::warn!("PROCHMI: fidispatch page-hook failed: {e}"),
+        }
+    }
+
+    // r791t: media-availability decision fields.  Both deciders read only
+    // this+{0x80,0x88,0x98,0x9c}, so the entry dump plus the decompiled
+    // switch fully determines the returned state (3 = ok, 4 = unknown,
+    // 5 = not-inserted-ish, 0/1/2/6 = other).  Distinguishes the fabricated
+    // cryptcard from the guest's real media action per evaluation.
+    for (offset, label) in [
+        (0x0171_fd7cu32, "chkmedium"),
+        (0x0171_fcf4u32, "medavail"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:mediadec", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 15_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 30
+            {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let f80 = read_u32(uc, r0.wrapping_add(0x80));
+            let f88 = read_u32(uc, r0.wrapping_add(0x88));
+            let b98 = read_u32(uc, r0.wrapping_add(0x98));
+            let b9c = read_u32(uc, r0.wrapping_add(0x9c));
+            log::warn!(
+                "PROCHMI {label} t={}ms tid=[{}] act={r0:#x} +80={f80:#x} +88={f88:#x} recs={b98:#x}..{b9c:#x} n={}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                b9c.wrapping_sub(b98) / 24,
             );
             0
         });

@@ -212,6 +212,18 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
 }
 
 pub fn dapiapp_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    // r792: SD-card authenticity chain (see docs in map_conv/hack_cid.md):
+    // DAPIAPP dap_dev_tclDeviceTableWorker::bCheckSigniture is the consumer
+    // that asks libosal to verify the card's SDX_META.DAT signature (whose
+    // partition digest covers the card CID).  We must see it run - the
+    // "No SD card inserted" popup appeared as soon as enavi's availability
+    // gate passed, and its verdict comes from this check's result.
+    for (address, name) in [
+        (0x008b_2ee4, "bCheckSigniture"),
+        (0x008b_4c40, "bRegPRMNotifications:re"),
+    ] {
+        hook_entry(unicorn, base_address, address, name);
+    }
     for (address, name) in [
         (0x0081_37e0, "vStartApp"),
         (0x0081_8170, "scd_init"),
@@ -287,7 +299,10 @@ pub fn dapiapp_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     hook_rs_media_info(unicorn, base_address);
     }
     hook_media_info_vector(unicorn, base_address);
-    hook_dapi_device_config(unicorn, base_address);
+
+    if std::env::var("EMU_PROCHMI_NAV_TRACE").is_ok() {
+        hook_media_name_write_watch(unicorn);
+    }    hook_dapi_device_config(unicorn, base_address);
     if crate::libs::procmapengine::render_trace_enabled() {
     hook_dapi_file_lookup(unicorn, base_address);
     }
@@ -2152,6 +2167,65 @@ fn hook_rs_media_info(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
         }
 }
 
+// r792: who writes the media-info name buffer.  The announced medium's
+    // name string at the (deterministic, f125-f128 stable) heap cell
+    // 0x1013a58 holds an interleave of partial copies of "/dev/cryptnav"
+    // ("/devdev/ev/cv/cr/cry...") instead of the clean value from the
+    // registry (DEVICE_NAV_2 = "/dev/cryptnav").  Watch the buffer to see
+    // every writer and its pc.
+    fn hook_media_name_write_watch(unicorn: &mut Unicorn<'_, Context>) {
+        let watch_res = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            0x0101_3a50u64,
+            0x0101_3ad0u64,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                static WATCHED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if WATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 120 {
+                    return true;
+                }
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::warn!(
+                    "DAPI medianame WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x} lr={lr:#x}",
+                    emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    address,
+                    size,
+                    value,
+                    uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32,
+                );
+                true
+            },
+        );
+        log::info!("DAPI medianame write-watch installed: {}", watch_res.is_ok());
+        // r792b: the same garbled name string was observed copied at the
+        // (also run-stable) cell 0x100d8e8 already at t=1.9s - watch it too.
+        let watch_res2 = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            0x0100_d8e0u64,
+            0x0100_d920u64,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                static WATCHED2: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if size >= 4
+                    || WATCHED2.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 600
+                {
+                    return true;
+                }
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::warn!(
+                    "DAPI askedbuf WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x} lr={lr:#x}",
+                    emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    address,
+                    size,
+                    value,
+                    uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32,
+                );
+                true
+            },
+        );
+        log::info!("DAPI askedbuf write-watch installed: {}", watch_res2.is_ok());
+    }
+
 /// `dap_tclMediaInfoCtrl` is nothing but a deserialized `dap_devmanfi_tclMsgMediaInfoStatus`
 /// (device-manager FI media-info status) message: the media it lists live in a
 /// `bpstl::vector<fi_tcl_DevMediaInfo>` at `ctrl + 0x08`, and the regionselection manager
@@ -2205,11 +2279,23 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     }
                 })
                 .collect::<String>();
+            // r792 fix: many fields are std::string *objects* (vtable +
+            // size + char* at +0x08), not raw char pointers; deref one more
+            // level when the first word looks like a pointer.
+            let name2 = |uc: &mut Unicorn<'_, Context>, at: u32| -> String {
+                let head = read_u32_at(uc, at);
+                if (0x0080_0000..0x0140_0000).contains(&head) || (0x0f00_0000..0x1200_0000).contains(&head) {
+                    let chars = read_u32_at(uc, at + 8);
+                    format!("str_obj[{head:#x}]->{chars:#x}:{:?}", name(uc, chars))
+                } else {
+                    format!("{:?}", name(uc, at))
+                }
+            };
             let mut derefs = Vec::new();
             for index in (0..60u32).step_by(4) {
                 let word = read_u32_at(uc, begin + index);
                 if (0x00e0_0000..0x0140_0000).contains(&word) {
-                    derefs.push(format!("+{index:#04x}->{word:#x}:{:?}", name(uc, word)));
+                    derefs.push(format!("+{index:#04x}->{word:#x}:{}", name2(uc, word)));
                 }
             }
             log::warn!(
@@ -2224,7 +2310,7 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                 emu_t0_elapsed_ms(),
                 uc.get_data().inner.thread_id(),
                 ctrl,
-                name(uc, asked),
+                name2(uc, asked),
                 span / 60,
                 begin,
                 finish,

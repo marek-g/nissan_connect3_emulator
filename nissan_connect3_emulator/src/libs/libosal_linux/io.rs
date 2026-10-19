@@ -17,6 +17,117 @@ pub fn hook_io_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     // of 0x38 bytes, entry+0 = device name pointer) on every table lookup, so
     // we can see which device names each process actually registered and why
     // opening /dev/cryptcard misses.
+    // r792c: fix-size mempool block hand-out audit.  DAPI heap cells got
+    // written by two threads at t=1.88s (double hand-out suspected).  On
+    // GetBlock return log the returned block; keep a host-side set of
+    // live blocks per pool and flag any block handed out twice without an
+    // intervening RelBlock (double-alloc smoking gun).  Free-list ops of
+    // the DAPI process only, filtered to the arena around the corrupted
+    // cells (0x0100_0000..0x0105_0000) to keep the log usable.
+    if unicorn.get_data().elf_path.contains("DAPIAPP") {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static LIVE: std::sync::Mutex<Option<HashMap<u32, Vec<u32>>>> = std::sync::Mutex::new(None);
+        {
+            // entry probes: remember (pool, tid) of the in-flight request
+            for (offset, name) in [
+                (0x4850_d4e8u32, "GetBlock"),
+                (0x4850_d32cu32, "RelBlock"),
+            ] {
+                let address = (base_address + (offset - 0x484d_8000)) as u64;
+                let e_name = name;
+                let res = unicorn.add_code_hook(address, address + 4, move |uc: &mut Unicorn<'_, Context>, _a, _| {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let tid = uc.get_data().inner.thread_id();
+                    let mut guard = LIVE.lock().unwrap();
+                    let map = guard.get_or_insert_with(HashMap::new);
+                    map.entry(0xffff_ffff).or_default().clear();
+                    map.insert(0xffff_fffe, vec![r0, r1, tid, e_name.as_bytes()[0] as u32]);
+                });
+                if res.is_err() {
+                    log::warn!("LIBOSAL alloc-trace entry hook {name} failed");
+                }
+            }
+        }
+        for (offset, name) in [
+            (0x4850_d63cu32, "GetBlock:ret"),
+            (0x4850_d408u32, "RelBlock:ret"),
+        ] {
+            let address = (base_address + (offset - 0x484d_8000)) as u64;
+            let e_name = name;
+            let res = unicorn.add_code_hook(address, address + 4, move |uc: &mut Unicorn<'_, Context>, _a, _| {
+                let block = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                if !(0x0100_0000..0x0105_0000).contains(&block) {
+                    return;
+                }
+                static LOGGED: AtomicU32 = AtomicU32::new(0);
+                let tid = uc.get_data().inner.thread_id();
+                let mut guard = LIVE.lock().unwrap();
+                let map = guard.get_or_insert_with(HashMap::new);
+                let req = map.remove(&0xffff_fffe).unwrap_or_default();
+                let pool = req.first().copied().unwrap_or(0);
+                let live = map.entry(pool).or_default();
+                let dup = if e_name.starts_with("Get") {
+                    let seen = live.contains(&block);
+                    live.push(block);
+                    seen
+                } else {
+                    if let Some(pos) = live.iter().position(|b| *b == block) {
+                        live.swap_remove(pos);
+                    }
+                    false
+                };
+                if dup || LOGGED.fetch_add(1, Ordering::Relaxed) < 80 {
+                    log::warn!(
+                        "LIBOSAL alloc-audit {} [{}] {} pool={pool:#x} block={block:#x}{}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        tid,
+                        e_name,
+                        if dup { "  <<<< DOUBLE HAND-OUT" } else { "" },
+                    );
+                }
+            });
+            if res.is_err() {
+                log::warn!("LIBOSAL alloc-audit return hook {name} failed");
+            }
+        }
+    }
+
+    // r792: SDX signature-verification chain entries inside libosal (per
+    // hack_cid.md analysis).  The emulator must let this chain run for real:
+    // the partition signature hashes the card CID (ioctl 0x410), so serving
+    // the real CID + real card files makes the check pass organically.  Log
+    // every call with caller lr to find which link bails or never starts.
+    for (offset, name) in [
+        (0x4853_13a0u32, "fd_crypt_verify_signaturefile"),
+        (0x4853_07d8u32, "fd_crypt_sdx_xml_verification"),
+        (0x4853_204cu32, "fd_crypt_verify_xml_signature"),
+        (0x4853_9c50u32, "BPCL_EC_DSA_Verify"),
+        (0x4853_9ec0u32, "BPCL_EC_DSA_Verify:ret-setup"),
+    ] {
+        let address = base_address + (offset - 0x484d_8000);
+        let name = name;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/io.rs:sdx-chain", move |uc: &mut Unicorn<'_, Context>| {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 60 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            log::warn!(
+                "LIBOSAL {} [{}] sdx-chain {} r0={r0:#x} r1={r1:#x} lr={lr:#x} elf={}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                name,
+                uc.get_data().elf_path,
+            );
+            0
+        });
+    }
+
     let lookup = base_address + (0x484f_12b4u32 - 0x484d_8000);
     let table = base_address + (0x4856_7b58u32 - 0x484d_8000);
     
