@@ -17,6 +17,26 @@ Also: never block inside a hook that runs in guest context, and never hold a
 host lock across a sleep - the whole emulator is serialized on those, so a
 host-side "wait" freezes every process instead of staggering them.
 
+## Fidelity rule: only fabricate what the real unit gets from outside
+
+The emulator exists to debug the OSM->navi data converter, so a bug in the SD
+card's address/POI database must surface in the emulator at the same code path
+and error code as on the real unit (same binaries, same parsers). Fabricating
+protocol answers can mask exactly those bugs, so:
+
+1. Only fabricate answers of partners that are *not* among the emulated
+   processes (hardware / TE side: LPM power proxy, GPS provider, CCA
+   registration-id directory, encrypted registry values, camera/renfi input).
+   Answers that PROCNAV/DAPI would produce on the real unit must be produced
+   by PROCNAV/DAPI in the emulator too. If such a process stays silent, do not
+   inject its reply - find and fix the missing precondition in its environment
+   (RNW CCP connection, POI database state, service registration, ...) so it
+   answers on its own.
+2. Every fabrication must be visible in the log, and where it could mask a
+   data error it must sit behind an environment flag (e.g.
+   `EMU_FAKE_DESTENTRY=1`) that is off by default - a diagnostic run goes
+   exclusively down the genuine inter-process path.
+
 ## Code hooks: narrow ranges can silently never fire (unicorn-engine 2.1.5)
 
 `add_code_hook(begin, end)` with a narrow range (a few bytes) sometimes
