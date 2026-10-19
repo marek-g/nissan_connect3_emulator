@@ -43,6 +43,50 @@ fn seed_dynamic_ffs_recursive(source: &Path, destination: &Path) -> io::Result<(
     Ok(())
 }
 
+/// Provision the runtime-created persistence files the unit's dynamic FFS
+/// carries but neither firmware seed nor SD card contains.  Without them
+/// procbaselx's SPM-slave data-pool stack (the home of the CL datapool
+/// elements, e.g. FI 0x8076000 that feeds the HSA_Navigation wait-sync
+/// mediator behind the Enter-Destination keyboard page) and prochmi's
+/// personal-data manager / LUA glue each abort their bring-up on the very
+/// first open.  The files are provisioned EMPTY: the guests open them
+/// read-first and tolerate an empty pool/config (they provision the content
+/// themselves while running), exactly like the unit does on a fresh flash.
+fn provision_dynamic_ffs() -> io::Result<()> {
+    let root = PathBuf::from("/tmp/opencode/nissan_emu/ffs_dynamic");
+    for path in [
+        "DATAPOOL/001C",
+        "DATAPOOL/FFF0",
+        "datapool/001c",
+        "datapool/fff0",
+        "LUA_Scripts",
+        "LUA_SCRIPTS",
+    ] {
+        std::fs::create_dir_all(root.join(path))?;
+    }
+    for path in [
+        "DATAPOOL/001C/SPMSLVDPCONF.DAT",
+        "DATAPOOL/DP00000001.DAT",
+        "DATAPOOL/FFF0/DPINTERNDATA.DAT",
+        "DATAPOOL/GENERIC.REG",
+        "datapool/001c/SpmSlvDpConf.dat",
+        "datapool/Dp00000001.dat",
+        "datapool/fff0/DpInternData.dat",
+        "datapool/generic.reg",
+        "PDATA_MNGR_LM.DAT",
+        "PDATA_MNGR_LM_OLD.DAT",
+        "LUA_Scripts/main.lua",
+        "LUA_SCRIPTS/MAIN.LUA",
+    ] {
+        let full = root.join(path);
+        if !full.exists() {
+            std::fs::write(&full, b"")?;
+            log::info!("provisioned empty dynamic-FFS file {}", full.display());
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     // Millisecond timestamps: the map pipeline spans minutes and every
     // phase-gap question needs a wall clock in the log (the old plain init
@@ -51,6 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
     // nothing - it does not read the environment).
     pretty_env_logger::init_timed();
     seed_dynamic_ffs()?;
+    provision_dynamic_ffs()?;
 
     // Self-diagnostic: an empty navbin silently produces a PROCNAV-less boot
     // (spawn logs "succeeded", but no thread ever starts) - see run r347.

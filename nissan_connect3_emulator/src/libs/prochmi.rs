@@ -4313,15 +4313,200 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 }
                 log::warn!("PROCHMI cid-reg-dump{line}");
                 // The wait's actual data source: GUI_ContentFunction entry
-                // 0x206 (mediator 0x90000206) in the static getter table
-                // (prelinked 0x05202510, 8-byte {fnptr, +4 raw, +6 type}).
-                // fnptr names the producer class that must feed the dialog.
-                let entry = 0x0520_2510u32.wrapping_add(0x206 * 8);
+                // 0x206 (mediator 0x90000206).  s_pGetData: table =
+                // [.got 0x02a12818 + 0x3ea4] (heap, allocated by
+                // GUI_ContentId::s_vInitialize), 8-byte {fnptr, raw, type}
+                // rows; fnptr names the producer class feeding the dialog.
+                let table = read_u32(uc, 0x02a1_66bcu32);
+                let entry = table.wrapping_add(0x206 * 8);
                 let fnp = read_u32(uc, entry);
                 let raw = read_u32(uc, entry + 4);
                 log::warn!(
-                    "PROCHMI cid-fn206 entry={entry:#x} getter={fnp:#x} raw={raw:#x} type={}",
+                    "PROCHMI cid-fn206 table={table:#x} entry={entry:#x} getter={fnp:#x} raw={raw:#x} type={}",
                     read_u32(uc, entry + 6) & 0xff,
+                );
+            }
+            0
+        });
+    }
+
+    // r788: timer arming/firing for the mediator-sync waits, plus the
+    // HSA_Navigation wait-sync-state getter's state fields (the dialog's
+    // count source: content function 0x206 -> GUI_FUNCTION_WaitSyncState_
+    // 22081 -> clHSA_Navigation::ulwWaitSyncState; [obj+0x68] waiting flag,
+    // [obj+0x80] wait-event mask, [obj+0x88] request mask, all zero = "no
+    // pending wait" -> returns 1).  No timer fire AND no data update =>
+    // bCheckState never re-runs and the keyboard transition can never fire.
+    {
+        for (offset, name) in [
+            (0x0137_5670u32, "mediator-timerarm"),
+            (0x0137_55d8u32, "mediator-timerfire"),
+        ] {
+            let address = base_address + offset - ORIGINAL_BASE;
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:mediator-timer", move |uc: &mut Unicorn<'_, Context>| {
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 300 {
+                    return 0;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCHMI {name} t={}ms this={r0:#x} flags={:#x} tmr={:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    read_u32(uc, r0 + 0x28),
+                    read_u32(uc, r0 + 0x24),
+                );
+                0
+            });
+        }
+        let address = base_address + 0x0189_28e0u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:hsa-waitstate", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 400 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            log::warn!(
+                "PROCHMI hsa-waitstate t={}ms hsa={r0:#x} mask={r1:#x} waiting={} waitmask={:#x} reqmask={:#x} proxy={:#x} pvt={:#x} lr={lr:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                read_u32(uc, r0 + 0x68) & 0xff,
+                read_u32(uc, r0 + 0x80),
+                read_u32(uc, r0 + 0x88),
+                {
+                    let p = read_u32(uc, r0 + 0xc);
+                    p
+                },
+                read_u32(uc, read_u32(uc, r0 + 0xc)),
+            );
+            0
+        });
+    }
+
+    // r788: who arms/clrs the HSA_Navigation wait events.  [hsa+0x68]=1 was
+    // already set when the dialog's getter ran - the setter's lr names the
+    // code that issues the dest-entry request, and its request-sibling is
+    // what must reach PROCNAV.  (vSetWaitEventId 0x18a3394, vSetWaitEv_
+    // ReqPrepareDestEnvMap 0x1879af8, vClrWaitEv_ReqPrepareWeatherMap
+    // 0x1879b20.)
+    {
+        for (offset, name) in [
+            (0x018a_3394u32, "hsa-setevent"),
+            (0x0187_9af8u32, "hsa-set-destenv"),
+            (0x0187_9b88u32, "hsa-set-syncmap"),
+        ] {
+            let address = base_address + offset - ORIGINAL_BASE;
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:hsa-setwait", move |uc: &mut Unicorn<'_, Context>| {
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 300 {
+                    return 0;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCHMI {name} t={}ms hsa={r0:#x} a1={r1:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                );
+                0
+            });
+        }
+        // Who writes the HSA_Navigation waiting flag ([obj+0x68]) - it reads
+        // 1 when the dialog evaluates, yet no setter function ran: some path
+        // writes the field directly.  (Object 0x3908d98 = heap-deterministic
+        // clHSA_Navigation instance.)
+        {
+            use unicorn_engine::unicorn_const::HookType;
+            let res = unicorn.add_mem_hook(
+                HookType::MEM_WRITE,
+                0x0390_8d98u64 + 0x68,
+                0x6b,
+                move |_uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                    static HITS: AtomicU32 = AtomicU32::new(0);
+                    if address >= 0x0390_8da0u64
+                        && address < 0x0390_8da4u64
+                        && HITS.fetch_add(1, Ordering::Relaxed) < 40
+                    {
+                        let pc = _uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                        let lr = _uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                        log::warn!(
+                            "PROCHMI hsa-flag <- {value:#x} (size {size}) pc={pc:#x} lr={lr:#x}",
+                        );
+                    }
+                    true
+                },
+            );
+            if res.is_err() {
+                log::debug!("prochmi: hsa-flag watch not installed");
+            }
+        }
+    }
+
+    // r788: datapool/GUI registration pairing.  Every mediator-sync state
+    // that arms registers its receiver in GUI_ObserverList via vInitialize;
+    // the DATA side registers a datapool listener (bdp_Register) for the
+    // element.  Zero bdp_Register(0x8076000) => the CL pump for the
+    // dest-entry element was never started anywhere in the system.
+    {
+        let address = base_address + 0x0137_5150u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:mediator-init", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 300 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            log::warn!(
+                "PROCHMI mediator-init t={}ms this={r0:#x} flags={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                read_u32(uc, r0 + 0x28),
+            );
+            0
+        });
+        let address = base_address + 0x0138_2c6cu32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:bdp-register", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 2000 {
+                return 0;
+            }
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            log::warn!(
+                "PROCHMI bdp-register t={}ms id={r1:#x} lr={lr:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+            );
+            0
+        });
+    }
+
+    // r788: GUI_ObserverList::vOnDataUpdate(contentId) (0x13662bc) - THE
+    // notify entry that feeds every mediator-sync wait (the mediator waits
+    // register their receiver here via vInitialize for the content id in
+    // their ROM row).  Logging id + lr names the provider module that
+    // pushes data for each mediator family; a missing 0x90000206 push is
+    // the exact silence that keeps the keyboard page from opening.
+    {
+        let address = base_address + 0x0136_62bcu32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:obs-notify", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 4000 {
+                return 0;
+            }
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(u32, u32), u32>>> =
+                std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+            let mut show = true;
+            if let Ok(mut m) = SEEN.lock() {
+                let c = m.entry((r1, lr)).or_insert(0);
+                *c += 1;
+                show = *c <= 2;
+            }
+            if show {
+                log::warn!(
+                    "PROCHMI obs-notify t={}ms tid=[{}] id={r1:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
                 );
             }
             0
