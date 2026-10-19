@@ -222,6 +222,25 @@ impl OsalQueueService {
         }
 
         let priority = osal_priority_to_mq_priority(osal_priority);
+        // r786 forensics: EMU_OSAL_MSGLOG=1 dumps every enqueued message
+        // (queue + AIL header words) so the destination-entry CL request/
+        // answer round can be identified on the bus.
+        if std::env::var_os("EMU_OSAL_MSGLOG").is_some() {
+            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4000 {
+                let words: Vec<String> = data
+                    .chunks_exact(4)
+                    .take(10)
+                    .map(|c| format!("{:#010x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                    .collect();
+                log::info!(
+                    "OSAL-POST {name} len={} class={:#04x} w={}",
+                    data.len(),
+                    data.get(0x0b).copied().unwrap_or(0xff),
+                    words.join(" ")
+                );
+            }
+        }
         mq.insert_message(id, data, priority)
     }
 

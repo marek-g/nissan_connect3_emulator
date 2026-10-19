@@ -3330,6 +3330,9 @@ crate::os::code_stub::trap_site(unicorn, state_do_transition, crate::os::code_st
         let page = base_address + 0x0137_1000u32 - ORIGINAL_BASE;
         let do_t = base_address + GUI_STATEMACHINE_DO_TRANSITION;
         let perf_t = base_address + GUI_STATEMACHINE_PERFORM_TRANSITION;
+        // r786: bOnMessage entry witness - which SM instance receives which
+        // message id while in which state (the transition-matching input).
+        let onmsg_t = base_address + GUI_STATEMACHINE_ON_MESSAGE;
         // r779: decision points inside vPerformTransition for the post-click
         // autopsies: which gate (from/to path, LCA, [sm+0x18] byte, dynamic
         // stack) aborts a pending transition.  Armed whenever performTransition
@@ -3553,6 +3556,27 @@ crate::os::code_stub::trap_site(unicorn, state_do_transition, crate::os::code_st
                         "PROCHMI SM-PAGE performTransition t={}ms sm={sm:#x} pending={transition:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                     );
+                } else if addr == onmsg_t {
+                    // r786: every message entering a state machine, with the
+                    // machine's current state - the transition-matching input.
+                    if nav_trace_enabled() {
+                        static ON_HITS: AtomicU32 = AtomicU32::new(0);
+                        if ON_HITS.fetch_add(1, Ordering::Relaxed) < 3000 {
+                            let msg = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                            let msgid = read_u32(uc, msg + 4);
+                            let mtype = read_u16(uc, msg + 0xc);
+                            let state = read_u32(uc, sm + 8);
+                            let dyn18 = read_u32(uc, sm + 0x18) & 0xff;
+                            let leaf =
+                                if sm != 0 { read_u32(uc, sm + GUI_STATE_SM_CURRENT_LEAF) } else { 0 };
+                            let state_id =
+                                if leaf != 0 { read_u16(uc, leaf + GUI_STATE_STATE_ID) } else { 0 };
+                            log::warn!(
+                                "PROCHMI SM-PAGE onMessage t={}ms sm={sm:#x} msgid={msgid:#x} type={mtype:#x} state={state:#x} dyn={dyn18:#x} sid={state_id:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                            );
+                        }
+                    }
                 } else if nav_trace_enabled() {
                     for (dec_addr, dec_name) in dec_points.iter() {
                         if addr != *dec_addr {
@@ -3907,7 +3931,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 return 0;
             }
             static HITS: AtomicU32 = AtomicU32::new(0);
-            if HITS.fetch_add(1, Ordering::Relaxed) >= 300 {
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 4000 {
                 return 0;
             }
             let msg = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
@@ -3915,13 +3939,188 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             let w0 = read_u32(uc, msg);
             let w1 = read_u32(uc, msg + 4);
             let w2 = read_u32(uc, msg + 8);
+            // r786: GUI_Message::vFire dispatch key is the type short at +0xc
+            // (GUI_SuperStateMachine::bOnMessage switches on it), the id word
+            // alone is per-class and not the routing key.
+            let mtype = read_u16(uc, msg + 0xc);
+            // r786: receiver class fingerprint.  The vptr is a static rodata
+            // address (Ghidra VAs == runtime VAs for this image), so the vtable
+            // dump identifies the receiver's C++ class without symbols.
+            let vptr = read_u32(uc, receiver);
+            let vtab: Vec<u32> = if (ORIGINAL_BASE..0x3000_0000).contains(&vptr) {
+                (0..6u32)
+                    .map(|i| read_u32(uc, vptr.wrapping_add(i * 4)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // r786: type 0x49 = GUI_ContentPopupOper action token.  The
+            // action table (GUI_ContentPopupOper::s_vPerformAction_now:
+            // entry = u16 op, u16 a, u16 c, u8 b; table ptr @0x02a1769c,
+            // SuperSM global @[[0x02a14178]] - both slots of the GUI global
+            // table at 0x02a12818) decides which dynamic-stack operation a
+            // button click runs.  Dump the decoded entry so tap actions
+            // resolve offline.
+            let action = if mtype == 0x49 && (w1 & 0xf000_0000) == 0xc000_0000 {
+                let idx = w1 & 0x07ff_ffff;
+                let table = read_u32(uc, 0x02a1_769c);
+                if idx < 0x300 && table != 0 {
+                    let e = table + idx * 8;
+                    let op = read_u16(uc, e);
+                    let a = read_u16(uc, e + 2);
+                    let c = read_u16(uc, e + 4);
+                    let b = (read_u32(uc, e + 4) >> 16) as u16 & 0xff;
+                    let smg = read_u32(uc, read_u32(uc, 0x02a1_4178));
+                    Some(format!("idx={idx:#x} op={op:#x} a={a:#x} b={b:#x} c={c:#x} sm={smg:#x}"))
+                } else {
+                    Some(format!("idx={idx:#x} table={table:#x}"))
+                }
+            } else {
+                None
+            };
             log::warn!(
-                "PROCHMI msg-fire t={}ms msg={msg:#x} w=[{w0:#x},{w1:#x},{w2:#x}] receiver={receiver:#x} lr={:#x}",
+                "PROCHMI msg-fire t={}ms msg={msg:#x} w=[{w0:#x},{w1:#x},{w2:#x}] type={mtype:#x} receiver={receiver:#x} vptr={vptr:#x} vt={:?} action={:?} lr={:#x}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
+                vtab.iter().map(|w| format!("{w:#x}")).collect::<Vec<_>>(),
+                action,
                 read_u32(uc, (uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32).wrapping_sub(8)),
             );
             0
         });
+    }
+
+    // r786: GUI_SuperStateMachine::vPerformDynamicStackOperation (0x1377370)
+    // - the decoded action every content-popup button executes (r1 = op/state
+    // index, r2 = popup id, r3 = operation kind 0..7, [sp] = priority).  This
+    // is the level where "New Address" either pushes the keyboard popup onto
+    // the dynamic stack or silently drops it.
+    {
+        let want = base_address + 0x0137_7370u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, want, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:dynstack-op", move |uc: &mut Unicorn<'_, Context>| {
+            if !nav_trace_enabled() {
+                return 0;
+            }
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 500 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+            let prio = read_u16(uc, sp);
+            // Top of the live dynamic stack after previous ops: begin/end
+            // cursors at sm+0x30/+0x34, records 0x18B with the key u16 pair
+            // at record+0x4/+0x6 (seen as end-0x14/end-0x12 in the switch).
+            let begin = read_u32(uc, r0 + 0x30);
+            let end = read_u32(uc, r0 + 0x34);
+            let top = if end >= begin + 0x18 {
+                let t = end - 0x18;
+                format!("{:#x}/{:#x}", read_u16(uc, t + 4), read_u16(uc, t + 6))
+            } else {
+                "empty".into()
+            };
+            // r786: on INSERT, dump the state-table slots the operation
+            // resolves (GUI_StateBase slots at *(sm+4)[op] and *(sm+4)[popup])
+            // and the popup state object's head - the slot whose +0x30 u16 is
+            // the view cid the companion block later instantiates.
+            let slots = if r3 == 0 {
+                let tb = read_u32(uc, r0 + 4);
+                let sop = read_u32(uc, tb.wrapping_add(r1 * 4));
+                let spo = read_u32(uc, tb.wrapping_add(r2 * 4));
+                let obj = if spo != 0 && spo < 0x0f00_0000 {
+                    let w: Vec<u32> =
+                        (0..10u32).map(|i| read_u32(uc, spo + i * 4)).collect();
+                    format!(
+                        " cid={:#x} vt={:#x} w={:?}",
+                        read_u16(uc, spo + 0x30),
+                        w[0],
+                        w.iter()
+                            .skip(1)
+                            .map(|v| format!("{v:#x}"))
+                            .collect::<Vec<_>>()
+                    )
+                } else {
+                    String::new()
+                };
+                format!(" slot[{r1:#x}]={sop:#x} slot[{r2:#x}]={spo:#x}{obj}")
+            } else {
+                String::new()
+            };
+            log::warn!(
+                "PROCHMI dynstack-op t={}ms sm={r0:#x} op={r1:#x} popup={r2:#x} kind={r3:#x} prio={prio:#x} top={top} slots={slots}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+            );
+            0
+        });
+    }
+
+    // r786: who writes the pending companion cid of the overlay view record
+    // (0x0391ab50: main pair {cur,next} u16 at +0x10/+0x12, overlay pair at
+    // +0x18/+0x1a)?  "New Address" switches with next cid 0 - the writer of
+    // that 0 is the requester whose CCA binding failed; the waypoint writer
+    // (cid 653) is the working reference.
+    {
+        use unicorn_engine::unicorn_const::HookType;
+        let ovl = 0x0391_ab50u32;
+        let res = unicorn.add_mem_hook(
+            HookType::MEM_WRITE,
+            (ovl + 0x10) as u64,
+            (ovl + 0x1b) as u64,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                if !nav_trace_enabled() {
+                    return true;
+                }
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 300 {
+                    return true;
+                }
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCHMI ovl-cid t={}ms ovl+{:#x} <- {:#x} (size {}) lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    address as u32 - ovl,
+                    value & 0xffff_ffff,
+                    size,
+                    lr,
+                );
+                true
+            },
+        );
+        log::debug!("PROCHMI ovl-cid watch installed: {}", res.is_ok());
+    }
+
+    // r786: vPerformViewChange companion-block loads: 0x136491c loads the
+    // outgoing cid from record+0x12, 0x136492c the incoming one from
+    // record+0x1a (r5 = the view-change record).  Dump r5 and the record on
+    // every companion switch so the requester that queued cid 0 (popup 0x636)
+    // can be identified and its record memory watched.
+    {
+        for (offset, label) in [
+            (0x0136_491cu32 - ORIGINAL_BASE, "ovl-out"),
+            (0x0136_492cu32 - ORIGINAL_BASE, "ovl-in"),
+        ] {
+            let address = base_address + offset;
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:viewchg-ovl", move |uc: &mut Unicorn<'_, Context>| {
+                if !nav_trace_enabled() {
+                    return 0;
+                }
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 60 {
+                    return 0;
+                }
+                let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                let rec: Vec<u32> =
+                    (0..10u32).map(|i| read_u32(uc, r5.wrapping_add(i * 4))).collect();
+                log::warn!(
+                    "PROCHMI viewchg {label} t={}ms r5={r5:#x} rec={:?}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    rec.iter().map(|w| format!("{w:#x}")).collect::<Vec<_>>(),
+                );
+                0
+            });
+        }
     }
 
     // r779: GUI_Widget::vDraw (0x137af7c) - the per-view render-block entry

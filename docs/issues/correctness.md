@@ -1246,3 +1246,42 @@ word+0x18 (SEM_LOCK 0x195c8, SYNC_LOCK 0x10a1ec, EV__LOCK 0x1cc, TSK_LOCK
   input session (dynamic-list config `dynlistconf_NAVI__DESTENTRY_LIST2`
   / input-method list) that no emulator service ever answers.  That answer,
   not painting, is the milestone-C gate.
+
+## r786 - milestone C root cause decoded: popup 0x636 requests view cid 0
+- Full click->view chain decoded with new probes (msg-fire type+vtable
+  fingerprint, SM-PAGE onMessage, dynstack-op + state slots, viewchg-ovl,
+  ovl-cid MEM_WRITE watch on the overlay record 0x0391ab50):
+  * Every content button fires a type-0x49 message; GUI_ContentPopupOper::
+    s_vPerformAction_now(0x1364044) maps id&0x07ffffff into a static action
+    table (ptr at GUI globals 0x02a1769c, 8-byte entries {op,a,c,b}) and
+    calls GUI_SuperStateMachine::vPerformDynamicStackOperation (0x1377370)
+    on the SuperSM singleton (0x39e1cb0).
+  * tap1 Menu / tap2 Enter-Destination / tap3 New Address all execute
+    correctly.  tap3 = REMOVE popup 0x4fa + INSERT (op 0x1e9 sysdlg family,
+    popup 0x636, prio 0x12c).  The dynamic-stack insert runs and
+    vShowDynamicState enters the popup's GUI_StateView.
+  * GUI_StateView::vEnter (0x1375a4c) requests the view via
+    GUI_MenuManager::vSetView(this+0x30, layer=[parent+0x21c]) - the u16 at
+    state+0x30 is the view cid, passed through verbatim into the layer
+    pending slot (record +0x18/+0x1a).  vCreateStates (0x13729c8) binds it
+    at compile time from the descriptor record word +0xc (view = v>>4).
+  * The popup-0x636 state object (slot table *(SuperSM+4)[0x636] =
+    0x39fa2d8) has +0x30 == 0 and +0x04 (view ptr) NULL, while the working
+    page states (0x5da) carry a non-zero view + bound view ptr.  So the
+    keyboard/dest-entry dialog's compiled state asks for view cid 0 ->
+    pCreateView(0) -> cid-0 placeholder companion -> replaced by the
+    waypoint animation ~0.5 s later.  This also explains the "no vEnter
+    write" observation: vSetView(0) only clears/arm slots, the observed
+    0x1375c6c writes; no real cid write ever happens.
+- Interpretation: the dest-entry dialog's real view id must be filled into
+  that state by the DYNAMIC state machine (dynsm) path - SuperSM byte +0x18
+  (bIsDynamicStateMachineActivated) gates whether vEnter even requests a
+  view; SM-DEC dynsm-active last fires at t~12 s.  The dynamic descriptor
+  for the NAVI destination-entry dialog is fed by CL/fi_tcl data that
+  PROCNAV would deliver on the unit (msg ids 0xc0000052/5a are per-class
+  message ordinals, w0=6 at tap3 = mode/session arg).
+- Per the AGENTS.md fidelity rule, the fix target is therefore PROCNAV's
+  precondition for emitting the dest-entry session data (its srvctrl/RNW
+  service state), NOT an injected answer.
+- Working reference for a healthy dynamic popup: waypoint companion 653
+  (0x28d) requested via the same vEnter->vSetView path at t=33605.
