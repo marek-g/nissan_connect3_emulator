@@ -2830,6 +2830,27 @@ fn bridge_mbx_queue(
                     }
                 }
             }
+            // r788: kernel-side SPM (Service Pool Manager, registry appid
+            // 0x0000) answers its own service registration.  The HMI posts
+            // ServiceRegister(svc 0x0100) to dst 0x0000 (mbx_0) and nothing
+            // on the unit's Linux side ever answers - the SPM lives in the
+            // Triton executive, which this emulator IS the Linux side of.
+            // The answer content is the same RegisterConf+ServiceStatus
+            // pair any server app sends (see cca_server_answer_register),
+            // with src 0.  Behind EMU_FAKE_SPM_SERVER=1: a diagnostic run
+            // without the flag must stay on the genuine no-answer path.
+            if name == "mbx_0"
+                && body.len() >= 0x18
+                && body[0xb] == 0x41
+                && u16::from_le_bytes([body[0], body[1]]) == 0x0109
+                && u16::from_le_bytes([body[0x14], body[0x15]]) == 0x0100
+                && std::env::var_os("EMU_FAKE_SPM_SERVER").is_some_and(|v| v == "1")
+            {
+                log::warn!(
+                    "[LIBOSAL-MBX] EMU_FAKE_SPM_SERVER: answering ServiceRegister(svc 0x0100) as kernel SPM"
+                );
+                cca_server_answer_register(unicorn, 0x0000, 0x0109, 0x0100);
+            }
             // r755: and the follow-up ServiceData requests for the
             // navigation service (wait-widget data), see
             // `cca_server_answer_data_request_if_unhosted`.

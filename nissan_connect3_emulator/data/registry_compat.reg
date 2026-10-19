@@ -705,3 +705,9 @@
 "AUTOREQUEST_TIME_ON_STATECHANGE"=dword:00000000
 [HKEY_LOCAL_MACHINE\SOFTWARE\BLAUPUNKT\PROCESS\NAVAPP\TIMA\APP_CONFIG]
 "AUTOREQUEST_TIME_ON_STATECHANGE"=dword:00000000
+
+; NOTE (r788, f43 vs f44): PROCESS\CONFIG\PROCNAVI APPID is queried by
+; PROCNAV's own monitor threads (scd_s32GetThreadConfiguration), NOT by the
+; HMI enavi client - seeding it changed nothing on the bus.  The key is
+; deliberately absent again; the enavi client's real precondition lives
+; elsewhere (see docs/issues/correctness.md r788).
