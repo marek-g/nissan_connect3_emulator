@@ -1266,7 +1266,19 @@ fn hmi_frame_is_non_black(pixels: &[u8]) -> bool {
 }
 
 fn should_capture_hmi_frame(frame: u32) -> bool {
-    frame < 5 || matches!(frame, 50 | 100 | 200 | 400 | 800 | 2000 | 4000 | 8000)
+    // EMU_GPU_HMI_CAPTURE_EVERY=N additionally captures every N-th frame
+    // (used to follow touch-driven screen changes on the wall-clock timeline).
+    if frame < 5 || matches!(frame, 50 | 100 | 200 | 400 | 800 | 2000 | 4000 | 8000) {
+        return true;
+    }
+    static EVERY: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| {
+        std::env::var("EMU_GPU_HMI_CAPTURE_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    });
+    every > 0 && frame.is_multiple_of(every)
 }
 
 fn save_hmi_capture(prefix: &str, frame: u32, pixels: &[u8], width: i32, height: i32) {
