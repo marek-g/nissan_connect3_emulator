@@ -6161,11 +6161,27 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         (0x0138_2d14u32, "cl-have"),
         (0x0138_2d38u32, "cl-nosvc"),
         (0x0161_d328u32, "sinkscan-vec"),
+        // r796: navsrv-side notify posts that should wake the CL entries:
+        // both are function entries (safe for narrow traps).
+        (0x0157_8d88u32, "notify-svc"),
+        (0x0157_5cdu32 & 0xffff_fffcu32, "notify-gen"),
+        // r796: the tick's READY decision: 0x1719ac8 = all-sinks-connected
+        // (0x17ba0a0 svc-status AND 0x17ba318 sink-state); its result gates
+        // the store of 2 to the gate word at 0x1719cec-0x1719cf4.
+        (0x0171_9af4u32, "conn-a"),
+        (0x0171_9b0cu32, "conn-b"),
+        (0x0171_9cf8u32, "conn-all"),
+        (0x0171_9d04u32, "conn-jump2"),
+        // per-entry conf verdict in the cmdsub step: r0 from 0x17b94b8;
+        // r4 = [entry+0x28] (outstanding-conf counter), obj = the entry.
+        (0x0171_9cecu32, "conf-res"),
+        // r796: replaced dead narrow hooks - page-watch dispatch below.
+        (0x0171_9cf0u32, "conf-store"),
     ] {
         let address = base_address + offset - ORIGINAL_BASE;
         crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:s9gate", move |uc: &mut Unicorn<'_, Context>| {
             static HITS: AtomicU32 = AtomicU32::new(0);
-            if HITS.fetch_add(1, Ordering::Relaxed) >= 150 {
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 300 {
                 return 0;
             }
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -6176,6 +6192,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
             let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
             let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
             // r796: the FINAVI vSvcReady event lands on r0's vfn+0x1c;
             // dump the callee class so the consumer can be disassembled.
             let spost = if label.starts_with("svc-post") {
@@ -6208,9 +6225,103 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 String::new()
             };
             log::warn!(
-                "PROCHMI s9gate {label} t={}ms tid=[{}] r0={r0:#x} r1={r1:#x} obj={obj:#x} obj+4={st} r7={r7:#x} r3={r3:#x} r4={r4:#x}{spost}",
+                "PROCHMI s9gate {label} t={}ms tid=[{}] r0={r0:#x} r1={r1:#x} r2={r2:#x} obj={obj:#x} obj+4={st} r7={r7:#x} r3={r3:#x} r4={r4:#x}{spost}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
                 uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r796: page-watch over the cmdsub step + tick tail on page 0x1719000:
+    // the narrow probes at conf-res/conn-* are mid-TB and false-negative
+    // (conf-store fired via the mem-watch while its conf-res probe stayed
+    // at zero hits - AGENTS.md unicorn quirk).  Dispatch per fetch address.
+    {
+        let page = base_address + 0x0171_9000u32 - ORIGINAL_BASE;
+        let sites: [(u32, &str); 12] = [
+            (base_address + 0x0171_9af4u32 - ORIGINAL_BASE, "conn-a"),
+            (base_address + 0x0171_9b0cu32 - ORIGINAL_BASE, "conn-b"),
+            (base_address + 0x0171_9cecu32 - ORIGINAL_BASE, "conf-res"),
+            (base_address + 0x0171_9cf0u32 - ORIGINAL_BASE, "conf-store"),
+            (base_address + 0x0171_9cf8u32 - ORIGINAL_BASE, "conf-open"),
+            (base_address + 0x0171_9d04u32 - ORIGINAL_BASE, "conn-jump2"),
+            // r796: the SERVICE_STATUS event handler (entry vfn+0x1c):
+            // entry, [entry+4] conn ptr, conn-ready check, the two branch
+            // decisions, and the state-2 store itself.
+            (base_address + 0x0171_9b74u32 - ORIGINAL_BASE, "ev-entry"),
+            (base_address + 0x0171_9b88u32 - ORIGINAL_BASE, "ev-conn"),
+            (base_address + 0x0171_9bd8u32 - ORIGINAL_BASE, "ev-connready"),
+            (base_address + 0x0171_9c04u32 - ORIGINAL_BASE, "ev-v38"),
+            (base_address + 0x0171_9e58u32 - ORIGINAL_BASE, "ev-store2"),
+            (base_address + 0x0171_9c60u32 - ORIGINAL_BASE, "ev-v2c"),
+        ];
+        let _ = unicorn.add_code_hook(
+            page as u64,
+            page as u64 + 0x1000,
+            move |uc: &mut Unicorn<'_, Context>, addr, _| {
+                static HP: AtomicU32 = AtomicU32::new(0);
+                let hit = addr as u32;
+                let Some((_, label)) = sites.iter().find(|(a, _)| *a == hit) else {
+                    return;
+                };
+                if HP.fetch_add(1, Ordering::Relaxed) >= 120 {
+                    return;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                let entry = if *label == "ev-entry" { r0 } else { r5 };
+                let svc = read_u32(uc, entry.wrapping_add(0x20)) & 0xffff;
+                let st = read_u32(uc, entry.wrapping_add(4));
+                let conn = read_u32(uc, entry.wrapping_add(8));
+                log::warn!(
+                    "PROCHMI stepprobe {label} t={}ms tid=[{}] r0={r0:#x} entry={entry:#x} state={st} svc={svc:#x} c28={r4:#x} conn={conn:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                );
+            },
+        );
+    }
+    // r796: earliest reliable sighting of the gate object: 0x17c28a0 runs
+    // right after `bl 0x161f754` (hmi singleton) inside 0x17c2760 - install
+    // the gate-word write-watch HERE (no 15 s gate, no hit budget) so the
+    // boot-time 0 -> 1 writer and any later writer are all captured.
+    {
+        let address = base_address + 0x017c_28a0u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:earlygate", move |uc: &mut Unicorn<'_, Context>| {
+            static SEEN: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if SEEN.swap(true, Ordering::Relaxed) {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let holder = read_u32(uc, r0.wrapping_add(4));
+            let obj = read_u32(uc, holder.wrapping_add(4));
+            if obj == 0 {
+                return 0;
+            }
+            let word = obj.wrapping_add(4);
+            let cur = read_u32(uc, word);
+            log::warn!(
+                "PROCHMI earlygate t={}ms hmi={r0:#x} holder={holder:#x} obj={obj:#x} word={word:#x} cur={cur}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+            );
+            let _ = uc.add_mem_hook(
+                unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                (word - 0x10) as u64,
+                (word + 0x10) as u64,
+                move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                    static WE: AtomicU32 = AtomicU32::new(0);
+                    if WE.fetch_add(1, Ordering::Relaxed) < 24 {
+                        let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                        let pc = uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                        log::warn!(
+                            "PROCHMI earlygate WRITE t={}ms addr={address:#x} size={size} value={value:#x} pc={pc:#x} lr={lr:#x}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                        );
+                    }
+                    true
+                },
             );
             0
         });

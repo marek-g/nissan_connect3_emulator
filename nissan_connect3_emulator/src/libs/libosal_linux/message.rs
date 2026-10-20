@@ -2335,6 +2335,9 @@ fn cca_server_answer_register(
             // service state, and the popup's whole release chain keys off it.
             // A state-0 (fastmap ACTIVE) status only ever produces the base
             // id; the nav service needs state 1 to reach the startup case.
+            // r796 note: do NOT copy this for the CL service 0x000a - state 1
+            // reads as UNAVAILABLE there and drops the state-5 gate again
+            // (f187: c6-svc0a flipped 1 -> 0).
             body[0x18] = 1; // ServiceStatus: state 1 for the NAVI service
         } // else ServiceStatus: state byte 0 = ACTIVE (fastmap precedent)
         stamp_registration_id(&target, &mut body);

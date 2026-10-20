@@ -1742,3 +1742,36 @@ verdict `0x161fb14`->`0x162f570`->`0x162d3b0`/`0x162d3a0`, dynamic gate-watch
 `ready-setter`/`srvsetter` traps, finavi-global slot watches (`0x2a1be8c`,
 `0x2a1ce78`, stored by a static ctor at lr=0x47371944), dynamic
 `navsrv-state` watch on `[proxy4c+0xe0]`.
+
+## r796b: the gate word is the CL connection entry's state; writer located, event pipeline pinned
+
+Extending r796, the gate object `0x3a23f58` is the *command-subscriber entry*
+for service 0x000a in the navsrv CL client, and the whole state-6 gate reads
+`[entry+4]`:
+
+- `0x17c2760`'s inner getter `0x166c0d0` = `([entry+4]==2)`; the entry's
+  runtime vtable is at `0x291b698` (**bss-resident, file reads useless** -
+  probe `[vt+0x18]=0x166c0d0` live, offline read of that address is garbage).
+- The state-1 writer is the transaction step `0x1719c8c` at `0x1719cf0`
+  (`streq r0,[r5,#4]` after the send/reply helper `0x17b94b8` returns 1 =
+  RegisterConf accepted). Confirmed live (earlygate write-watch, pc=0x1719cf0,
+  value 1) - the fake's RegisterConf *is* consumed.
+- The state-2 stores in the same page are `0x1719d74` (svc-not-required leg,
+  dead for NAVI since `USE_CCA_SRV_NAVI=1` is genuine) and `0x1719ea4` on the
+  `0x1719e58` branch of the SERVICE_STATUS event handler `0x1719b74`
+  (entry vfn+0x1c): `0x17192ac` re-drives the entry when `[entry+4]==1`.
+- f185/f186: that handler runs - but only for the svc 0x0006 entries (event
+  pump `HMINavServerLib_1`, posts from `0x17c3698`, 3 total). The svc-0x000a
+  entry never receives its SERVICE_STATUS event even though its 0x43/0x44
+  answers are posted to mbx_289 (`cca answer posted ... live 2`).
+- DAPI's genuine 0x44 (svc 0x06 -> mbx_289) carries `regid 03 00` at +0x16
+  and `fe ff` at +0x14/15, ours (r755 shape) has stamped regid 0xe0.. and
+  zeros there; the f187 experiment (state byte 1 for svc 0x000a) was a
+  REGRESSION (state 1 = UNAVAILABLE drops the state-5 gate, `c6-svc0a` 1->0)
+  and was reverted - state byte must stay 0.
+
+Remaining suspects for the missing svc-0x000a entry event: the +0x14/0x15
+field or the regid pairing consumed by `bIsDataSet`-style reference matching,
+or a class-0x45 follow-up the real SENSORFI sends that our responder covers
+only for GpsDataStatus requests. Next: delivery-side content dump of the
+fake's mbx_289 answers + cl-entry event-id comparison.
