@@ -6181,7 +6181,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         let address = base_address + offset - ORIGINAL_BASE;
         crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:s9gate", move |uc: &mut Unicorn<'_, Context>| {
             static HITS: AtomicU32 = AtomicU32::new(0);
-            if HITS.fetch_add(1, Ordering::Relaxed) >= 300 {
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 4000 {
                 return 0;
             }
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -6238,7 +6238,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
     // at zero hits - AGENTS.md unicorn quirk).  Dispatch per fetch address.
     {
         let page = base_address + 0x0171_9000u32 - ORIGINAL_BASE;
-        let sites: [(u32, &str); 12] = [
+        let sites: [(u32, &str); 13] = [
             (base_address + 0x0171_9af4u32 - ORIGINAL_BASE, "conn-a"),
             (base_address + 0x0171_9b0cu32 - ORIGINAL_BASE, "conn-b"),
             (base_address + 0x0171_9cecu32 - ORIGINAL_BASE, "conf-res"),
@@ -6254,6 +6254,10 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             (base_address + 0x0171_9c04u32 - ORIGINAL_BASE, "ev-v38"),
             (base_address + 0x0171_9e58u32 - ORIGINAL_BASE, "ev-store2"),
             (base_address + 0x0171_9c60u32 - ORIGINAL_BASE, "ev-v2c"),
+            // r796b: the helper result at the step prologue: zero branches
+            // straight to the state-2 store (0x1719e58), non-zero registers
+            // the entry in the pump list and continues to the send.
+            (base_address + 0x0171_9ca4u32 - ORIGINAL_BASE, "step-branch"),
         ];
         let _ = unicorn.add_code_hook(
             page as u64,
@@ -6274,13 +6278,118 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 let svc = read_u32(uc, entry.wrapping_add(0x20)) & 0xffff;
                 let st = read_u32(uc, entry.wrapping_add(4));
                 let conn = read_u32(uc, entry.wrapping_add(8));
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                // r796b: list-selection global (helper 0x1719b4c) live value
+                let g = read_u32(uc, 0x02a1_39f8);
+                let gv = read_u32(uc, g);
                 log::warn!(
-                    "PROCHMI stepprobe {label} t={}ms tid=[{}] r0={r0:#x} entry={entry:#x} state={st} svc={svc:#x} c28={r4:#x} conn={conn:#x}",
+                    "PROCHMI stepprobe {label} t={}ms tid=[{}] r0={r0:#x} entry={entry:#x} state={st} svc={svc:#x} c28={r4:#x} conn={conn:#x} lsv={gv:#x} lr={lr:#x}",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     uc.get_data().inner.thread_id(),
                 );
             },
         );
+    }
+    // r796c: the real HMINavServerLib pump (libosal caller offsets are
+    // lr-0x8000, so "caller=+0x17c36xx" lines are runtime VA 0x17cb6xx):
+    // 0x17cb574 receives one message from [obj+8], special-cases class 0x45
+    // (extracts content+0x1b/+0x1c, converts via 0xfb8f50); 0x17cb668 posts
+    // the 8-byte internal event. All three are function entries (safe for
+    // narrow traps).
+    {
+        for (off, label, budget) in [
+            (0x017c_b574u32, "rx-pump", 30u32),
+            (0x000f_b8f0u32, "rx-45", 12),
+            (0x017c_b668u32, "post8", 12),
+            (0x017c_b6b0u32, "notify", 12),
+            (0x017c_cb88u32, "list-add", 24),
+            (0x017b_93fcu32, "dispatch", 30),
+            (0x017c_ce38u32, "re-entry", 24),
+        ] {
+            let address = base_address + off - ORIGINAL_BASE;
+            let _ = budget;
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:pumptrace", move |uc: &mut Unicorn<'_, Context>| {
+                static HITS: std::sync::OnceLock<
+                    std::sync::Mutex<std::collections::HashMap<&'static str, u32>>,
+                > = std::sync::OnceLock::new();
+                let map = HITS.get_or_init(Default::default);
+                let mut map = match map.lock() {
+                    Ok(m) => m,
+                    Err(p) => p.into_inner(),
+                };
+                let n = map.entry(label).or_insert(0);
+                if *n >= 30 {
+                    return 0;
+                }
+                *n += 1;
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                if label == "rx-pump" {
+                    // r3 = message ref, content = [r3+4] (see 0x17cb5e0)
+                    let content = read_u32(uc, r3.wrapping_add(4));
+                    let cls = read_u32(uc, content.wrapping_add(0x08)) >> 24;
+                    let svc = read_u32(uc, content.wrapping_add(0x14)) & 0xffff;
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] obj={r0:#x} msg={r3:#x} content={content:#x} class={cls:#x} svc={svc:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "post8" {
+                    let q = read_u32(uc, r0.wrapping_add(8));
+                    let w1 = read_u32(uc, r1.wrapping_add(4));
+                    let w3 = read_u32(uc, r1.wrapping_add(0xc));
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] queue={q:#x} w1={w1:#x} w3={w3:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "dispatch" {
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let a4 = read_u32(uc, sp.wrapping_add(0x20));
+                    let a5 = read_u32(uc, sp.wrapping_add(0x24));
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] obj={r0:#x} event={r1:#x} key={r2:#x} a4={a4:#x} a5={a5:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "list-add" {
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] anchor={r0:#x} node={r1:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "notify" {
+                    let w1 = read_u32(uc, r1.wrapping_add(4));
+                    let w2 = read_u32(uc, r1.wrapping_add(8));
+                    let w3 = read_u32(uc, r1.wrapping_add(0xc));
+                    let p0 = read_u32(uc, w3);
+                    let p4 = read_u32(uc, w3.wrapping_add(4));
+                    let p8 = read_u32(uc, w3.wrapping_add(8));
+                    let pc = read_u32(uc, w3.wrapping_add(0xc));
+                    let p10 = read_u32(uc, w3.wrapping_add(0x10));
+                    let p14 = read_u32(uc, w3.wrapping_add(0x14));
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] w1={w1:#x} w2={w2:#x} payload={w3:#x} [{p0:#x} {p4:#x} {p8:#x} {pc:#x} {p10:#x} {p14:#x}] lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else {
+                    let a0 = read_u32(uc, r0);
+                    let a1 = read_u32(uc, r0.wrapping_add(4));
+                    let a2 = read_u32(uc, r0.wrapping_add(8));
+                    let a3 = read_u32(uc, r0.wrapping_add(0xc));
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] r0={r0:#x} [r0]={a0:#x} [r0+4]={a1:#x} [r0+8]={a2:#x} [r0+0xc]={a3:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                }
+                0
+            });
+        }
     }
     // r796: earliest reliable sighting of the gate object: 0x17c28a0 runs
     // right after `bl 0x161f754` (hmi singleton) inside 0x17c2760 - install
@@ -6474,6 +6583,12 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         for (lo, hi, want, tag) in [
             (0x02a1_c000u64, 0x02a1_cfffu64, 0x02a1_ce78u32, "getter-slot"),
             (0x02a1_b000u64, 0x02a1_bfffu64, 0x02a1_be8cu32, "svc-slot"),
+            // r796b: helper 0x1719b4c reads [[0x2a139f8]]; its null-ness at
+            // entry-registration time picks the pump list (entry+0x14 vs
+            // entry+0x28): only the +0x28-list entries get re-ticked by the
+            // event pump.  The 0x0a entry landed in the +0x14 list, so this
+            // global was non-null when it registered - catch its writer.
+            (0x02a1_3000u64, 0x02a1_3fffu64, 0x02a1_39f8u32, "list-sel"),
         ] {
             unicorn
                 .add_mem_hook(

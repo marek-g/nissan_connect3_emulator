@@ -2323,6 +2323,14 @@ fn cca_server_answer_register(
         body[4..8].copy_from_slice(&(0x20u32).to_le_bytes());
         body[8..10].copy_from_slice(&2u16.to_le_bytes());
         body[0xb] = class;
+        // r796c: the claim walk (`ail_tclServiceReference::bIsDataSet`) compares
+        // the message's unique id at +0x0e against the receiver reference's
+        // stored slot, and the 0xffff wildcard covers only the message side.
+        // DAPI's genuine conf/status on mbx_289 carry AIL_NO_UNIQUE_ID (0xfffe)
+        // there, which the navsrv client's references match; our zeros made
+        // every answer unclaimable, so `bIsDataSet` never flipped and the CL
+        // entry event (the gate-word's state-2 writer) never fired.
+        body[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
         let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed) as u32;
         body[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
         body[0x14..0x16].copy_from_slice(&service.to_le_bytes());
@@ -2343,6 +2351,27 @@ fn cca_server_answer_register(
         stamp_registration_id(&target, &mut body);
         answers.push(body);
     }
+    if service == 0x000a {
+        // r796c: re-announce the ServiceStatus once, the way the genuine
+        // providers do (DAPI posts the svc 0x06 status twice per register).
+        // The enavi CL-entry transaction consumes the conf + first status;
+        // only the *second* status is seen by the connector's event walk
+        // (HMINavServerLib_1 pump -> entry vfn+0x1c 0x1719b74 -> 0x17192ac
+        // -> vfn+0x4c), whose sink-vector check stores the READY(2) state
+        // the startup gate 0x17c2760 waits for.  With a single status the
+        // entry stayed at REGISTERED(1) forever (f181-f196).
+        if let Some(status) = answers.iter().find(|b| b[0x0b] == 0x44).cloned() {
+            let mut second = status;
+            let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed) as u32;
+            second[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
+            stamp_registration_id(&target, &mut second);
+            log::info!(
+                "[LIBOSAL-MBX] cca directory: re-announcing ServiceStatus(svc {service:#06x}) for the CL entry event walk"
+            );
+            answers.push(second);
+        }
+    }
+    let answer_total = answers.len();
     let mut kept: Vec<Vec<u8>> = Vec::new();
     let mut posted = 0usize;
     for body in answers {
@@ -2402,7 +2431,7 @@ fn cca_server_answer_register(
     }
     log::info!(
         "[LIBOSAL-MBX] cca server {server_app:#06x}: answered ServiceRegister(svc {service:#06x}) from {client:#06x} with RegisterConf+ServiceStatus (live {posted}, spooled {})",
-        2 - posted,
+        answer_total.saturating_sub(posted),
     );
     // r758 experiment: see post_navi_event_probe.  Runs once, right after the
     // NAVI service registration is answered (the HMI's nav client is live by
@@ -2626,6 +2655,11 @@ fn cca_server_answer_sensorfi_data_request(
     body[4..8].copy_from_slice(&total_len.to_le_bytes());
     body[8..10].copy_from_slice(&2u16.to_le_bytes());
     body[0xb] = 0x45;
+    // r796c: AIL_NO_UNIQUE_ID at +0x0e so `bIsDataSet` can claim the answer
+    // (same reasoning as in `cca_server_answer_register`).  Only for this
+    // responder's client (navsrv 0x0121), whose references keep 0xfffe; the
+    // working 0x0027 answer to the HMI keeps zero.
+    body[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
     static MSG_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x5000);
     let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed) as u32;
     body[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());

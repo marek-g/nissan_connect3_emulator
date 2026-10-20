@@ -1775,3 +1775,41 @@ field or the regid pairing consumed by `bIsDataSet`-style reference matching,
 or a class-0x45 follow-up the real SENSORFI sends that our responder covers
 only for GpsDataStatus requests. Next: delivery-side content dump of the
 fake's mbx_289 answers + cl-entry event-id comparison.
+
+## r796c: provider-attribution audit + event-dispatch located (session wrap)
+
+**Audit („czy PROCNAV/procmwlx ma hostować FI?”) - answer: NO, the libosal
+fabrication point is correct:**
+- `procmwlx_out.out` hosts IPOD/audio-route/UPS/device-manager/demo
+  (apps 0x33/0x89/0x3b/0x1b/0x800; services 0x43/0x4c/0x5e/0x77/0x93/0x888).
+  No sensorfi/posfi/navifi strings in the binary; none of our FI services.
+- SERVICEID 0x0a/0x1e exist in NO firmware .reg; the real unit resolves them
+  through the kernel SCD runtime table. `procmw.out` (apps incl. SENSOR
+  0x2739) is not in the Linux firmware at all - RTOS core.
+- PROCNAV is a *client* of 0x0a (r388/r215 ground truth in
+  `data/registry_compat.reg`): `STAT_tclThread` consumes GpsDataStatus;
+  APPID 0x15 in the compat seed is deliberately an *external provider id*
+  so replies route to mbx_21. So SENSORFI/POSFI = TE/RTOS-side provider -
+  fabrication in libosal is AGENTS-rule-1 legitimate and must stay.
+
+**Session fixes (kept):** fake answers now carry `AIL_NO_UNIQUE_ID (0xfffe)`
+at +0x0e (claim-walk `bIsDataSet` parity with DAPI, f190 byte diff) and the
+NAVI (0x000a) register answer re-announces the ServiceStatus (genuine
+providers send status >= 2 per register; the enavi transaction consumes one
+and the event walk needs the next) + overflow fix in its log line.
+
+**Dispatch chain located:** the SERVICE_STATUS handler `0x1719b74` is called
+from the keyed dispatcher `0x17b93fc` (`bl` at `0x17b9460`, f199 lr):
+`obj` = navsrv-side service container `0x392bb08`, event ids seen
+`0x80000218`/`0x80000215` (state-change family), key = vector index,
+arg5 = 0x22, caller `lr=0x1c80c3c`. The svc-0x06 entries are members of the
+container's PRIMARY vector (`obj+0x14`, filled outside `0x17ccb88` - that
+only saw the connector-list registrations at `0x3b223ec`); the gate entry
+(0x000a) is in the connector list but NOT in the dispatcher container.
+**Next session:** find who registers service objects into the `0x392bb08`
+container (probe writes to `[0x392bb1c+0xc]` count field / callers of its
+add helper near `0x17ccc04`), and what makes the guest add the 0x0a service
+there (compare the 0x06 chain: it completed via DAPI's genuine
+RegisterConf+2xStatus+0x45 data on mbx_289); then expect
+ev-entry(0x0a) -> `0x17192ac` state1 -> `0x17193b0` -> vfn+0x4c -> store 2
+(`0x171ae04`) -> gate opens -> FSM 6->7->8->9, popup 0x5da closes.
