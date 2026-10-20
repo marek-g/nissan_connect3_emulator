@@ -423,6 +423,12 @@ static HMI_NAV_HANDLER_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 /// enavi start-request) right before the first real NORMAL broadcast.
 pub static OFF_SEEN: AtomicU32 = AtomicU32::new(0);
 
+/// r799g: runtime addresses of the state-8 f74 readiness gate and its
+/// startup-step owner, captured by the s8b-in probe.  Used to filter the
+/// 0x17188b8 name-iterator watch to the objects that matter.
+pub static F74_GATE: AtomicU32 = AtomicU32::new(0);
+pub static F74_STEP: AtomicU32 = AtomicU32::new(0);
+
 /// The prev-state value the device's OFF dwell would have left in the static
 /// `clFi_Navi` previous-state global when the first post-OFF NORMAL broadcast
 /// runs; 0 = nothing to reproduce.
@@ -7204,6 +7210,145 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             Err(e) => log::warn!("PROCHMI: regleg page watch failed: {e}"),
         }
     }
+    // r799g: the name-iterator advance (0x17c7bc4 -> 0x17c7d6c -> 0x17188b8
+    // (gate, &gate+0x58, u16 id from 0x1719ab8)).  f323: the gnf leg now
+    // hits the gate (+4 = 2 via vp-ev) but the getter still never sees it -
+    // the expected golden exit is instead the s8-v24 strcmp turning != 0
+    // (iterator advanced) -> `bne 0x17c7c18` store-9.  0x17188b8 removes
+    // the entry ONLY when the connector vfn+0x8(name id) returns non-zero
+    // (0x17189d0 beq 0x1718960 = silent return).  Watch which leg the f74
+    // call takes: entry(E), compare-miss(M-miss 0x17189b8->0x17188e8),
+    // match(M-hit 0x17189bc), vfn+0x8 result(Z: 0x17189d4 r0=0 abort),
+    // rebuild path(R: 0x17189d8).  Page hook per AGENTS.md (mid-TB).
+    {
+        let page = (base_address + 0x0171_8000u32 - ORIGINAL_BASE) as u64;
+        let sites = [
+            (0x0171_88bcu32, "E"),
+            (0x0171_89b8u32, "cmp"),
+            (0x0171_89d4u32, "vfn8"),
+            (0x0171_89d8u32, "rebuild"),
+            (0x0171_8960u32, "ret"),
+        ];
+        let targets: Vec<(u64, &'static str)> = sites
+            .iter()
+            .map(|(off, l)| ((base_address + off - ORIGINAL_BASE) as u64, *l))
+            .collect();
+        let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
+            let Some((_, tag)) = targets.iter().find(|(t, _)| *t == addr) else {
+                return;
+            };
+            // member-era removes are noise: the exit we chase only
+            // matters once the startup FSM sits in state 8.
+            if crate::libs::libosal_linux::message::hmi_fsm_state() < 8 {
+                return;
+            }
+            static N: AtomicU32 = AtomicU32::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) >= 400 {
+                return;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+            let mut extra = String::new();
+            if matches!(*tag, "vfn8" | "ret") {
+                let d = read_u32(uc, r6 + 0x5c);
+                let cap = read_u32(uc, r6 + 0x60);
+                let cnt = read_u32(uc, r6 + 0x64);
+                let namep = read_u32(uc, r6 + 0x7c);
+                let name0 = read_u32(uc, namep);
+                let mut sb = [0u8; 24];
+                let printable = if name0 > 0x1000_0000 && uc.mem_read(name0 as u64, &mut sb).is_ok()
+                {
+                    String::from_utf8_lossy(&sb)
+                        .chars()
+                        .take_while(|c| *c != '\0')
+                        .filter(|c| c.is_ascii_graphic() || *c == '/')
+                        .collect::<String>()
+                } else {
+                    String::new()
+                };
+                extra = format!(
+                    " vec={d:#x} cap={cap} cnt={cnt} namep={namep:#x} name0={name0:#x} s={printable}"
+                );
+            }
+            log::warn!(
+                "PROCHMI rmv {tag} t={}ms tid=[{}] r0={r0:#x} gate={r6:#x} lr={lr:#x}{extra}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+        });
+        match result {
+            Ok(_) => log::info!("PROCHMI: rmv page watch installed"),
+            Err(e) => log::warn!("PROCHMI: rmv page watch failed: {e}"),
+        }
+    }
+    // r799g: the s8-v24 trap reports res=0 at 0x17c7ba4, but the vfn word
+    // [s78+0x24] = 0x1feb794 (runtime code confirmed) can only return 0 on
+    // the strcmp-equal leg (it pops r0 as non-zero on BOTH NULL legs!).
+    // A zero result therefore means a DIFFERENT function ran (or the trap
+    // lies).  Page watch the candidate body (AGENTS.md page dispatch).
+    {
+        let page = (base_address + 0x01fe_b000u32 - ORIGINAL_BASE) as u64;
+        let lo = (base_address + 0x01fe_b794u32 - ORIGINAL_BASE) as u64;
+        let hi = (base_address + 0x01fe_b7ecu32 - ORIGINAL_BASE) as u64;
+        let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
+            if addr < lo || addr > hi {
+                return;
+            }
+            static V: AtomicU32 = AtomicU32::new(0);
+            if V.fetch_add(1, Ordering::Relaxed) >= 400 {
+                return;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            log::warn!(
+                "PROCHMI v24body t={}ms tid=[{}] pc={addr:#x} r0={r0:#x} r1={r1:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+        });
+        match result {
+            Ok(_) => log::info!("PROCHMI: v24body page watch installed"),
+            Err(e) => log::warn!("PROCHMI: v24body page watch failed: {e}"),
+        }
+    }
+    // r799g: v24body proved the leg vfn returns 1 (both name operands NULL
+    // -> 0x1feb7dc r0=1) at 27.8 s while the startup state stayed 8 - the
+    // store-9 at 0x17c7c1c must then run and be rewound (or never run:
+    // the s8-v24 trap at 0x17c7ba4 may be a lying mid-TB trap).  Page-watch
+    // the branch target (B9) and the retry branch (RETRY) for real fetches.
+    {
+        let page = (base_address + 0x017c_7000u32 - ORIGINAL_BASE) as u64;
+        let sites = [
+            (0x017c_7ba8u32, "br"),
+            (0x017c_7c1cu32, "B9"),
+            (0x017c_7c14u32, "retry-chk"),
+            (0x017c_7c10u32, "v18-ret"),
+        ];
+        let targets: Vec<(u64, &'static str)> = sites
+            .iter()
+            .map(|(off, l)| ((base_address + off - ORIGINAL_BASE) as u64, *l))
+            .collect();
+        let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
+            let Some((_, tag)) = targets.iter().find(|(t, _)| *t == addr) else {
+                return;
+            };
+            static W: AtomicU32 = AtomicU32::new(0);
+            if W.fetch_add(1, Ordering::Relaxed) >= 300 {
+                return;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            log::warn!(
+                "PROCHMI s9path {tag} t={}ms tid=[{}] r0={r0:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+        });
+        match result {
+            Ok(_) => log::info!("PROCHMI: s9path page watch installed"),
+            Err(e) => log::warn!("PROCHMI: s9path page watch failed: {e}"),
+        }
+    }
     // r799d: return of the HMINavServerLib_1 Wait in tid-62's drain (the api
     // intercept logs caller=+0x17c35c0: `bl #0x161f754` at 0x17c35bc, result
     // check at 0x17c35c4).  f278: the drain consumed its last rx at 27.26s
@@ -7664,6 +7809,47 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // The ready-leg virtual calls target the object at
                 // [sl+0x74] (0x17c2430) and its +0x78 sub-object.
                 let f74 = read_u32(uc, sl.wrapping_add(0x74));
+                // r799g: runtime truth for the vfn+0x24 leg - the table
+                // word [s78+0x24] actually fed to `ldr pc,[r2,#0x24]` plus
+                // its first code words (the seg2 file mapping may differ
+                // from -0x10000, so decode the RUNTIME bytes).
+                if label == "s8-v24" {
+                    let s78w = read_u32(uc, f74.wrapping_add(0x78));
+                    let v24x = read_u32(uc, s78w.wrapping_add(0x24));
+                    // r799g: the vfn compares [gate+0x7c] (string object)
+                    // against [[w48]+4].  Log both operands and their text.
+                    let gp = read_u32(uc, f74.wrapping_add(0x7c));
+                    let sp_ = read_u32(uc, w48.wrapping_add(4));
+                    let gq = read_u32(uc, gp);
+                    let sq = read_u32(uc, sp_);
+                    let txt = |p: u32| {
+                        let mut b = [0u8; 20];
+                        match uc.mem_read(p as u64, &mut b) {
+                            Ok(()) => String::from_utf8_lossy(&b)
+                                .chars()
+                                .take_while(|c| *c != '\0')
+                                .filter(|c| c.is_ascii_graphic() || *c == '/')
+                                .collect::<String>(),
+                            Err(_) => String::new(),
+                        }
+                    };
+                    log::warn!(
+                        "PROCHMI envigate v24nm t={}ms gate_s={gp:#x}->{gq:#x}:{} step_s={sp_:#x}->{sq:#x}:{}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        txt(gq),
+                        txt(sq),
+                    );
+                    let mut code = [0u8; 32];
+                    let _ = uc.mem_read(v24x as u64, &mut code);
+                    let cw: Vec<u32> = code
+                        .chunks(4)
+                        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    log::warn!(
+                        "PROCHMI envigate v24x t={}ms s78={s78w:#x} vfn={v24x:#x} code={cw:#x?}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                    );
+                }
                 let vt74 = read_u32(uc, f74);
                 let s78 = read_u32(uc, f74.wrapping_add(0x78));
                 let vt78 = read_u32(uc, s78);
@@ -7729,6 +7915,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // missing; watch the whole FSM object page for writes into
                 // its header fields (offsets 0x2c..0x5c).
                 if label == "s8b-in" && sl != 0 {
+                    F74_STEP.store(sl, Ordering::Relaxed);
                     static SLWATCH: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
                     if !SLWATCH.swap(true, Ordering::Relaxed) {
@@ -7744,7 +7931,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
                                 static WH: AtomicU32 = AtomicU32::new(0);
                                 let off = address.wrapping_sub((sl & !0xfff) as u64) as u32;
-                                if (0x2c..0x5c).contains(&off)
+                                if (0x28..0x5c).contains(&off)
                                     && WH.fetch_add(1, Ordering::Relaxed) < 40
                                 {
                                     let lr = uc
@@ -7774,6 +7961,34 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     static F74WATCH: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
                     if !F74WATCH.swap(true, Ordering::Relaxed) {
+                        F74_GATE.store(f74, Ordering::Relaxed);
+                        // r799g: attach the watch name to the f74 gate.
+                        // The leg vfn+0x24 (0x1feb794, runtime bytes
+                        // decoded in f329/f330) returns 1 - "readiness
+                        // satisfied" - only when the gate's pending name
+                        // [gate+0x7c] and the step name [sl+0x4c] compare
+                        // equal (1 - strcmp), or both are NULL.  The real
+                        // unit's connector attaches the name during the
+                        // genuine register round-trip (the ack carries it);
+                        // in the emulator the ack is fabricated and never
+                        // attaches, so [gate+0x7c] stays NULL forever ->
+                        // the leg consumes/re-registers until boot dies.
+                        // Attach the very same string object the step waits
+                        // on (identity pointer -> strcmp 0 -> 1 -> `bne
+                        // 0x17c7c18` store-9).  EMU_F74_ATTACHNAME=0 off.
+                        if std::env::var_os("EMU_F74_ATTACHNAME").map_or(true, |v| v != "0") {
+                            let step_name = read_u32(uc, sl.wrapping_add(0x4c));
+                            if step_name != 0 {
+                                let _ = uc.mem_write(
+                                    (f74 + 0x7c) as u64,
+                                    &step_name.to_le_bytes(),
+                                );
+                                log::warn!(
+                                    "PROCHMI envigate f74 attach-name t={}ms gate={f74:#x} +0x7c := {step_name:#x} (EMU_F74_ATTACHNAME=0 disables)",
+                                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                                );
+                            }
+                        }
                         let want = f74 & !0xfff;
                         log::warn!(
                             "PROCHMI envigate f74-watch installed t={}ms f74={f74:#x}",
@@ -7788,7 +8003,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                 static WH: AtomicU32 = AtomicU32::new(0);
                                 let off =
                                     address.wrapping_sub(base_word as u64) as i64;
-                                if (-4..0xc).contains(&off)
+                                if (-4..0xc).contains(&off) || (0x78..0x84).contains(&off)
                                     && WH.fetch_add(1, Ordering::Relaxed) < 300
                                 {
                                     let lr = uc
