@@ -6583,16 +6583,46 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // +0x30 && +0x38) / 0x171aa50 (+0x30 set, +0x38 null) /
             // 0x171aa74 (event tag 0xf); 0x171aa94 = both null.  Establish
             // whether the poll runs at all and which branch it takes.
-            (0x0171_92acu32, "vtick", 60),
-            (0x0171_a960u32, "vpoll", 120),
-            (0x0171_a9a8u32, "vp-both", 60),
-            (0x0171_aa50u32, "vp-ev", 60),
-            (0x0171_aa94u32, "vp-null", 60),
+            (0x0171_92acu32, "vtick", 900),
+            (0x0171_a960u32, "vpoll", 900),
+            (0x0171_a9a8u32, "vp-both", 300),
+            (0x0171_aa50u32, "vp-ev", 300),
+            (0x0171_aa94u32, "vp-null", 900),
             // the gate notify vf (vtable+0x40, 0x1719b74): stores (event,
             // extra) at +0x30/+0x38, runs vTick, clears.  Which dispatcher
             // feeds the sibling gates but never the f74 cryptcard gate?
-            (0x0171_9bacu32, "gnf-run", 60),
-            (0x0171_9bd0u32, "gnf-end", 60),
+            (0x0171_9bacu32, "gnf-run", 300),
+            (0x0171_9bd0u32, "gnf-end", 300),
+            // r799g: the receiver +0x14 vector holds {u16 id, ptr} entries;
+            // the completion dispatch (event id from the CL pending entry,
+            // 0 for the f74) looks its id up there and calls gnf on a hit
+            // (f315 did: walk -> ev-entry -> gnf -> gate +4 = 2).  f318
+            // dispatches but never reaches gnf -> find whether the s8-tick
+            // unregister removed the entry and under which id the s8-tick
+            // register re-inserts it.
+            (0x017c_cc04u32, "idq-find", 250),
+            (0x017c_cc58u32, "idq-fhit", 250),
+            (0x017c_cc0cu32, "idq-fcnt", 250),
+            (0x017c_ce38u32, "idq-ins", 250),
+            (0x017c_ce88u32, "idq-igrow", 250),
+            // r799g: the register leg (0x1719cc0) decides inside 0x17b94b8
+            // whether to (re-)insert the {id, gate} entry: type byte r4
+            // (gate+0x24) selects the leg and vtbl+0x1c (state > 1) skips
+            // insertion.  f319: the s8-tick registers store +4=1 (st1) but
+            // NEVER reach idq-ins, so the next dispatch finds no entry.
+            // Log the leg inputs for member-era vs s8-tick registers.
+            (0x017b_94fcu32, "reg-leg", 150),
+            (0x0171_9cd8u32, "reg-arg", 150),
+            // r799g: every writer of the gate-class readiness word +0x4:
+            // 0x166c104/0x16703b8 store 2 (data set), 0x1670398/0x16703a8
+            // store 0 (unregister/consume), 0x1719cf0 stores 1 inside the
+            // register leg (object there is r5).  Name the writer that
+            // races the s8 getter.
+            (0x0166_c104u32, "st2a", 150),
+            (0x0167_03b8u32, "st2b", 150),
+            (0x0167_0398u32, "st0a", 150),
+            (0x0167_03a8u32, "st0b", 150),
+            (0x0171_9cf0u32, "st1", 150),
         ] {
             let address = base_address + off - ORIGINAL_BASE;
             crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:pumptrace", move |uc: &mut Unicorn<'_, Context>| {
@@ -6614,7 +6644,60 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
                 let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
                 let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
-                if label == "rx-pump" {
+                if label == "idq-find" || label == "idq-ins" {
+                    // receiver+0x64: dispatcher 0x17b9400 drops EVERY event
+                    // while this byte is 1 (early return before the table
+                    // walk).  r0 = receiver+0x14 (the vector) - read the
+                    // flag off the receiver itself.
+                    let susp = read_u32(uc, r0.wrapping_add(0x64 - 0x14));
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] vec={r0:#x} id={:#x} susp={:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        r1 & 0xffff,
+                        susp & 0xff,
+                    );
+                } else if label == "idq-fhit" {
+                    // entry ip (R12) about to be removed: dump {u16 id, ptr}
+                    let ip = uc.reg_read(RegisterARM::R12).unwrap_or(0) as u32;
+                    let e0 = read_u32(uc, ip);
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] entry={ip:#x} [{e0:#x}] lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "reg-leg" {
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] type={r4:#x} vtbl1c={r0:#x} rcv={r5:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "reg-arg" {
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    let w20 = read_u32(uc, r5.wrapping_add(0x20));
+                    let w24 = read_u32(uc, r5.wrapping_add(0x24));
+                    let w28 = read_u32(uc, r5.wrapping_add(0x28));
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] gate={r5:#x} w20={w20:#x} w24={w24:#x} w28={w28:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "st1" {
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] gate={r5:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if matches!(label, "st2a" | "st2b" | "st0a" | "st0b") {
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] gate={r0:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "rx-pump" {
                     // r3 = message ref, content = [r3+4] (see 0x17cb5e0)
                     let content = read_u32(uc, r3.wrapping_add(4));
                     let cls = read_u32(uc, content.wrapping_add(0x08)) >> 24;
@@ -6662,10 +6745,12 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
                     let a4 = read_u32(uc, sp.wrapping_add(0x20));
                     let a5 = read_u32(uc, sp.wrapping_add(0x24));
+                    let susp = read_u32(uc, r0.wrapping_add(0x64));
                     log::warn!(
-                        "PROCHMI pumptrace {label} t={}ms tid=[{}] obj={r0:#x} event={r1:#x} key={r2:#x} a4={a4:#x} a5={a5:#x} lr={lr:#x}",
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] obj={r0:#x} event={r1:#x} key={r2:#x} a4={a4:#x} a5={a5:#x} susp={:#x} lr={lr:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
+                        susp & 0xff,
                     );
                 } else if label == "completer" {
                     // r797b: trap fires BEFORE the entry's
@@ -6957,7 +7042,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             hi,
                             move |uc: &mut Unicorn<'_, Context>, _t, address, size, _| {
                                 static RP: AtomicU32 = AtomicU32::new(0);
-                                if RP.fetch_add(1, Ordering::Relaxed) >= 40 {
+                                if RP.fetch_add(1, Ordering::Relaxed) >= 900 {
                                     return true;
                                 }
                                 let pc = uc
@@ -7062,6 +7147,61 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         match result {
             Ok(_) => log::info!("PROCHMI: pumppage decision watch installed"),
             Err(e) => log::warn!("PROCHMI: pumppage watch failed: {e}"),
+        }
+    }
+    // r799g: register-leg watcher (0x17b94b8).  The trap_site at 0x17b94fc
+    // was dead in f320 (mid-TB, registered-never-fired) so use a
+    // page-range hook (AGENTS.md).  A: after bl 0x16faecc - r4 = type byte
+    // (gate+0x24), r0 = consume result.  B: right after the idq insert
+    // (bl 0x17cce38).  C: the type-5 leg that returns 1 WITHOUT inserting
+    // (f319/f320: the s8-tick registers store +4=1 but no idq-ins follows -
+    // which leg do they actually take?).
+    {
+        let page = (base_address + 0x017b_9000u32 - ORIGINAL_BASE) as u64;
+        let sites = [
+            (0x017b_94fcu32, "A"),
+            (0x017b_9554u32, "B-ins"),
+            (0x017b_9564u32, "C-ret1"),
+            (0x017b_956cu32, "D-ret0"),
+        ];
+        let targets: Vec<(u64, &'static str)> = sites
+            .iter()
+            .map(|(off, l)| ((base_address + off - ORIGINAL_BASE) as u64, *l))
+            .collect();
+        let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
+            let Some((_, tag)) = targets.iter().find(|(t, _)| *t == addr) else {
+                return;
+            };
+            static P: AtomicU32 = AtomicU32::new(0);
+            if P.fetch_add(1, Ordering::Relaxed) >= 300 {
+                return;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+            if *tag == "B-ins" && r4 == 0 {
+                // f74 gate register (type byte gate+0x24 = 0; the member
+                // gates register with 1/3): hand the connector-assigned
+                // ordinal to the responder so its answer can carry it as
+                // the completion key (see message.rs F74_REG_ORD).
+                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                let ord = read_u16(uc, sp + 0x16) as u16;
+                crate::libs::libosal_linux::message::F74_REG_ORD.store(ord, Ordering::Relaxed);
+                log::warn!(
+                    "PROCHMI regleg f74-ord t={}ms ord={ord:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                );
+            }
+            log::warn!(
+                "PROCHMI regleg {tag} t={}ms tid=[{}] r0={r0:#x} type={r4:#x} rcv={r5:#x} lr={lr:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+        });
+        match result {
+            Ok(_) => log::info!("PROCHMI: regleg page watch installed"),
+            Err(e) => log::warn!("PROCHMI: regleg page watch failed: {e}"),
         }
     }
     // r799d: return of the HMINavServerLib_1 Wait in tid-62's drain (the api
@@ -7615,6 +7755,50 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                         .unwrap_or(0) as u32;
                                     log::warn!(
                                         "PROCHMI fsm-watch WRITE t={}ms sl+{off:#x} size={size} value={value:#x} pc={pc:#x} lr={lr:#x}",
+                                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                                    );
+                                }
+                                true
+                            },
+                        );
+                    }
+                }
+                // r799f: the f74 gate readiness word is written 2 by the
+                // vp-ev branch and read back as 1 by the s8-v18 getter a few
+                // ms later, every single tick - no static store with an
+                // immediate 1 exists in 0x1600000..0x1730000, so the writer
+                // computes the value.  Watch the word itself (installed once
+                // on the first state-8 body hit, from the observed f74) and
+                // log every write with pc/lr to name the resetter.
+                if label == "s8b-in" && f74 > 0x10000 {
+                    static F74WATCH: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !F74WATCH.swap(true, Ordering::Relaxed) {
+                        let want = f74 & !0xfff;
+                        log::warn!(
+                            "PROCHMI envigate f74-watch installed t={}ms f74={f74:#x}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                        );
+                        let base_word = f74;
+                        let _ = uc.add_mem_hook(
+                            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                            want as u64,
+                            want as u64 + 0xfff,
+                            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                                static WH: AtomicU32 = AtomicU32::new(0);
+                                let off =
+                                    address.wrapping_sub(base_word as u64) as i64;
+                                if (-4..0xc).contains(&off)
+                                    && WH.fetch_add(1, Ordering::Relaxed) < 300
+                                {
+                                    let lr = uc
+                                        .reg_read(RegisterARM::R14)
+                                        .unwrap_or(0) as u32;
+                                    let pc = uc
+                                        .reg_read(RegisterARM::R15)
+                                        .unwrap_or(0) as u32;
+                                    log::warn!(
+                                        "PROCHMI f74-watch WRITE t={}ms f74+{off:#x} size={size} value={value:#x} pc={pc:#x} lr={lr:#x}",
                                         crate::libs::dapi::emu_t0_elapsed_ms(),
                                     );
                                 }

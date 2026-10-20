@@ -2628,6 +2628,19 @@ pub fn push_blob_to_mbx_289(unicorn: &mut Unicorn<'_, Context>, body: Vec<u8>) -
 /// the startup-step watch in prochmi.rs.  `0xffff_ffff` until first observed.
 static HMI_FSM_STATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xffff_ffff);
 
+/// r799g: the connector-assigned registration ordinal of the f74
+/// cryptcard readiness gate.  Set by the `regleg` page-hook in prochmi.rs
+/// at 0x17b9554 (the halfword `[sp,#0x16]` the register leg inserts into
+/// the receiver's +0x14 {u16 id, ptr} table).  The completion dispatcher
+/// 0x17b9400 looks the notification's key up in THAT table, and the key is
+/// the answer body's +0x18 halfword (f322: the message whose +0x18 was 2
+/// dispatched `id=2` and hit the gate registered under 2 -> gnf -> +4 = 2).
+/// The genuine answers echo the connector's transaction ordinal, which is
+/// NOT the ordinal carried in the client request (+0x1c, f322: the s8 ticks
+/// registered 0xb..0xe while the request kept 6/7 -> the answer hit a
+/// leftover member entry instead of the gate).
+pub static F74_REG_ORD: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
 pub fn note_hmi_fsm_state(state: u32) {
     HMI_FSM_STATE.store(state, Ordering::Relaxed);
 }
@@ -3207,27 +3220,48 @@ fn cca_server_answer_sensorfi_data_request(
     // 0x06).  The mbx-era wire layout (result at +0x18, ordinal at +0x1c)
     // looked up as (1, ordinal, 0, 9) and missed every entry.
     if name == "mbx_7" {
-        body[0x18..0x1a].copy_from_slice(&txn_key.to_le_bytes());
-        body[0x1a] = 6;
-        body[0x1b] = 1;
-        body[0x1c..0x1e].copy_from_slice(&service.to_le_bytes());
-        // r799e (f312): the +0x18 u32 is ALSO the event id the pump
-        // converts the event into ([sl+0x74]+0x30's first word).  The gate
-        // classifier 0x1718b20 maps id 0 -> "null event" (gate +8 = 0),
-        // which vTick re-arms instead of keeping READY - the f74 gate
-        // oscillated +4 = 2 -> 1 forever.  The genuine DAPI svc-6 answers
-        // carried event 0x80000215 (r798/f232 observation, f312 sibling
-        // gate 0x3a2ae68), the class this gate accepts.  The completer
-        // still reads only the halfwords +0x18 (ordinal) / +0x1c (service),
-        // so the event id must live above them - 0x80000215 keeps the
-        // ordinal halfword at +0x18 (0x0215 would NOT) ... the low
-        // halfword IS the ordinal slot, so the id's low halfword has to
-        // stay the txn: 0x8000_0000 | txn keeps the id OUTSIDE the
-        // classifier table.  Instead the id goes where the pump reads the
-        // EVENT: the pump's 0xfb8f50 conversion yields the id from the
-        // body's +0x10 msg-id word (r799d pool forensics), so stamp the
-        // golden id there for this one answer.
-        body[0x10..0x14].copy_from_slice(&0x8000_0215u32.to_le_bytes());
+        if service == 0x0006 && reg_id == 3 {
+            // r799g: completion key = the connector-assigned registration
+            // ordinal the gate is CURRENTLY inserted under (the receiver
+            // +0x14 table stores {u16 ord, gate}, the dispatcher looks the
+            // answer's +0x18 halfword up there - f322 proved the match).
+            // Publishing at +0x1c too keeps the pump CL lookup (slot,svc,
+            // ord,optype) MISSED on purpose: the golden-era completions
+            // completed through the not-found leg (0x1c80c3c, dispatch with
+            // a4 = message buffer, a5 = libosal ptr) and that is the leg
+            // whose gnf stored the gate +4 = 2.
+            let ord = {
+                let o = F74_REG_ORD.load(Ordering::Relaxed);
+                if o == 0 {
+                    txn_key
+                } else {
+                    o
+                }
+            };
+            body[0x18..0x1a].copy_from_slice(&ord.to_le_bytes());
+            body[0x1a] = 6;
+            body[0x1b] = 1;
+            body[0x1c..0x1e].copy_from_slice(&ord.to_le_bytes());
+        } else {
+            body[0x18..0x1a].copy_from_slice(&txn_key.to_le_bytes());
+            body[0x1a] = 6;
+            body[0x1b] = 1;
+            body[0x1c..0x1e].copy_from_slice(&service.to_le_bytes());
+        }
+        // r799f: the dispatcher 0x17b9400 routes the completion's event id
+        // (the SM msg-id, body word +0x10): an id FOUND in the receiver's
+        // +0x14 (id, gate) table takes the gnf leg (0x1719b74 -> vTick ->
+        // vp-ev -> gate +4 = 2 READY); an id NOT found falls to the generic
+        // vfn+0x70 leg (0x1719cc0 -> 0x17b94b8), whose registration-ack
+        // branch stores +4 = 1 - that was the killer that wiped the READY
+        // between gnf-end and the s8-v18 getter (f315's 2 -> 1 interleave,
+        // f317's trio +4=0/+4=1 per tick).  The f74 gate's own registration
+        // inserts id 0 (f315: gnf ran with ev=[0x0, conn] and stored +4=2),
+        // so the answer must carry id 0.  The 0x80000215 stamp (r799e) was
+        // never in f74's table -> every in-window answer degraded to the
+        // ack leg.  The completer keys stay untouched (+0x18 ordinal,
+        // +0x1c service, +0x1b slot, +0x1a optype 6).
+        body[0x10..0x14].copy_from_slice(&0u32.to_le_bytes());
     }
     // r799d: the state-8 f74 answer belongs to the navsrv pump consumer.
     // On mbx_289 tid-84's enConnect drops every class-0x45 whose (svc,
