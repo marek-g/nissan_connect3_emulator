@@ -7916,6 +7916,24 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // its header fields (offsets 0x2c..0x5c).
                 if label == "s8b-in" && sl != 0 {
                     F74_STEP.store(sl, Ordering::Relaxed);
+                    // r799h: name-attach retry each tick (see the attach in
+                    // the f74-watch block for the why): later startup steps
+                    // arm OTHER gates through the same leg, and the one-shot
+                    // install point only ever sees the first gate.
+                    if std::env::var_os("EMU_F74_ATTACHNAME").map_or(true, |v| v != "0") {
+                        let gate = read_u32(uc, sl.wrapping_add(0x74));
+                        let step_name = read_u32(uc, sl.wrapping_add(0x4c));
+                        if gate > 0x10000 && step_name != 0 && read_u32(uc, gate + 0x7c) == 0 {
+                            let _ = uc.mem_write(
+                                (gate + 0x7c) as u64,
+                                &step_name.to_le_bytes(),
+                            );
+                            log::warn!(
+                                "PROCHMI envigate f74 attach-name(tick) t={}ms gate={gate:#x} +0x7c := {step_name:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                            );
+                        }
+                    }
                     static SLWATCH: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
                     if !SLWATCH.swap(true, Ordering::Relaxed) {
