@@ -244,8 +244,47 @@ pub fn write(unicorn: &mut Unicorn<'_, Context>, fd: u32, buf: u32, length: u32)
             String::from_utf8_lossy(&buf2)
         );
     }
+    if fd == 2 {
+        // r799d: WARN-level stderr mirror - the Bosch apps' assert() text
+        // (tid-62's exit(127) after the f74 completion, f287/f289) is the
+        // only witness to guest-side assertion failures.
+        log::warn!(
+            "{:#x}: [{}] [STDERR] {:?}",
+            unicorn.reg_read(RegisterARM::PC).unwrap(),
+            unicorn.get_data().inner.thread_id(),
+            String::from_utf8_lossy(&buf2)
+        );
+    } else if crate::os::syscalls::fcntl::TTY_FDS
+        .lock()
+        .unwrap()
+        .contains(&fd)
+    {
+        // r799e: glibc __libc_message writes the abort/assert text to the
+        // tty when fd 2 is closed - mirror it (flaky tid-62 exit(127)).
+        log::warn!(
+            "{:#x}: [{}] [TTY fd {}] {:?}",
+            unicorn.reg_read(RegisterARM::PC).unwrap(),
+            unicorn.get_data().inner.thread_id(),
+            fd,
+            String::from_utf8_lossy(&buf2)
+        );
+    }
     let file_system = &mut unicorn.get_data().inner.file_system.clone();
     let is_open = file_system.lock().unwrap().is_open(fd as i32);
+    if !is_open && fd > 2 {
+        // r799e: the flaky tid-62 abort runs are preceded by hundreds of
+        // failing OSAL IO writes (f307: 298x vSetError(-1) on tid 62, zero
+        // in live runs f297/f303) - the write path silently returns -1 for
+        // un-open fds; make the fd visible.
+        static W: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if W.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
+            log::warn!(
+                "{:#x}: [{}] [SYSCALL] write to UNOPEN fd={fd} len={length}",
+                unicorn.reg_read(RegisterARM::PC).unwrap(),
+                unicorn.get_data().inner.thread_id(),
+            );
+        }
+    }
     let res = if is_open {
         match file_system.lock().unwrap().write(fd as i32, &buf2) {
             Ok(len) => {
@@ -713,6 +752,33 @@ pub fn exit(unicorn: &mut Unicorn<'_, Context>, status: u32) -> u32 {
         unicorn.get_data().thread_id(),
         status,
     );
+    if status != 0 {
+        // r799d: tid-62's drain returns exit(127) right after consuming an
+        // f74 completion (f287/f289) - capture the return chain so the
+        // giving-up caller is identifiable.
+        let lr = unicorn.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+        let sp = unicorn.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+        let mut chain: Vec<u32> = Vec::new();
+        for i in 0..64u32 {
+            let mut w = [0u8; 4];
+            if unicorn.mem_read((sp + i * 4) as u64, &mut w).is_err() {
+                break;
+            }
+            let w = u32::from_le_bytes(w);
+            if (0x8000..0x0300_0000).contains(&w) && w & 3 == 0 {
+                if !chain.contains(&w) {
+                    chain.push(w);
+                    if chain.len() >= 12 {
+                        break;
+                    }
+                }
+            }
+        }
+        log::warn!(
+            "[{}] [SYSCALL] exit(status={status:#x}) lr={lr:#x} sp={sp:#x} chain={chain:#x?}",
+            unicorn.get_data().thread_id(),
+        );
+    }
 
     unicorn
         .get_data()
@@ -735,6 +801,43 @@ pub fn exit_group(unicorn: &mut Unicorn<'_, Context>, status: u32) -> u32 {
         unicorn.get_data().thread_id(),
         status,
     );
+    if status != 0 {
+        // r799d: tid-62's drain aborts with exit_group(127) right after
+        // consuming an f74 completion (f287-f296).  f296: the call comes
+        // with lr=0x8ef24 and an empty in-image chain - resolve lr through
+        // the module map (glibc abort() ends in `_exit(127)` after two
+        // raise(SIGABRT)s, matching the f295 `rt_sigaction(sig 6 -> 0)`
+        // right before the death line).
+        let lr = unicorn.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+        let sp = unicorn.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+        let owner = {
+            let mmu = unicorn.get_data().mmu.lock().unwrap();
+            match mmu.executable_location(lr) {
+                Some((library, offset)) => format!("{library}+0x{offset:x}"),
+                None => format!("{lr:#x}"),
+            }
+        };
+        let mut chain: Vec<u32> = Vec::new();
+        for i in 0..256u32 {
+            let mut w = [0u8; 4];
+            if unicorn.mem_read((sp + i * 4) as u64, &mut w).is_err() {
+                break;
+            }
+            let w = u32::from_le_bytes(w);
+            if (0x8000..0x5000_0000).contains(&w) && w & 3 == 0 {
+                if !chain.contains(&w) {
+                    chain.push(w);
+                    if chain.len() >= 16 {
+                        break;
+                    }
+                }
+            }
+        }
+        log::warn!(
+            "[{}] [SYSCALL] exit_group(status={status:#x}) lr={owner} sp={sp:#x} chain={chain:#x?}",
+            unicorn.get_data().thread_id(),
+        );
+    }
 
     unicorn
         .get_data()

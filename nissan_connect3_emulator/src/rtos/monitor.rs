@@ -1928,6 +1928,80 @@ fn spawn_guest_thread(unicorn: &mut Unicorn<'_, Context>, entry: u32, arg: u32, 
     tid
 }
 
+/// r799d: spawn a guest thread that CALLS a guest function with the given
+/// r0..r3 and exits through the kernel teardown stub when it returns.  Lets
+/// a fabricated TE-side delivery run the client's OWN native OSAL post
+/// (real queue ring, real waiter wake-up) instead of re-implementing the
+/// queue semantics host-side - hosting the queue bridge-side broke the
+/// consumer loop twice (f263-f265, f275; see the note in osal-queues.rs).
+pub fn spawn_guest_call(
+    unicorn: &mut Unicorn<'_, Context>,
+    entry: u32,
+    args: [u32; 4],
+    stack_size: u32,
+) -> u32 {
+    if entry < 0x1000 {
+        return 0xffff_ffff;
+    }
+    let size = (stack_size.max(0x4000) + 0xfff) & !0xfff;
+    let mmu = {
+        let data = unicorn.get_data();
+        data.mmu.clone()
+    };
+    let stack = {
+        let mut mmu = mmu.lock().unwrap();
+        mmu.heap_alloc(unicorn, size, Prot::READ | Prot::WRITE, "guest-call-stack")
+    };
+    if stack == 0 {
+        return 0xffff_ffff;
+    }
+    let sp = (stack + size - 8) & !7;
+    let parent_context = unicorn.context_init().unwrap();
+    for (reg, value) in [
+        (RegisterARM::R0, args[0]),
+        (RegisterARM::R1, args[1]),
+        (RegisterARM::R2, args[2]),
+        (RegisterARM::R3, args[3]),
+        (RegisterARM::R13, sp),
+    ] {
+        unicorn
+            .reg_write(reg as i32, value as u64)
+            .unwrap();
+    }
+    // return = quiet thread exit (see spawn_guest_thread's r754 comment).
+    unicorn
+        .reg_write(RegisterARM::R14 as i32, MQ_NOTIFY_EXIT_STUB as u64)
+        .unwrap();
+    let start = entry & !1;
+    unicorn
+        .reg_write(RegisterARM::PC as i32, start as u64)
+        .unwrap();
+    let cpsr = unicorn.reg_read(RegisterARM::CPSR).unwrap_or(0) as u32;
+    let cpsr = if entry & 1 != 0 { cpsr | 0x20 } else { cpsr & !0x20 };
+    unicorn.reg_write(RegisterARM::CPSR as i32, cpsr as u64).unwrap();
+    let child_context = unicorn.context_init().unwrap();
+    unicorn.context_restore(&parent_context).unwrap();
+
+    let tid = {
+        let data = unicorn.get_data();
+        let tid = data
+            .inner
+            .next_thread_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        data.threads.lock().unwrap().push(GuestThread {
+            id: tid,
+            rtos_task: true,
+            status: ThreadStatus::Runnable,
+            cpu_context: Some(child_context),
+            pc: start,
+            pending_result: None,
+            clear_child_tid: None,
+        });
+        tid
+    };
+    tid
+}
+
 /// Read and start one OSAL thread CB (`{ name, len, stack, entry, argument }`, see the
 /// `OSAL_THREAD_*` docs). Returns the new thread id, or `-1` when the CB carries no entry -
 /// the callers (`OSAL_bInitAsyncIO` among them) branch on exactly that.

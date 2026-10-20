@@ -10,6 +10,12 @@ use unicorn_engine::{RegisterARM, Unicorn};
 pub static NAVDATA_FDS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+// fds handed out for /dev/tty: glibc abort() (__libc_message) falls back to
+// the tty when stderr is closed, so the guest's abort/assert text lands on
+// writes to these fds (r799e forensics on the flaky tid-62 exit(127)).
+pub static TTY_FDS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
 pub fn open(unicorn: &mut Unicorn<'_, Context>, path_name: u32, flags: u32, mode: u32) -> u32 {
     log::trace!(
         "{:#x}: [{}] [SYSCALL] open(path_name = {:#x}, flags: {:#x} = {:?}, mode: {:#x}) [IN]",
@@ -225,6 +231,9 @@ fn open_internal(
     {
         Ok(fd) => {
             if path_name.starts_with("/dev") {
+                if path_name == "/dev/tty" {
+                    TTY_FDS.lock().unwrap().insert(fd as u32);
+                }
                 log::info!(
                     "[{}] [SYSCALL] open {} flags={:#x} -> fd={}",
                     thread,

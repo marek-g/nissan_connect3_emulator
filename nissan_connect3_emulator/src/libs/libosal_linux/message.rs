@@ -341,6 +341,55 @@ pub fn hook_message_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     const MESSAGE_CREATE: u32 = 0x48513cc0 - 0x484d8000;
     const MESSAGE_DELETE: u32 = 0x48513850 - 0x484d8000;
 
+    // r799e: the flaky tid-62 exit(127) runs show OSAL_vSetErrorCode /
+    // OSAL_s32IOWrite / OSALUTIL_s32TraceWrite return legs in the abort's
+    // stack chain (f300-f304): the fatal path is an OSAL error report.
+    // Log the error code and caller so the next death says WHY.
+    const VSETERRORCODE: u32 = 0x48505e4c - 0x484d8000;
+    {
+        crate::os::code_stub::trap_site(unicorn, (base_address + VSETERRORCODE), crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/message.rs:osal_err", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() >= 15_000
+                || HITS.fetch_add(1, Ordering::Relaxed) < 60
+            {
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                log::warn!(
+                    "[LIBOSAL-MBX] OSAL_vSetError({r0:#x}) t={}ms tid=[{}] caller={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                );
+            }
+            0
+        });
+    }
+    // r799e (f308): the IO-write failure does not go through write(2) at all
+    // - OSAL_s32IOWrite calls the driver's write method ([drv+0x1c]) at
+    // 0x484f0a6c and fails there or on the device-id check.  Log handle,
+    // driver, channel and the id the driver reports.
+    const IOWRITE_DISPATCH: u32 = 0x484f0a50 - 0x484d8000;
+    {
+        crate::os::code_stub::trap_site(unicorn, (base_address + IOWRITE_DISPATCH), crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/message.rs:osal_iow", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() >= 15_000
+                || HITS.fetch_add(1, Ordering::Relaxed) < 40
+            {
+                let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                let r8 = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+                let ch = read_u32_or_invalid(uc, r5.wrapping_add(0x10));
+                let id = read_u32_or_invalid(uc, r7.wrapping_add(0x20));
+                let nm = read_cstr(uc, r7.wrapping_add(0x28), 24);
+                log::warn!(
+                    "[LIBOSAL-MBX] OSAL_IOWrite dispatch t={}ms tid=[{}] h={r5:#x} ch={ch:#x} drv={r7:#x} drv0={id:#x} len={r8:#x} nm={nm:?}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                );
+            }
+            0
+        });
+    }
+
     
 crate::os::code_stub::trap_site(unicorn, (base_address + QUEUE_OPEN), crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/message.rs:334", move |uc: &mut Unicorn<'_, Context>| {
             let addr = (base_address + QUEUE_OPEN) as u64;
@@ -608,6 +657,15 @@ fn handle_queue_api(
                     caller
                 );
                 log_osal_message_ref(unicorn, base_address, &format!("post {}", decoded.name), r1);
+                // r799d: remember how to CALL this very function natively
+                // (entry VA, live handle, message length) so fabricated pump
+                // completions can be posted by the guest's own code path -
+                // see pump_push_completion / monitor::spawn_guest_call.
+                if decoded.name == "HMINavServerLib_1" {
+                    PUMP_POST_FN.store(addr, Ordering::Relaxed);
+                    PUMP_POST_HANDLE.store(r0, Ordering::Relaxed);
+                    PUMP_POST_MSGLEN.store(r2, Ordering::Relaxed);
+                }
             } else {
                 let stack_timeout = read_stack_timeout(unicorn, api_name);
                 log::info!(
@@ -2574,6 +2632,11 @@ pub fn note_hmi_fsm_state(state: u32) {
     HMI_FSM_STATE.store(state, Ordering::Relaxed);
 }
 
+/// Latest observed HMI startup FSM state (`0xffff_ffff` until first seen).
+pub fn hmi_fsm_state() -> u32 {
+    HMI_FSM_STATE.load(Ordering::Relaxed)
+}
+
 /// posts onto the pump queue HMINavServerLib_1 (`data=[1, slot, w2, w3]`);
 /// the pumptrace post8 probe stashes them from a live post so host-side
 /// completion events can carry the byte-identical shape.
@@ -2587,25 +2650,36 @@ pub fn note_pump_post_shape(w2: u32, w3: u32) {
     }
 }
 
+/// Entry VA of the guest's own `OSAL_s32MessageQueuePost` (recorded at the
+/// api intercept), its live pump-queue handle and message length.  All three
+/// come from a genuine tid-84 post, so the host can replay that post by
+/// CALLING the guest implementation (r799d).
+static PUMP_POST_FN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PUMP_POST_HANDLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PUMP_POST_MSGLEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Post a CL completion push straight to the pump queue HMINavServerLib_1,
 /// bypassing the mbx_289 receive race: tid 84's enConnect Wait pops nearly
 /// every mbx_289 message before the navsrv consumer (0x17cb574) sees it
-/// (f241: 22 Wait-delivered vs 4 post8-forwarded), so an mbx_289 push only
-/// completes an entry when it happens to win that race.  Shape mirrors the
-/// consumer's own post: the blob (1/len/body envelope) lands in one of the
-/// connector's 0x90901000..0x90908000 pool slots - the very VA range the
-/// pump hands to the completer as `data` - and the queue message carries
-/// `[1, slot, w2, w3]` exactly like a genuine post8.  Needs the stashed
-/// shape; falls back to nothing otherwise.  `EMU_FAKE_FI_READY_PUSH=0`
+/// (f241: 22 Wait-delivered vs 4 post8-forwarded), and in the state-8 era
+/// enConnect drops every class-0x45 that is not one of its own transactions
+/// (f273: 31 answered f74 requests, zero answers reached the pump).  r799d:
+/// delivery runs the CLIENT'S OWN native post - a host-spawned guest thread
+/// calls `OSAL_s32MessageQueuePost` (entry/handle/len recorded from a live
+/// tid-84 post) with `data=[1, slot, w2, w3]` pointing at a body written to
+/// a dedicated pool slot.  This keeps native queue-ring and waiter wake-up
+/// semantics; the two host-side hosting attempts corrupted the consumer
+/// loop (f263-f265 buffer overflow, f275 drain starvation).  Falls back to
+/// nothing until a genuine post has been observed; `EMU_FAKE_FI_READY_PUSH=0`
 /// disables at the callers.
-pub fn pump_push_completion(unicorn: &mut Unicorn<'_, Context>, body: Vec<u8>) -> bool {
-    // f263/f264 forensics: the native post8 queue message is EIGHT bytes
-    // `[1, pool-slot]` (w2/w3 belong to the enclosing OSAL message struct and
-    // are never copied to the receiver, which waits with a 0x8 buffer).  A
-    // 16-byte event here overflowed tid 62's wait buffer and killed the pump
-    // loop, so mirror the native frame exactly.  The blob goes to dedicated
-    // pages, not the connector's live 0x90901000 pool (it still owns those
-    // materialized copies).
+pub fn pump_push_completion(unicorn: &mut Unicorn<'_, Context>, mut body: Vec<u8>) -> bool {
+    let post_fn = PUMP_POST_FN.load(Ordering::Relaxed);
+    let handle = PUMP_POST_HANDLE.load(Ordering::Relaxed);
+    if post_fn == 0 || handle == 0 {
+        // No live post seen yet - the native post function's runtime VA and
+        // the queue handle are unknown, nothing safe to call.
+        return false;
+    }
     static POOL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     if POOL.get().is_none() {
         let mmu_arc = unicorn.get_data().mmu.clone();
@@ -2622,60 +2696,104 @@ pub fn pump_push_completion(unicorn: &mut Unicorn<'_, Context>, body: Vec<u8>) -
         return false;
     }
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let slot = pool + (NEXT.fetch_add(1, Ordering::Relaxed) & 1) as u32 * 0x1000;
-    let mut blob = Vec::with_capacity(8 + body.len());
-    blob.extend_from_slice(&1u32.to_le_bytes());
-    blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
-    blob.extend_from_slice(&body);
-    let mut msg = Vec::with_capacity(8);
-    for word in [1u32, slot] {
-        msg.extend_from_slice(&word.to_le_bytes());
+    // 0x100-byte stride: the body (0x22 B) must not be overwritten by the
+    // next completion before the pump has parsed this one.
+    let idx = NEXT.fetch_add(1, Ordering::Relaxed) % 32;
+    let slot = pool + (idx as u32) * 0x100;
+    // r799d: mirror enConnect's relay re-stamp.  The genuine answers that
+    // completed DAPI's svc-6 transaction (f273: completer saw
+    // svc=0x6 key=5 src=0x7 regid=0x3) reached the pump THROUGH enConnect,
+    // which delivers from src 0x0007 (the DAPI app id, f286 lookup watch).
+    // A pump-direct event bypasses that rewrite, so stamp src here.  The
+    // +0x1b/+0x1c/+0x18 field shaping is per-service and lives with the
+    // answer builders (f286: the table lookup reads ordinal from +0x18,
+    // service from +0x1c, slot byte +0x1b stays 1, optype +0x1a = 6).
+    if body.len() >= 0x1e {
+        body[0x00..0x02].copy_from_slice(&0x0007u16.to_le_bytes());
     }
-    let host_backed = {
-        let state = unicorn.get_data().namespace.lock().unwrap();
-        state.mq.queue_id_for_name("HMINavServerLib_1").is_some()
-    };
-    if !host_backed {
-        // The pump queue only reaches the host table once a guest Wait/Post
-        // on it is intercepted (r798b: it joined `is_rtos_intercepted_queue`);
-        // until then the mbx_289 fallback below is the live route.  Do NOT
-        // touch the pool in this case.
-        static Q: AtomicU32 = AtomicU32::new(0);
-        if Q.fetch_add(1, Ordering::Relaxed) < 1 {
-            log::info!(
-                "[LIBOSAL-MBX] pump completion: queue HMINavServerLib_1 not host-backed, using mbx_289 fallback"
-            );
-        }
-        return false;
-    }
-    if unicorn.mem_write(slot as u64, &blob).is_err() {
+    // The consumer hands the completer the BODY start as `data`
+    // ([data+8]>>24 == class 0x45), so the slot carries the body itself.
+    if unicorn.mem_write(slot as u64, &body).is_err() {
         static W: AtomicU32 = AtomicU32::new(0);
         if W.fetch_add(1, Ordering::Relaxed) < 3 {
             log::warn!("[LIBOSAL-MBX] pump completion: slot {slot:#x} mem_write failed");
         }
         return false;
     }
-    let mut state = unicorn.get_data().namespace.lock().unwrap();
-    if OsalQueueService::guest_post(&mut state.mq, "HMINavServerLib_1", msg, 0) {
-        state.notify_waiters();
-        return true;
+    // The r1 argument of the native post: a 16-byte OSAL message struct
+    // `[1, pool-slot, w2, w3]` (w2/w3 stashed from live post8s), posted with
+    // the recorded length (8 - exactly what tid 84 posts).  One frame per
+    // slot index: f277 forensics showed the guest post threads run LATER
+    // (Runnable, ~ms behind the spawner), so a single shared frame let every
+    // queued poster read the newest body's slot - 23 events piled on two
+    // bodies and the drain died at the duplicate completions.
+    static MSGBUF: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if MSGBUF.get().is_none() {
+        let mmu_arc = unicorn.get_data().mmu.clone();
+        let buf = mmu_arc.lock().unwrap().heap_alloc(
+            unicorn,
+            0x1000,
+            Prot::READ | Prot::WRITE,
+            "[pump-post-msgbuf]",
+        );
+        let _ = MSGBUF.set(buf);
     }
-    false
+    let msgbuf0 = MSGBUF.get().copied().unwrap_or(0);
+    if msgbuf0 == 0 {
+        return false;
+    }
+    let msgbuf = msgbuf0 + (idx as u32) * 16;
+    let mut msg = Vec::with_capacity(16);
+    for word in [
+        1u32,
+        slot,
+        PUMP_W2.load(Ordering::Relaxed),
+        PUMP_W3.load(Ordering::Relaxed),
+    ] {
+        msg.extend_from_slice(&word.to_le_bytes());
+    }
+    if unicorn.mem_write(msgbuf as u64, &msg).is_err() {
+        return false;
+    }
+    let msglen = PUMP_POST_MSGLEN.load(Ordering::Relaxed).clamp(8, 16);
+    let tid = crate::rtos::monitor::spawn_guest_call(
+        unicorn,
+        post_fn,
+        [handle, msgbuf, msglen, 0],
+        0x2000,
+    );
+    if tid == 0xffff_ffff {
+        static S: AtomicU32 = AtomicU32::new(0);
+        if S.fetch_add(1, Ordering::Relaxed) < 3 {
+            log::warn!("[LIBOSAL-MBX] pump completion: spawn_guest_call(post_fn={post_fn:#x} handle={handle:#x}) failed");
+        }
+        return false;
+    }
+    static D: AtomicU32 = AtomicU32::new(0);
+    if D.fetch_add(1, Ordering::Relaxed) < 8 {
+        log::warn!(
+            "[LIBOSAL-MBX] pump completion: guest post thread [{tid}] native-posting [1,{slot:#x}] to HMINavServerLib_1 (post_fn={post_fn:#x} handle={handle:#x} len={msglen})"
+        );
+    }
+    true
 }
 
-/// GpsDataStatus-shaped answer with the pump-first / mbx_289-fallback route
-/// of `fabricate_fi_ready_push`; returns the route taken ("pump", "mbx",
-/// "none") for the caller's log line.
+/// GpsDataStatus-shaped answer for the MEMBER-era GPS cycle.  mbx_289 FIRST:
+/// the members complete through tid-84's enConnect resolution of its own
+/// DAPI transactions (event -> post8 -> pump), so their answers must arrive
+/// over the same mailbox as genuine TE answers (f274/f276: pump-first
+/// ordering hijacked member answers and state 6 never closed).  The pump
+/// route is only for the state-8 f74 answer (`fabricate_f74_ready_event`).
 pub fn push_gps_answer(unicorn: &mut Unicorn<'_, Context>, key: u16) -> &'static str {
     if std::env::var_os("EMU_FAKE_SENSORFI").is_some_and(|v| v == "0") {
         return "none";
     }
     let body = gps_data_status_answer_body(key);
-    if pump_push_completion(unicorn, body.clone()) {
-        return "pump";
-    }
-    if push_blob_to_mbx_289(unicorn, body) {
+    if push_blob_to_mbx_289(unicorn, body.clone()) {
         return "mbx";
+    }
+    if pump_push_completion(unicorn, body) {
+        return "pump";
     }
     "none"
 }
@@ -2735,18 +2853,12 @@ pub fn fabricate_fi_ready_push(unicorn: &mut Unicorn<'_, Context>, service: u16,
     body[0x1a] = 9; // server OPTYPE
     body[0x1b] = 1; // service slot
     body[0x1c..0x1e].copy_from_slice(&key.to_le_bytes()); // transaction ordinal
-    // r798b: deliver through the pump queue when its post shape is known.
-    // mbx_289 is popped by tid 84's enConnect Wait first (f241: 22 delivered
-    // there vs 4 forwarded to the pump), so an mbx_289 push only completes
-    // its entry when it wins that race - 1 of 6 in f240/241.  The pump
-    // route posts the byte-identical [1, slot, w2, w3] event the connector
-    // itself would have posted and no other consumer reads that queue.
-    if pump_push_completion(unicorn, body.clone()) {
-        log::warn!(
-            "[LIBOSAL-MBX] fabricated FI ServiceData(svc {service:#06x} txn {key}) pump event to HMINavServerLib_1 to complete the CL transaction (EMU_FAKE_FI_READY_PUSH=0 disables)"
-        );
-        return;
-    }
+    // r799d NOTE: this route deliberately does NOT use pump_push_completion
+    // (f274: with HMINavServerLib_1 hosted the pump-first order hijacked the
+    // MEMBER answers away from mbx_289 - the members complete through
+    // tid-84's enConnect resolution of its own DAPI transactions, event ->
+    // post8 -> pump - and state 6 never closed).  The f74 state-8 answer has
+    // its own pump route: `fabricate_f74_ready_event`.
     let mut blob = Vec::with_capacity(8 + body.len());
     blob.extend_from_slice(&1u32.to_le_bytes());
     blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -2761,6 +2873,40 @@ pub fn fabricate_fi_ready_push(unicorn: &mut Unicorn<'_, Context>, service: u16,
             state.notify_waiters();
         }
     }
+}
+
+/// r799d: deliver the state-8 f74 readiness answer as the `[1, slot]` pump
+/// event (queue HMINavServerLib_1, hosted since r799d).  The mbx_289 route
+/// is a dead end for this one: tid-84's enConnect consumer drops every
+/// class-0x45 whose (svc, ordinal) is not one of its own transactions
+/// (f273: 31 answered requests, zero answers reached the pump completer).
+/// The body mirrors the responder's svc-6 regid-3 server answer; the pump
+/// drain's 0x45 special case parses byte +0x1b (slot) and u16 +0x1c (the
+/// ordinal) out of it, so those must carry the live values.
+#[allow(dead_code)] // kept as the direct-injection fallback (see prochmi.rs r799d note)
+pub fn fabricate_f74_ready_event(unicorn: &mut Unicorn<'_, Context>, key: u16) -> bool {
+    if std::env::var_os("EMU_FAKE_FI_READY_PUSH").is_some_and(|v| v == "0") {
+        return false;
+    }
+    static MSG_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x7900);
+    let mut body = vec![0u8; 0x22];
+    body[0..2].copy_from_slice(&0x0015u16.to_le_bytes()); // src SENSORFI
+    body[2..4].copy_from_slice(&0x0121u16.to_le_bytes()); // dst navi srv
+    body[4..8].copy_from_slice(&(0x22u32).to_le_bytes());
+    body[8..10].copy_from_slice(&2u16.to_le_bytes());
+    body[0xb] = 0x45;
+    body[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
+    let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    body[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
+    body[0x14..0x16].copy_from_slice(&0x0006u16.to_le_bytes()); // svc
+    body[0x16..0x18].copy_from_slice(&0x0003u16.to_le_bytes()); // regid 3 (f271 wire dump)
+    // r799d golden pump-lookup shape (f286 lookup watch): ordinal at +0x18,
+    // optype 6 at +0x1a, slot 1 at +0x1b, service at +0x1c.
+    body[0x18..0x1a].copy_from_slice(&key.to_le_bytes()); // transaction ordinal
+    body[0x1a] = 6; // golden OPTYPE (member completions read optype 6)
+    body[0x1b] = 1; // service slot
+    body[0x1c..0x1e].copy_from_slice(&0x0006u16.to_le_bytes()); // service
+    pump_push_completion(unicorn, body)
 }
 
 /// r755: answer the `ServiceData` *requests* (class 0x45, OPTYPE byte @+0x1a
@@ -3042,6 +3188,45 @@ fn cca_server_answer_sensorfi_data_request(
     body[0x1b] = 1;
     body[0x1c..0x1e].copy_from_slice(&txn_key.to_le_bytes());
     body[0x20..].copy_from_slice(&payload);
+    // r799d: golden pump-lookup shape for the mbx_7-served answers.  The
+    // f286 lookup watch pinned the table key the pump-event handler builds
+    // in 0x1c7ed50: (slot=+0x1b u8, service=+0x1c u16, ordinal=+0x18 u16,
+    // optype=+0x1a u8) - golden member completions read (1, svc, ordinal,
+    // 0x06).  The mbx-era wire layout (result at +0x18, ordinal at +0x1c)
+    // looked up as (1, ordinal, 0, 9) and missed every entry.
+    if name == "mbx_7" {
+        body[0x18..0x1a].copy_from_slice(&txn_key.to_le_bytes());
+        body[0x1a] = 6;
+        body[0x1b] = 1;
+        body[0x1c..0x1e].copy_from_slice(&service.to_le_bytes());
+    }
+    // r799d: the state-8 f74 answer belongs to the navsrv pump consumer.
+    // On mbx_289 tid-84's enConnect drops every class-0x45 whose (svc,
+    // ordinal) is not one of its own transactions (f273: 31 answers, zero
+    // reached the pump), so deliver the mbx_7 svc-6 answers straight as the
+    // byte-identical [1, slot] pump event.  r799e (f303): the pump route
+    // completes the CONNECTOR table (clook hits) but the readiness entry's
+    // vPoll (0x171a960) only stores +4 = 2 once a service-DATA event object
+    // reaches the APP receiver ([f74+0x30]) - the leg the golden unit rides
+    // through enConnect's relay into the app's SM (msg-fire 0x49).  So also
+    // post the answer to the requester's own queue (golden shape: the
+    // f284 mis-completion came from the old mbx-era wire layout, which
+    // enConnect parsed as (0xb,0); with the +0x18-ordinal shape the relay
+    // table lookup should match f74's own transaction).  The pump push
+    // stays (the completer leg); EMU_F74_MBX=0 disables the second leg.
+    if name == "mbx_7" {
+        let pumped = pump_push_completion(unicorn, body.clone());
+        let mbx_leg = std::env::var_os("EMU_F74_MBX").map_or(true, |v| v != "0");
+        log::info!(
+            "[LIBOSAL-MBX] sensorfi fake server {server_app:#06x}: f74 answer ServiceData(svc {service:#06x} regid {reg_id:#04x} func {function:#06x} txn {txn_key}) pump={} mbx{} (EMU_FAKE_SENSORFI=0 disables, EMU_F74_MBX=0 drops the app-receiver leg)",
+            pumped,
+            if mbx_leg { "+mbx" } else { "" }
+        );
+        if !mbx_leg {
+            return;
+        }
+        // fall through: post the same body to the requester's queue
+    }
     let mut blob = Vec::with_capacity(8 + body.len());
     blob.extend_from_slice(&1u32.to_le_bytes());
     blob.extend_from_slice(&(body.len() as u32).to_le_bytes());

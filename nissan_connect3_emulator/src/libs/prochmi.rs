@@ -5938,16 +5938,70 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         let address = base_address + offset - ORIGINAL_BASE;
         crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:mediadec", move |uc: &mut Unicorn<'_, Context>| {
             static HITS: AtomicU32 = AtomicU32::new(0);
-            if crate::libs::dapi::emu_t0_elapsed_ms() < 15_000
-                || HITS.fetch_add(1, Ordering::Relaxed) >= 30
-            {
-                return 0;
-            }
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let f80 = read_u32(uc, r0.wrapping_add(0x80));
             let f88 = read_u32(uc, r0.wrapping_add(0x88));
             let b98 = read_u32(uc, r0.wrapping_add(0x98));
             let b9c = read_u32(uc, r0.wrapping_add(0x9c));
+            // r799e (moved here from the 0x1614dac wrapper in f302: the
+            // state-8 legs call the deciders directly): the enavi
+            // media-device entry carries +0x80 = +0x88 = 0 and an EMPTY
+            // record vector, because on the real unit those fields are set
+            // by the TE-side media-state answers the emulator has no
+            // source for.  Give the entry the READY shape the fabricated
+            // cryptcard carries (and the popup-release leg accepts):
+            // +0x80 = 2, +0x88 = 3 (state switch case 3 -> READY record
+            // scan -> 2), one 0x18 record (+4 nonzero, +0x0c = 2).  Same
+            // provider-signal class as fake_cryptcard_into_idapi;
+            // EMU_FAKE_ENAVI_MEDIA=0 disables, state-8 gate as for the
+            // SENSORFI responder (early READY ran the release branch
+            // against a half-initialised app - f300).
+            {
+                let enabled =
+                    std::env::var_os("EMU_FAKE_ENAVI_MEDIA").map_or(true, |v| v != "0");
+                let fsm = crate::libs::libosal_linux::message::hmi_fsm_state();
+                if enabled && r0 > 0x8000 && r0 < 0x4000_0000 && (8..0xffff_ffff).contains(&fsm)
+                    && f80 <= 2 && f88 == 0 && b98 == b9c
+                {
+                    static REC: AtomicU32 = AtomicU32::new(0);
+                    let mut rec = REC.load(Ordering::Relaxed);
+                    if rec == 0 {
+                        let mmu_arc = uc.get_data().mmu.clone();
+                        rec = mmu_arc.lock().unwrap().heap_alloc(
+                            uc,
+                            0x100,
+                            Prot::READ | Prot::WRITE,
+                            "[prochmi-enavi-media-fab]",
+                        );
+                        REC.store(rec, Ordering::Relaxed);
+                        if rec != 0 {
+                            let words = [r0, 1, 0, 2, 0, 0];
+                            for (i, w) in words.iter().enumerate() {
+                                let _ = write_u32(uc, rec + (i * 4) as u32, *w);
+                            }
+                        }
+                    }
+                    if rec != 0 {
+                        let ok = write_u32(uc, r0 + 0x80, 2)
+                            && write_u32(uc, r0 + 0x88, 3)
+                            && write_u32(uc, r0 + 0x98, rec)
+                            && write_u32(uc, r0 + 0x9c, rec + 0x18);
+                        static ONCE: AtomicU32 = AtomicU32::new(0);
+                        if ok && ONCE.fetch_add(1, Ordering::Relaxed) < 3 {
+                            log::warn!(
+                                "PROCHMI enavi-media-fab t={}ms: media READY shape (+0x80=2 +0x88=3, record {rec:#x}) on device entry {r0:#x} at {label} (media-state provider signal; EMU_FAKE_ENAVI_MEDIA=0 disables)",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                            );
+                        }
+                        return 0;
+                    }
+                }
+            }
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 15_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 30
+            {
+                return 0;
+            }
             log::warn!(
                 "PROCHMI {label} t={}ms tid=[{}] act={r0:#x} +80={f80:#x} +88={f88:#x} recs={b98:#x}..{b9c:#x} n={}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
@@ -6476,6 +6530,53 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             (0x01c7_c768u32, "vfn10", 300),
             (0x01c7_c778u32, "guard-c", 120),
             (0x01c7_c794u32, "guard-150", 120),
+            // r799d: the pending-entry table lookup the pump-event handler
+            // performs (0x1c7ed50 -> 0x1c7d110(r0=conn+0x38, r1=svc u16,
+            // r2=key u16, r3=func u16(content+0x18), [sp]=optype
+            // (content+0x1a), [sp+4]=msgobj).  Log the live parameter shape
+            // so the golden completions' func/optype can be compared with
+            // our fabricated answers' (func 0, optype 9).
+            (0x01c7_d110u32, "lookup", 300),
+            // r799d: right after `bl #0x1c7ddac` (the service->entry map
+            // find inside the lookup): r0 = entry (0 = the misses we keep
+            // getting), else dump its fields: +0x00 u16, +0x02 u16,
+            // +0x06 u16, +0x08 u16, +0x0a STATE byte (3 = pending, 4 =
+            // answered leg) and +0x0c u16 (transaction id).
+            (0x01c7_d14cu32, "found", 300),
+            // r799d: the completer's OWN pending-map find
+            // (0x1c80adc -> bl 0x1f8d018(r0,r1,r2) -> bl 0x1f6e098): log the
+            // key triple at entry and the found/NULL result right after.
+            (0x01f8_d018u32, "clook-e", 200),
+            (0x01f8_d020u32, "clook-r", 200),
+            // r799d: return of the completer (vfn+0x1c) inside the guard
+            // chain (0x1c7c7bc `ldr pc,[ip,#0x1c]`, r4 = result at 0x1c7c7ec)
+            // - f292: the answer FINDS the entry yet tid-62 still exits(127)
+            // moments later, so the poison is returned deeper down.
+            (0x01c7_c7ecu32, "compres", 300),
+            // r799d: return of the pump-event handler `bl #0x1c80298` in
+            // tid-62's drain loop (0x17c1ca8, r4 = result at 0x17c1cac).
+            // The loop fed a non-zero result into its thread-body exit
+            // (exit(127), f287-f293) - read the per-message code.
+            (0x017c_1cacu32, "hres", 300),
+            // r799d: tid-62 dies through glibc abort() (raise SIGABRT with
+            // no stderr message = uncaught C++ exception / bare abort) right
+            // after the f74 found-leg handler returns (f294: 27667ms).
+            // Capture WHICH host calls abort/throw.
+            (0x00fb_6ca4u32, "abort", 40),
+            (0x00fb_6b60u32, "throw", 40),
+            (0x00fb_6a64u32, "assert", 40),
+            // f296: tid-62 dies via exit_group(127) with lr inside the
+            // static glibc leaf region - glibc abort() raises SIGABRT twice
+            // and ends `_exit(127)`.  The abort() body itself never hit its
+            // dynsym site (f295), so watch `raise` as the sequence witness.
+            (0x00fb_6b78u32, "raise", 40),
+            // r799e: 0x1614dac(idapi, key, &out) = vector search + the
+            // 0x171fcf4 record scan (medavail).  The state-8 f74 consumer
+            // leg ends on entry 0x3a31f40 with an EMPTY record vector
+            // (f294/f297) - log which key asks for it, and who asks.
+            (0x0161_4dacu32, "idq", 120),
+            (0x0161_4db8u32, "idq-r", 120),
+            (0x0161_4d94u32, "ids-r", 120),
         ] {
             let address = base_address + off - ORIGINAL_BASE;
             crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:pumptrace", move |uc: &mut Unicorn<'_, Context>| {
@@ -6592,6 +6693,189 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     let fc = read_u32(uc, r0.wrapping_add(0xc));
                     log::warn!(
                         "PROCHMI pumptrace {label} t={}ms tid=[{}] recv={r0:#x} +0xc={fc:#x} r1={r1:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if matches!(label, "idq-r" | "ids-r") {
+                    // r799e: the enavi media-device entry resolved for the
+                    // popup-release / f74-readiness legs (f294/f297/f298:
+                    // 0x3a31f40, f299: 0x3a332a8) carries +0x80 = +0x88 = 0
+                    // and an EMPTY record vector, because on the real unit
+                    // those fields are set by the TE-side media-state
+                    // answers the emulator has no source for.  The
+                    // deciders (0x171fd7c state switch on +0x88,
+                    // 0x171fcf4 record leg) then report EMPTY(0).  Give the
+                    // entry the byte-identical READY shape the fabricated
+                    // cryptcard carries and that the popup-release leg
+                    // accepts: +0x80 = 2, +0x88 = 3 (switch case 3 -> READY
+                    // record scan -> 2), one 0x18 record (+4 nonzero,
+                    // +0x0c = 2).  Same provider-signal fabrication class
+                    // as fake_cryptcard_into_idapi; EMU_FAKE_ENAVI_MEDIA=0
+                    // disables.
+                    let f80 = read_u32(uc, r0.wrapping_add(0x80));
+                    let f88 = read_u32(uc, r0.wrapping_add(0x88));
+                    let b98 = read_u32(uc, r0.wrapping_add(0x98));
+                    let b9c = read_u32(uc, r0.wrapping_add(0x9c));
+                    let enabled =
+                        std::env::var_os("EMU_FAKE_ENAVI_MEDIA").map_or(true, |v| v != "0");
+                    // Same state-8 gate policy as the SENSORFI responder:
+                    // answering the popup leg before startup reaches state 8
+                    // runs the release branch against a half-initialised app
+                    // (f300: fab at t=3.5s, abort on tid 62 at 26.7s).
+                    let fsm = crate::libs::libosal_linux::message::hmi_fsm_state();
+                    if enabled && r0 != 0 && r0 < 0xf000_0000 && (8..0xffff_ffff).contains(&fsm) && f80 <= 2 && f88 == 0 && b98 == b9c {
+                        static REC: AtomicU32 = AtomicU32::new(0);
+                        let mut rec = REC.load(Ordering::Relaxed);
+                        if rec == 0 {
+                            let mmu_arc = uc.get_data().mmu.clone();
+                            rec = mmu_arc.lock().unwrap().heap_alloc(
+                                uc,
+                                0x100,
+                                Prot::READ | Prot::WRITE,
+                                "[prochmi-enavi-media-fab]",
+                            );
+                            REC.store(rec, Ordering::Relaxed);
+                            if rec != 0 {
+                                // one 0x18-byte status record: device back-
+                                // pointer, +4 nonzero (valid), +0x0c = 2
+                                // (READY), remaining words 0.
+                                let words = [r0, 1, 0, 2, 0, 0];
+                                for (i, w) in words.iter().enumerate() {
+                                    let _ = write_u32(uc, rec + (i * 4) as u32, *w);
+                                }
+                            }
+                        }
+                        if rec != 0 {
+                            let ok = write_u32(uc, r0 + 0x80, 2)
+                                && write_u32(uc, r0 + 0x88, 3)
+                                && write_u32(uc, r0 + 0x98, rec)
+                                && write_u32(uc, r0 + 0x9c, rec + 0x18);
+                            static ONCE: AtomicU32 = AtomicU32::new(0);
+                            if ok && ONCE.fetch_add(1, Ordering::Relaxed) < 3 {
+                                log::warn!(
+                                    "PROCHMI enavi-media-fab t={}ms: media READY shape (+0x80=2 +0x88=3, record {rec:#x}) on device entry {r0:#x} (media-state provider signal; EMU_FAKE_ENAVI_MEDIA=0 disables)",
+                                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                                );
+                            }
+                        }
+                    }
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] entry={r0:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "idq" {
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    let (k0, k1) = if r1 > 0x8000 && r1 < 0xf000_0000 {
+                        (read_u32(uc, r1), read_u32(uc, r1.wrapping_add(4)))
+                    } else {
+                        (0, 0)
+                    };
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] idapi={r0:#x} key={r1:#x} kw=[{k0:#x},{k1:#x}] out={r2:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if matches!(label, "abort" | "throw" | "assert" | "raise") {
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let mut chain: Vec<u32> = Vec::new();
+                    for i in 0..64u32 {
+                        let mut w = [0u8; 4];
+                        if uc.mem_read((sp + i * 4) as u64, &mut w).is_err() {
+                            break;
+                        }
+                        let w = u32::from_le_bytes(w);
+                        if (0x8000..0x0300_0000).contains(&w) && w & 3 == 0 {
+                            if !chain.contains(&w) {
+                                chain.push(w);
+                                if chain.len() >= 10 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] lr={lr:#x} sp={sp:#x} chain={chain:#x?}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "hres" {
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] handler_res={r0:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "compres" {
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] completer_res={r4:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "clook-e" {
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] a0={r0:#x} a1={r1:#x} a2={r2:#x} r3={r3:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "clook-r" {
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] res={r0:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "found" {
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32 & 0xffff;
+                    let ordinal = read_u32(uc, sp + 0x14) & 0xffff;
+                    let (w0, w2, w6, w8, wa, wc) = if r0 != 0 && r0 < 0xf000_0000 {
+                        (
+                            read_u32(uc, r0) & 0xffff,
+                            (read_u32(uc, r0.wrapping_add(2)) >> 16) & 0xffff,
+                            read_u32(uc, r0.wrapping_add(6)) & 0xffff,
+                            (read_u32(uc, r0.wrapping_add(8)) >> 16) & 0xffff,
+                            (read_u32(uc, r0.wrapping_add(8)) >> 8) & 0xff,
+                            read_u32(uc, r0.wrapping_add(0xc)) & 0xffff,
+                        )
+                    } else {
+                        (0xffff, 0xffff, 0xffff, 0xffff, 0xff, 0xffff)
+                    };
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] entry={r0:#x} service={r7:#x} want_ord={ordinal:#x} w0={w0:#x} w2={w2:#x} w6={w6:#x} w8={w8:#x} state={wa:#x} w12={wc:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "lookup" {
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let optype = read_u32(uc, sp) & 0xff;
+                    let msgobj = read_u32(uc, sp.wrapping_add(4));
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] tbl={r0:#x} svc={:#x} key={:#x} func={:#x} optype={optype:#x} msgobj={msgobj:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        r1 & 0xffff,
+                        r2 & 0xffff,
+                        r3 & 0xffff,
+                    );
+                } else if label == "waitret" {
+                    // r0 = message-ref pointer (0 on timeout).  Dump the ref
+                    // and the 8-byte queue frame the Wait wrote at its
+                    // output buffer (fixed tid-62 stack VA 0x907bdd2c, same
+                    // every call; the completer's msgobj == 0x907bdd20).
+                    let (w0, w4, w8, wc) = if r0 != 0 && r0 < 0xf000_0000 {
+                        (
+                            read_u32(uc, r0),
+                            read_u32(uc, r0.wrapping_add(4)),
+                            read_u32(uc, r0.wrapping_add(8)),
+                            read_u32(uc, r0.wrapping_add(0xc)),
+                        )
+                    } else {
+                        (0, 0, 0, 0)
+                    };
+                    let buf = 0x907b_dd2cu32;
+                    let (b0, b4) = (read_u32(uc, buf), read_u32(uc, buf + 4));
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] r0={r0:#x} ref=[{w0:#x},{w4:#x},{w8:#x},{wc:#x}] buf=[{b0:#x},{b4:#x}] lr={lr:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                     );
@@ -6728,6 +7012,49 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         match result {
             Ok(_) => log::info!("PROCHMI: pumppage decision watch installed"),
             Err(e) => log::warn!("PROCHMI: pumppage watch failed: {e}"),
+        }
+    }
+    // r799d: return of the HMINavServerLib_1 Wait in tid-62's drain (the api
+    // intercept logs caller=+0x17c35c0: `bl #0x161f754` at 0x17c35bc, result
+    // check at 0x17c35c4).  f278: the drain consumed its last rx at 27.26s
+    // although 24 fabricated events were native-posted 27.3-28.9s, then the
+    // loop gave up (the f263-era pump-death shape).  Did the Wait return 0
+    // (the native queue never delivering our posts) or a filled ref?
+    // Page-dispatched: the narrow trap_site at this mid-TB address is dead
+    // in f279 (registered, zero hits, while the same-thread entry traps fire).
+    {
+        let page = (base_address + 0x017c_3000u32 - ORIGINAL_BASE) as u64;
+        let sites = [(0x017c_35c4u32, "A"), (0x017c_3630u32, "B"), (0x017c_369cu32, "C")];
+        let targets: Vec<u64> = sites
+            .iter()
+            .map(|(off, _)| (base_address + off - ORIGINAL_BASE) as u64)
+            .collect();
+        let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
+            let Some(idx) = targets.iter().position(|t| *t == addr) else {
+                return;
+            };
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 240 {
+                return;
+            }
+            let tid = uc.get_data().inner.thread_id();
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let (w0, w4) = if r0 != 0 && r0 < 0xf000_0000 {
+                (read_u32(uc, r0), read_u32(uc, r0.wrapping_add(4)))
+            } else {
+                (0, 0)
+            };
+            let buf = 0x907b_dd2cu32;
+            let (b0, b4) = (read_u32(uc, buf), read_u32(uc, buf + 4));
+            log::warn!(
+                "PROCHMI waitret{} t={}ms tid=[{tid}] r0={r0:#x} ref=[{w0:#x},{w4:#x}] buf=[{b0:#x},{b4:#x}]",
+                sites[idx].1,
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+            );
+        });
+        match result {
+            Ok(_) => log::info!("PROCHMI: waitret page watch installed"),
+            Err(e) => log::warn!("PROCHMI: waitret watch failed: {e}"),
         }
     }
     // r796: earliest reliable sighting of the gate object: 0x17c28a0 runs
@@ -7156,7 +7483,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // +0x04 is the state the 0x166c0d0 getter compares to 2,
                 // +0x08..+0x2c hold the registration identity.
                 let mut ew = String::new();
-                for i in (0..0x30u32).step_by(4) {
+                for i in (0..0x40u32).step_by(4) {
                     ew.push_str(&format!(
                         " +{i:#x}={:#x}",
                         read_u32(uc, f74.wrapping_add(i))
@@ -7199,14 +7526,14 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     // pump consumer side.
                     let f74 = read_u32(uc, sl.wrapping_add(0x74));
                     let ord = SVC6_TXN.lock().ok().and_then(|t| t.get(&f74).copied());
-                    static RP8: AtomicU32 = AtomicU32::new(0);
-                    if let Some(o) = ord {
-                        if RP8.fetch_add(1, Ordering::Relaxed) < 400 {
-                            crate::libs::libosal_linux::message::fabricate_fi_ready_push(
-                                uc, 0x0006, o,
-                            );
-                        }
-                    }
+                    // r799d: re-drive REMOVED.  The responder now answers
+                    // every mbx_7 regid-3 request 1:1 as a pump event, and
+                    // this per-tick hammer (budget 400) duplicated that:
+                    // f281 spawned guest-post threads tid 100..481, ~380
+                    // events for a drain that consumes ~25 - the queue
+                    // overflowed, tid-65's loop gave up and tid-84 exited.
+                    // Ordinal presence stays observable via the log line.
+                    let _ = ord;
                 }
                 // Whoever sets b4c/b50 organically is the producer we are
                 // missing; watch the whole FSM object page for writes into

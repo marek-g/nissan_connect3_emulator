@@ -170,10 +170,15 @@ impl OsalQueueService {
         matches!(
             canonical_mq_name(name).as_str(),
             TE_TERM_MQ | LI_TERM_MQ | OSAL_CB_HDR_TE | OSAL_CB_HDR_LI_MAIN
-            // r798b NOTE: hosting "HMINavServerLib_1" here was tried and
-            // REVERTED (f263-f265): its consumer does not use the OSAL Wait
-            // API in native runs, and an empty-served Wait poisoned the
-            // pump loop (msg-fire stopped at ~13 s, state-6 never completed).
+            // r799d NOTE: hosting "HMINavServerLib_1" was tried twice and
+            // reverted twice.  The consumer's native loop does not survive
+            // bridge-served Waits (f263-f265: 16-byte event overflowed the
+            // 0x8 wait buffer; f275: even with the byte-identical 8-byte
+            // event and parked timeout-0 waits the drain processed 6 Waits
+            // instead of 144 and state 6 never closed).  The fabrication
+            // delivers pump events by CALLING the guest's own
+            // OSAL_s32MessageQueuePost from a host-spawned guest thread
+            // (message.rs pump_push_completion) - native semantics kept.
         )
     }
 
