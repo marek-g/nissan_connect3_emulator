@@ -1986,8 +1986,17 @@ User interactive session findings:
    (it never even saw the requests). Probes burned their budgets early
    (conn-b 88/90 in BOTH runs) - raise budgets / filter to era window
    before next comparison. g1.log vs f342.log are the diff pair.
-   NOTE: user's interactive runs pass 6 normally - correlates with era
-   starting late (>33 s)?
+   CORRECTED (g4 vs g3): the stalled runs had EMU_TOUCH_TEST set but its
+   taps were NEVER injected (STARTUP_PAST_9 gate held them - grep shows
+   zero 'touch-test tap' lines in g1/g2/g4), so this stall is NOT
+   tap-induced.  Perfect correlation found: the stall happens iff the
+   startup era starts LATE (g1/g2/g4: era at 34-36 s -> stuck; g3/f342:
+   era at 27.7-28.2 s -> 6->7->8->9 in <100 ms).  f345 (era ~36 s) did
+   close, so late eras CAN close - it's a race inside the late-era path,
+   roughly 50/50.  Host load (late era itself correlates with load) is
+   the suspected driver.  Repro recipe: run under CPU load until era >33
+   s; diff member request issuance at era time (push histogram via ISO
+   timestamps, see the python snippet pattern in this file's history).
 3. HARDKEYS (interactive SDL path): Setup opens the Setup screen on EVERY
    press (short!), but Esc (Back) does NOTHING now - yet it DID work for
    the user after ceac5f1 (verified later, before the state-9 work).
