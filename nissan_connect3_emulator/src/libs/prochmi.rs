@@ -6577,6 +6577,22 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             (0x0161_4dacu32, "idq", 120),
             (0x0161_4db8u32, "idq-r", 120),
             (0x0161_4d94u32, "ids-r", 120),
+            // r799e: the gate-class readiness poll chain (vtable 0x29140b8
+            // of the [sl+0x74] f74 object): vTick 0x17192ac, vPoll 0x171a960.
+            // vPoll stores +4=2 only at the branch heads 0x171a9a8 (both
+            // +0x30 && +0x38) / 0x171aa50 (+0x30 set, +0x38 null) /
+            // 0x171aa74 (event tag 0xf); 0x171aa94 = both null.  Establish
+            // whether the poll runs at all and which branch it takes.
+            (0x0171_92acu32, "vtick", 60),
+            (0x0171_a960u32, "vpoll", 120),
+            (0x0171_a9a8u32, "vp-both", 60),
+            (0x0171_aa50u32, "vp-ev", 60),
+            (0x0171_aa94u32, "vp-null", 60),
+            // the gate notify vf (vtable+0x40, 0x1719b74): stores (event,
+            // extra) at +0x30/+0x38, runs vTick, clears.  Which dispatcher
+            // feeds the sibling gates but never the f74 cryptcard gate?
+            (0x0171_9bacu32, "gnf-run", 60),
+            (0x0171_9bd0u32, "gnf-end", 60),
         ] {
             let address = base_address + off - ORIGINAL_BASE;
             crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:pumptrace", move |uc: &mut Unicorn<'_, Context>| {
@@ -6693,6 +6709,40 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     let fc = read_u32(uc, r0.wrapping_add(0xc));
                     log::warn!(
                         "PROCHMI pumptrace {label} t={}ms tid=[{}] recv={r0:#x} +0xc={fc:#x} r1={r1:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "gnf-end" {
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    let f4 = read_u32(uc, r5.wrapping_add(4));
+                    let f30 = read_u32(uc, r5.wrapping_add(0x30));
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] gate={r5:#x} +0x4={} +0x30={f30:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        f4,
+                    );
+                } else if label == "gnf-run" {
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                    let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                    let (e0, e1) = if r6 != 0 {
+                        (read_u32(uc, r6), read_u32(uc, r6.wrapping_add(4)))
+                    } else {
+                        (0, 0)
+                    };
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] gate={r5:#x} g+0x20={:#x} ev={r6:#x}[{e0:#x},{e1:#x}] r7={r7:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        read_u32(uc, r5.wrapping_add(0x20)),
+                    );
+                } else if matches!(label, "vp-both" | "vp-ev" | "vp-null") {
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    let f30 = read_u32(uc, r5.wrapping_add(0x30));
+                    let f38 = read_u32(uc, r5.wrapping_add(0x38));
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] obj={r5:#x} +0x30={f30:#x} +0x38={f38:#x} r1={r1:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                     );
@@ -11718,14 +11768,23 @@ const ALL_HARDKEYS: &[(&str, crate::input::HardKey)] = &[
 /// Host semantic key -> pinned `GUI_KeyInjector` id.  Pinned statically from
 /// the rodata key table (`0x0257c85c` = `vKeyPressed`'s pc-relative literal
 /// `0x2a12818 + 0xffb6a044`, stride 24) cross-checked against
-/// `clHSI_CMKeyboard::bExecuteMessage`'s 47 immediate-id `vKeyPressed` call
-/// sites (0x1813e44..0x1814168 dispatch): the injector ids ARE the table
-/// rows, so these pairs reproduce real key taps exactly.  `back` rides the
-/// SWC-back row (there is no panel `HK_BACK_PRESS` press row; the real unit
-/// routes "back" through `SWC_BACK_SHORT`, row 45).  The resolver still
-/// cross-checks each row's press content name at runtime and logs the pair.
+/// `clHSI_CMKeyboard::bExecuteMessage`'s KBD scan -> row jump table
+/// (0x1813620: `sub r3,#3; cmp #0x65; addls pc` + table at 0x1813634, e.g.
+/// scan 11/12 -> row 3 press/release, scan 59 -> row 29, scan 91/92 -> row
+/// 26): the injector ids ARE the table rows, so these pairs reproduce real
+/// key taps exactly.  Emission semantics (from `vKeyPressed`/`vKeyReleased`
+/// 0x1368138/0x1368028): an `lp == 0` row fires its +0x0c press content on
+/// press; an `lp != 0` row fires nothing on press and emits its *tap* content
+/// at +0x12 on release before the long-press timer (the +0x0c content is the
+/// HOLD content the timer emits instead).  `back` therefore rides row 18 -
+/// the wide panel key below the Day/Night+Setup rocker, which on a tap emits
+/// exactly `HK_BACK_LONG` (content 44, row 18 +0x12).  Row 45 is the
+/// *steering-wheel* back (`SWC_BACK_*`) and emits `SWC_PHONE_SDS_END_REPEAT`
+/// on a tap - it does nothing in the HMI, which is why Back appeared dead.
+/// The resolver cross-checks each row's press content name at runtime and
+/// logs the pair.
 const PINNED_HARDKEY_ROWS: &[(&str, crate::input::HardKey, u16, &str)] = &[
-    ("back", crate::input::HardKey::Back, 45, "SWC_BACK_SHORT"),
+    ("back", crate::input::HardKey::Back, 18, "tap -> HK_BACK_LONG"),
     ("phone", crate::input::HardKey::Phone, 8, "HK_PHONE_PRESS"),
     ("radio", crate::input::HardKey::Radio, 7, "HK_RADIO_SHORT"),
     ("cd", crate::input::HardKey::Cd, 10, "HK_CD_PRESS"),
@@ -11743,7 +11802,11 @@ const PINNED_HARDKEY_ROWS: &[(&str, crate::input::HardKey, u16, &str)] = &[
 /// The press-event content name of each supported hardwired key, as named in
 /// `GUI_ContentString` (fallback resolution for builds whose pinned rows
 /// drift; the row for a key is whichever key-table row carries that content
-/// id at +0x0c).
+/// id at +0x0c).  Note this lookup only fires on taps for `lp == 0` rows -
+/// HOLD rows carry their +0x0c content on the long-press timer and tap-fire
+/// their +0x12 content instead - so rows resolved this way for `lp != 0` keys
+/// are best-effort, and the pinned table above (taken from the KBD scan ->
+/// row jump table) is authoritative.
 fn hardkey_press_content_name(key: crate::input::HardKey) -> &'static str {
     use crate::input::HardKey;
     match key {
@@ -11821,12 +11884,14 @@ fn resolve_key_injector_rows(unicorn: &mut Unicorn<'_, Context>, base: u32) {
     }
     let mut resolved = rows.lock().unwrap();
     for (test_name, key, id, expect) in PINNED_HARDKEY_ROWS {
-        let press_id =
-            read_u16(unicorn, base + KEY_INJECTOR_KEY_TABLE + 24 * u32::from(*id) + 0xc);
+        let entry = base + KEY_INJECTOR_KEY_TABLE + 24 * u32::from(*id);
+        let press_id = read_u16(unicorn, entry + 0xc);
+        let tap_id = read_u16(unicorn, entry + 0x12);
         resolved.insert(*key, *id);
         log::info!(
-            "PROCHMI: keyinj {test_name} -> id {id} press={} (expect {expect})",
+            "PROCHMI: keyinj {test_name} -> id {id} press={} tap={} (expect {expect})",
             name_of(press_id),
+            name_of(tap_id),
         );
     }
     for (test_name, key) in ALL_HARDKEYS {

@@ -3138,6 +3138,18 @@ fn cca_server_answer_sensorfi_data_request(
         }
     }
     let function = u16::from_le_bytes([body[0x18], body[0x19]]);
+    if name == "mbx_7" && service == 0x0006 && reg_id == 3 {
+        // r799e: raw request forensics - which field carries the event id
+        // the completion should fire (compare sibling-gate requests vs the
+        // f74's; the gmf dispatcher takes ev.id from the notification).
+        log::info!(
+            "[LIBOSAL-MBX] f74 REQUEST raw: {}",
+            body.iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
     // r797b: the fabricated client request carries the CL transaction
     // ordinal to complete at +0x1c (genuine requests keep 0 there).
     let txn_key = u16::from_le_bytes([body[0x1c], body[0x1d]]);
@@ -3199,6 +3211,23 @@ fn cca_server_answer_sensorfi_data_request(
         body[0x1a] = 6;
         body[0x1b] = 1;
         body[0x1c..0x1e].copy_from_slice(&service.to_le_bytes());
+        // r799e (f312): the +0x18 u32 is ALSO the event id the pump
+        // converts the event into ([sl+0x74]+0x30's first word).  The gate
+        // classifier 0x1718b20 maps id 0 -> "null event" (gate +8 = 0),
+        // which vTick re-arms instead of keeping READY - the f74 gate
+        // oscillated +4 = 2 -> 1 forever.  The genuine DAPI svc-6 answers
+        // carried event 0x80000215 (r798/f232 observation, f312 sibling
+        // gate 0x3a2ae68), the class this gate accepts.  The completer
+        // still reads only the halfwords +0x18 (ordinal) / +0x1c (service),
+        // so the event id must live above them - 0x80000215 keeps the
+        // ordinal halfword at +0x18 (0x0215 would NOT) ... the low
+        // halfword IS the ordinal slot, so the id's low halfword has to
+        // stay the txn: 0x8000_0000 | txn keeps the id OUTSIDE the
+        // classifier table.  Instead the id goes where the pump reads the
+        // EVENT: the pump's 0xfb8f50 conversion yields the id from the
+        // body's +0x10 msg-id word (r799d pool forensics), so stamp the
+        // golden id there for this one answer.
+        body[0x10..0x14].copy_from_slice(&0x8000_0215u32.to_le_bytes());
     }
     // r799d: the state-8 f74 answer belongs to the navsrv pump consumer.
     // On mbx_289 tid-84's enConnect drops every class-0x45 whose (svc,
