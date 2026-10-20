@@ -2501,6 +2501,93 @@ pub fn cca_post_deferred_status(
     }
 }
 
+/// r797b: the entry-keyed dispatcher (`0x1c80adc`, f213) is fed ONLY by
+/// class-0x45 ServiceData messages - the two svc-0x06 CL entries reached
+/// READY because DAPI pushed genuine 0x45s (regid 3) after they registered,
+/// while no 0x45 for service 0x000a ever arrived after the gate entry was
+/// built (the one genuine HMI request at ~5 s predates registration).  The
+/// enavi client pushes that subscription itself once its FI session is up on
+/// the real unit; the session cannot come up before the gate opens, so post
+/// the client-side request (mirroring the genuine capture on mbx_21:
+/// src 0x0121, dst 0x0015, len 0x20, class 0x45, svc, regid, func, client
+/// OPTYPE 1) through the *genuine* SENSORFI responder, which then answers
+/// with GpsDataStatus/NavPositionStatus (0x45) on its own.  The transaction
+/// ordinal the CL completer matches on (content +0x1c, f217: the gate
+/// opened with ordinal 3) is carried at request +0x1c and echoed.  Client-
+/// side fabrication (the request), server-side answer produced by our
+/// existing emulated provider; `EMU_FAKE_SENSORFI=0` kills both.
+pub fn fabricate_fi_data_request(unicorn: &mut Unicorn<'_, Context>, service: u16, key: u16) {
+    if std::env::var_os("EMU_FAKE_SENSORFI").is_some_and(|v| v == "0") {
+        return;
+    }
+    let mut body = vec![0u8; 0x20];
+    body[0..2].copy_from_slice(&0x0121u16.to_le_bytes()); // client navi srv
+    body[2..4].copy_from_slice(&0x0015u16.to_le_bytes()); // server SENSORFI
+    body[4..8].copy_from_slice(&(0x20u32).to_le_bytes());
+    body[8..10].copy_from_slice(&2u16.to_le_bytes());
+    body[0xb] = 0x45;
+    static MSG_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x7000);
+    let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    body[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
+    body[0x14..0x16].copy_from_slice(&service.to_le_bytes());
+    body[0x16..0x18].copy_from_slice(&0xffffu16.to_le_bytes());
+    stamp_registration_id("mbx_289", &mut body);
+    if service == 0x000a {
+        body[0x18..0x1a].copy_from_slice(&0x0f02u16.to_le_bytes()); // GpsDataStatus
+    }
+    body[0x1a] = 1; // client OPTYPE, per genuine capture
+    body[0x1b] = 1;
+    body[0x1c..0x1e].copy_from_slice(&key.to_le_bytes()); // transaction ordinal
+    log::warn!(
+        "[LIBOSAL-MBX] fabricated client ServiceData request(svc {service:#06x} func {:#06x} txn {key}) to mbx_21 so the SENSORFI responder completes the CL transaction (EMU_FAKE_SENSORFI=0 disables)",
+        if service == 0x000a { 0x0f02u16 } else { 0 }
+    );
+    cca_server_answer_sensorfi_data_request(unicorn, "mbx_21", &body);
+}
+
+/// r797b: FI services outside the SENSORFI responder's set (0x0018 LIM,
+/// 0x001f, 0x002c, 0x000d, 0x0300 - all answered by the RTOS core on the
+/// real unit) get the same completion trick as a direct class-0x45 push:
+/// a minimal ServiceData (DAPI's answers are 0x22 bytes, no meaningful
+/// payload for the CL layer - the completer only reads +0x1b/+0x1c) whose
+/// +0x1c is the entry's transaction ordinal, driving the keyed dispatch ->
+/// ev-entry -> vfn+0x4c -> READY(2).  `EMU_FAKE_FI_READY_PUSH=0` disables.
+pub fn fabricate_fi_ready_push(unicorn: &mut Unicorn<'_, Context>, service: u16, key: u16) {
+    if std::env::var_os("EMU_FAKE_FI_READY_PUSH").is_some_and(|v| v == "0") {
+        return;
+    }
+    static MSG_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x7800);
+    let mut body = vec![0u8; 0x22];
+    body[0..2].copy_from_slice(&0x0015u16.to_le_bytes()); // src SENSORFI
+    body[2..4].copy_from_slice(&0x0121u16.to_le_bytes()); // dst navi srv
+    body[4..8].copy_from_slice(&(0x22u32).to_le_bytes());
+    body[8..10].copy_from_slice(&2u16.to_le_bytes());
+    body[0xb] = 0x45;
+    body[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
+    let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    body[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
+    body[0x14..0x16].copy_from_slice(&service.to_le_bytes());
+    body[0x16..0x18].copy_from_slice(&0xffffu16.to_le_bytes());
+    stamp_registration_id("mbx_289", &mut body);
+    body[0x1a] = 9; // server OPTYPE
+    body[0x1b] = 1; // service slot
+    body[0x1c..0x1e].copy_from_slice(&key.to_le_bytes()); // transaction ordinal
+    let mut blob = Vec::with_capacity(8 + body.len());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&body);
+    let mut state = unicorn.get_data().namespace.lock().unwrap();
+    if let Some(q) = state.mq.queue_id_for_name("mbx_289") {
+        state.mq.grow_msgsize(q, blob.len() as i64);
+        if OsalQueueService::guest_post(&mut state.mq, "mbx_289", blob, 0) {
+            log::warn!(
+                "[LIBOSAL-MBX] fabricated FI ServiceData(svc {service:#06x} txn {key}) push to mbx_289 to complete the CL transaction (EMU_FAKE_FI_READY_PUSH=0 disables)"
+            );
+            state.notify_waiters();
+        }
+    }
+}
+
 /// r755: answer the `ServiceData` *requests* (class 0x45, OPTYPE byte @+0x1a
 /// in the client set) the HMI sends once a service registration is
 /// confirmed - the navigation service (0x0027) queries are what the HMI
@@ -2685,6 +2772,9 @@ fn cca_server_answer_sensorfi_data_request(
     let client = u16::from_le_bytes([body[0], body[1]]);
     let reg_id = u16::from_le_bytes([body[0x16], body[0x17]]);
     let function = u16::from_le_bytes([body[0x18], body[0x19]]);
+    // r797b: the fabricated client request carries the CL transaction
+    // ordinal to complete at +0x1c (genuine requests keep 0 there).
+    let txn_key = u16::from_le_bytes([body[0x1c], body[0x1d]]);
     static SEQ: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(1);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     // Echo the client's reference tuple (svc/regid and the +0x0c function
@@ -2720,6 +2810,15 @@ fn cca_server_answer_sensorfi_data_request(
     // +0x18 word: result 0 (no error), +0x19 dynamic-length 0; the function
     // slot +0x0c stays 0 to match the reference (see comment above).
     body[0x1a] = 9; // OPTYPE: server data response
+    // r797b (f216/f217): the navsrv pump (0x17cb574) hands the CL completer
+    // exactly two halfwords parsed out of every 0x45: byte +0x1b (service
+    // slot inside the answered transaction) and u16 +0x1c (the ordinal of
+    // the pending registration transaction the answer completes - the
+    // genuine client request carries its own ordinal there, echo it).  The
+    // svc-0x06 CL entries reached READY via DAPI's answers; zeros made ours
+    // un-claimable, the gate opened only after echoing 3.
+    body[0x1b] = 1;
+    body[0x1c..0x1e].copy_from_slice(&txn_key.to_le_bytes());
     body[0x20..].copy_from_slice(&payload);
     let mut blob = Vec::with_capacity(8 + body.len());
     blob.extend_from_slice(&1u32.to_le_bytes());

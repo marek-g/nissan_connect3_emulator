@@ -5431,7 +5431,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         let address = base_address + 0x017c_73c0u32 - ORIGINAL_BASE;
         crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:startup-step", move |uc: &mut Unicorn<'_, Context>| {
             static HITS: AtomicU32 = AtomicU32::new(0);
-            if HITS.fetch_add(1, Ordering::Relaxed) >= 30 {
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 20_000 {
                 return 0;
             }
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -5439,6 +5439,12 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // addls pc,pc,r3<<2` at 0x17c73dc).  +0xc is a self back-pointer,
             // which is why earlier runs printed a constant pointer value.
             let state = read_u32(uc, r0.wrapping_add(0x30));
+            // r797b: state 6 opened (f217) - the 30-hit budget hid everything
+            // past it; log only state changes now.
+            static LAST: AtomicU32 = AtomicU32::new(0xffff_ffff);
+            if LAST.swap(state, Ordering::Relaxed) == state {
+                return 0;
+            }
             log::warn!(
                 "PROCHMI startup-step t={}ms tid=[{}] proc={r0:#x} state={state}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
@@ -6278,9 +6284,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 let Some((_, label)) = sites.iter().find(|(a, _)| *a == hit) else {
                     return;
                 };
-                if HP.fetch_add(1, Ordering::Relaxed) >= 120 {
-                    return;
-                }
+                let logged = HP.fetch_add(1, Ordering::Relaxed) < 4000;
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                 let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
                 let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
@@ -6307,26 +6311,74 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     read_u32(uc, entry.wrapping_add(0x18)),
                     read_u32(uc, entry.wrapping_add(0x1c)),
                 );
-                log::warn!(
+                if logged {
+                    log::warn!(
                     "PROCHMI stepprobe {label} t={}ms tid=[{}] r0={r0:#x} entry={entry:#x} state={st} svc={svc:#x} c28={r4:#x} conn={conn:#x} lsv={gv:#x} lr={lr:#x} vt={vt:#x} v1c={s1c:#x} v30={s30:#x} v34={s34:#x} v38={s38:#x} f0c={f0c:#x} f18={f18:#x} f1c={f1c:#x}",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     uc.get_data().inner.thread_id(),
                 );
+                }
                 // r797: the gate entry (svc 0x000a) has now stored its
                 // REGISTERED(1) state - its event pump only picks up
                 // statuses that arrive *after* this point (f202: earlier
                 // ones were eaten by the startup connector's Wait).  The
                 // late status makes the keyed dispatch reach the entry,
                 // which drives vfn+0x4c -> store READY(2) -> popup 0x5da.
-                if *label == "conf-store" && svc == 0x000a {
-                    static DEFERRED: AtomicU32 = AtomicU32::new(0);
-                    if DEFERRED.fetch_add(1, Ordering::Relaxed) == 0 {
-                        log::warn!(
-                            "PROCHMI gate: conf-store for svc 0xa done, injecting the late SENSORFI ServiceStatus"
-                        );
-                        crate::libs::libosal_linux::message::cca_post_deferred_status(
-                            uc, 0x0015, 0x0121, 0x000a,
-                        );
+                // r797b (f217): the gate OPENED this way.  The keyed
+                // completer (0x1c80adc) only fires for class-0x45 answers
+                // and matches the entry purely by the transaction ordinal
+                // echoed at content +0x1c (the dispatcher accepted even
+                // event=0x0), and r1 at this very site IS that ordinal
+                // (f217: 1,2 = the svc-0x06 entries, 3 = the gate).  The
+                // state-7+ gates are the burst-registered FI services
+                // (0x1e/0x18/0x1f/0x2c/0x0d/0x300), so answer every
+                // unhosted conf the same way: 0x0a/0x1e ride the genuine
+                // SENSORFI responder (real GpsDataStatus/NavPositionStatus
+                // payloads), the rest get a minimal ServiceData push.
+                // All of it is logged; EMU_FAKE_SENSORFI=0 / 
+                // EMU_FAKE_FI_READY_PUSH=0 disable the legs.
+                if *label == "conf-store" && st == 0 {
+                    let ordinal =
+                        (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff) as u16;
+                    if svc == 0x000a {
+                        static DEFERRED: AtomicU32 = AtomicU32::new(0);
+                        if DEFERRED.fetch_add(1, Ordering::Relaxed) == 0 {
+                            log::warn!(
+                                "PROCHMI gate: conf-store for svc 0xa done (ordinal {ordinal}), injecting the late SENSORFI ServiceStatus"
+                            );
+                            crate::libs::libosal_linux::message::cca_post_deferred_status(
+                                uc, 0x0015, 0x0121, 0x000a,
+                            );
+                            crate::libs::libosal_linux::message::fabricate_fi_data_request(
+                                uc, 0x000a, ordinal,
+                            );
+                        }
+                    } else if matches!(svc, 0x001e | 0x0018 | 0x001f | 0x002c | 0x000d | 0x0300) {
+                        // one push per (service, transaction ordinal); a
+                        // re-registration gets a new ordinal and is answered
+                        // anew, repeats of the same transaction are not.
+                        static ANSWERED: std::sync::OnceLock<
+                            std::sync::Mutex<std::collections::HashSet<(u16, u16)>>,
+                        > = std::sync::OnceLock::new();
+                        let set = ANSWERED.get_or_init(Default::default);
+                        let fresh = set
+                            .lock()
+                            .map(|mut s| s.insert((svc as u16, ordinal)))
+                            .unwrap_or(true);
+                        if fresh {
+                            log::warn!(
+                                "PROCHMI fi-ready: fabricating ServiceData completion for svc {svc:#06x} transaction {ordinal} (EMU_FAKE_SENSORFI=0 / EMU_FAKE_FI_READY_PUSH=0 disable)"
+                            );
+                            if svc == 0x001e {
+                                crate::libs::libosal_linux::message::fabricate_fi_data_request(
+                                    uc, svc as u16, ordinal,
+                                );
+                            } else {
+                                crate::libs::libosal_linux::message::fabricate_fi_ready_push(
+                                    uc, svc as u16, ordinal,
+                                );
+                            }
+                        }
                     }
                 }
             },
@@ -6347,6 +6399,22 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             (0x017c_cb88u32, "list-add", 24),
             (0x017b_93fcu32, "dispatch", 30),
             (0x017c_ce38u32, "re-entry", 24),
+            // r797b: the CCA answer-completer (liboscbcu-in-prochmi): called
+            // per consumed answer with r0=connector, r1=event id,
+            // ldrh [sp+0x50]=svc, ldrh [sp+0x54]=transaction key,
+            // [sp+0x58]=msg object.  It produced dispatch(key=1/2) for
+            // DAPI's genuine svc-0x06 pair and NOTHING for our 0x0a answers
+            // (f204-f209) - log its arguments to see whether our message
+            // ever reaches it and which field disqualifies it.
+            (0x01c8_0adcu32, "completer", 40),
+            // r797b: between keyed dispatch and completer there are two
+            // bail guards (f214 disasm): the receiver's vfn+0x10 (0x1c7c768)
+            // must return != 0, then [receiver+0xc] (0x1c7c778) must be non-
+            // NULL and 0x1c7c150 (before 0x1c7c794) must return != 0.  Our
+            // GpsDataStatus 0x45 died on one of them - find which.
+            (0x01c7_c768u32, "vfn10", 40),
+            (0x01c7_c778u32, "guard-c", 40),
+            (0x01c7_c794u32, "guard-150", 40),
         ] {
             let address = base_address + off - ORIGINAL_BASE;
             let _ = budget;
@@ -6394,6 +6462,57 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     let a5 = read_u32(uc, sp.wrapping_add(0x24));
                     log::warn!(
                         "PROCHMI pumptrace {label} t={}ms tid=[{}] obj={r0:#x} event={r1:#x} key={r2:#x} a4={a4:#x} a5={a5:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "completer" {
+                    // r797b: trap fires BEFORE the entry's
+                    // `push {r4..lr}, sub sp,#0x2c` (0x50 bytes total), so
+                    // the function's `[sp+0x50]/[sp+0x54]/[sp+0x58]` stack
+                    // args (svc u16, transaction key u16, msg object) sit
+                    // at OUR sp+0x00 / +0x04 / +0x08.
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let svc = read_u32(uc, sp) & 0xffff;
+                    let key = read_u32(uc, sp.wrapping_add(4)) & 0xffff;
+                    let msgobj = read_u32(uc, sp.wrapping_add(8));
+                    let data = if msgobj != 0 {
+                        read_u32(uc, msgobj.wrapping_add(4))
+                    } else {
+                        0
+                    };
+                    let (mut w, mut cls, mut src, mut regid) =
+                        (0u32, 0u32, 0u32, 0u32);
+                    if data != 0 {
+                        w = read_u32(uc, data.wrapping_add(8));
+                        cls = (w >> 24) & 0xff; // content byte +0x0b
+                        src = read_u32(uc, data) & 0xffff;
+                        regid = (read_u32(uc, data.wrapping_add(0x14)) >> 16)
+                            & 0xffff;
+                    }
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] conn={r0:#x} event={r1:#x} svc={svc:#x} key={key:#x} msgobj={msgobj:#x} data={data:#x} class={cls:#x} src={src:#x} regid={regid:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "vfn10" {
+                    let vt = read_u32(uc, r0);
+                    let f10 = read_u32(uc, vt.wrapping_add(0x10));
+                    let f1c = read_u32(uc, vt.wrapping_add(0x1c));
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] recv={r0:#x} vt={vt:#x} f10={f10:#x} f1c={f1c:#x} r1={r1:#x} r2={r2:#x} r3={r3:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "guard-c" {
+                    let fc = read_u32(uc, r0.wrapping_add(0xc));
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] recv={r0:#x} +0xc={fc:#x} r1={r1:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "guard-150" {
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] res={r0:#x} r1={r1:#x} lr={lr:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                     );
@@ -6465,6 +6584,65 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 }
                 0
             });
+        }
+    }
+    // r797b: the rx-pump's content/class decision (f215 disasm): 0x17cb5e0
+    // loads content=[r7+4] (content==0 jumps to 0x17cb5f8), 0x17cb5ec tests
+    // byte content[0xb] == 0x45 (else fall-through reject 0x17cb5f8), the
+    // accept leg is 0x17cb60c, receive-empty is 0x17cb600.  Page-watch the
+    // whole page and dispatch on the fetch address (mid-TB narrow traps can
+    // register dead, r797 lesson).
+    {
+        let page = (base_address + 0x017c_b000u32 - ORIGINAL_BASE) as u64;
+        let rej = (base_address + 0x017c_b5f8u32 - ORIGINAL_BASE) as u64;
+        let acc = (base_address + 0x017c_b60cu32 - ORIGINAL_BASE) as u64;
+        let empty = (base_address + 0x017c_b600u32 - ORIGINAL_BASE) as u64;
+        let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
+            if addr != rej && addr != acc && addr != empty {
+                return;
+            }
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 24_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 40
+            {
+                return;
+            }
+            let tag = if addr == rej {
+                "reject"
+            } else if addr == acc {
+                "accept"
+            } else {
+                "empty"
+            };
+            let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+            let mut word = |a: u64| -> u32 {
+                let mut b = [0u8; 4];
+                if uc.mem_read(a, &mut b).is_ok() {
+                    u32::from_le_bytes(b)
+                } else {
+                    0
+                }
+            };
+            let content = word(r7 as u64 + 4);
+            let (w0, w4, w14, cls) = if content != 0 {
+                (
+                    word(content as u64),
+                    word(content as u64 + 4),
+                    word(content as u64 + 0x14),
+                    word(content as u64 + 8) >> 24,
+                )
+            } else {
+                (0, 0, 0, 0xff)
+            };
+            log::warn!(
+                "PROCHMI pumppage {tag} t={}ms tid=[{}] msgobj={r7:#x} content={content:#x} cls={cls:#x} w0={w0:#x} w4={w4:#010x} w14={w14:#010x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+        });
+        match result {
+            Ok(_) => log::info!("PROCHMI: pumppage decision watch installed"),
+            Err(e) => log::warn!("PROCHMI: pumppage watch failed: {e}"),
         }
     }
     // r796: earliest reliable sighting of the gate object: 0x17c28a0 runs
