@@ -1940,3 +1940,27 @@ v24body/s9path/rmv probes, f74-watch, `f74 REQUEST raw`, responder-skip logs
 can all be trimmed now that the chain is closed; decide whether the mbx ack
 leg (+0x10=0 stamp, EMU_F74_MBX) stays.  NEXT: the GPS position page
 (Krakow coordinates; lat/lon M8 + altitude M7 encodings are empirical).
+
+## r799i/r799i2: post-state-9 GUI forensics - keypad OK, touch OK, hardkeys dead, GPS POSITION gated by SETUP
+
+- Keypad + touch verified (f332/f335): the state-9 screen renders the
+  numeric keypad (1-6 + Menu) and scripted taps on the SDL-queue path open
+  MAP OPTIONS and page 2 (title MAP SCROLL).  MAP SCROLL is a dead end:
+  body fully transparent, grid taps do nothing.
+- GPS POSITION page: title string va 0x2522390, table ref 0x2a58180 - it
+  is a SETUP/system-settings tree page (same table neighbourhood as SETUP,
+  SYSTEM SETTINGS), NOT a map-options page.
+- Hardkeys (r799i): row 18 is lp=1500 DUAL: tap -> HK_BACK_LONG, 1500 ms
+  hold -> HK_SETTINGS_PRESS (one physical key; setup/back sharing the row
+  is by design).  EMU_KEY_TEST gained the +<secs> hold suffix.  BUT both
+  the tap (back) and the hold (setup) injections deliver=true via
+  GUI_KeyInjector_vKeyPressed/vKeyReleased with ZERO visible effect
+  (f338/f340) - suspect the injector API is not what emits tap content
+  for lp rows; next candidate is synthesizing the KBD FI sample into
+  clHSI_CMKeyboard::bExecuteMessage (scan -> row jump table 0x1813620),
+  which is the path real keys take.  This gates the GPS POSITION page.
+- f341/f343 trap: scripted taps scheduled by wall-clock can land in the
+  member era (drifts 28..35 s) and wedge the startup FSM at state 6
+  forever.  r799i2: scripts rebase from the s9path B9 fetch
+  (STARTUP_PAST_9), relative spacing kept.  Do not gate on
+  hmi_fsm_state() - it is the currently-stepping process's state (f344).
