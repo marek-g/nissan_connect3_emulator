@@ -6238,7 +6238,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
     // at zero hits - AGENTS.md unicorn quirk).  Dispatch per fetch address.
     {
         let page = base_address + 0x0171_9000u32 - ORIGINAL_BASE;
-        let sites: [(u32, &str); 13] = [
+        let sites: [(u32, &str); 14] = [
             (base_address + 0x0171_9af4u32 - ORIGINAL_BASE, "conn-a"),
             (base_address + 0x0171_9b0cu32 - ORIGINAL_BASE, "conn-b"),
             (base_address + 0x0171_9cecu32 - ORIGINAL_BASE, "conf-res"),
@@ -6258,6 +6258,16 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // straight to the state-2 store (0x1719e58), non-zero registers
             // the entry in the pump list and continues to the send.
             (base_address + 0x0171_9ca4u32 - ORIGINAL_BASE, "step-branch"),
+            // r797: the conf-result store's branch target.  With no CCA
+            // directory in the emulator the gate's RegisterConf is consumed
+            // by the enConnect wait BEFORE this send runs (the burst raced
+            // ahead at t=26.4), so 0x17b94b8 returns "no conf" and the step
+            // falls into the service-resolution legs, where the gate's
+            // vfn+0x38 is NULL (nothing resolves FI services for client
+            // 0x0121) and the state-2 stores at 0x1719d74/0x1719ea4 are
+            // unreachable.  The probe below re-stores the value the unit's
+            // transaction layer would have returned.
+            (base_address + 0x0171_9cf4u32 - ORIGINAL_BASE, "conf-tail"),
         ];
         let _ = unicorn.add_code_hook(
             page as u64,
@@ -6282,11 +6292,43 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // r796b: list-selection global (helper 0x1719b4c) live value
                 let g = read_u32(uc, 0x02a1_39f8);
                 let gv = read_u32(uc, g);
+                // r797: live dump of the entry's vtable and the fields the
+                // conf-failure legs evaluate (the runtime vtable lives in
+                // .bss and must be read live, never offline).
+                let vt = read_u32(uc, entry);
+                let (s1c, s30, s34, s38) = (
+                    read_u32(uc, vt.wrapping_add(0x1c)),
+                    read_u32(uc, vt.wrapping_add(0x30)),
+                    read_u32(uc, vt.wrapping_add(0x34)),
+                    read_u32(uc, vt.wrapping_add(0x38)),
+                );
+                let (f0c, f18, f1c) = (
+                    read_u32(uc, entry.wrapping_add(0xc)),
+                    read_u32(uc, entry.wrapping_add(0x18)),
+                    read_u32(uc, entry.wrapping_add(0x1c)),
+                );
                 log::warn!(
-                    "PROCHMI stepprobe {label} t={}ms tid=[{}] r0={r0:#x} entry={entry:#x} state={st} svc={svc:#x} c28={r4:#x} conn={conn:#x} lsv={gv:#x} lr={lr:#x}",
+                    "PROCHMI stepprobe {label} t={}ms tid=[{}] r0={r0:#x} entry={entry:#x} state={st} svc={svc:#x} c28={r4:#x} conn={conn:#x} lsv={gv:#x} lr={lr:#x} vt={vt:#x} v1c={s1c:#x} v30={s30:#x} v34={s34:#x} v38={s38:#x} f0c={f0c:#x} f18={f18:#x} f1c={f1c:#x}",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     uc.get_data().inner.thread_id(),
                 );
+                // r797: the gate entry (svc 0x000a) has now stored its
+                // REGISTERED(1) state - its event pump only picks up
+                // statuses that arrive *after* this point (f202: earlier
+                // ones were eaten by the startup connector's Wait).  The
+                // late status makes the keyed dispatch reach the entry,
+                // which drives vfn+0x4c -> store READY(2) -> popup 0x5da.
+                if *label == "conf-store" && svc == 0x000a {
+                    static DEFERRED: AtomicU32 = AtomicU32::new(0);
+                    if DEFERRED.fetch_add(1, Ordering::Relaxed) == 0 {
+                        log::warn!(
+                            "PROCHMI gate: conf-store for svc 0xa done, injecting the late SENSORFI ServiceStatus"
+                        );
+                        crate::libs::libosal_linux::message::cca_post_deferred_status(
+                            uc, 0x0015, 0x0121, 0x000a,
+                        );
+                    }
+                }
             },
         );
     }
@@ -6452,7 +6494,11 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             let _ = uc.add_mem_hook(
                 unicorn_engine::unicorn_const::HookType::MEM_WRITE,
                 (word - 0x10) as u64,
-                (word + 0x10) as u64,
+                (word + 0x30) as u64, // r797: extended - also watch the
+                // registration-timeout pair at +0x18/+0x1c that the sink walk's
+                // vfn+0x14 (`0x1719258`) evaluates: it returns "not connected"
+                // while `+0x1c == 0`, so whoever is supposed to store the
+                // timeout window into the gate entry is on the critical path.
                 move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
                     static WE: AtomicU32 = AtomicU32::new(0);
                     if WE.fetch_add(1, Ordering::Relaxed) < 24 {
@@ -6461,6 +6507,32 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         log::warn!(
                             "PROCHMI earlygate WRITE t={}ms addr={address:#x} size={size} value={value:#x} pc={pc:#x} lr={lr:#x}",
                             crate::libs::dapi::emu_t0_elapsed_ms(),
+                        );
+                    }
+                    true
+                },
+            );
+            // r797: who READS the gate entry at all?  Every dispatch of its
+            // vfn+0x1c handler fetches the vtable from [entry+0], every walk
+            // reads the svc field at +0x20 / the state at +4.  A read-watch
+            // over the whole entry header proves whether the pump ever
+            // touches this entry after its REGISTERED(1) store - the keyed
+            // dispatch chain demonstrably never calls 0x1719b74 on it.
+            let _ = uc.add_mem_hook(
+                unicorn_engine::unicorn_const::HookType::MEM_READ,
+                (obj - 4) as u64,
+                (obj + 0x30) as u64,
+                move |uc: &mut Unicorn<'_, Context>, _t, address, size, _| {
+                    static RE: AtomicU32 = AtomicU32::new(0);
+                    let t = crate::libs::dapi::emu_t0_elapsed_ms();
+                    if t < 24000 {
+                        return true;
+                    }
+                    if RE.fetch_add(1, Ordering::Relaxed) < 90 {
+                        let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                        let pc = uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                        log::warn!(
+                            "PROCHMI earlygate READ t={t}ms addr={address:#x} size={size} pc={pc:#x} lr={lr:#x}",
                         );
                     }
                     true

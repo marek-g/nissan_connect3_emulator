@@ -1837,3 +1837,52 @@ vfn+0x4c -> store 2 at `0x171ae04` -> gate opens -> FSM 6->7->8->9 ->
 popup 0x5da closes -> golden triple-tap (45-50s, taps >=6s apart) with
 EMU_GPU_HMI_CAPTURE_EVERY=1 -> keyboard/Enter Destination; then position
 page (Krakow coords via fc-stat M8/M7 encodings, pin empirically).
+
+## r797: late-Status injection + per-pair app-info + full gate-entry live picture
+
+Fixes (all committed, all still default-on):
+- Fake conf/status now mirror DAPI's wire shape: reg-id stamped at BOTH
+  +0x16 and +0x1a; the NAVI pair (mbx_289, svc 0x000a) is handed reg-id 3
+  (DAPI's own id style on that queue; `bDispatchCCAMessages` routes by
+  reg-id).
+- `ApplicationInfoStatus(AVAILABLE)` for EVERY unhosted server is now
+  synthesized per (server, client) pair when its ServiceRegister lands
+  (previously once-globally, so only the first pair got it). Without it the
+  client never marks the server known. (f209: 0x0015 got it; still no gate
+  event - the client-side answer routing needs more than directory state.)
+- `cca_post_deferred_status`: the gate conf-store probe injects one exact
+  DAPI-shaped 0x44 (len 0x1a, blob 34) for svc 0x000a onto mbx_289 AFTER the
+  entry registered (the burst was always consumed earlier by the startup
+  connector's synchronous Wait on the same queue). EMU_LATE_NAVI_STATUS=0
+  disables. Empirical result: consumed by tid 84's enConnect Wait again,
+  routed to the FI-event layer (event2app 0x81008114 x14, same in all runs)
+  - never reached the keyed dispatcher.
+- stepprobe: `conf-tail` site (0x1719cf4) + live per-entry dump of the
+  runtime vtable slots and timeout fields. f212 ground truth, all three
+  entries (two svc 0x6 + the gate svc 0x0a):
+  vfn+0x1c=0x166c0e4, vfn+0x30=0x1718d3c (state 0 -> vfn+0x58),
+  vfn+0x34=0x1670340, timeout armed (f18=now f1c=0x01000000); gate
+  vfn+0x38=0x17b1adc returns the static singleton NON-NULL (its store-2 leg
+  at 0x1719d70/0x1719ea4 is only evaluated when 0x17b94b8's transaction
+  result != 1, and 0x17b94b8 = bRegisterAsync always returns 1 on push_back
+  success - so state 1 is terminal there BY DESIGN: the async table waits
+  for the provider's ServiceStatus EVENT).
+- sink/container walk decoded: 0x17ada8 (vfn+0x4c) stores 2 into the entry
+  once every [this+0x24..0x28) member's vfn+0x30 returns != 0; it is only
+  invoked from the keyed-dispatch handler path (0x1719b74 -> 0x17192ac
+  state1 -> 0x17193b0). The keyed dispatcher `0x17b93fc(obj, event, key)`
+  is called from ONE site (`ldr pc,[ip,#0x10]` at 0x1c80c38) inside a
+  per-message handler 0x1c80b40 (parses a 0x300-byte CCA message, event
+  0x80000215/0x80000218, key = transaction id, arg5=0x22) that runs on the
+  navsrv PUMP thread (tid 62) - the thread whose receive on the answer path
+  returned EMPTY (rx-pump content=0x0) in every run: the startup connector's
+  blocking Wait (tid 84) on mbx_289 steals every late answer first.
+  NEXT SESSION: deliver the late 0x44 so the PUMP receives it - i.e. make
+  the navsrv pump's own receive see the message (inspect what API feeds
+  0x17cb574's [obj+8]: msgrcv on mbx_289 vs our Wait-only delivery), e.g.
+  deliver the deferred status while the connector's Wait is NOT pending, or
+  queue-deliver it as a priority message the pump's recv picks up. When the
+  keyed dispatch fires with the gate's reg-id 3, the rest of the chain is
+  proven: handler 0x1719b74 -> state1 leg -> vfn+0x4c -> store 2 ->
+  0x17c2760 gate passes -> FSM 6->7->8->9 -> popup 0x5da closes -> golden
+  triple-tap -> keyboard/Enter Destination; then position page.

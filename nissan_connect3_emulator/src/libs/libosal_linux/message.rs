@@ -104,6 +104,15 @@ fn stamp_registration_id(queue: &str, body: &mut [u8]) {
         Err(poisoned) => poisoned.into_inner(),
     };
     let key = (queue.to_string(), service);
+    // r797: `bDispatchCCAMessages` matches answers to client transactions by
+    // the handed-out reg-id (see the mbx_1024 comment: ids of 0xfffe are
+    // "unroutable").  DAPI's genuine conf/status on the navif client's queue
+    // route with id 3 (f202), while our own 0xe0-style assignments are
+    // consumed but never dispatched (f204/f205).  Hand the NAVI-FI pair the
+    // same low id style the unit's directory uses.
+    if service == 0x000a && queue == "mbx_289" {
+        table.entry(key.clone()).or_insert(3);
+    }
     if class == 0x43 {
         if current != UNASSIGNED {
             table.insert(key, current);
@@ -2349,27 +2358,15 @@ fn cca_server_answer_register(
             body[0x18] = 1; // ServiceStatus: state 1 for the NAVI service
         } // else ServiceStatus: state byte 0 = ACTIVE (fastmap precedent)
         stamp_registration_id(&target, &mut body);
-        answers.push(body);
-    }
-    if service == 0x000a {
-        // r796c: re-announce the ServiceStatus once, the way the genuine
-        // providers do (DAPI posts the svc 0x06 status twice per register).
-        // The enavi CL-entry transaction consumes the conf + first status;
-        // only the *second* status is seen by the connector's event walk
-        // (HMINavServerLib_1 pump -> entry vfn+0x1c 0x1719b74 -> 0x17192ac
-        // -> vfn+0x4c), whose sink-vector check stores the READY(2) state
-        // the startup gate 0x17c2760 waits for.  With a single status the
-        // entry stayed at REGISTERED(1) forever (f181-f196).
-        if let Some(status) = answers.iter().find(|b| b[0x0b] == 0x44).cloned() {
-            let mut second = status;
-            let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed) as u32;
-            second[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
-            stamp_registration_id(&target, &mut second);
-            log::info!(
-                "[LIBOSAL-MBX] cca directory: re-announcing ServiceStatus(svc {service:#06x}) for the CL entry event walk"
-            );
-            answers.push(second);
+        // r797: DAPI's genuine conf/status carry the registration id in a
+        // second slot at +0x1a as well (f202 byte diff: `03 00` at both
+        // +0x16 and +0x1a); mirror it so the CL router can match the answer
+        // to the transaction record with either field.
+        if body.len() >= 0x1c {
+            let reg_id = [body[0x16], body[0x17]];
+            body[0x1a..0x1c].copy_from_slice(&reg_id);
         }
+        answers.push(body);
     }
     let answer_total = answers.len();
     let mut kept: Vec<Vec<u8>> = Vec::new();
@@ -2445,6 +2442,61 @@ fn cca_server_answer_register(
             // phone-side FI event 0x80108031) is fabricated right before the
             // first post-OFF NORMAL broadcast - see OFF_SEEN and the
             // hsimngr-dispatch trap in libs/prochmi.rs.
+        }
+    }
+}
+
+/// r797: post a ServiceStatus (class 0x44) for an already-answered
+/// registration *late* - at the moment the client's CL entry has actually
+/// registered.  Ground truth (f202): the enavi startup-gate entry (svc
+/// 0x000a) subscribes only after the provider's conf+status burst was
+/// consumed by the navsrv startup connector's synchronous Wait (tid 84 took
+/// the fake statuses at t=27015-27032 while the gate entry's conf-store ran
+/// on tid 55 at t=27169), so nothing is left for that entry's event pump to
+/// pick up - on the real unit the RTOS provider's asynchronous status
+/// arrives exactly this late.  The svc-0x06 entries prove the pattern: the
+/// status consumed by the client's own pump (tid 55, t=27037) produced the
+/// keyed dispatch (t=27047/27166) that drove the entries to READY(2).
+/// Disable with EMU_LATE_NAVI_STATUS=0 for diagnostic runs.
+pub fn cca_post_deferred_status(
+    unicorn: &mut Unicorn<'_, Context>,
+    server_app: u16,
+    client: u16,
+    service: u16,
+) {
+    if std::env::var("EMU_LATE_NAVI_STATUS").map(|v| v == "0").unwrap_or(false) {
+        return;
+    }
+    static MSG_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x5000);
+    let target = format!("mbx_{client}");
+    // r797: exact DAPI wire shape for a ServiceStatus: declared payload
+    // length 0x1a (the genuine svc-0x06 status on mbx_289 is blob_len=34;
+    // our 0x20-length variants were consumed without ever reaching the
+    // keyed dispatcher - f204).
+    let mut body = vec![0u8; 0x20];
+    body[0..2].copy_from_slice(&server_app.to_le_bytes());
+    body[2..4].copy_from_slice(&client.to_le_bytes());
+    body[4..8].copy_from_slice(&(0x1au32).to_le_bytes());
+    body[8..10].copy_from_slice(&2u16.to_le_bytes());
+    body[0xb] = 0x44;
+    body[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
+    let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    body[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
+    body[0x14..0x16].copy_from_slice(&service.to_le_bytes());
+    body[0x16..0x18].copy_from_slice(&0xffffu16.to_le_bytes());
+    stamp_registration_id(&target, &mut body);
+    let mut blob = Vec::with_capacity(8 + 0x1a);
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(0x1au32).to_le_bytes());
+    blob.extend_from_slice(&body[..0x1a]);
+    let mut state = unicorn.get_data().namespace.lock().unwrap();
+    if let Some(q) = state.mq.queue_id_for_name(&target) {
+        state.mq.grow_msgsize(q, blob.len() as i64);
+        if OsalQueueService::guest_post(&mut state.mq, &target, blob, 0) {
+            log::info!(
+                "[LIBOSAL-MBX] cca directory {server_app:#06x}: posted DEFERRED ServiceStatus(svc {service:#06x}) to {target} for the CL entry event walk (EMU_LATE_NAVI_STATUS=0 disables)"
+            );
+            state.notify_waiters();
         }
     }
 }
@@ -3134,6 +3186,31 @@ fn bridge_mbx_queue(
                                 && !crate::common::registry::HOSTED_SERVER_APPS
                                     .contains(&(server as u32))
                             {
+                                // r797: the unit's CCA directory also
+                                // broadcasts ApplicationInfoStatus(server,
+                                // AVAILABLE) to a registering client - the
+                                // client's AIL layer only routes answers of
+                                // servers it knows (f207: only DAPI 0x0007
+                                // had this synthesized, and only DAPI's
+                                // conf/status reached the keyed dispatcher;
+                                // every 0x0015 answer was consumed without
+                                // dispatch).  Same directory-level
+                                // fabrication, same EMU_NO_APP_INFO_SYNTH
+                                // kill-switch.  Guarded per (server, client)
+                                // pair, not globally.
+                                if std::env::var_os("EMU_NO_APP_INFO_SYNTH").is_none() {
+                                    static APP_INFO_PAIRS: std::sync::OnceLock<
+                                        std::sync::Mutex<std::collections::HashSet<(u32, u32)>>,
+                                    > = std::sync::OnceLock::new();
+                                    let pairs = APP_INFO_PAIRS.get_or_init(Default::default);
+                                    let fresh = pairs
+                                        .lock()
+                                        .map(|mut s| s.insert((server, client as u32)))
+                                        .unwrap_or(false);
+                                    if fresh {
+                                        post_app_info_status_raw(unicorn, server, client as u32);
+                                    }
+                                }
                                 cca_server_answer_register(
                                     unicorn,
                                     server as u16,
@@ -3512,13 +3589,20 @@ pub(crate) fn post_app_info_status_to(
     client_app: u32,
     once: &std::sync::atomic::AtomicBool,
 ) -> bool {
-    if server_app == 0 || server_app == 0xffff {
-        return false;
-    }
     if once.swap(true, Ordering::Relaxed) {
         return false;
     }
+    post_app_info_status_raw(unicorn, server_app, client_app)
+}
 
+fn post_app_info_status_raw(
+    unicorn: &mut Unicorn<'_, Context>,
+    server_app: u32,
+    client_app: u32,
+) -> bool {
+    if server_app == 0 || server_app == 0xffff {
+        return false;
+    }
     let queue_name = format!("mbx_{}", client_app);
     let mut info = vec![0u8; 0x20];
     let info_len = info.len() as u32;
