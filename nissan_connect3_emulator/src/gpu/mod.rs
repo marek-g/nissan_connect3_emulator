@@ -1081,11 +1081,69 @@ fn poll_events(backend: &mut Backend) -> bool {
                     }
                 }
             }
+            Event::KeyDown { scancode: Some(sc), repeat, .. } => {
+                // Physical-key bridge: the headunit's hardwired keys and
+                // rotary encoders stand in as host keys (Esc=Back, F1..F12,
+                // numpad Insert/Del = volume knob, PgUp/PgDn = map knob).
+                // Auto-repeat is dropped; the guest key injector (and the Lua
+                // HK_* state machines) do their own repeat/long-press timing.
+                if !repeat {
+                    if let Some(event) = key_press_event(sc) {
+                        crate::input::push_key(event);
+                    }
+                }
+            }
+            Event::KeyUp { scancode: Some(sc), .. } => {
+                if let Some(key) = hardkey_for(sc) {
+                    crate::input::push_key(crate::input::KeyEvent::Release(key));
+                }
+            }
             _ => {}
         }
     }
 
     false
+}
+
+/// The semantic hardwired key a host scancode stands for.
+fn hardkey_for(sc: sdl2::keyboard::Scancode) -> Option<crate::input::HardKey> {
+    use crate::input::HardKey;
+    use sdl2::keyboard::Scancode;
+    Some(match sc {
+        Scancode::Escape => HardKey::Back,
+        Scancode::F1 => HardKey::Phone,
+        Scancode::F2 => HardKey::Radio,
+        Scancode::F3 => HardKey::Cd,
+        Scancode::F4 => HardKey::Aux,
+        Scancode::F5 => HardKey::Previous,
+        Scancode::F6 => HardKey::Next,
+        Scancode::F7 => HardKey::Camera,
+        Scancode::F8 => HardKey::Map,
+        Scancode::F9 => HardKey::Nav,
+        Scancode::F10 => HardKey::Info,
+        Scancode::F11 => HardKey::NightDay,
+        Scancode::F12 => HardKey::Setup,
+        _ => return None,
+    })
+}
+
+/// KeyDown -> queue event (hardkeys plus the two encoders).
+fn key_press_event(sc: sdl2::keyboard::Scancode) -> Option<crate::input::KeyEvent> {
+    use crate::input::KeyEvent;
+    use sdl2::keyboard::Scancode;
+    if let Some(key) = hardkey_for(sc) {
+        return Some(KeyEvent::Press(key));
+    }
+    Some(match sc {
+        // Volume knob rotations (numpad Insert/0 and Del/. share scancodes
+        // between NumLock states).
+        Scancode::Insert | Scancode::Kp0 => KeyEvent::Encoder { volume: true, dir: 1 },
+        Scancode::Delete | Scancode::KpDecimal => KeyEvent::Encoder { volume: true, dir: -1 },
+        // Map/menu knob rotations (zoom on the map screen).
+        Scancode::PageUp | Scancode::Kp9 => KeyEvent::Encoder { volume: false, dir: 1 },
+        Scancode::PageDown | Scancode::Kp3 => KeyEvent::Encoder { volume: false, dir: -1 },
+        _ => return None,
+    })
 }
 
 fn make_target_current(backend: &mut Backend, target: GpuTarget) {

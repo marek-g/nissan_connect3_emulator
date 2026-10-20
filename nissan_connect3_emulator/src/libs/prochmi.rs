@@ -105,6 +105,31 @@ const GUI_MAINLOOP_TRACE_END: u32 = 0x0133_c07c - ORIGINAL_BASE;
 const TOUCH_PAD_V_PRESSED: u32 = 0x0136_e418 - ORIGINAL_BASE;
 const TOUCH_PAD_V_MOVED: u32 = 0x0136_e328 - ORIGINAL_BASE;
 const TOUCH_PAD_V_RELEASED: u32 = 0x0136_e278 - ORIGINAL_BASE;
+// GUI_KeyInjector's exported hardwired-key API (`.dynsym`): the exact
+// functions `clHSI_CMKeyboard::bExecuteMessage` calls for real
+// `midw_kbdfi_tclMsgKeyInfo` samples (47/46 bl sites inside it), so the
+// widget engine + Lua HK_* state machines see a stock input path (guest code
+// untouched).  `vKeyPressed` takes the id of its 51-entry key table (<= 50),
+// rejects others; `vKeyReleased` only fires when the id matches the active
+// key (state VA 0x02cb9574, active id at +8); the two encoder entries take a
+// signed direction and fire |dir| events each.
+const KEY_INJECTOR_V_KEY_PRESSED: u32 = 0x0136_8138 - ORIGINAL_BASE;
+const KEY_INJECTOR_V_KEY_RELEASED: u32 = 0x0136_8028 - ORIGINAL_BASE;
+const KEY_INJECTOR_V_ENCODER_MOVED: u32 = 0x0136_7f84 - ORIGINAL_BASE;
+const KEY_INJECTOR_V_VOLUME_ENCODER_MOVED: u32 = 0x0136_7f6c - ORIGINAL_BASE;
+/// `GUI_ContentString::ms_apcStrings`: content id -> C-string name (the key
+/// table stores content ids, so the semantic name of every hardwired key is
+/// resolved at runtime instead of guessing row numbers).
+const GUI_CONTENT_STRINGS: u32 = 0x02a4_3b28 - ORIGINAL_BASE;
+/// `GUI_KeyInjector`'s static 51 x 24-byte key table (id = row index):
+/// +0x0c u16 press content id, +0x12 u16 short-release content id,
+/// +0x14 u16 long-release content id.  Base pinned from vKeyPressed's
+/// pc-relative literal pool (`0x2a12818 + 0xffb6a044` at the `add r5,pc,r5`
+/// anchor 0x0136814c, so +0xc past the symbol-style guess 0x0257c854);
+/// `vKeyReleased` confirms +0x12 (fires as type 4) and +0x14 (type 5).
+/// Contents are filled by `vInit` at runtime, so the resolver must read
+/// guest memory, not the file image.
+const KEY_INJECTOR_KEY_TABLE: u32 = 0x0257_c85c - ORIGINAL_BASE;
 const GUI_GL_CONTEXT_INITIALIZE: u32 = 0x0134_8b04 - ORIGINAL_BASE;
 const CL_LUA_DEBUGGER_S_INITIALIZE: u32 = 0x0133_ae10 - ORIGINAL_BASE;
 const GUI_DISPLAY_WIDTH: u32 = 800;
@@ -9546,6 +9571,9 @@ fn drain_gui_touch_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
         return;
     }
     let Some(event) = crate::input::pop_touch() else {
+        // No touch this iteration: the hardwired-key bridge may use the
+        // injection slot instead (also one event per pump iteration).
+        drain_gui_key_event(unicorn, resume_pc);
         return;
     };
     let base = PROCHMI_BASE.load(Ordering::Relaxed);
@@ -9659,6 +9687,292 @@ fn inject_scripted_touch_test() {
     crate::input::push_touch(crate::input::TouchKind::Release, x, y);
     log::info!(
         "PROCHMI: touch-test tap #{index} scheduled ({x},{y}) at {due_ms}ms (now {now}ms)"
+    );
+}
+
+/// All hardwired keys the host keyboard bridge supports, with the
+/// `EMU_KEY_TEST` / parse name for each.
+const ALL_HARDKEYS: &[(&str, crate::input::HardKey)] = &[
+    ("back", crate::input::HardKey::Back),
+    ("phone", crate::input::HardKey::Phone),
+    ("radio", crate::input::HardKey::Radio),
+    ("cd", crate::input::HardKey::Cd),
+    ("aux", crate::input::HardKey::Aux),
+    ("previous", crate::input::HardKey::Previous),
+    ("next", crate::input::HardKey::Next),
+    ("camera", crate::input::HardKey::Camera),
+    ("map", crate::input::HardKey::Map),
+    ("nav", crate::input::HardKey::Nav),
+    ("info", crate::input::HardKey::Info),
+    ("nightday", crate::input::HardKey::NightDay),
+    ("setup", crate::input::HardKey::Setup),
+];
+
+/// Host semantic key -> pinned `GUI_KeyInjector` id.  Pinned statically from
+/// the rodata key table (`0x0257c85c` = `vKeyPressed`'s pc-relative literal
+/// `0x2a12818 + 0xffb6a044`, stride 24) cross-checked against
+/// `clHSI_CMKeyboard::bExecuteMessage`'s 47 immediate-id `vKeyPressed` call
+/// sites (0x1813e44..0x1814168 dispatch): the injector ids ARE the table
+/// rows, so these pairs reproduce real key taps exactly.  `back` rides the
+/// SWC-back row (there is no panel `HK_BACK_PRESS` press row; the real unit
+/// routes "back" through `SWC_BACK_SHORT`, row 45).  The resolver still
+/// cross-checks each row's press content name at runtime and logs the pair.
+const PINNED_HARDKEY_ROWS: &[(&str, crate::input::HardKey, u16, &str)] = &[
+    ("back", crate::input::HardKey::Back, 45, "SWC_BACK_SHORT"),
+    ("phone", crate::input::HardKey::Phone, 8, "HK_PHONE_PRESS"),
+    ("radio", crate::input::HardKey::Radio, 7, "HK_RADIO_SHORT"),
+    ("cd", crate::input::HardKey::Cd, 10, "HK_CD_PRESS"),
+    ("aux", crate::input::HardKey::Aux, 11, "HK_AUX_PRESS"),
+    ("previous", crate::input::HardKey::Previous, 12, "HK_PREVIOUS_RELEASE"),
+    ("next", crate::input::HardKey::Next, 13, "HK_NEXT_RELEASE"),
+    ("camera", crate::input::HardKey::Camera, 32, "HK_CAMERA_RELEASE"),
+    ("map", crate::input::HardKey::Map, 17, "HK_MAP_PRESS"),
+    ("nav", crate::input::HardKey::Nav, 14, "HK_NAV_PRESS"),
+    ("info", crate::input::HardKey::Info, 26, "HK_INFO_PRESS"),
+    ("nightday", crate::input::HardKey::NightDay, 30, "HK_ILLUM_PRESS"),
+    ("setup", crate::input::HardKey::Setup, 18, "HK_SETTINGS_PRESS"),
+];
+
+/// The press-event content name of each supported hardwired key, as named in
+/// `GUI_ContentString` (fallback resolution for builds whose pinned rows
+/// drift; the row for a key is whichever key-table row carries that content
+/// id at +0x0c).
+fn hardkey_press_content_name(key: crate::input::HardKey) -> &'static str {
+    use crate::input::HardKey;
+    match key {
+        HardKey::Back => "HK_BACK_PRESS",
+        HardKey::Phone => "HK_PHONE_PRESS",
+        HardKey::Radio => "HK_RADIO_PRESS",
+        HardKey::Cd => "HK_CD_PRESS",
+        HardKey::Aux => "HK_AUX_PRESS",
+        HardKey::Previous => "HK_PREVIOUS_PRESS",
+        HardKey::Next => "HK_NEXT_PRESS",
+        HardKey::Camera => "HK_CAMERA_PRESS",
+        HardKey::Map => "HK_MAP_PRESS",
+        HardKey::Nav => "HK_NAV_PRESS",
+        HardKey::Info => "HK_INFO_PRESS",
+        HardKey::NightDay => "HK_ILLUM_PRESS",
+        HardKey::Setup => "HK_SETTINGS_PRESS",
+    }
+}
+
+static KEY_INJECTOR_ROWS: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<crate::input::HardKey, u16>>,
+> = OnceLock::new();
+
+/// Resolve semantic hardkeys to `GUI_KeyInjector_vKeyPressed` ids once, by
+/// walking the key table and translating each row's press content id through
+/// `GUI_ContentString::ms_apcStrings`.  Dumps the full resolved table so the
+/// row layout (and any name the panel build does not actually use) is visible
+/// in the log instead of being assumed.
+fn resolve_key_injector_rows(unicorn: &mut Unicorn<'_, Context>, base: u32) {
+    static DONE: AtomicU32 = AtomicU32::new(0);
+    let rows = KEY_INJECTOR_ROWS.get_or_init(Default::default);
+    if DONE.swap(1, Ordering::Relaxed) == 1 {
+        return;
+    }
+    // Content id -> name (only HK_* entries matter, but record all names for
+    // the row dump).
+    let mut names: Vec<String> = Vec::new();
+    let mut content_ids: std::collections::HashMap<String, u32> = Default::default();
+    for index in 0..8192u32 {
+        let pointer = read_u32(unicorn, base + GUI_CONTENT_STRINGS + 4 * index);
+        let name = if pointer == 0 {
+            String::new()
+        } else {
+            read_sm_name(unicorn, pointer)
+        };
+        if !name.is_empty() && name.starts_with("HK_") {
+            content_ids.entry(name.clone()).or_insert(index);
+        }
+        names.push(name);
+    }
+    let name_of = |id: u32| -> String {
+        names.get(id as usize).cloned().unwrap_or_default()
+    };
+    let mut press_to_row: std::collections::HashMap<u32, u16> = Default::default();
+    for row in 0..51u32 {
+        let entry = base + KEY_INJECTOR_KEY_TABLE + 24 * row;
+        let long_press_ms = read_u32(unicorn, entry);
+        let press = read_u16(unicorn, entry + 0xc);
+        let short_release = read_u16(unicorn, entry + 0x12);
+        let long_release = read_u16(unicorn, entry + 0x14);
+        if press != 0 && press != 0xffff {
+            press_to_row.entry(press).or_insert(row as u16);
+        }
+        log::info!(
+            "PROCHMI: keyinj row {row} lp={long_press_ms} press={} short={} long={}",
+            name_of(press),
+            name_of(short_release),
+            name_of(long_release),
+        );
+    }
+    // Encoder/volume-event ids reported by the static analysis of
+    // vEncoderMoved/vVolumeEncoderMoved: name them for the record.
+    for id in [41u32, 42, 68, 69] {
+        log::info!("PROCHMI: keyinj content[{id}] = {}", name_of(id));
+    }
+    let mut resolved = rows.lock().unwrap();
+    for (test_name, key, id, expect) in PINNED_HARDKEY_ROWS {
+        let press_id =
+            read_u16(unicorn, base + KEY_INJECTOR_KEY_TABLE + 24 * u32::from(*id) + 0xc);
+        resolved.insert(*key, *id);
+        log::info!(
+            "PROCHMI: keyinj {test_name} -> id {id} press={} (expect {expect})",
+            name_of(press_id),
+        );
+    }
+    for (test_name, key) in ALL_HARDKEYS {
+        if resolved.contains_key(key) {
+            continue;
+        }
+        let content_name = hardkey_press_content_name(*key);
+        match content_ids.get(content_name).and_then(|id| press_to_row.get(id)) {
+            Some(row) => {
+                resolved.insert(*key, *row);
+            }
+            None => log::warn!("PROCHMI: keyinj no table row for {content_name} ({test_name})"),
+        }
+    }
+    log::info!("PROCHMI: keyinj resolved {} hardkeys", resolved.len());
+}
+
+/// Host keyboard -> guest hardwired keys: pops at most one queued key event
+/// per GUI mainloop iteration and drives the guest's own
+/// `GUI_KeyInjector_vKeyPressed/vKeyReleased/v(Volume)EncoderMoved` entry
+/// points - the same ones `clHSI_CMKeyboard::bExecuteMessage` calls for real
+/// KBD-FI key samples.  Same register-save / `guest_call_via_lr` protocol as
+/// the touch bridge (the injected call returns onto this trap site, where
+/// `TOUCH_RETURN_PENDING` restores the clobbered entry registers).
+fn drain_gui_key_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
+    inject_scripted_key_test();
+    let Some(event) = crate::input::pop_key() else {
+        return;
+    };
+    if GUI_ENGINE_ADDRESS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let base = PROCHMI_BASE.load(Ordering::Relaxed);
+    if base == 0 {
+        return;
+    }
+    resolve_key_injector_rows(unicorn, base);
+    let (offset, name, arg) = match event {
+        crate::input::KeyEvent::Encoder { volume, dir } => (
+            if volume {
+                KEY_INJECTOR_V_VOLUME_ENCODER_MOVED
+            } else {
+                KEY_INJECTOR_V_ENCODER_MOVED
+            },
+            if volume { "volEncoder" } else { "encoder" },
+            (dir as u8) as u32,
+        ),
+        crate::input::KeyEvent::Press(key) | crate::input::KeyEvent::Release(key) => {
+            let release = matches!(event, crate::input::KeyEvent::Release(_));
+            let row = KEY_INJECTOR_ROWS.get().and_then(|rows| {
+                let map = rows.lock().unwrap();
+                map.get(&key).copied()
+            });
+            let Some(row) = row else { return };
+            (
+                if release {
+                    KEY_INJECTOR_V_KEY_RELEASED
+                } else {
+                    KEY_INJECTOR_V_KEY_PRESSED
+                },
+                if release { "released" } else { "pressed" },
+                row as u32,
+            )
+        }
+    };
+    for (index, register) in [
+        RegisterARM::R0,
+        RegisterARM::R1,
+        RegisterARM::R2,
+        RegisterARM::R3,
+        RegisterARM::R12,
+        RegisterARM::R13,
+        RegisterARM::R14,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        TOUCH_RETURN_REGS[index].store(
+            unicorn.reg_read(register).unwrap_or(0) as u32,
+            Ordering::Relaxed,
+        );
+    }
+    TOUCH_RETURN_PENDING.store(1, Ordering::Relaxed);
+    let delivered = guest_call_via_lr(
+        unicorn,
+        resume_pc,
+        base + offset,
+        [arg, 0, 0, 0],
+        64,
+    );
+    if !delivered {
+        TOUCH_RETURN_PENDING.store(0, Ordering::Relaxed);
+    }
+    log::info!(
+        "PROCHMI: key {name} {event:?} delivered={delivered} t={}ms",
+        crate::libs::dapi::emu_t0_elapsed_ms(),
+    );
+}
+
+/// Headless verification path (`EMU_KEY_TEST="24:back,30:map,36:zoomin"`):
+/// scripted key presses at wall-t seconds after t0 through the same queue the
+/// SDL keyboard feeds.  Hardkeys are a Press+Release pair consumed on two
+/// consecutive mainloop iterations; encoder events are a single nudge.
+fn inject_scripted_key_test() {
+    static SPEC: OnceLock<Vec<(u64, crate::input::KeyEvent)>> = OnceLock::new();
+    let spec = SPEC.get_or_init(|| {
+        std::env::var("EMU_KEY_TEST")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|entry| {
+                let parts: Vec<&str> = entry.trim().split(':').collect();
+                if parts.len() != 2 {
+                    return None;
+                }
+                let secs = parts[0].trim().parse::<f64>().ok()?;
+                let name = parts[1].trim().to_ascii_lowercase();
+                let event = match name.as_str() {
+                    "volup" => crate::input::KeyEvent::Encoder { volume: true, dir: 1 },
+                    "voldown" => crate::input::KeyEvent::Encoder { volume: true, dir: -1 },
+                    "zoomin" => crate::input::KeyEvent::Encoder { volume: false, dir: 1 },
+                    "zoomout" => crate::input::KeyEvent::Encoder { volume: false, dir: -1 },
+                    _ => {
+                        let (_, key) = ALL_HARDKEYS.iter().find(|(n, _)| *n == name.as_str())?;
+                        crate::input::KeyEvent::Press(*key)
+                    }
+                };
+                Some(((secs * 1000.0) as u64, event))
+            })
+            .collect()
+    });
+    if spec.is_empty() {
+        return;
+    }
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let index = NEXT.load(Ordering::Relaxed) as usize;
+    if index >= spec.len() {
+        return;
+    }
+    let (due_ms, event) = spec[index];
+    let now = crate::libs::dapi::emu_t0_elapsed_ms() as u64;
+    if now < due_ms {
+        return;
+    }
+    NEXT.fetch_add(1, Ordering::Relaxed);
+    match event {
+        crate::input::KeyEvent::Press(key) => {
+            crate::input::push_key(crate::input::KeyEvent::Press(key));
+            crate::input::push_key(crate::input::KeyEvent::Release(key));
+        }
+        other => crate::input::push_key(other),
+    }
+    log::info!(
+        "PROCHMI: key-test #{index} {event:?} scheduled at {due_ms}ms (now {now}ms)"
     );
 }
 

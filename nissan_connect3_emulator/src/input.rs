@@ -88,3 +88,51 @@ pub fn pop_touch() -> Option<TouchEvent> {
 pub fn dropped_events() -> u32 {
     DROPPED_EVENTS.load(Ordering::Relaxed)
 }
+
+/// The head-unit's hardwired keys the host keyboard stands in for (the
+/// widget-engine's `GUI_KeyInjector` takes an id into its 51-entry table; the
+/// prochmi hook resolves each of these semantic names to that id at runtime
+/// through `GUI_ContentString::ms_apcStrings`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum HardKey {
+    Back,
+    Phone,
+    Radio,
+    Cd,
+    Aux,
+    Previous,
+    Next,
+    Camera,
+    Map,
+    Nav,
+    Info,
+    NightDay,
+    Setup,
+}
+
+/// Queue item for the physical-key bridge.  `Encoder` covers the rotary
+/// inputs (volume knob, map/menu knob) which have no release state - the
+/// prochmi hook turns each into one `v(Volume)EncoderMoved(dir)` call.
+#[derive(Clone, Copy, Debug)]
+pub enum KeyEvent {
+    Press(HardKey),
+    Release(HardKey),
+    Encoder { volume: bool, dir: i8 },
+}
+
+static KEY_QUEUE: Mutex<VecDeque<KeyEvent>> = Mutex::new(VecDeque::new());
+
+/// Producer side (GPU backend thread SDL keyboard, and scripted tests).
+pub fn push_key(event: KeyEvent) {
+    if let Ok(mut queue) = KEY_QUEUE.try_lock() {
+        if queue.len() >= 64 {
+            queue.pop_front();
+        }
+        queue.push_back(event);
+    }
+}
+
+/// Consumer side (prochmi GUI mainloop hook): one event per pump iteration.
+pub fn pop_key() -> Option<KeyEvent> {
+    KEY_QUEUE.try_lock().ok()?.pop_front()
+}
