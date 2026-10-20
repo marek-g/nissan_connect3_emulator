@@ -1964,3 +1964,45 @@ leg (+0x10=0 stamp, EMU_F74_MBX) stays.  NEXT: the GPS position page
   forever.  r799i2: scripts rebase from the s9path B9 fetch
   (STARTUP_PAST_9), relative spacing kept.  Do not gate on
   hmi_fsm_state() - it is the currently-stepping process's state (f344).
+
+## r799j-open: user GUI session feedback (2026-10-21) - three open bugs, evidence captured
+
+User interactive session findings:
+1. THE DESTINATION KEYBOARD NEVER OPENS: tapping Enter Destination /
+   New Address shows a spinner that never resolves. That screen's
+   address-entry backend request is unanswered (candidate: navsrv
+   address-entry / POI-database service on PROCNAV, which sits PARKED
+   with svc 0x350564 yields). NEXT: scripted repro (EMU_TOUCH_TEST
+   2:70:330,6:180:160 - the r799i2 rebase makes it land after state 9),
+   then trace the FIRST unanswered CCA/mbx request after the tap
+   (responder logs + mbx_289/mbx_7 traffic + which CL transactions stay
+   open). This is the real "pojawienie się klawiatury" the user means.
+2. INTERMITTENT state-6 stall (new variant, g1.log): startup reached
+   state 6 at 34.5 s (era drift), fabricated FI-ready txns 1,2 landed,
+   but member transactions 3..0xa NEVER issued their requests (0 pushes
+   after 35 s vs 13 pushes inside the 27-28 s era in f342 which then
+   closed 6->7->8->9 in <100 ms). So SOME precondition of the member
+   request loop is missing in slow-era runs - and it is NOT the responder
+   (it never even saw the requests). Probes burned their budgets early
+   (conn-b 88/90 in BOTH runs) - raise budgets / filter to era window
+   before next comparison. g1.log vs f342.log are the diff pair.
+   NOTE: user's interactive runs pass 6 normally - correlates with era
+   starting late (>33 s)?
+3. HARDKEYS (interactive SDL path): Setup opens the Setup screen on EVERY
+   press (short!), but Esc (Back) does NOTHING now - yet it DID work for
+   the user after ceac5f1 (verified later, before the state-9 work).
+   Row 18 is lp=1500 press=HK_SETTINGS_PRESS short(tap)=HK_BACK_LONG.
+   Both keys pin row 18; the user's observed asymmetry means the bridge
+   likely emits the press-slot content (SETTINGS) immediately on
+   vKeyPressed, not on the lp timeout (contradicts the r796 model), and
+   Back's tap content HK_BACK_LONG is a no-op on the current screen (it
+   worked on the old state-8 popup screen - context-dependent, so maybe
+   NOT a regression!). Verify: (a) probe GUI_KeyInjector_vKeyPressed
+   0x1368138 leg taken on tap, (b) scripted back from the MAP OPTIONS
+   popup (rebase makes this scriptable now), (c) whether HK_BACK_PRESS
+   exists in ms_apcStrings and on which row (it is absent from the
+   keyinj row dump - so 'HK_BACK_LONG' as the tap content may be right
+   after all and Esc-on-main-screen legitimately does nothing).
+GPS POSITION page: still gated behind Setup-tree navigation - the user
+sees the Setup screen, so once (3)/(1) are sorted, walk it with scripted
+taps (capture the Setup screen first - its layout is unknown).
