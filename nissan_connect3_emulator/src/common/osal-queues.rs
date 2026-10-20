@@ -170,6 +170,10 @@ impl OsalQueueService {
         matches!(
             canonical_mq_name(name).as_str(),
             TE_TERM_MQ | LI_TERM_MQ | OSAL_CB_HDR_TE | OSAL_CB_HDR_LI_MAIN
+            // r798b NOTE: hosting "HMINavServerLib_1" here was tried and
+            // REVERTED (f263-f265): its consumer does not use the OSAL Wait
+            // API in native runs, and an empty-served Wait poisoned the
+            // pump loop (msg-fire stopped at ~13 s, state-6 never completed).
         )
     }
 

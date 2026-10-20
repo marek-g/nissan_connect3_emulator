@@ -2566,6 +2566,14 @@ pub fn push_blob_to_mbx_289(unicorn: &mut Unicorn<'_, Context>, body: Vec<u8>) -
 }
 
 /// r798b: the navsrv connector words of the 8-byte events tid 84's consumer
+/// r798b: latest value of the HMI startup FSM (`[proc+0x30]`), published by
+/// the startup-step watch in prochmi.rs.  `0xffff_ffff` until first observed.
+static HMI_FSM_STATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0xffff_ffff);
+
+pub fn note_hmi_fsm_state(state: u32) {
+    HMI_FSM_STATE.store(state, Ordering::Relaxed);
+}
+
 /// posts onto the pump queue HMINavServerLib_1 (`data=[1, slot, w2, w3]`);
 /// the pumptrace post8 probe stashes them from a live post so host-side
 /// completion events can carry the byte-identical shape.
@@ -2591,17 +2599,55 @@ pub fn note_pump_post_shape(w2: u32, w3: u32) {
 /// shape; falls back to nothing otherwise.  `EMU_FAKE_FI_READY_PUSH=0`
 /// disables at the callers.
 pub fn pump_push_completion(unicorn: &mut Unicorn<'_, Context>, body: Vec<u8>) -> bool {
-    let w2 = PUMP_W2.load(Ordering::Relaxed);
-    let w3 = PUMP_W3.load(Ordering::Relaxed);
-    if w2 == 0 || w3 == 0 {
+    // f263/f264 forensics: the native post8 queue message is EIGHT bytes
+    // `[1, pool-slot]` (w2/w3 belong to the enclosing OSAL message struct and
+    // are never copied to the receiver, which waits with a 0x8 buffer).  A
+    // 16-byte event here overflowed tid 62's wait buffer and killed the pump
+    // loop, so mirror the native frame exactly.  The blob goes to dedicated
+    // pages, not the connector's live 0x90901000 pool (it still owns those
+    // materialized copies).
+    static POOL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if POOL.get().is_none() {
+        let mmu_arc = unicorn.get_data().mmu.clone();
+        let pool = mmu_arc.lock().unwrap().heap_alloc(
+            unicorn,
+            0x2000,
+            Prot::READ | Prot::WRITE,
+            "[pump-completion-pool]",
+        );
+        let _ = POOL.set(pool);
+    }
+    let pool = POOL.get().copied().unwrap_or(0);
+    if pool == 0 {
         return false;
     }
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let slot = 0x9090_1000u32 + (NEXT.fetch_add(1, Ordering::Relaxed) & 7) as u32 * 0x1000;
+    let slot = pool + (NEXT.fetch_add(1, Ordering::Relaxed) & 1) as u32 * 0x1000;
     let mut blob = Vec::with_capacity(8 + body.len());
     blob.extend_from_slice(&1u32.to_le_bytes());
     blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
     blob.extend_from_slice(&body);
+    let mut msg = Vec::with_capacity(8);
+    for word in [1u32, slot] {
+        msg.extend_from_slice(&word.to_le_bytes());
+    }
+    let host_backed = {
+        let state = unicorn.get_data().namespace.lock().unwrap();
+        state.mq.queue_id_for_name("HMINavServerLib_1").is_some()
+    };
+    if !host_backed {
+        // The pump queue only reaches the host table once a guest Wait/Post
+        // on it is intercepted (r798b: it joined `is_rtos_intercepted_queue`);
+        // until then the mbx_289 fallback below is the live route.  Do NOT
+        // touch the pool in this case.
+        static Q: AtomicU32 = AtomicU32::new(0);
+        if Q.fetch_add(1, Ordering::Relaxed) < 1 {
+            log::info!(
+                "[LIBOSAL-MBX] pump completion: queue HMINavServerLib_1 not host-backed, using mbx_289 fallback"
+            );
+        }
+        return false;
+    }
     if unicorn.mem_write(slot as u64, &blob).is_err() {
         static W: AtomicU32 = AtomicU32::new(0);
         if W.fetch_add(1, Ordering::Relaxed) < 3 {
@@ -2609,23 +2655,10 @@ pub fn pump_push_completion(unicorn: &mut Unicorn<'_, Context>, body: Vec<u8>) -
         }
         return false;
     }
-    let mut msg = Vec::with_capacity(16);
-    for word in [1u32, slot, w2, w3] {
-        msg.extend_from_slice(&word.to_le_bytes());
-    }
     let mut state = unicorn.get_data().namespace.lock().unwrap();
-    let q = state.mq.queue_id_for_name("HMINavServerLib_1");
-    let posted = q.is_some()
-        && OsalQueueService::guest_post(&mut state.mq, "HMINavServerLib_1", msg, 0);
-    if posted {
+    if OsalQueueService::guest_post(&mut state.mq, "HMINavServerLib_1", msg, 0) {
         state.notify_waiters();
         return true;
-    }
-    static Q: AtomicU32 = AtomicU32::new(0);
-    if Q.fetch_add(1, Ordering::Relaxed) < 3 {
-        log::warn!(
-            "[LIBOSAL-MBX] pump completion: queue HMINavServerLib_1 q={q:?} posted={posted}"
-        );
     }
     false
 }
@@ -2905,14 +2938,59 @@ fn cca_server_answer_sensorfi_data_request(
     }
     let server_app = match name.strip_prefix("mbx_").and_then(|d| d.parse::<u32>().ok()) {
         Some(0x15) => 0x0015u16,
+        // r798b (f268 wire dump): the navsrv CL transport (tid 62) posts its
+        // ServiceData requests - svc 0x0006 regid 3 func 0x000a, the f74
+        // readiness entry the state-8 FSM spins on - to the CAM queue mbx_7,
+        // where no responder existed: the request went to the (emulated-absent)
+        // TE side and died.  The genuine SENSORFI server (0x0015) answers
+        // this service on the real unit; stand in for it here (same rules:
+        // logged, EMU_FAKE_SENSORFI=0 disables, payload reuses the sanctioned
+        // GPS fabrication - no second position truth).
+        Some(7) => 0x0015u16,
         _ => return,
     };
     let service = u16::from_le_bytes([body[0x14], body[0x15]]);
-    if !matches!(service, 0x000a | 0x001e) {
+    if !matches!(service, 0x000a | 0x001e | 0x0006) {
         return;
     }
     let client = u16::from_le_bytes([body[0], body[1]]);
     let reg_id = u16::from_le_bytes([body[0x16], body[0x17]]);
+    // r798b: answer only regid 3 on mbx_7.  The early regid-1/2 svc-6
+    // requests are posted while the member registrations are still pending
+    // on mbx_289, and the answer's +0x1c ordinal echo then collides with
+    // those member transactions and steals their completion (f269: member
+    // completions vanished, state 6 never closed).  The state-8 f74 entry
+    // registers with regid 3 on every tick - that is the request we must
+    // serve, and the wire dump (f268) shows it stable across re-registrations.
+    if name == "mbx_7" {
+        if reg_id != 3 {
+            static R7SKIP: AtomicU32 = AtomicU32::new(0);
+            if R7SKIP.fetch_add(1, Ordering::Relaxed) < 8 {
+                log::info!(
+                    "[LIBOSAL-MBX] mbx_7 0x45 svc={service:#06x} regid={reg_id:#04x} -> responder skip (want regid 3)"
+                );
+            }
+            return;
+        }
+        // r798b: the regid-3 pair's transaction ordinals (1, 2 - f271 wire
+        // dump) live in the navsrv connector's counter and collide with the
+        // DAPI member transactions while state 6 is still closing; answering
+        // them then steals the members' completions (f269/f271: the
+        // member-era death).  The consumer of these answers - the state-8
+        // readiness entry [sl+0x74] - only exists from state 8 on, so serve
+        // the requests from that state up (published by the startup-step
+        // fsm-watch, prochmi.rs).
+        let fsm = HMI_FSM_STATE.load(Ordering::Relaxed);
+        if fsm < 8 {
+            static R7G: AtomicU32 = AtomicU32::new(0);
+            if R7G.fetch_add(1, Ordering::Relaxed) < 8 {
+                log::info!(
+                    "[LIBOSAL-MBX] mbx_7 regid-3 svc-6 request at fsm state {fsm} -> deferred (state 8 consumer only)"
+                );
+            }
+            return;
+        }
+    }
     let function = u16::from_le_bytes([body[0x18], body[0x19]]);
     // r797b: the fabricated client request carries the CL transaction
     // ordinal to complete at +0x1c (genuine requests keep 0 there).
@@ -2924,7 +3002,9 @@ fn cca_server_answer_sensorfi_data_request(
     // `trace_dapi_map_service_data`: svc@+0x14, regid@+0x16, fn@+0x0c) and
     // append the sensorfi/posfi status payload at +0x20 - the frame shape
     // `cca_server_answer_data_request` proved reaches the AIL app receiver.
-    let (payload, what) = if service == 0x000a {
+    let (payload, what) = if service == 0x000a || service == 0x0006 {
+        // svc 0x0006 is the navsrv position-readiness service (the state-8
+        // f74 entry): carry the same sanctioned GpsDataStatus payload.
         (crate::libs::procnav::gps_wire_body(), "GpsDataStatus")
     } else {
         (
@@ -3558,8 +3638,7 @@ fn bridge_mbx_queue(
                 && matches!(u16::from_le_bytes([body[0], body[1]]), 0x0400 | 0x0109)
                 && matches!(body[0xb], 0x41 | 0x42 | 0x44 | 0x45)
             {
-                if matches!(body[0xb], 0x42 | 0x45) {
-                    log::info!(
+                if matches!(body[0xb], 0x42 | 0x45) {                    log::info!(
                         "[LIBOSAL-MBX] class{:#04x} body: {}",
                         body[0xb],
                         body.iter()
@@ -3588,6 +3667,19 @@ fn bridge_mbx_queue(
                     u16::from_le_bytes([body[0xc], body[0xd]]),
                     u16::from_le_bytes([body[0xe], body[0xf]]),
                 );
+            }
+            // r798b diagnostic (temporary): tid 62's navsrv CL transport posts
+            // 0x41-class RegisterConfs to mbx_7 whose src is none of the
+            // known apps, so the filter above never dumps them - one of them
+            // is the f74 entry's registration whose answer we must shape.
+            if name == "mbx_7" {
+                static B7: AtomicU32 = AtomicU32::new(0);
+                if B7.fetch_add(1, Ordering::Relaxed) < 300 {
+                    log::info!(
+                        "[LIBOSAL-MBX] mbx_7 body: {}",
+                        body.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+                    );
+                }
             }
             let mut blob = Vec::with_capacity(8 + body.len());
             blob.extend_from_slice(&1u32.to_le_bytes());
