@@ -6361,6 +6361,40 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                     );
+                    // r796d: watch the vector header (data ptr @+4, count
+                    // @+0xc) from the first registration on: whoever READS
+                    // these fields is the walker that dispatches to the
+                    // entries - catching its pc/lr pins the event path the
+                    // gate entry (svc 0x000a) is missing.
+                    static WALKED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WALKED.swap(true, Ordering::Relaxed) && r0 != 0 {
+                        let lo = r0.wrapping_sub(4) as u64;
+                        let hi = r0.wrapping_add(0x20) as u64;
+                        let _ = uc.add_mem_hook(
+                            unicorn_engine::unicorn_const::HookType::MEM_READ,
+                            lo,
+                            hi,
+                            move |uc: &mut Unicorn<'_, Context>, _t, address, size, _| {
+                                static RP: AtomicU32 = AtomicU32::new(0);
+                                if RP.fetch_add(1, Ordering::Relaxed) >= 40 {
+                                    return true;
+                                }
+                                let pc = uc
+                                    .reg_read(RegisterARM::PC)
+                                    .unwrap_or(0) as u32;
+                                let lr = uc
+                                    .reg_read(RegisterARM::LR)
+                                    .unwrap_or(0) as u32;
+                                log::warn!(
+                                    "PROCHMI vecwalk t={}ms tid=[{}] addr={address:#x} size={size} pc={pc:#x} lr={lr:#x}",
+                                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                                    uc.get_data().inner.thread_id(),
+                                );
+                                true
+                            },
+                        );
+                    }
                 } else if label == "notify" {
                     let w1 = read_u32(uc, r1.wrapping_add(4));
                     let w2 = read_u32(uc, r1.wrapping_add(8));

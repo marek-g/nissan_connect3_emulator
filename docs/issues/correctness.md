@@ -1813,3 +1813,27 @@ there (compare the 0x06 chain: it completed via DAPI's genuine
 RegisterConf+2xStatus+0x45 data on mbx_289); then expect
 ev-entry(0x0a) -> `0x17192ac` state1 -> `0x17193b0` -> vfn+0x4c -> store 2
 (`0x171ae04`) -> gate opens -> FSM 6->7->8->9, popup 0x5da closes.
+
+## r796d (session wrap): the dispatcher container is the transaction object itself
+
+`vecwalk` (dynamic MEM_READ watch on the first `list-add` anchor, installed
+from the `list-add` trap) showed the watched vector header (data @+0x18,
+count @+0x20 of container `0x392bb08`) is touched by:
+- `0x17cce38` (lr=`0x17b9554`) - which decoded is NOT a walker but the
+  vector **push_back** (`0x17b94b8`'s site at `0x17b9550`: appends
+  `{u16 [sp+0x16], r8}` to `this+0x14` for every transaction type != 5);
+- `0x17ccc04` (lr=`0x17b944c`) - the keyed dispatcher find (`0x17b93fc`).
+So container `0x392bb08` == the transaction/connector object `this` used by
+`0x17b94b8`; its vector is the transaction response log keyed by a u16
+(the `key=1/2` in the dispatch lines), NOT the CL-entry registry. The
+`0x17ccb88` registrations (anchor seen `0x3b223ec` in f196) are the real
+CL-entry vector. NEXT: dynamic-read-watch the `0x17ccb88` anchor captured at
+the list-add whose anchor != the transaction object (skip anchors in the
+first hit's range), i.e. capture the THIRD argument pattern: anchor is the
+connector list at helper-object `0x3b223d8+0x14`; find who reads THAT list
+- that reader is the SERVICE_STATUS event walk that must reach the 0x0a
+entry. Then: handler `0x1719b74` -> `0x17192ac` state1 -> `0x17193b0` ->
+vfn+0x4c -> store 2 at `0x171ae04` -> gate opens -> FSM 6->7->8->9 ->
+popup 0x5da closes -> golden triple-tap (45-50s, taps >=6s apart) with
+EMU_GPU_HMI_CAPTURE_EVERY=1 -> keyboard/Enter Destination; then position
+page (Krakow coords via fc-stat M8/M7 encodings, pin empirically).
