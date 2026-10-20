@@ -429,6 +429,14 @@ pub static OFF_SEEN: AtomicU32 = AtomicU32::new(0);
 pub static F74_GATE: AtomicU32 = AtomicU32::new(0);
 pub static F74_STEP: AtomicU32 = AtomicU32::new(0);
 
+/// r799i: set once the s9path page watch fetches the store-9 instruction
+/// (0x17c7c1c) - the f74 readiness step really advanced to state 9, i.e.
+/// startup is over and the keypad screen is up.  Unlike the fsm-watch's
+/// `hmi_fsm_state()` (the CURRENTLY stepping process's state - other
+/// processes pass through 9 much earlier), this is unambiguous.
+pub static STARTUP_PAST_9: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The prev-state value the device's OFF dwell would have left in the static
 /// `clFi_Navi` previous-state global when the first post-OFF NORMAL broadcast
 /// runs; 0 = nothing to reproduce.
@@ -7338,6 +7346,9 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 return;
             }
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            if *tag == "B9" {
+                STARTUP_PAST_9.store(true, Ordering::Relaxed);
+            }
             log::warn!(
                 "PROCHMI s9path {tag} t={}ms tid=[{}] r0={r0:#x}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
@@ -12156,6 +12167,28 @@ fn inject_scripted_touch_test() {
     if now < due_ms {
         return;
     }
+    // f341/f343: taps landing DURING the startup FSM's member era (states
+    // < 9) interleave messages into the very queues the media/member
+    // completions race on and the 6 -> 7 transition never closes (run
+    // sticks at state 6 forever).  Hold the whole script back until the
+    // startup step reaches state 9 and then rebase the schedule from that
+    // moment - the era drifts run to run (28..35 s), so a wall-clock
+    // schedule cannot express it; relative spacing is preserved.
+    static TBASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let base = match TBASE.load(std::sync::atomic::Ordering::Relaxed) {
+        u64::MAX => {
+            if !STARTUP_PAST_9.load(Ordering::Relaxed) {
+                return;
+            }
+            let b = now.saturating_sub(due_ms);
+            TBASE.store(b, std::sync::atomic::Ordering::Relaxed);
+            b
+        }
+        b => b,
+    };
+    if now < due_ms + base {
+        return;
+    }
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::input::push_touch(crate::input::TouchKind::Press, x, y);
     crate::input::push_touch(crate::input::TouchKind::Release, x, y);
@@ -12472,7 +12505,21 @@ fn inject_scripted_key_test() {
     }
     let (due_ms, event) = spec[index];
     let now = crate::libs::dapi::emu_t0_elapsed_ms() as u64;
-    if now < due_ms {
+    // see inject_scripted_touch_test: scripts only make sense once the
+    // startup FSM is past the member era; rebase from state 9 onwards.
+    static KBASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let base = match KBASE.load(Ordering::Relaxed) {
+        u64::MAX => {
+            if !STARTUP_PAST_9.load(Ordering::Relaxed) {
+                return;
+            }
+            let b = now.saturating_sub(due_ms);
+            KBASE.store(b, Ordering::Relaxed);
+            b
+        }
+        b => b,
+    };
+    if now < due_ms + base {
         return;
     }
     NEXT.fetch_add(1, Ordering::Relaxed);
