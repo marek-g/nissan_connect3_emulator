@@ -12412,32 +12412,55 @@ fn drain_gui_key_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
 /// scripted key presses at wall-t seconds after t0 through the same queue the
 /// SDL keyboard feeds.  Hardkeys are a Press+Release pair consumed on two
 /// consecutive mainloop iterations; encoder events are a single nudge.
+/// A `+<secs>` hold suffix (`"33:setup+2"`) splits the pair across that many
+/// host seconds - the guest's own lp-timer (rows with lp != 0, e.g. row 18's
+/// 1500 ms HK_SETTINGS_PRESS hold content) fires while the release is still
+/// pending, exactly like a held physical key.
 fn inject_scripted_key_test() {
     static SPEC: OnceLock<Vec<(u64, crate::input::KeyEvent)>> = OnceLock::new();
     let spec = SPEC.get_or_init(|| {
-        std::env::var("EMU_KEY_TEST")
-            .unwrap_or_default()
-            .split(',')
-            .filter_map(|entry| {
-                let parts: Vec<&str> = entry.trim().split(':').collect();
-                if parts.len() != 2 {
-                    return None;
+        let mut out: Vec<(u64, crate::input::KeyEvent)> = Vec::new();
+        for entry in std::env::var("EMU_KEY_TEST").unwrap_or_default().split(',') {
+            let parts: Vec<&str> = entry.trim().split(':').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let Ok(secs) = parts[0].trim().parse::<f64>() else { continue };
+            let due = (secs * 1000.0) as u64;
+            let raw = parts[1].trim().to_ascii_lowercase();
+            let (name, hold_ms) = match raw.split_once('+') {
+                Some((n, h)) => (
+                    n.to_owned(),
+                    h.parse::<f64>().map(|s| (s * 1000.0) as u64).unwrap_or(0),
+                ),
+                None => (raw.clone(), 0u64),
+            };
+            let event = match name.as_str() {
+                "volup" => Some(crate::input::KeyEvent::Encoder { volume: true, dir: 1 }),
+                "voldown" => Some(crate::input::KeyEvent::Encoder { volume: true, dir: -1 }),
+                "zoomin" => Some(crate::input::KeyEvent::Encoder { volume: false, dir: 1 }),
+                "zoomout" => Some(crate::input::KeyEvent::Encoder { volume: false, dir: -1 }),
+                _ => ALL_HARDKEYS
+                    .iter()
+                    .find(|(n, _)| *n == name.as_str())
+                    .map(|(_, k)| crate::input::KeyEvent::Press(*k)),
+            };
+            let Some(event) = event else { continue };
+            if let (hold_ms, crate::input::KeyEvent::Press(key)) = (hold_ms, event) {
+                if hold_ms > 0 {
+                    out.push((due, crate::input::KeyEvent::Press(key)));
+                    out.push((due + hold_ms, crate::input::KeyEvent::Release(key)));
+                    continue;
                 }
-                let secs = parts[0].trim().parse::<f64>().ok()?;
-                let name = parts[1].trim().to_ascii_lowercase();
-                let event = match name.as_str() {
-                    "volup" => crate::input::KeyEvent::Encoder { volume: true, dir: 1 },
-                    "voldown" => crate::input::KeyEvent::Encoder { volume: true, dir: -1 },
-                    "zoomin" => crate::input::KeyEvent::Encoder { volume: false, dir: 1 },
-                    "zoomout" => crate::input::KeyEvent::Encoder { volume: false, dir: -1 },
-                    _ => {
-                        let (_, key) = ALL_HARDKEYS.iter().find(|(n, _)| *n == name.as_str())?;
-                        crate::input::KeyEvent::Press(*key)
-                    }
-                };
-                Some(((secs * 1000.0) as u64, event))
-            })
-            .collect()
+            }
+            out.push((due, event));
+            if let crate::input::KeyEvent::Press(key) = event {
+                // tap: the matching Release on the next mainloop iteration
+                // (same due -> consecutive spec entries).
+                out.push((due, crate::input::KeyEvent::Release(key)));
+            }
+        }
+        out
     });
     if spec.is_empty() {
         return;
@@ -12453,13 +12476,7 @@ fn inject_scripted_key_test() {
         return;
     }
     NEXT.fetch_add(1, Ordering::Relaxed);
-    match event {
-        crate::input::KeyEvent::Press(key) => {
-            crate::input::push_key(crate::input::KeyEvent::Press(key));
-            crate::input::push_key(crate::input::KeyEvent::Release(key));
-        }
-        other => crate::input::push_key(other),
-    }
+    crate::input::push_key(event);
     log::info!(
         "PROCHMI: key-test #{index} {event:?} scheduled at {due_ms}ms (now {now}ms)"
     );
