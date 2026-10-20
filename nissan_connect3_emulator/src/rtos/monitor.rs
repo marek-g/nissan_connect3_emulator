@@ -1946,8 +1946,40 @@ fn start_osal_thread(unicorn: &mut Unicorn<'_, Context>, cb: u32, verb: &str) ->
     }
     let name = read_c_string(unicorn, name_ptr).unwrap_or_default();
     let tid = spawn_guest_thread(unicorn, entry, arg, stack);
+    // The real µITRON kernel releases a created task without letting it run
+    // through: the creator keeps the CPU until it blocks.  Creator-side init
+    // relies on that (STAT_tclThread.cpp): `s32Initialize` vStart()s the STAT
+    // tasks, then still fills the object members vEntry() null-checks.  An
+    // immediate Runnable start lets the child win the race and both STAT
+    // threads exit on `NaviThread::vEntry() nullpointer` (f258/f260: the
+    // +0x4c producer at lr 0x4d3732 lands ~40 ms after the threads died).
+    // A small start delay keeps the creator ahead; EMU_OSAL_START_DELAY_MS=0
+    // disables it for control runs.
+    let delay_ms = std::env::var("EMU_OSAL_START_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60);
+    if delay_ms > 0 && tid != 0xffff_ffff {
+        if let Some(target) = unicorn
+            .get_data()
+            .threads
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|t| t.id == tid)
+        {
+            target.status = ThreadStatus::Blocked(BlockReason::SleepUntil(
+                std::time::Instant::now() + std::time::Duration::from_millis(delay_ms),
+            ));
+        }
+    }
     log::info!(
-        "monitor: OSAL thread {verb} (name {name:?}, entry {entry:#x}, arg {arg:#x}, stack {stack:#x}) -> thread [{tid}]"
+        "monitor: OSAL thread {verb} (name {name:?}, entry {entry:#x}, arg {arg:#x}, stack {stack:#x}) -> thread [{tid}]{}",
+        if delay_ms > 0 {
+            format!(" (start delayed {delay_ms} ms, EMU_OSAL_START_DELAY_MS=0 disables)")
+        } else {
+            String::new()
+        },
     );
     tid
 }

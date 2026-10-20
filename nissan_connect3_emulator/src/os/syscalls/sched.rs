@@ -1,6 +1,6 @@
 use crate::emulator::context::Context;
 use crate::emulator::memory_map::{STACK_BASE, STACK_SIZE};
-use crate::emulator::thread::{GuestThread, ThreadStatus};
+use crate::emulator::thread::{BlockReason, GuestThread, ThreadStatus};
 use crate::emulator::utils::pack_u32;
 use std::sync::atomic::Ordering;
 use unicorn_engine::unicorn_const::Prot;
@@ -245,10 +245,30 @@ pub fn clone(
 
     {
         let data = unicorn.get_data();
+        // A real glibc/Nucleus thread start takes milliseconds (stack setup,
+        // priority release): the creator's critical section after `clone`
+        // reliably finishes first.  Starting Runnable here lets the child
+        // preempt and lose that race - f258/f260: STAT_tclThread's
+        // `s32Initialize` vStart()s the STAT workers BEFORE filling the
+        // members vEntry() null-checks (producer lr 0x4d3732 lands ~40 ms
+        // later), so both STAT threads die on `NaviThread::vEntry()
+        // nullpointer` every boot.  The small start delay models the real
+        // release; EMU_OSAL_START_DELAY_MS=0 disables it for control runs.
+        let delay_ms = std::env::var("EMU_OSAL_START_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60);
+        let status = if delay_ms > 0 {
+            ThreadStatus::Blocked(BlockReason::SleepUntil(
+                std::time::Instant::now() + std::time::Duration::from_millis(delay_ms),
+            ))
+        } else {
+            ThreadStatus::Runnable
+        };
         data.threads.lock().unwrap().push(GuestThread {
             id: child_tid,
             rtos_task: false,
-            status: ThreadStatus::Runnable,
+            status,
             cpu_context: Some(child_context),
             pc,
             pending_result: None,
