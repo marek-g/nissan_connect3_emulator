@@ -1690,3 +1690,55 @@ Not yet done: procmapengine's 17 svc-0x26 class-0x45 map-data requests still
 get no data reply from DAPI (dataset/RNW precondition), and the GUI needs a
 visual confirmation that the popup really stays gone and the keyboard page
 (milestone C) appears on the triple tap.
+
+## r796: the state-6 deadlock fully unwound - missing CCA connect-confirm for the external FI providers
+
+The startup FSM (`0x17c73c0`, state at `[obj+0x30]`, jump table at `0x17c73e4`)
+advances 0->6 now (svc-availability gate passes, r795) but loops forever in
+state 6 (handler `0x17c7908`), keeping popup `0x5da` on top of the GUI stack.
+This round pinned the exact reason end to end:
+
+1. Advancing 6->7 needs the out-byte set by `0x17c2760`.  With
+   `bIsCCAServiceRequired(0x0a)==1` - which is genuine: the firmware's own
+   `D605_registry/ni2k_eur/hminavserver.reg` ships `USE_CCA_SRV_*=1` (the
+   emulated registry serves exactly those values, confirmed via the new
+   `reqcheck` probes) - the gate takes the interface branch at `0x17c289c`,
+   whose only byte-setting path is the loop-back `b 0x17c2788` reached when
+   the inner proxy getter (`0x166c0d0` = `[obj+4]==2`, "server READY") is
+   true.  `bl 0x169de68` then supplies r0=1 -> `*out=1`.
+2. The gate word `[0x3a23f5c]` was observed live (dynamic write-watch
+   installed from the `envigate g-vfn18` probe, heap addresses move per
+   build): it starts 0, becomes 1 (CONNECTING) via the one `state=0` server
+   broadcast at t=3.35 s, and is NEVER written again (watch: 0 hits over
+   20+ gate cycles).
+3. The setter chain is `navsrv::vSetStateAndNotify` (`0x161d3d8`, broadcasts
+   to the sink vector `[navsrv+0x58..0x5c]`, sink vfn+0x8 = `0x15f48a4`
+   writes `[sink+4]` and notifies the FINAVI singleton via vfn+0).  The new
+   `srvsetter` trap saw it fire exactly once: `(0x38fa1dc, state=0)` at
+   t=3.35 s (bt `0x17be808 0x17bf660`).
+4. The producer of state=READY is the enconnect handshake:
+   `enconnect-entry (svc=0x299) -> scd-lookup -> scd-openq (svc 0x0a.. app
+   0x15 SENSORFI / app 0x24 HMINAVSERVER) -> post request to the provider's
+   queue -> wait on OSAL semaphore (e.g. semh=0x4001b174)`.  The kernel
+   answers the SCD lookup (r791) and ServiceData (r795) but nothing answers
+   the connect request, so the semaphore never posts, the proxy stays at
+   CONNECTING(1), and the gate can never pass.
+5. The state-6 timeout branch (`0x17c7b64`, reached from `0x17c78e0` via
+   `[sl+0x4c]` byte) calls `[iface+0x78].vfn+0x24` (`0x1719458`) and jumps
+   to `0x17c7c18` (state:=9, popup release) when it returns != 0; for a
+   state-1 proxy that path routes through vfn+0x44 (no-op `bx lr` on this
+   class) and returns 0 -> no escape.  `s9-vfn24res` (probe at `0x17c7ba4`)
+   confirms it never even runs while the FSM polls state 6.
+
+Fix belongs in the CCA directory emulation (`libosal_linux/message.rs`):
+apps 0x15/0x24 are not among the emulated processes, so their connect-confirm
+is fabricated per the fidelity rule (logged, env-flag gated), which lets the
+guest's own post handler + `vSetStateAndNotify` + broadcast + gate run
+genuinely.  New probes this round: `s9gate` (state-9-skip caller, `0x1719458`
+chain, svc-post events 0x8070000/0x80b9000, `cl-*` CL-client consumer at
+`0x1382cf0`, sink-vector scan, bcast sites), `envigate` (LIM availability
+verdict `0x161fb14`->`0x162f570`->`0x162d3b0`/`0x162d3a0`, dynamic gate-watch
++-0x100), `reqcheck` (`0x169e308` registry reads -> `USE_CCA_SRV_*`=1),
+`ready-setter`/`srvsetter` traps, finavi-global slot watches (`0x2a1be8c`,
+`0x2a1ce78`, stored by a static ctor at lr=0x47371944), dynamic
+`navsrv-state` watch on `[proxy4c+0xe0]`.

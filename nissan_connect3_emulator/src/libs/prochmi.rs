@@ -2361,9 +2361,65 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                     )
                 }
                 "event-conf" => format!(" this={r0:#x} trace={r1:#x}"),
+                // r795b: vSvcReady (0x15e1954) has four null-guards
+                // (+0x15c, FINAVI singleton at global 0x2a1ce78, +0x7dc,
+                // +0x160) - any zero aborts the READY propagation that the
+                // state-6 gate waits for ([0x3a23f5c]==2 via 0x166c0d0).
+                // Dump all four to find the missing wire.
+                "navsrv-svcready" => {
+                    let finavi_ptr = read_u32(uc, 0x02a1_be8c);
+                    let finavi = read_u32(uc, finavi_ptr);
+                    format!(
+                        " this={r0:#x} +15c={:#x} fsvc={finavi_ptr:#x} finavi={finavi:#x} +7dc={:#x} +160={:#x}",
+                        read_u32(uc, r0 + 0x15c),
+                        read_u32(uc, r0 + 0x7dc),
+                        read_u32(uc, r0 + 0x160),
+                    )
+                }
                 "srvstate-get" => {
                     let v = read_u32(uc, r0 + 0x140);
                     let proxy = read_u32(uc, r0 + 0x4c);
+                    // r796: dynamic write-watch on the navsrv server-state
+                    // word [proxy+0xe0] (1 -> 2 without sink broadcast; the
+                    // gate object's cached copy never follows).  Heap moves
+                    // per build, so pin it at first observation.
+                    if proxy != 0 {
+                        static SW: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !SW.swap(true, Ordering::Relaxed) {
+                            let want = (proxy + 0xe0) as u64;
+                            log::warn!(
+                                "PROCHMI navsrv-state watch installed t={}ms word={:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                want,
+                            );
+                            let _ = uc.add_mem_hook(
+                                unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                                want,
+                                want + 3,
+                                move |uc: &mut Unicorn<'_, Context>,
+                                      _t,
+                                      address,
+                                      size,
+                                      value| {
+                                    static WHS: AtomicU32 = AtomicU32::new(0);
+                                    if WHS.fetch_add(1, Ordering::Relaxed) < 12 {
+                                        let lr = uc
+                                            .reg_read(RegisterARM::R14)
+                                            .unwrap_or(0) as u32;
+                                        let pc = uc
+                                            .reg_read(RegisterARM::R15)
+                                            .unwrap_or(0) as u32;
+                                        log::warn!(
+                                            "PROCHMI navsrv-state WRITE t={}ms addr={address:#x} size={size} value={value:#x} pc={pc:#x} lr={lr:#x}",
+                                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                                        );
+                                    }
+                                    true
+                                },
+                            );
+                        }
+                    }
                     format!(
                         " this={r0:#x} +140={v:#x} proxy4c={proxy:#x} e0={:#x}",
                         if proxy != 0 {
@@ -5379,7 +5435,10 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 return 0;
             }
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
-            let state = read_u32(uc, r0.wrapping_add(0xc));
+            // The FSM state word is at +0x30 (switched by `cmp r3,[obj+0x30];
+            // addls pc,pc,r3<<2` at 0x17c73dc).  +0xc is a self back-pointer,
+            // which is why earlier runs printed a constant pointer value.
+            let state = read_u32(uc, r0.wrapping_add(0x30));
             log::warn!(
                 "PROCHMI startup-step t={}ms tid=[{}] proc={r0:#x} state={state}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
@@ -5941,6 +6000,408 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             }
             log::warn!(
                 "PROCHMI {label} t={}ms tid=[{}]",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r795b: the state-6 (0x17c7604) service-availability case in detail.
+    // Its two null guards silently fall back to state 1 (`beq 0x17c7410`):
+    // [server]=obj+0x34 and [server+0xec] (the transfer-msg handler the
+    // navif brings up).  The nine `bl bIsServiceAvailable; cmp r0,#1` sites
+    // gate {0x0a,0x2c,0x1f,0x1e,0x06,lit,0x3c,0x37,0x56}; non-available
+    // services fall to `0x169e308(svc)` (required-check) which decides
+    // between 0x17c745c (abort) and skipping - log each verdict + svc.
+    for (offset, label) in [
+        (0x017c_7604u32, "c6-entry"),
+        (0x017c_760cu32, "c6-guardsrv"),
+        (0x017c_7618u32, "c6-guardec"),
+        (0x017c_7624u32, "c6-svc0a"),
+        (0x017c_764cu32, "c6-svc2c"),
+        (0x017c_7674u32, "c6-svc1f"),
+        (0x017c_769cu32, "c6-svc1e"),
+        (0x017c_76c4u32, "c6-svc06"),
+        (0x017c_76ecu32, "c6-svcLIT"),
+        (0x017c_7714u32, "c6-svc3c"),
+        (0x017c_773cu32, "c6-svc37"),
+        (0x017c_7764u32, "c6-svc56"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:svcgate", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 8 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            log::warn!(
+                "PROCHMI svcgate {label} t={}ms tid=[{}] r0={r0:#x} r1={r1:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r795b: the state-6 -> 7 gate `0x17c2760(sl,&ready)` (bIsHmiReady-
+    // style poll): 0x169e308(0x0a) says service 0x0a required -> path
+    // 0x17c289c wants 0x161f754()!=0 and its [+4] (the iENVI/IDAPI
+    // interface) non-null; NOT-required path iterates the [this+0x58]
+    // sink vector via vfn+0x24 then vfn+0x18.  Log which verdict and
+    // which object is missing.
+    for (offset, label) in [
+        (0x017c_277cu32, "p0-req0a"),
+        (0x017c_27f4u32, "p-false"),
+        (0x017c_2814u32, "p-ret"),
+        (0x017c_28a0u32, "p1-hmiobj"),
+        (0x017c_28b0u32, "p2-iface"),
+        (0x017c_27a4u32, "p3-req06"),
+        (0x017c_27b4u32, "p4-req3c"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:readygate", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 15_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 10
+            {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            log::warn!(
+                "PROCHMI readygate {label} t={}ms tid=[{}] r0={r0:#x} r4={r4:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r795b: dissect bIsCCAServiceRequired (0x169e308).  For svc 0x0a it
+    // returns 1, which drives 0x17c2760 down the branch whose *out byte is
+    // never set (only the req(0x0a)!=1 fall-through writes *out=1 at
+    // 0x17c2808) - so the state-6 -> 7 advance is impossible.  The verdict
+    // comes from either a registry value read (0xfc4780, key name from the
+    // table at anchor+0x2acc08) or the static default byte at anchor+0x98+idx.
+    // Log which source fired and with what value + key name.
+    for (offset, label) in [
+        (0x0169_e3e0u32, "rq-default"),
+        (0x0169_e3bcu32, "rq-cached"),
+        (0x0169_e408u32, "rq-regread"),
+        (0x0169_e40cu32, "rq-regres"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:reqcheck", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 40 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            let key = if label == "rq-regread" {
+                read_cstr(uc, r1, 48)
+            } else {
+                String::new()
+            };
+            // On the registry-return site also dump the out-param [sp+4].
+            let out4 = if label == "rq-regres" {
+                let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                read_u32(uc, sp + 4)
+            } else {
+                0
+            };
+            // At rq-default the `ldrb r0,[r3,#0x98]` has not executed yet;
+            // read the static default byte ourselves (r3 = anchor + idx).
+            let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+            let dflt = if label == "rq-default" {
+                let mut b = [0u8; 1];
+                if uc.mem_read((r3 + 0x98) as u64, &mut b).is_ok() {
+                    b[0]
+                } else {
+                    0xff
+                }
+            } else {
+                0
+            };
+            log::warn!(
+                "PROCHMI reqcheck {label} t={}ms tid=[{}] r0={r0:#x} idx={r4} out4={out4:#x} dflt={dflt} key={key}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r795b: THE decisive site.  The state-6 timeout/second branch
+    // (0x17c7b64) calls vfn+0x24 (0x1719458) on the sub-object at
+    // [iface+0x78] and if it returns != 0 jumps to 0x17c7c18 which sets
+    // state = 9 (bypassing the 0x17c2760 byte gate entirely).  vfn+0x24
+    // dispatches on [obj+4]: state 0 -> lock, vfn+0x38, vfn+0x48 -> r7
+    // (return value!), vfn+0x18; state 1 -> vfn+0x44; state 2 -> r7=1...
+    // Probe the whole decision chain with one page hook (unicorn narrow
+    // hooks are unreliable mid-TB - page dispatch per XP_TARGETS design).
+    for (offset, label) in [
+        (0x017c_7ba4u32, "s9-vfn24res"),
+        (0x0171_9458u32, "v24-entry"),
+        (0x0171_94d4u32, "v24-v48res"),
+        (0x0171_94ecu32, "v24-v18res"),
+        (0x0171_9500u32, "v24-v14res"),
+        (0x0171_955cu32, "v24-ret"),
+        (0x0161_4ce4u32, "bcast-a"),
+        (0x0161_8fa0u32, "bcast-b"),
+        (0x0161_d364u32, "bcast-sinkvfn"),
+        (0x0161_d264u32, "bcast18-sinkvfn"),
+        // r796: the vSvcReady vfn+0x1c event post (to the static FINAVI
+        // object) and the navsrv sink-vector scan decision: 0x161d32c
+        // skips the whole scan when the vector is empty (r4==r2).
+        (0x015e_1a30u32, "svc-post"),
+        (0x015e_1a54u32, "svc-post2"),
+        // r796: the SERVICE_STATE_CHANGED consumer on the CL client object:
+        // r4+0x30 = connected-service handler; null -> event dropped.
+        (0x0138_2cf0u32, "cl-entry"),
+        (0x0138_2d14u32, "cl-have"),
+        (0x0138_2d38u32, "cl-nosvc"),
+        (0x0161_d328u32, "sinkscan-vec"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:s9gate", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 150 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+            let obj = if label == "v24-entry" { r0 } else { r5 };
+            let st = read_u32(uc, obj.wrapping_add(4));
+            let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+            let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+            let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            // r796: the FINAVI vSvcReady event lands on r0's vfn+0x1c;
+            // dump the callee class so the consumer can be disassembled.
+            let spost = if label.starts_with("svc-post") {
+                let vt = read_u32(uc, r0);
+                format!(
+                    " vt={vt:#x} v0={:#x} v18={:#x} v1c={:#x} v20={:#x} byte0={:#x} byte1={:#x}",
+                    read_u32(uc, vt),
+                    read_u32(uc, vt.wrapping_add(0x18)),
+                    read_u32(uc, vt.wrapping_add(0x1c)),
+                    read_u32(uc, vt.wrapping_add(0x20)),
+                    {
+                        let mut b = [0u8; 2];
+                        let _ = uc.mem_read(r0 as u64, &mut b);
+                        b[0]
+                    },
+                    {
+                        let mut b = [0u8; 2];
+                        let _ = uc.mem_read(r0 as u64, &mut b);
+                        b[1]
+                    },
+                )
+            } else if label.starts_with("cl-") {
+                let base = if label == "cl-entry" { r0 } else { r4 };
+                format!(
+                    " clvt={:#x} handler={:#x}",
+                    read_u32(uc, base),
+                    read_u32(uc, base.wrapping_add(0x30)),
+                )
+            } else {
+                String::new()
+            };
+            log::warn!(
+                "PROCHMI s9gate {label} t={}ms tid=[{}] r0={r0:#x} r1={r1:#x} obj={obj:#x} obj+4={st} r7={r7:#x} r3={r3:#x} r4={r4:#x}{spost}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r795b: the state-6 gate's interface round-trip: iface = [[0x3a23eb8
+    // +4]+4]; vfn+0x24 -> r8, vfn+0x18 -> gate pass, and the state-7 body
+    // (0x17c7908) first calls vfn+0x1c (cmp #1).  Log the three results and
+    // the iface vtable.
+    for (offset, label) in [
+        (0x017c_28ccu32, "g-vfn24"),
+        (0x017c_28e4u32, "g-vfn18"),
+        (0x0161_fb60u32, "g-limnull"),
+        (0x0161_fb70u32, "g-lim-plusc"),
+        (0x0161_fb8cu32, "g-lim-2f570"),
+        (0x0162_09b4u32, "g-lim-sub"),
+        (0x0162_f598u32, "g-lim-d3b0"),
+        (0x0162_f590u32, "g-srv24"),
+        (0x0162_f5a0u32, "g-srv-ok"),
+        (0x0162_f5a4u32, "g-srv-fail"),
+        (0x017c_7918u32, "g7-vfn1c"),
+        (0x017c_7938u32, "g7-vfn18res"),
+        (0x017c_7954u32, "g7-byte"),
+    ] {
+        let address = base_address + offset - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:envigate", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 15_000
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 120
+            {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r8 = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+            let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            // 0x165a900 returns [[holder+4]]-deref chain: the CALLEE object
+            // is [r4+4], its vtable is the word there - not [r4] (holder's
+            // own vtable), which is what earlier runs printed.
+            let obj = read_u32(uc, r4.wrapping_add(4));
+            let vt = read_u32(uc, obj);
+            // r795b: heap objects shift between builds, so pin the gate
+            // word dynamically: on the first inner vfn+0x18 observation,
+            // attach a write-watch to [obj+4] (the state byte 0x166c0d0
+            // compares against 2) and log every writer with PC/LR.
+            if label == "g-vfn18" && obj != 0 {
+                static WATCHED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WATCHED.swap(true, Ordering::Relaxed) {
+                    let word = obj.wrapping_add(4);
+                    let want = (word - 0x100) as u64;
+                    let cur = read_u32(uc, word);
+                    log::warn!(
+                        "PROCHMI envigate gate-watch installed t={}ms word={:#x} cur={cur}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        word,
+                    );
+                    let _ = uc.add_mem_hook(
+                        unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                        want,
+                        want + 0x200 - 1,
+                        move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                            static WH: AtomicU32 = AtomicU32::new(0);
+                            if WH.fetch_add(1, Ordering::Relaxed) < 40 {
+                                let lr =
+                                    uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                                let pc =
+                                    uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                                log::warn!(
+                                    "PROCHMI envigate gate-watch WRITE t={}ms addr={address:#x} size={size} value={value:#x} pc={pc:#x} lr={lr:#x}",
+                                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                                );
+                            }
+                            true
+                        },
+                    );
+                }
+            }
+            // At the state-6 caller: the ready byte lives at [sp+0x27]
+            // before `ldrb r3,[sp,#0x27]` executes.
+            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+            let rdy = if label == "g7-byte" {
+                let mut b = [0u8; 1];
+                if uc.mem_read((sp + 0x27) as u64, &mut b).is_ok() {
+                    b[0]
+                } else {
+                    0xff
+                }
+            } else {
+                0
+            };
+            // r796: LIM verdict chain - 0x162d3b0 = [[x+0xac]+0x4c],
+            // 0x162d3a0 = [[x+0xac]+0x54].  At the g-srv/g-lim sites r0 is
+            // the hmi singleton; dump its sub-object fields.
+            let sub = read_u32(uc, r0.wrapping_add(0xac));
+            log::warn!(
+                "PROCHMI envigate {label} t={}ms tid=[{}] r0={r0:#x} r8={r8:#x} rdy={rdy} holder={r4:#x} obj={obj:#x} vt={vt:#x} v18={:#x} v1c={:#x} v24={:#x} hmi+0xc={:#x} hmi+0x24={:#x} sub={sub:#x} s4c={:#x} s54={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                read_u32(uc, vt.wrapping_add(0x18)),
+                read_u32(uc, vt.wrapping_add(0x1c)),
+                read_u32(uc, vt.wrapping_add(0x24)),
+                read_u32(uc, r0.wrapping_add(0xc)),
+                read_u32(uc, r0.wrapping_add(0x24)),
+                read_u32(uc, sub.wrapping_add(0x4c)),
+                read_u32(uc, sub.wrapping_add(0x54)),
+            );
+            0
+        });
+    }
+    // r795b: the two stale fixed-address page watches on the gate word were
+    // replaced by the dynamic gate-watch installed inside the envigate
+    // probe above (heap addresses shift between builds, static addresses
+    // went stale).
+    // r796: trap vOnUpdateEnaviServerState (0x15f48a4: `str r1,[r0,#4]` +
+    // singleton vfn+0 notify).  If the READY(2) call for the gate object
+    // never appears here, the producer of that transition is elsewhere.
+    {
+        let address = base_address + 0x015f_48a4u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:srvsetter", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 60 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+            let mut bt = String::new();
+            for i in 0..10u32 {
+                let w = read_u32(uc, sp.wrapping_add(i * 4));
+                if (0x00fb_7080..0x023b_eb1b).contains(&w) {
+                    bt.push_str(&format!(" {w:#x}"));
+                }
+            }
+            log::warn!(
+                "PROCHMI srvsetter t={}ms tid=[{}] obj={r0:#x} state={r1:#x} lr={lr:#x} bt:{bt}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+    // r795b: the FINAVI singleton globals.  0x15e1954 (vSvcReady, run 12x)
+    // aborts at `finavi=[global]` null-guard - both singleton slots
+    // (0x2a1ce78 via the 0x14b9148 getter, 0x2628d0c for 0x15e1954 itself)
+    // are 0, so the server-READY propagation that sets the state-6 gate
+    // word ([0x3a23f5c]==2) dies.  Watch both slots: whoever must store the
+    // FINAVI object will show up with PC; zero hits = the creating path
+    // never ran.
+    {
+        for (lo, hi, want, tag) in [
+            (0x02a1_c000u64, 0x02a1_cfffu64, 0x02a1_ce78u32, "getter-slot"),
+            (0x02a1_b000u64, 0x02a1_bfffu64, 0x02a1_be8cu32, "svc-slot"),
+        ] {
+            unicorn
+                .add_mem_hook(
+                    unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                    lo,
+                    hi,
+                    move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                        static HITS: AtomicU32 = AtomicU32::new(0);
+                        if address as u32 == want
+                            && HITS.fetch_add(1, Ordering::Relaxed) < 8
+                        {
+                            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                            log::warn!(
+                                "PROCHMI finavi-global WRITE {tag} t={}ms value={value:#x} size={size} lr={lr:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                            );
+                        }
+                        true
+                    },
+                )
+                .unwrap();
+        }
+    }
+    // r795b: trap the READY setter (0x166c104: `str #2,[r0,#4]`) - it lives
+    // at vfn+0x34 of ~200 state-proxy classes.  Log every object that ever
+    // reaches READY and the caller, to find which trigger is missing for
+    // the inner gate object 0x3a23f58 (vfn+0x18 on it gates state 6 -> 7).
+    {
+        let address = base_address + 0x0166_c104u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:ready-setter", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 60 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            let vt = read_u32(uc, r0);
+            log::warn!(
+                "PROCHMI ready-setter t={}ms tid=[{}] obj={r0:#x} vt={vt:#x} lr={lr:#x}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
                 uc.get_data().inner.thread_id(),
             );
