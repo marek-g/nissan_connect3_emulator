@@ -6337,9 +6337,21 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // payloads), the rest get a minimal ServiceData push.
                 // All of it is logged; EMU_FAKE_SENSORFI=0 / 
                 // EMU_FAKE_FI_READY_PUSH=0 disable the legs.
-                if *label == "conf-store" && st == 0 {
-                    let ordinal =
-                        (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff) as u16;
+                let ordinal =
+                    (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff) as u16;
+                // r798b: answer re-registrations too.  A CL entry whose
+                // first answer got stolen (or raced) re-sends RegisterConf
+                // with a NEW ordinal via the vfn+0x24 state-1 leg, whose
+                // 0x1719cf0 store sees st==1; answering only st==0 left
+                // seven of the eight state-6 members READY-starved forever
+                // (f239 g-list-mem: only mem[1] ever won).  One push per
+                // (service, ordinal) still bounds the traffic, and a READY
+                // entry stops re-driving (the state-2 leg never re-sends).
+                if *label == "conf-store" && (st == 0 || st == 1) {
+                    // r798b: ordinal 0 stays answerable: two svc-0x06
+                    // members register with it (f240) and only a key-0 push
+                    // can complete them; a wrong-key match is a no-op in the
+                    // completer (f232: keys 0x11..0x1e all inert).
                     if svc == 0x000a {
                         static DEFERRED: AtomicU32 = AtomicU32::new(0);
                         if DEFERRED.fetch_add(1, Ordering::Relaxed) == 0 {
@@ -6352,18 +6364,44 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             crate::libs::libosal_linux::message::fabricate_fi_data_request(
                                 uc, 0x000a, ordinal,
                             );
+                            // r798b: the request leg depends on the parked
+                            // tid-84 reader of mbx_21; also post the server
+                            // answer directly (pump queue first, see
+                            // message.rs) so the gate completion (and the
+                            // FI-event kick it doubles as) does not depend
+                            // on it (f235: request never consumed, state 6
+                            // forever).
+                            let route =
+                                crate::libs::libosal_linux::message::push_gps_answer(
+                                    uc, ordinal,
+                                );
+                            log::info!(
+                                "[LIBOSAL-MBX] gate svc 0x000a txn {ordinal}: direct GpsDataStatus answer route {route}"
+                            );
                         }
-                    } else if matches!(svc, 0x001e | 0x0018 | 0x001f | 0x002c | 0x000d | 0x0300) {
+                    } else if matches!(svc, 0x0006 | 0x001e | 0x0018 | 0x001f | 0x002c | 0x000d | 0x0300) {
                         // one push per (service, transaction ordinal); a
                         // re-registration gets a new ordinal and is answered
                         // anew, repeats of the same transaction are not.
+                        // r798: DAPI's GENUINE svc-0x06 (DAP_RESINF) answers
+                        // do reach the completer and dispatch (f232: key=1
+                        // at 26926ms) but carry events 0x80000215/218/00e,
+                        // which route to the app data receiver, never to the
+                        // entry-completion leg; only event=0 (what the
+                        // pump's 0xfb8f50 conversion yields for the minimal
+                        // push shape) drove the gate's READY store.  The
+                        // startup entry therefore needs its own event-0
+                        // completion like the other unhosted confs.
                         static ANSWERED: std::sync::OnceLock<
-                            std::sync::Mutex<std::collections::HashSet<(u16, u16)>>,
+                            std::sync::Mutex<std::collections::HashSet<(u16, u16, u32)>>,
                         > = std::sync::OnceLock::new();
                         let set = ANSWERED.get_or_init(Default::default);
+                        // r798b: keyed by ENTRY too - f240 saw two svc-0x06
+                        // members register with transaction 0, and a
+                        // (svc, ordinal) dedup left one of them starved.
                         let fresh = set
                             .lock()
-                            .map(|mut s| s.insert((svc as u16, ordinal)))
+                            .map(|mut s| s.insert((svc as u16, ordinal, entry)))
                             .unwrap_or(true);
                         if fresh {
                             log::warn!(
@@ -6450,7 +6488,11 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 } else if label == "post8" {
                     let q = read_u32(uc, r0.wrapping_add(8));
                     let w1 = read_u32(uc, r1.wrapping_add(4));
+                    let w2 = read_u32(uc, r1.wrapping_add(8));
                     let w3 = read_u32(uc, r1.wrapping_add(0xc));
+                    // r798b: keep the live [1, slot, w2, w3] shape so host
+                    // completion pushes can be byte-identical (message.rs).
+                    crate::libs::libosal_linux::message::note_pump_post_shape(w2, w3);
                     log::warn!(
                         "PROCHMI pumptrace {label} t={}ms tid=[{}] queue={q:#x} w1={w1:#x} w3={w3:#x} lr={lr:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
@@ -6687,6 +6729,42 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             crate::libs::dapi::emu_t0_elapsed_ms(),
                         );
                     }
+                    // r798: the state-6 body only re-evaluates the gate when
+                    // an enavi-server status event re-ticks its handler
+                    // (f232: the 6->7 advance ran ~4 s AFTER the READY store,
+                    // kicked by a GpsDataStatus event2app; f233: the store
+                    // landed 211 ms after the LAST burst event and the FSM
+                    // sat in state 6 forever).  Every 1 -> READY(2) transition
+                    // of the gate word therefore fires one fabricated
+                    // SENSORFI request whose genuine GpsDataStatus answer
+                    // supplies the kick.  A high dummy ordinal keeps it out
+                    // of the completer (unmatched keys are no-ops, f232:
+                    // 0x11..0x1e).  EMU_FAKE_SENSORFI=0 disables.
+                    if address == word as u64 && value == 2 {
+                        static KICK: AtomicU32 = AtomicU32::new(0);
+                        if KICK.fetch_add(1, Ordering::Relaxed) < 3 {
+                            // r798b: the fabricated REQUEST path is unreliable
+                            // here - mbx_21's only reader is the same tid-84
+                            // enConnect loop that is often parked (f235: the
+                            // request was never consumed, the gate never
+                            // opened).  Post the server-side answer directly:
+                            // identical body shape to the responder's, so the
+                            // pump converts it to the same 0x81008114 FI event
+                            // whose tid-50 handler re-ticks the startup FSM.
+                            // pump queue (see message.rs), so the kick does
+                            // not depend on the mbx_289 receive race.
+                            let route =
+                                crate::libs::libosal_linux::message::push_gps_answer(
+                                    uc, 0x5aa5,
+                                );
+                            if route != "none" {
+                                log::warn!(
+                                    "PROCHMI gate-kick: gate stored READY(2), posted a GpsDataStatus-shaped answer via {route} so its FI event re-ticks the enavi-status handler t={}ms (EMU_FAKE_SENSORFI=0 disables)",
+                                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                                );
+                            }
+                        }
+                    }
                     true
                 },
             );
@@ -6726,6 +6804,31 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
     for (offset, label) in [
         (0x017c_28ccu32, "g-vfn24"),
         (0x017c_28e4u32, "g-vfn18"),
+        // r797b: reached only when the inner vfn+0x18 returned != 0; r8 =
+        // the vfn+0x24 result that the helper turns into the ready byte.
+        (0x017c_2910u32, "g-lic"),
+        // r798b: helper 0x17c2760 has flag-query legs (0x169e308 = feature
+        // membership in a lazily built 16-entry u16 list) and a second
+        // object leg (0x17c2920) that reach the byte-0 exit 0x17c2814 even
+        // when the gate itself is READY; f237 saw g-lic with r8=1 yet the
+        // byte never became 1.  Log every leg result.
+        (0x017c_277cu32, "g-fla"),
+        (0x017c_27a4u32, "g-fl6"),
+        (0x017c_27b4u32, "g-fl3c"),
+        (0x017c_2800u32, "g-fl3cb"),
+        (0x017c_27d4u32, "g-s30"),
+        (0x017c_281cu32, "g-list"),
+        (0x017c_2920u32, "g-leg920"),
+        (0x017c_2960u32, "g-v18b"),
+        (0x017c_2808u32, "g-byte1"),
+        (0x017c_284cu32, "g-m24"),
+        (0x017c_2880u32, "g-m18"),
+        // r798b: the navsrv connector's mbx_289 receive (0x17cb574) silently
+        // drops every message whose content is null or whose content[+0xb]
+        // != 0x45 (r0=1 -> caller waits again: popped and lost).  Observe
+        // the filter decisions to find where the completion pushes die.
+        (0x017c_b5ecu32, "f-accept"),
+        (0x017c_b5f8u32, "f-drop"),
         (0x0161_fb60u32, "g-limnull"),
         (0x0161_fb70u32, "g-lim-plusc"),
         (0x0161_fb8cu32, "g-lim-2f570"),
@@ -6737,12 +6840,43 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         (0x017c_7918u32, "g7-vfn1c"),
         (0x017c_7938u32, "g7-vfn18res"),
         (0x017c_7954u32, "g7-byte"),
+        // r797b: state-8 body = per-entry scan of the list at [hmi+0x24]
+        // (0x169e02c = iterator next; 0x1614d8c = per-entry state query,
+        // result 2 == OK).  Log both results (r0 at these sites is exactly
+        // the value consumed by the `mov r8/r5, r0` that follows).
+        (0x017c_7830u32, "s8-next"),
+        (0x017c_7840u32, "s8-item"),
+        (0x0161_4d9cu32, "s8-found"),
+        // r798: the *real* state-8 body is 0x17c78bc (jump table base
+        // 0x17c73e8 + 8*4 = 0x17c7408 -> b 0x17c78bc); the scan body above
+        // (0x17c77c0) is state 7 and its list-exhausted leg 0x17c7a6c
+        // stores 8 only when [sl+0x50] != 1, else 9.  Body 8 polls the
+        // readiness pointer [sl+0x4c] (byte != 0 -> 0x17c7b64) and falls
+        // through to a [sl+0x34] check; body 9 (0x17c746c) calls 0x17c6330
+        // and stores 0 (startup finished) when [sp+0x27] == 1.
+        (0x017c_78ccu32, "s8b-4c"),
+        (0x017c_78bcu32, "s8b-in"),
+        (0x017c_7b64u32, "s8b-rdy"),
+        (0x017c_747cu32, "s9-chk"),
+        // r798: inside 0x17c2a64 (state-8 readiness-by-name query):
+        // 0x17c2ab0 = right after `bl 0x1614dac` (found && 0x171fcf4 == 1),
+        // 0x17c2ac4 = after `bl 0x1614d8c` (legacy query, 3 -> ready).
+        // r4 = list, r5 = name string pointer.
+        (0x017c_2ab0u32, "s8q-dac"),
+        (0x017c_2ac4u32, "s8q-d8c"),
+        // r798: the three virtual calls of the state-8 ready leg; r0 at
+        // each is the value the following cmp consumes.  0x17c7c18 is the
+        // `str #9` store itself.
+        (0x017c_7ba4u32, "s8-v24"),
+        (0x017c_7bf8u32, "s8-v24b"),
+        (0x017c_7c10u32, "s8-v18"),
+        (0x017c_7c18u32, "s8-to9"),
     ] {
         let address = base_address + offset - ORIGINAL_BASE;
         crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:envigate", move |uc: &mut Unicorn<'_, Context>| {
             static HITS: AtomicU32 = AtomicU32::new(0);
             if crate::libs::dapi::emu_t0_elapsed_ms() < 15_000
-                || HITS.fetch_add(1, Ordering::Relaxed) >= 120
+                || HITS.fetch_add(1, Ordering::Relaxed) >= 4000
             {
                 return 0;
             }
@@ -6804,6 +6938,288 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             } else {
                 0
             };
+            if label.starts_with("s8-") {
+                // r7 = sp+0x1c: the iterator's out slot ([r7] = current item
+                // word, [r7+4] = iterator flag word), [sp+0x14] = list root.
+                let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                let sp14 = read_u32(uc, sp.wrapping_add(0x14));
+                let item = read_u32(uc, r7);
+                log::warn!(
+                    "PROCHMI envigate {label} t={}ms tid=[{}] res={r0:#x} item={item:#x} list={sp14:#x} r8={r8:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                );
+            }
+            if label == "f-accept" || label == "f-drop" {
+                // f-accept: r3 = content pointer before the +0xb test.
+                // f-drop: r3 = the class byte (class leg) or 0 (null-content
+                // leg) on the r0=1 "popped and ignored" return.
+                let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let (cls, svc, txn) = if r3 > 0x10000 {
+                    (
+                        read_u32(uc, r3.wrapping_add(0xb)) & 0xff,
+                        read_u32(uc, r3.wrapping_add(0x14)) & 0xffff,
+                        read_u32(uc, r3.wrapping_add(0x1c)) & 0xffff,
+                    )
+                } else {
+                    (r3, 0xffff, 0xffff)
+                };
+                log::warn!(
+                    "PROCHMI envigate {label} t={}ms tid=[{}] r3={r3:#x} cls={cls:#x} svc={svc:#06x} txn={txn}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                );
+            }
+            if label.starts_with("g-fl")
+                || label == "g-s30"
+                || label == "g-list"
+                || label == "g-leg920"
+                || label == "g-v18b"
+                || label == "g-byte1"
+                || label == "g-m24"
+                || label == "g-m18"
+            {
+                // r6 = sl (the startup-FSM object, moved at 0x17c2770);
+                // [sl+0x58..0x5c] is the member list of the 0x17c281c leg.
+                let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                let l58 = read_u32(uc, r6.wrapping_add(0x58));
+                let l5c = read_u32(uc, r6.wrapping_add(0x5c));
+                let mem = if label == "g-m18" || label == "g-m24" {
+                    let m = read_u32(uc, r4);
+                    format!(
+                        " m={m:#x} st4={} v18={:#x}",
+                        read_u32(uc, m.wrapping_add(4)),
+                        read_u32(uc, read_u32(uc, m).wrapping_add(0x18))
+                    )
+                } else {
+                    String::new()
+                };
+                log::warn!(
+                    "PROCHMI envigate {label} t={}ms tid=[{}] r0={r0:#x} r4={r4:#x} r5={r5:#x} r8={r8:#x} sl={r6:#x} l58={l58:#x} l5c={l5c:#x}{mem}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                );
+                if label == "g-list" {
+                    // per tick only the FIRST non-ready member's vfn+0x18
+                    // aborts the leg, so name every member up front: entry,
+                    // class vtable, state word, service, getter.
+                    let mut p = l58;
+                    let mut i = 0u32;
+                    while p != l5c && i < 12 {
+                        let w = read_u32(uc, p);
+                        let vt = read_u32(uc, w);
+                        log::warn!(
+                            "PROCHMI envigate g-list-mem[{i}] t={}ms slot={p:#x} entry={w:#x} vt={vt:#x} st4={} svc={:#x} v18={:#x} v24={:#x}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            read_u32(uc, w.wrapping_add(4)),
+                            read_u32(uc, w.wrapping_add(0x20)) & 0xffff,
+                            read_u32(uc, vt.wrapping_add(0x18)),
+                            read_u32(uc, vt.wrapping_add(0x24)),
+                        );
+                        i += 1;
+                        p = p.wrapping_add(4);
+                    }
+                }
+            }
+            if label == "s8b-in" || label == "s8b-4c" || label == "s8b-rdy"
+                || label == "s9-chk"
+                || label.starts_with("s8q-")
+                || label.starts_with("s8-v")
+                || label == "s8-to9"
+            {
+                // r798: state-8/9 body observation.  `sl` (R10) is the
+                // startup-FSM object the switch at 0x17c73dc works on.
+                let sl = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
+                let state = read_u32(uc, sl.wrapping_add(0x30));
+                let f34 = read_u32(uc, sl.wrapping_add(0x34));
+                let p4c = read_u32(uc, sl.wrapping_add(0x4c));
+                let b4c = if p4c != 0 {
+                    let mut b = [0u8; 1];
+                    if uc.mem_read(p4c as u64, &mut b).is_ok() {
+                        b[0]
+                    } else {
+                        0xff
+                    }
+                } else {
+                    0xfe
+                };
+                let mut b50 = [0u8; 1];
+                if uc.mem_read(sl.wrapping_add(0x50) as u64, &mut b50).is_err() {
+                    b50[0] = 0xff;
+                }
+                let b50b = b50[0];
+                let rdy27 = if label == "s9-chk" {
+                    let mut b = [0u8; 1];
+                    if uc.mem_read((sp + 0x27) as u64, &mut b).is_ok() {
+                        b[0]
+                    } else {
+                        0xff
+                    }
+                } else {
+                    0xfe
+                };
+                // r798: the readiness name the state-8 query searches for
+                // (r5 inside 0x17c2a64) plus the [sl+0x48] word.
+                let mut nm = String::new();
+                for p in [
+                    uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32,
+                    read_u32(uc, sl.wrapping_add(0x48)),
+                    p4c,
+                ] {
+                    if p == 0 {
+                        continue;
+                    }
+                    let mut buf = [0u8; 24];
+                    if let Ok(()) = uc.mem_read(p as u64, &mut buf) {
+                        let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+                        if end >= 3 && buf[..end].iter().all(|c| c.is_ascii_graphic()) {
+                            nm.push_str(&format!(
+                                " \"{}\"",
+                                String::from_utf8_lossy(&buf[..end])
+                            ));
+                        }
+                    }
+                }
+                let w48 = read_u32(uc, sl.wrapping_add(0x48));
+                // The ready-leg virtual calls target the object at
+                // [sl+0x74] (0x17c2430) and its +0x78 sub-object.
+                let f74 = read_u32(uc, sl.wrapping_add(0x74));
+                let vt74 = read_u32(uc, f74);
+                let s78 = read_u32(uc, f74.wrapping_add(0x78));
+                let vt78 = read_u32(uc, s78);
+                let v18t = read_u32(uc, vt74.wrapping_add(0x18));
+                let v24t = read_u32(uc, vt74.wrapping_add(0x24));
+                // r798: the entry words of the [sl+0x74] gate-class object:
+                // +0x04 is the state the 0x166c0d0 getter compares to 2,
+                // +0x08..+0x2c hold the registration identity.
+                let mut ew = String::new();
+                for i in (0..0x30u32).step_by(4) {
+                    ew.push_str(&format!(
+                        " +{i:#x}={:#x}",
+                        read_u32(uc, f74.wrapping_add(i))
+                    ));
+                }
+                log::warn!(
+                    "PROCHMI envigate {label} t={}ms tid=[{}] sl={sl:#x} state={state} f34={f34:#x} p4c={p4c:#x} b4c={b4c} b50={b50b} w48={w48:#x} r0={r0:#x} rdy27={rdy27} f74={f74:#x} vt74={vt74:#x} s78={s78:#x} vt78={vt78:#x} v18t={v18t:#x} v24t={v24t:#x}{ew}{nm}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                );
+                // Whoever sets b4c/b50 organically is the producer we are
+                // missing; watch the whole FSM object page for writes into
+                // its header fields (offsets 0x2c..0x5c).
+                if label == "s8b-in" && sl != 0 {
+                    static SLWATCH: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !SLWATCH.swap(true, Ordering::Relaxed) {
+                        let want = sl & !0xfff;
+                        log::warn!(
+                            "PROCHMI envigate fsm-watch installed t={}ms sl={sl:#x}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                        );
+                        let _ = uc.add_mem_hook(
+                            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                            want as u64,
+                            want as u64 + 0xfff,
+                            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                                static WH: AtomicU32 = AtomicU32::new(0);
+                                let off = address.wrapping_sub((sl & !0xfff) as u64) as u32;
+                                if (0x2c..0x5c).contains(&off)
+                                    && WH.fetch_add(1, Ordering::Relaxed) < 40
+                                {
+                                    let lr = uc
+                                        .reg_read(RegisterARM::R14)
+                                        .unwrap_or(0) as u32;
+                                    let pc = uc
+                                        .reg_read(RegisterARM::R15)
+                                        .unwrap_or(0) as u32;
+                                    log::warn!(
+                                        "PROCHMI fsm-watch WRITE t={}ms sl+{off:#x} size={size} value={value:#x} pc={pc:#x} lr={lr:#x}",
+                                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                                    );
+                                }
+                                true
+                            },
+                        );
+                    }
+                }
+            }
+            if label == "s8-found" && r0 != 0 {
+                // right after `bl 0x1613ac4` in 0x1614d8c: r0 = the found
+                // connection object whose +0x88 state 0x171fd7c switches on
+                // (2 is served from +0x80 in states 4/7).  Dump its vtable,
+                // the state words and the 3 entries of the +0x98/+0x9c
+                // vector (8-byte elements), resolving any ASCII names.
+                let vt = read_u32(uc, r0);
+                let (b0, e0) = (read_u32(uc, r0.wrapping_add(0x98)), read_u32(uc, r0.wrapping_add(0x9c)));
+                let mut entries = String::new();
+                let mut a = b0;
+                while a < e0 && a.wrapping_sub(b0) < 0x60 {
+                    let w0 = read_u32(uc, a);
+                    let w1 = read_u32(uc, a.wrapping_add(4));
+                    let name = |p: u32| -> String {
+                        if !(0x8000..0xf000_0000).contains(&p) {
+                            return String::new();
+                        }
+                        let mut buf = [0u8; 24];
+                        match uc.mem_read(p as u64, &mut buf) {
+                            Ok(()) => {
+                                let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+                                let s = &buf[..end];
+                                if s.len() >= 3 && s.iter().all(|c| c.is_ascii_graphic()) {
+                                    String::from_utf8_lossy(s).into_owned()
+                                } else {
+                                    String::new()
+                                }
+                            }
+                            Err(_) => String::new(),
+                        }
+                    };
+                    let n0 = name(w0);
+                    let n1 = name(w1);
+                    let s0 = if n0.is_empty() { String::new() } else { format!(" \"{n0}\"") };
+                    let s1 = if n1.is_empty() { String::new() } else { format!(" \"{n1}\"") };
+                    entries.push_str(&format!(
+                        "[{a:#x}]={w0:#x}{s0}{w1:#x}{s1} "
+                    ));
+                    a += 8;
+                }
+                log::warn!(
+                    "PROCHMI envigate {label} t={}ms tid=[{}] obj={r0:#x} vt={vt:#x} +0x80={:#x} +0x88={:#x} vec=[{b0:#x},{e0:#x}] {entries}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    read_u32(uc, r0.wrapping_add(0x80)),
+                    read_u32(uc, r0.wrapping_add(0x88)),
+                );
+                // r797b: this is the "/dev/cryptcard" readiness object the
+                // state-8 body polls; whoever advances +0x88 (0 -> 3 with
+                // +0x80 = 1 makes 0x171fd7c return READY) unblocks the
+                // startup FSM.  Watch both state words live.
+                static CARDWATCH: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !CARDWATCH.swap(true, Ordering::Relaxed) {
+                    let want = r0.wrapping_add(0x80) & !0xff;
+                    let _ = uc.add_mem_hook(
+                        unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                        want as u64,
+                        want as u64 + 0x1ff,
+                        move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                            static WH: AtomicU32 = AtomicU32::new(0);
+                            if WH.fetch_add(1, Ordering::Relaxed) < 30 {
+                                let lr =
+                                    uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                                let pc =
+                                    uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                                log::warn!(
+                                    "PROCHMI cryptcard-state WRITE t={}ms addr={address:#x} size={size} value={value:#x} pc={pc:#x} lr={lr:#x}",
+                                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                                );
+                            }
+                            true
+                        },
+                    );
+                }
+            }
             // r796: LIM verdict chain - 0x162d3b0 = [[x+0xac]+0x4c],
             // 0x162d3a0 = [[x+0xac]+0x54].  At the g-srv/g-lim sites r0 is
             // the hmi singleton; dump its sub-object fields.
@@ -9403,8 +9819,16 @@ fn fake_cryptcard_into_idapi(unicorn: &mut Unicorn<'_, Context>) {
     }
     // card: vtable, +0x58 -> vtable (search reads [entry+0x58] then calls
     // [vtable+0x24]), +0x80 status must be 0 or 2 for 0x171fcf4 to scan the
-    // record vector (2 = the "answered" state), +0x88 state enum 0 (the
-    // 0x171fd7c table returns 1 for it), +0x98/+0x9c record vector.
+    // record vector (2 = the "answered" state), +0x98/+0x9c record vector.
+    // r798: +0x88 state enum = 3.  The state-8 body (0x17c7b64 leg) queries
+    // this card BY NAME through 0x17c2a64 -> 0x1614d8c and treats result 3
+    // as READY (f228: the name string at sl+0x48 is "/dev/cryptcard", the
+    // 0x1614dac leg already answers 1, only the 0x1614d8c answer 0 blocked
+    // it).  With +0x80 == 2, slot 3 of the 0x171fd7c table scans the record
+    // vector - the same predicate 0x171fcf4 already satisfies - and returns
+    // 3.  The state-7 scan treats any res != 2 as "scan continues", so 0
+    // and 3 follow the identical list-exhausted leg 0x17c7a6c (res == 2,
+    // i.e. +0x88 == 7, pinned state 7: f226).
     // r791q: the idapi media broadcast (svc-0x06 ServiceStatus -> IDAPI
     // media branch -> ActionReq::vMarkMediaStateOfDeviceUnknown 0x1720458)
     // virtually calls vtable slot +0x38 on every vector entry and feeds the
@@ -9426,7 +9850,7 @@ fn fake_cryptcard_into_idapi(unicorn: &mut Unicorn<'_, Context>) {
         && write_u32(unicorn, vtbl + 0x7c, NAME_MATCH)
         && write_u32(unicorn, card + 0x58, vtbl)
         && write_u32(unicorn, card + 0x80, 2)
-        && write_u32(unicorn, card + 0x88, 0)
+        && write_u32(unicorn, card + 0x88, 3)
         && write_u32(unicorn, card + 0x98, rec)
         && write_u32(unicorn, card + 0x9c, rec + 24);
     // record: +0x04 = status value reported to the caller (1 = card ready),

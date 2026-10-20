@@ -44,6 +44,36 @@ pub(crate) fn finish_guest_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, no
         if message.is_some() || deadline.map(|deadline| deadline <= now).unwrap_or(false) {
             state.mq.remove_waiter(queue_id, tid);
         }
+        // r798 diagnostic: parked waiter vs queue contents (the tid-84
+        // mbx_289 stall: posts report success yet this pop returns None).
+        if message.is_none()
+            && deadline.is_none()
+            && state
+                .mq
+                .queues
+                .get(&queue_id)
+                .map(|x| x.name == "mbx_289")
+                .unwrap_or(false)
+            && crate::libs::dapi::emu_t0_elapsed_ms() % 4000 < 300
+        {
+            static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let bucket = (crate::libs::dapi::emu_t0_elapsed_ms() / 4000) as u32;
+            if LAST.swap(bucket, std::sync::atomic::Ordering::Relaxed) != bucket {
+                let q = state.mq.queues.get(&queue_id);
+                log::info!(
+                    "[{tid}] osal-wait recheck q={queue_id} name={:?} pending={} msgsize={} maxmsg={} unlinked={} this_msgsize={}",
+                    q.as_ref().map(|x| x.name.clone()),
+                    q.as_ref().map(|x| x.messages.len()).unwrap_or(usize::MAX),
+                    q.as_ref().map(|x| x.msgsize).unwrap_or(-1),
+                    q.as_ref().map(|x| x.maxmsg).unwrap_or(-1),
+                    q.as_ref().map(|x| x.unlinked).unwrap_or(true),
+                    q.as_ref()
+                        .and_then(|x| x.messages.first())
+                        .map(|m| m.data.len())
+                        .unwrap_or(usize::MAX),
+                );
+            }
+        }
         message
     };
 

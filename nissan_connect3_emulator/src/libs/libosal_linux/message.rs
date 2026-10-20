@@ -2516,8 +2516,138 @@ pub fn cca_post_deferred_status(
 /// opened with ordinal 3) is carried at request +0x1c and echoed.  Client-
 /// side fabrication (the request), server-side answer produced by our
 /// existing emulated provider; `EMU_FAKE_SENSORFI=0` kills both.
-pub fn fabricate_fi_data_request(unicorn: &mut Unicorn<'_, Context>, service: u16, key: u16) {
+/// r798b: the GpsDataStatus-shaped server answer body (identical field
+/// layout to `cca_server_answer_sensorfi_data_request`'s payload) exposed
+/// for the startup-FSM gate-kick, which must not rely on the request leg
+/// (mbx_21's reader is the parked tid-84 enConnect loop).
+pub fn gps_data_status_answer_body(key: u16) -> Vec<u8> {
+    let payload = crate::libs::procnav::gps_wire_body();
+    let mut body = vec![0u8; 0x20 + payload.len()];
+    let total_len = body.len() as u32;
+    body[0..2].copy_from_slice(&0x0015u16.to_le_bytes()); // src SENSORFI
+    body[2..4].copy_from_slice(&0x0121u16.to_le_bytes()); // dst navi srv
+    body[4..8].copy_from_slice(&total_len.to_le_bytes());
+    body[8..10].copy_from_slice(&2u16.to_le_bytes());
+    body[0xb] = 0x45;
+    body[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
+    // The HSI-NAV client forwards the msgid as the FI event id verbatim
+    // (r757 note), so carry the genuine GpsDataStatus event id here.
+    body[0x10..0x14].copy_from_slice(&0x8100_8114u32.to_le_bytes());
+    body[0x14..0x16].copy_from_slice(&0x000au16.to_le_bytes());
+    stamp_registration_id("mbx_289", &mut body);
+    body[0x18..0x1a].copy_from_slice(&0x0f02u16.to_le_bytes()); // GpsDataStatus
+    body[0x1a] = 9; // server OPTYPE
+    body[0x1b] = 1;
+    body[0x1c..0x1e].copy_from_slice(&key.to_le_bytes());
+    body[0x20..].copy_from_slice(&payload);
+    body
+}
+
+/// Post an already-built body to mbx_289 as an 8-byte-prefixed blob with
+/// waiter notification (the responder's delivery leg, factored out).
+/// `EMU_FAKE_SENSORFI=0` disables.
+pub fn push_blob_to_mbx_289(unicorn: &mut Unicorn<'_, Context>, body: Vec<u8>) -> bool {
     if std::env::var_os("EMU_FAKE_SENSORFI").is_some_and(|v| v == "0") {
+        return false;
+    }
+    let mut blob = Vec::with_capacity(8 + body.len());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&body);
+    let mut state = unicorn.get_data().namespace.lock().unwrap();
+    if let Some(q) = state.mq.queue_id_for_name("mbx_289") {
+        state.mq.grow_msgsize(q, blob.len() as i64);
+        if OsalQueueService::guest_post(&mut state.mq, "mbx_289", blob, 0) {
+            state.notify_waiters();
+            return true;
+        }
+    }
+    false
+}
+
+/// r798b: the navsrv connector words of the 8-byte events tid 84's consumer
+/// posts onto the pump queue HMINavServerLib_1 (`data=[1, slot, w2, w3]`);
+/// the pumptrace post8 probe stashes them from a live post so host-side
+/// completion events can carry the byte-identical shape.
+static PUMP_W2: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PUMP_W3: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn note_pump_post_shape(w2: u32, w3: u32) {
+    if w2 != 0 && w3 != 0 {
+        PUMP_W2.store(w2, Ordering::Relaxed);
+        PUMP_W3.store(w3, Ordering::Relaxed);
+    }
+}
+
+/// Post a CL completion push straight to the pump queue HMINavServerLib_1,
+/// bypassing the mbx_289 receive race: tid 84's enConnect Wait pops nearly
+/// every mbx_289 message before the navsrv consumer (0x17cb574) sees it
+/// (f241: 22 Wait-delivered vs 4 post8-forwarded), so an mbx_289 push only
+/// completes an entry when it happens to win that race.  Shape mirrors the
+/// consumer's own post: the blob (1/len/body envelope) lands in one of the
+/// connector's 0x90901000..0x90908000 pool slots - the very VA range the
+/// pump hands to the completer as `data` - and the queue message carries
+/// `[1, slot, w2, w3]` exactly like a genuine post8.  Needs the stashed
+/// shape; falls back to nothing otherwise.  `EMU_FAKE_FI_READY_PUSH=0`
+/// disables at the callers.
+pub fn pump_push_completion(unicorn: &mut Unicorn<'_, Context>, body: Vec<u8>) -> bool {
+    let w2 = PUMP_W2.load(Ordering::Relaxed);
+    let w3 = PUMP_W3.load(Ordering::Relaxed);
+    if w2 == 0 || w3 == 0 {
+        return false;
+    }
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let slot = 0x9090_1000u32 + (NEXT.fetch_add(1, Ordering::Relaxed) & 7) as u32 * 0x1000;
+    let mut blob = Vec::with_capacity(8 + body.len());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&body);
+    if unicorn.mem_write(slot as u64, &blob).is_err() {
+        static W: AtomicU32 = AtomicU32::new(0);
+        if W.fetch_add(1, Ordering::Relaxed) < 3 {
+            log::warn!("[LIBOSAL-MBX] pump completion: slot {slot:#x} mem_write failed");
+        }
+        return false;
+    }
+    let mut msg = Vec::with_capacity(16);
+    for word in [1u32, slot, w2, w3] {
+        msg.extend_from_slice(&word.to_le_bytes());
+    }
+    let mut state = unicorn.get_data().namespace.lock().unwrap();
+    let q = state.mq.queue_id_for_name("HMINavServerLib_1");
+    let posted = q.is_some()
+        && OsalQueueService::guest_post(&mut state.mq, "HMINavServerLib_1", msg, 0);
+    if posted {
+        state.notify_waiters();
+        return true;
+    }
+    static Q: AtomicU32 = AtomicU32::new(0);
+    if Q.fetch_add(1, Ordering::Relaxed) < 3 {
+        log::warn!(
+            "[LIBOSAL-MBX] pump completion: queue HMINavServerLib_1 q={q:?} posted={posted}"
+        );
+    }
+    false
+}
+
+/// GpsDataStatus-shaped answer with the pump-first / mbx_289-fallback route
+/// of `fabricate_fi_ready_push`; returns the route taken ("pump", "mbx",
+/// "none") for the caller's log line.
+pub fn push_gps_answer(unicorn: &mut Unicorn<'_, Context>, key: u16) -> &'static str {
+    if std::env::var_os("EMU_FAKE_SENSORFI").is_some_and(|v| v == "0") {
+        return "none";
+    }
+    let body = gps_data_status_answer_body(key);
+    if pump_push_completion(unicorn, body.clone()) {
+        return "pump";
+    }
+    if push_blob_to_mbx_289(unicorn, body) {
+        return "mbx";
+    }
+    "none"
+}
+
+pub fn fabricate_fi_data_request(unicorn: &mut Unicorn<'_, Context>, service: u16, key: u16) {    if std::env::var_os("EMU_FAKE_SENSORFI").is_some_and(|v| v == "0") {
         return;
     }
     let mut body = vec![0u8; 0x20];
@@ -2572,6 +2702,18 @@ pub fn fabricate_fi_ready_push(unicorn: &mut Unicorn<'_, Context>, service: u16,
     body[0x1a] = 9; // server OPTYPE
     body[0x1b] = 1; // service slot
     body[0x1c..0x1e].copy_from_slice(&key.to_le_bytes()); // transaction ordinal
+    // r798b: deliver through the pump queue when its post shape is known.
+    // mbx_289 is popped by tid 84's enConnect Wait first (f241: 22 delivered
+    // there vs 4 forwarded to the pump), so an mbx_289 push only completes
+    // its entry when it wins that race - 1 of 6 in f240/241.  The pump
+    // route posts the byte-identical [1, slot, w2, w3] event the connector
+    // itself would have posted and no other consumer reads that queue.
+    if pump_push_completion(unicorn, body.clone()) {
+        log::warn!(
+            "[LIBOSAL-MBX] fabricated FI ServiceData(svc {service:#06x} txn {key}) pump event to HMINavServerLib_1 to complete the CL transaction (EMU_FAKE_FI_READY_PUSH=0 disables)"
+        );
+        return;
+    }
     let mut blob = Vec::with_capacity(8 + body.len());
     blob.extend_from_slice(&1u32.to_le_bytes());
     blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -2829,6 +2971,20 @@ fn cca_server_answer_sensorfi_data_request(
     {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
         if let Some(q) = state.mq.queue_id_for_name(&target) {
+            // r798 diagnostic: the tid-84 stall (blocked osalqueue[1100]
+            // while posts report success) needs the id/name pairing.
+            log::info!(
+                "[LIBOSAL-MBX] responder insert q={q} pending={} maxmsg={} msgsize={} unlinked={}",
+                state
+                    .mq
+                    .queues
+                    .get(&q)
+                    .map(|x| x.messages.len())
+                    .unwrap_or(usize::MAX),
+                state.mq.queues.get(&q).map(|x| x.maxmsg).unwrap_or(-1),
+                state.mq.queues.get(&q).map(|x| x.msgsize).unwrap_or(-1),
+                state.mq.queues.get(&q).map(|x| x.unlinked).unwrap_or(true),
+            );
             state.mq.grow_msgsize(q, blob.len() as i64);
             delivered = OsalQueueService::guest_post(&mut state.mq, &target, blob, 0);
             if delivered {
@@ -3655,7 +3811,7 @@ fn bridge_mbx_queue(
 
             let thread = unicorn.get_data().inner.thread_id();
             log::info!(
-                "[{}] [LIBOSAL-MBX] mbx wait blocking name={}",
+                "[{}] [LIBOSAL-MBX] mbx wait blocking name={} queue_id={queue_id}",
                 thread,
                 name
             );
