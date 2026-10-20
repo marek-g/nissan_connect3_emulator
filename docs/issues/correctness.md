@@ -1886,3 +1886,57 @@ Fixes (all committed, all still default-on):
   proven: handler 0x1719b74 -> state1 leg -> vfn+0x4c -> store 2 ->
   0x17c2760 gate passes -> FSM 6->7->8->9 -> popup 0x5da closes -> golden
   triple-tap -> keyboard/Enter Destination; then position page.
+
+## r798-r799h: state 8 -> 9 (f74 cryptcard readiness) fully decoded and closed
+
+The state-8 hang (startup step cycling consume/register/getter forever while
+waiting for the f74 "/dev/cryptcard" readiness gate) is SOLVED; f331/f333
+reach `startup-step state=9` and the HMI shows the numeric keypad, then the
+MAP OPTIONS menu under scripted touch. Chain, all proven with page-range
+hooks (AGENTS.md: the narrow traps at 0x1718xxx/0x17b9xxx and the static
+seg2 dump at -0x10000 were BOTH misleading - seg2 maps at -0x8000):
+
+1. Notification routing (f322): the receiver 0x394cef8 keeps a {u16 ord, ptr}
+   vector at +0x14; the register leg 0x17b94b8 inserts the gate under the
+   connector-ASSIGNED ordinal (`ldrh [sp,#0x16]` after the conn vtbl+0x1c
+   call, visible at the 0x17b9554 site), NOT under the service id.  The pump
+   completer dispatches answers with key = answer halfword +0x18, and the
+   dispatcher 0x17b9400 looks THAT up in the vector.  Echoing the request's
+   own ordinal (6/7) hit leftover member entries; the gate re-registered
+   under 0xb.. every tick -> gnf never reached it.
+   Fix: regleg page-hook publishes [sp,#0x16] as `message::F74_REG_ORD`;
+   the f74 (svc 6 regid 3) answer stamps it at +0x18 (completion key) and
+   +0x1c (intentionally missing the pump CL lookup - the golden-era answers
+   completed through the NOT-found leg 0x1c80c3c, whose gnf args a4=buffer
+   ptr, a5=lib ptr are the ones that stored +4=2).  gnf count 10 -> 83.
+2. Delivery timing (f323): gnf+vp-ev now stores gate+4=2 reliably, but the
+   store lands AFTER the tick's getter (~1 ms after st1) and the next tick's
+   consume (0x1718db8, vtbl+0x54) zeroes it before the getter can see it.
+   In-window delivery is impossible: between st1 and the getter tid 62 runs
+   pure guest code (no syscall => no VM lock release), and anything drained
+   during the register's ack-wait is clobbered by st1 afterwards.  The getter
+   leg is NOT the real exit.
+3. The real exit (f329/f330): the leg vfn+0x24 at [gate+0x78] is 0x1feb794
+   (runtime bytes; preceded by an `andeq` NOP-sled - the vtable entry points
+   INTO it): `1 - strcmp([gate+0x7c], [sl+0x4c])`, NULL-gate+NULL-step -> 1,
+   NULL-gate + step byte<=1 -> 0.  Returning 1 takes `bne 0x17c7c18` ->
+   store-9.  The f74 gate's pending name [gate+0x7c] is NEVER written in the
+   emulator: the genuine connector attaches it during the register round-trip
+   (the real TE's ack carries the name); our fabricated ack skips it, so the
+   gate stays nameless and the leg compares NULL-vs-step-name forever.
+   Fix (EMU_F74_ATTACHNAME=0 disables, logged): on every state-8 tick, if
+   [gate+0x7c] == 0 write the step name pointer [sl+0x4c] into it - identity
+   equality -> strcmp 0 -> leg returns 1 -> state 9 at ~28-32 s, run alive
+   past 50 s (GPS provider posting GpsDataStatus, PROCNAV parks normally).
+4. GUI verified headless: keypad screen renders (keys 1-6 + Menu), scripted
+   taps on the SAME queue as SDL open MAP OPTIONS ("Enter Destination",
+   Quick Stop POIs, Route List, Avoid Road, Cancel Route, Next Page) and page
+   2 "MAP SCROLL".  The second "Next Page" tap stayed on MAP SCROLL - the
+   page body renders black in the HMI-only capture; check whether its widgets
+   live on another layer or need the map surface.
+
+Cleanup still owed: idq-*/st*/regleg/vpoll/gnf/lookup/clook/compres/hres/
+v24body/s9path/rmv probes, f74-watch, `f74 REQUEST raw`, responder-skip logs
+can all be trimmed now that the chain is closed; decide whether the mbx ack
+leg (+0x10=0 stamp, EMU_F74_MBX) stays.  NEXT: the GPS position page
+(Krakow coordinates; lat/lon M8 + altitude M7 encodings are empirical).
