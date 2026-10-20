@@ -141,6 +141,8 @@ const XP_TARGETS: &[(u32, &str)] = &[
     (0x0026_a9a0, "senscluster"),
     (0x0059_6170, "gpshandler"),
     (0x0012_0014, "stat-dataset"),
+    (0x0011_dc34, "stat-ventry"),
+    (0x005e_a9f0, "stat-ctor"),
     (0x0068_ff8c, "sink"),
     (0x0011_dbd8, "ventry-entry"),
     (0x0011_dc56, "ventry-step"),
@@ -148,14 +150,16 @@ const XP_TARGETS: &[(u32, &str)] = &[
 
 /// The pages covering `XP_TARGETS`, one hook each (see the note above).
 const XP_PAGES: &[(u32, u32)] = &[
-    (0x0011_d000, 0x1000),
     (0x0012_0000, 0x1000),
     (0x0025_b000, 0x1000),
     (0x0026_a000, 0x1000),
     (0x0029_7000, 0x2000),
     (0x002c_4000, 0x1000),
     (0x0055_0000, 0x1000),
+    (0x0055_8000, 0x1000),
+    (0x0055_d000, 0x1000),
     (0x0056_0000, 0x1000),
+    (0x0056_3000, 0x1000),
     (0x002e_5000, 0x1000),
     (0x002e_b000, 0x1000),
     (0x0029_e000, 0x1000),
@@ -391,6 +395,79 @@ fn xp_watch(unicorn: &mut Unicorn<'_, Context>, tid: u32, address: u64) {
     let lr = (unicorn.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1;
     let sp = unicorn.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
     match *tag {
+        "stat-ctor" => {
+            // STAT_tclThread C1(this, component, ail): remember `this` and
+            // watch its page so a write (or the missing write) into +0x3c -
+            // the member vEntry() null-pointer-checks at cpp(568..628) - is
+            // attributed to a pc.  The object lives on the emulator heap and
+            // the STAT threads die before any later re-init could re-create
+            // it, so watching the page vEntry saw is enough.
+            let this = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            log::info!(
+                "PROCNAV[{tid}] xp-stat-ctor: this={this:#010x} component={:#x} ail={:#x}",
+                unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32,
+                unicorn.reg_read(RegisterARM::R2).unwrap_or(0) as u32,
+            );
+            if this != 0 {
+                static ARMED: std::sync::Mutex<Vec<u32>> =
+                    std::sync::Mutex::new(Vec::new());
+                let want = this & !0xfff;
+                {
+                    let mut armed = ARMED.lock().unwrap();
+                    if armed.len() >= 4 || armed.contains(&want) {
+                        return;
+                    }
+                    armed.push(want);
+                }
+                {
+                    let _ = unicorn.add_mem_hook(
+                        unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                        want as u64,
+                        want as u64 + 0x1fff,
+                        move |_uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                            let off = address.wrapping_sub(want as u64) as u32;
+                            // vEntry() runs on `this` from the OSAL helper;
+                            // the ctor's sub-writes sit at +0x10 shifts, so
+                            // log the whole 0x38..0x70 word band and let the
+                            // log line show the raw offsets.
+                            if (0x38..0x70).contains(&off) {
+                                let lr = _uc
+                                    .reg_read(RegisterARM::R14)
+                                    .unwrap_or(0) as u32
+                                    & !1;
+                                log::info!(
+                                    "PROCNAV: stat-obj WRITE +{off:#x} size={size} value={value:#x} this={want:#x} lr={lr:#x}",
+                                );
+                            }
+                            true
+                        },
+                    );
+                }
+            }
+        }
+        "stat-ventry" => {
+            // STAT_tclThread::vEntry null-member check: `[this+0x40]` (or
+            // +0x3c) null => `NaviThread::vEntry() nullpointer` + thread
+            // exit at t~5 s.  Dump `this` (r4) so the half-initialized
+            // STAT object is named on the log.
+            let this = unicorn.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            let mut st = Vec::new();
+            for i in 0..6u32 {
+                st.push(format!(
+                    "{:#x}",
+                    word(unicorn, sp.wrapping_add(0x30 + i * 4)).unwrap_or(0)
+                ));
+            }
+            log::info!(
+                "PROCNAV[{tid}] xp-stat-ventry: this={this:#010x} vt={:#x} +04={:#x} +20={:#x} +3c={:#x} +40={:#x} lr={lr:#x} sp+0x30..=[{}]",
+                word(unicorn, this).unwrap_or(0),
+                word(unicorn, this.wrapping_add(4)).unwrap_or(0),
+                word(unicorn, this.wrapping_add(0x20)).unwrap_or(0),
+                word(unicorn, this.wrapping_add(0x3c)).unwrap_or(0),
+                word(unicorn, this.wrapping_add(0x40)).unwrap_or(0),
+                st.join(" "),
+            );
+        }
         "err-set" => {
             // err_vSetError(handler, code, 0, message, line, file): log every
             // unique (code, lr) once - this names each distinct RDE emitter.
@@ -1449,8 +1526,7 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
     // EMU_PROCMAP_TRACE=1 (r743: per-instruction host callbacks on hot pages
     // are the emulator's main hook cost).
     if crate::libs::procmapengine::render_trace_enabled() {
-    for (page, span) in XP_PAGES {
-        let address = (base_address + (page - ORIGINAL_BASE)) as u64;
+    for (page, span) in XP_PAGES {        let address = (base_address + (page - ORIGINAL_BASE)) as u64;
         let result = unicorn.add_code_hook(
             address,
             address + *span as u64,
@@ -1464,6 +1540,25 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
             Err(error) => log::warn!("PROCNAV: cannot hook xp page {address:#x}: {error}"),
         }
     }
+    }
+
+    // r798b: the STAT_tclThread::vEntry page under the *nav* trace flag:
+    // under EMU_PROCMAP_TRACE the STAT threads never even start (run f256/
+    // f257), so the null-[+0x40] death that exits them at t~5 s in normal
+    // runs can only be observed on the fast path.  One page only.
+    if std::env::var_os("EMU_PROCHMI_NAV_TRACE").is_some() {
+        for page in [0x0011_d000u32, 0x005e_a000] {
+            let address = (base_address + (page - ORIGINAL_BASE)) as u64;
+            if unicorn
+                .add_code_hook(address, address + 0x1000, move |uc, addr, _| {
+                    let tid = uc.get_data().inner.thread_id();
+                    xp_watch(uc, tid, addr);
+                })
+                .is_ok()
+            {
+                log::info!("PROCNAV: xp-watch page {address:#x}+0x1000 (stat)");
+            }
+        }
     }
 
     // The sensorfi GPS provider is part of the emulator's device simulation

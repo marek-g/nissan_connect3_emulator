@@ -749,6 +749,14 @@ thread_local! {
     static PROCHMI_DISPLAY_MODE_NEXT: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
+/// r798b: last RegisterConf transaction ordinal per svc-0x06 CL entry
+/// (recorded by the conf-store page watch).  The state-6 member probe
+/// (g-m18) re-fires the completion push for entries whose first push lost
+/// the mbx_289 receive race to tid 84's enConnect Wait (f244: mem[5]/[6]
+/// starved at state 1 forever although READY only needs [+4]==2).
+static SVC6_TXN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, u16>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
 pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     PROCHMI_BASE.store(base_address, Ordering::Relaxed);
     // r789d one-shot diagnostic (EMU_PROCHMI_XREF_SCAN=1).  prochmi is
@@ -5445,6 +5453,11 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             if LAST.swap(state, Ordering::Relaxed) == state {
                 return 0;
             }
+            // r798b: publish the FSM state for the mbx_7 sensorfi responder
+            // (message.rs): its regid-3 svc-6 answers belong to the state-8
+            // readiness entry, and answering the same request during the
+            // member era collides with the members' pending transactions.
+            crate::libs::libosal_linux::message::note_hmi_fsm_state(state);
             log::warn!(
                 "PROCHMI startup-step t={}ms tid=[{}] proc={r0:#x} state={state}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
@@ -6339,6 +6352,13 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // EMU_FAKE_FI_READY_PUSH=0 disable the legs.
                 let ordinal =
                     (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff) as u16;
+                if svc == 6 && (st == 0 || st == 1) {
+                    // Record the live transaction ordinal per entry so the
+                    // g-m18 starvation leg can re-fire the completion push.
+                    if let Ok(mut m) = SVC6_TXN.lock() {
+                        m.insert(entry, ordinal);
+                    }
+                }
                 // r798b: answer re-registrations too.  A CL entry whose
                 // first answer got stolen (or raced) re-sends RegisterConf
                 // with a NEW ordinal via the vfn+0x24 state-1 leg, whose
@@ -6430,13 +6450,16 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
     // narrow traps).
     {
         for (off, label, budget) in [
-            (0x017c_b574u32, "rx-pump", 30u32),
-            (0x000f_b8f0u32, "rx-45", 12),
-            (0x017c_b668u32, "post8", 12),
-            (0x017c_b6b0u32, "notify", 12),
-            (0x017c_cb88u32, "list-add", 24),
-            (0x017b_93fcu32, "dispatch", 30),
-            (0x017c_ce38u32, "re-entry", 24),
+            // r798b: budgets raised across the board - f266 showed the old
+            // 30-hit caps were exhausted by the 27 s member burst, hiding
+            // every post-27 s completer/dispatch event (the f74 window).
+            (0x017c_b574u32, "rx-pump", 400u32),
+            (0x000f_b8f0u32, "rx-45", 200),
+            (0x017c_b668u32, "post8", 300),
+            (0x017c_b6b0u32, "notify", 200),
+            (0x017c_cb88u32, "list-add", 200),
+            (0x017b_93fcu32, "dispatch", 400),
+            (0x017c_ce38u32, "re-entry", 200),
             // r797b: the CCA answer-completer (liboscbcu-in-prochmi): called
             // per consumed answer with r0=connector, r1=event id,
             // ldrh [sp+0x50]=svc, ldrh [sp+0x54]=transaction key,
@@ -6444,18 +6467,17 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // DAPI's genuine svc-0x06 pair and NOTHING for our 0x0a answers
             // (f204-f209) - log its arguments to see whether our message
             // ever reaches it and which field disqualifies it.
-            (0x01c8_0adcu32, "completer", 40),
+            (0x01c8_0adcu32, "completer", 400),
             // r797b: between keyed dispatch and completer there are two
             // bail guards (f214 disasm): the receiver's vfn+0x10 (0x1c7c768)
             // must return != 0, then [receiver+0xc] (0x1c7c778) must be non-
             // NULL and 0x1c7c150 (before 0x1c7c794) must return != 0.  Our
             // GpsDataStatus 0x45 died on one of them - find which.
-            (0x01c7_c768u32, "vfn10", 40),
-            (0x01c7_c778u32, "guard-c", 40),
-            (0x01c7_c794u32, "guard-150", 40),
+            (0x01c7_c768u32, "vfn10", 300),
+            (0x01c7_c778u32, "guard-c", 120),
+            (0x01c7_c794u32, "guard-150", 120),
         ] {
             let address = base_address + off - ORIGINAL_BASE;
-            let _ = budget;
             crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:pumptrace", move |uc: &mut Unicorn<'_, Context>| {
                 static HITS: std::sync::OnceLock<
                     std::sync::Mutex<std::collections::HashMap<&'static str, u32>>,
@@ -6466,7 +6488,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     Err(p) => p.into_inner(),
                 };
                 let n = map.entry(label).or_insert(0);
-                if *n >= 30 {
+                if *n >= budget {
                     return 0;
                 }
                 *n += 1;
@@ -6480,8 +6502,29 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     let content = read_u32(uc, r3.wrapping_add(4));
                     let cls = read_u32(uc, content.wrapping_add(0x08)) >> 24;
                     let svc = read_u32(uc, content.wrapping_add(0x14)) & 0xffff;
+                    // r798b: every received message logged class 0 - dump the
+                    // raw frames once to pin the actual queue format.
+                    let (m0, m4, m8, mc) = (
+                        read_u32(uc, r3),
+                        read_u32(uc, r3.wrapping_add(4)),
+                        read_u32(uc, r3.wrapping_add(8)),
+                        read_u32(uc, r3.wrapping_add(0xc)),
+                    );
+                    static RAW: AtomicU32 = AtomicU32::new(0);
+                    let raw = if RAW.fetch_add(1, Ordering::Relaxed) < 6 {
+                        let (c0, c4, c8, cc, c14) = (
+                            read_u32(uc, content),
+                            read_u32(uc, content.wrapping_add(4)),
+                            read_u32(uc, content.wrapping_add(8)),
+                            read_u32(uc, content.wrapping_add(0xc)),
+                            read_u32(uc, content.wrapping_add(0x14)),
+                        );
+                        format!(" msg=[{m0:#x},{m4:#x},{m8:#x},{mc:#x}] blob=[{c0:#x},{c4:#x},{c8:#x},{cc:#x},{c14:#x}]")
+                    } else {
+                        String::new()
+                    };
                     log::warn!(
-                        "PROCHMI pumptrace {label} t={}ms tid=[{}] obj={r0:#x} msg={r3:#x} content={content:#x} class={cls:#x} svc={svc:#x} lr={lr:#x}",
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] obj={r0:#x} msg={r3:#x} content={content:#x} class={cls:#x} svc={svc:#x}{raw} lr={lr:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                     );
@@ -7021,6 +7064,25 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         p = p.wrapping_add(4);
                     }
                 }
+                if label == "g-m18" && r0 == 0 {
+                    // Starved member: its getter says not-READY while the
+                    // entry sits in state 1.  Re-fire the completion push
+                    // with the recorded ordinal - each attempt is a fresh
+                    // chance against tid 84's Wait on mbx_289, and a READY
+                    // entry stops asking (getter != 0 from then on).
+                    let m = read_u32(uc, r4);
+                    if read_u32(uc, m.wrapping_add(4)) == 1 {
+                        let ord = SVC6_TXN.lock().ok().and_then(|t| t.get(&m).copied());
+                        static RP: AtomicU32 = AtomicU32::new(0);
+                        if let Some(o) = ord {
+                            if RP.fetch_add(1, Ordering::Relaxed) < 300 {
+                                crate::libs::libosal_linux::message::fabricate_fi_ready_push(
+                                    uc, 0x0006, o,
+                                );
+                            }
+                        }
+                    }
+                }
             }
             if label == "s8b-in" || label == "s8b-4c" || label == "s8b-rdy"
                 || label == "s9-chk"
@@ -7105,6 +7167,47 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     uc.get_data().inner.thread_id(),
                 );
+                if label.starts_with("s8q-") {
+                    // Inside 0x17c2a64: r4 = readiness list, r5 = the name
+                    // descriptor from sl+0x48.  Dump both so the pending
+                    // service name state 8 waits for is on the log.
+                    let r4n = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    let r5n = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    let mut nb = [0u8; 32];
+                    let _ = uc.mem_read(r5n as u64, &mut nb);
+                    let s: String = nb
+                        .iter()
+                        .take_while(|b| **b >= 0x20 && **b < 0x7f)
+                        .map(|b| *b as char)
+                        .collect();
+                    log::warn!(
+                        "PROCHMI envigate {label}-args t={}ms tid=[{}] list={r4n:#x} name={r5n:#x} text={s:?} w0={:02x?}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        &nb[..12],
+                    );
+                }
+                if (label == "s8-v18" || label == "s8-v24") && r0 == 0 {
+                    // State-8 starved: the FSM body re-registers its
+                    // readiness entry ([sl+0x74]) every tick and the
+                    // completion push for the latest ordinal keeps getting
+                    // swallowed by tid 84's own enConnect Wait (the forwarder
+                    // only sees a fraction - f261: 209 delivered, none of the
+                    // f74 ordinals dispatched).  Same hammer as g-m18: with
+                    // the ordinal the conf-store page watch just recorded,
+                    // re-fire the completion push until one lands on the
+                    // pump consumer side.
+                    let f74 = read_u32(uc, sl.wrapping_add(0x74));
+                    let ord = SVC6_TXN.lock().ok().and_then(|t| t.get(&f74).copied());
+                    static RP8: AtomicU32 = AtomicU32::new(0);
+                    if let Some(o) = ord {
+                        if RP8.fetch_add(1, Ordering::Relaxed) < 400 {
+                            crate::libs::libosal_linux::message::fabricate_fi_ready_push(
+                                uc, 0x0006, o,
+                            );
+                        }
+                    }
+                }
                 // Whoever sets b4c/b50 organically is the producer we are
                 // missing; watch the whole FSM object page for writes into
                 // its header fields (offsets 0x2c..0x5c).
