@@ -1566,7 +1566,10 @@ const GPS_LON_DEG: f32 = 19.9456;
 /// least one satellite element.  Coordinates are written in several plausible
 /// encodings (degrees-as-f32 and arcsec*1000-as-u32) because the field
 /// semantics in the const block are not yet pinned down.
-fn gps_wire_body() -> Vec<u8> {
+/// The `GpsDataStatus` CIR payload (typebase header + packed const block +
+/// satellite vector), also used by the kernel-side sensorfi answer
+/// (`message::cca_server_answer_sensorfi_data_request`).
+pub(crate) fn gps_wire_body() -> Vec<u8> {
     let mut body = Vec::with_capacity(0x80);
     // Generic typebase driver (`0x2f55cf`) first consumes one u32 into the
     // typebase header field (`typebase + 4`), then the const block.
@@ -1763,29 +1766,24 @@ fn car_position(seq: u16) -> (f64, f64) {
     }
 }
 
-pub(crate) fn nav_position_status_message(seq: u16) -> Vec<u8> {
-    // fi_tcl visitor payload (r424/r425 object dumps): the NavPositionStatus
-    // wire is a flat sequential encoding - DataSetId u32, PositionWGS84
-    // {Longitude s32, Latitude s32}, then the one-cell / section fields read
-    // 1-2 bytes each (e8/e16 descriptors).  r425 proved the map-window gate in
-    // vHandleNavPosition only opens when PositionCalculationState != 0, and a
-    // sparse dword pattern left a 0x00 byte exactly there, so all bytes behind
-    // the coordinates are a uniform non-zero filler (0x01 keeps every scalar
-    // small, no length-loop risk).
-    //
-    // The coordinate unit is the engine's internal map position unit, not
-    // degrees * 1e5 (r444): vHandleNavPosition copies fi_tcl_s32_Longitude /
-    // fi_tcl_s32_Latitude into the window bbox (+0x70..+0x7c) with validity
-    // clamps near +-2^31 and no scaling, that bbox becomes the rect of the
-    // UpdateMapDataRequest, and the engine's own view request carries
-    // -990_231_045 / 506_995_542 in the same slots = lon -83.0 / lat 42.5 with
-    // one turn in 2^32 units.  Feeding 1e-5 degrees made DAPI see a rect near
-    // (0.17, 0.42) degrees in the ocean and answer without blocks.
+/// The `posfi_tclMsgNavPositionStatus` CIR payload: DataSetId u32,
+/// PositionWGS84 {Longitude s32, Latitude s32} in the engine's internal map
+/// position unit (one turn = 2^32, see `map_units`/r444), then a uniform
+/// non-zero filler so every trailing scalar reads non-zero (r425: the
+/// map-window gate in `vHandleNavPosition` only opens when
+/// PositionCalculationState != 0).  Also used by the kernel-side posfi
+/// answer (`message::cca_server_answer_sensorfi_data_request`).
+pub(crate) fn posfi_nav_position_payload(seq: u16) -> Vec<u8> {
     let mut body = Vec::with_capacity(0x2c0);
     body.extend_from_slice(&0u32.to_le_bytes()); // DataSetId
     body.extend_from_slice(&map_units(car_position(seq).0).to_le_bytes()); // Longitude
     body.extend_from_slice(&map_units(car_position(seq).1).to_le_bytes()); // Latitude
     body.resize(0x2c0, 0x01);
+    body
+}
+
+pub(crate) fn nav_position_status_message(seq: u16) -> Vec<u8> {
+    let mut body = posfi_nav_position_payload(seq);
     let len = 0x20 + body.len();
     let LEN = len.next_multiple_of(16);
     let mut content = vec![0u8; LEN];

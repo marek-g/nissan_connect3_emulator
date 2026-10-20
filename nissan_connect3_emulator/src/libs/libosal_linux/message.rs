@@ -2567,6 +2567,92 @@ fn cca_server_answer_data_request_if_unhosted(
     cca_server_answer_data_request(unicorn, server_app, client, service, reg_id, function);
 }
 
+/// The emulator stands in for the SENSORFI/POSFI server app (registry appid
+/// `0x0015`, part of PROCMW - not among the emulated processes), answering
+/// the class-0x45 `ServiceData` requests its registration fake handed out
+/// register-ids for.  The HMI's navif client (0x0121) posts exactly one
+/// `svc 0x000a fn 0x0f02 op 01` position query to mbx_21 and blocks on its
+/// mbx_289 pump waiting for the answer - on the real unit the position page
+/// fills from that reply.  The answer reuses the sanctioned GPS fabrication
+/// (the position values are the very payload the GPS provider feeds the FC_STAT
+/// sink, see `procnav::gps_status_message` / `procnav::nav_position_status_message`),
+/// so the emulator never invents a second position truth.  Visible in the log
+/// per answered request; `EMU_FAKE_SENSORFI=0` switches the fabrication off
+/// (the request then stays unanswered, as on a unit without the FI server).
+fn cca_server_answer_sensorfi_data_request(
+    unicorn: &mut Unicorn<'_, Context>,
+    name: &str,
+    body: &[u8],
+) {
+    if body.len() < 0x1c || body[0xb] != 0x45 {
+        return;
+    }
+    if std::env::var_os("EMU_FAKE_SENSORFI").is_some_and(|v| v == "0") {
+        return;
+    }
+    let server_app = match name.strip_prefix("mbx_").and_then(|d| d.parse::<u32>().ok()) {
+        Some(0x15) => 0x0015u16,
+        _ => return,
+    };
+    let service = u16::from_le_bytes([body[0x14], body[0x15]]);
+    if !matches!(service, 0x000a | 0x001e) {
+        return;
+    }
+    let client = u16::from_le_bytes([body[0], body[1]]);
+    let reg_id = u16::from_le_bytes([body[0x16], body[0x17]]);
+    let function = u16::from_le_bytes([body[0x18], body[0x19]]);
+    static SEQ: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(1);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    // Echo the client's reference tuple (svc/regid and the +0x0c function
+    // slot, both 0-matched by `bIsDataSet`, wire layout pinned by
+    // `trace_dapi_map_service_data`: svc@+0x14, regid@+0x16, fn@+0x0c) and
+    // append the sensorfi/posfi status payload at +0x20 - the frame shape
+    // `cca_server_answer_data_request` proved reaches the AIL app receiver.
+    let (payload, what) = if service == 0x000a {
+        (crate::libs::procnav::gps_wire_body(), "GpsDataStatus")
+    } else {
+        (
+            crate::libs::procnav::posfi_nav_position_payload(seq),
+            "NavPositionStatus",
+        )
+    };
+    let mut body = vec![0u8; 0x20 + payload.len()];
+    let total_len = body.len() as u32;
+    body[0..2].copy_from_slice(&server_app.to_le_bytes());
+    body[2..4].copy_from_slice(&client.to_le_bytes());
+    body[4..8].copy_from_slice(&total_len.to_le_bytes());
+    body[8..10].copy_from_slice(&2u16.to_le_bytes());
+    body[0xb] = 0x45;
+    static MSG_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x5000);
+    let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    body[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
+    body[0x14..0x16].copy_from_slice(&service.to_le_bytes());
+    body[0x16..0x18].copy_from_slice(&reg_id.to_le_bytes());
+    // +0x18 word: result 0 (no error), +0x19 dynamic-length 0; the function
+    // slot +0x0c stays 0 to match the reference (see comment above).
+    body[0x1a] = 9; // OPTYPE: server data response
+    body[0x20..].copy_from_slice(&payload);
+    let mut blob = Vec::with_capacity(8 + body.len());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&body);
+    let target = format!("mbx_{client}");
+    let mut delivered = false;
+    {
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
+        if let Some(q) = state.mq.queue_id_for_name(&target) {
+            state.mq.grow_msgsize(q, blob.len() as i64);
+            delivered = OsalQueueService::guest_post(&mut state.mq, &target, blob, 0);
+            if delivered {
+                state.notify_waiters();
+            }
+        }
+    }
+    log::info!(
+        "[LIBOSAL-MBX] sensorfi fake server {server_app:#06x}: answered ServiceData(svc {service:#06x} regid {reg_id:#04x} func {function:#06x}) from {client:#06x} on {name} with {what} (delivered {delivered} -> {target})"
+    );
+}
+
 fn bridge_guest_osal_queue(
     unicorn: &mut Unicorn<'_, Context>,
     api_name: &str,
@@ -3048,6 +3134,7 @@ fn bridge_mbx_queue(
             // `cca_server_answer_data_request_if_unhosted`.
             if name != "mbx_265" && name != "mbx_0" {
                 cca_server_answer_data_request_if_unhosted(unicorn, name, &body);
+                cca_server_answer_sensorfi_data_request(unicorn, name, &body);
             }
             trace_dapi_map_service_data(name, &body);
             // r755-diag: every mbx_0 post body once per (src, class), so the
