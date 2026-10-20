@@ -5410,6 +5410,188 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             0
         });
     }
+    // r795: does the guest ever execute address 0?  `bl 0xfb65b4`'s vector
+    // slot reads 0 in the probe; if the fetch to 0 lands in a mapped (zero)
+    // page, these andeq-NOPs run.  Page-range hook (reliable per AGENTS.md),
+    // fires only if page 0 is actually fetched.
+    {
+        let lo = 0u32;
+        let hi = 0x1000u32;
+        unicorn
+            .add_code_hook(lo as u64, hi as u64, move |uc: &mut Unicorn<'_, Context>, address: u64, _: u32| {
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+                    log::error!(
+                        "PROCHMI page0-exec t={}ms tid=[{}] addr={address:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                }
+            })
+            .unwrap();
+    }
+    // r795: f151 shows bNavIFCreate's `bl enNavIFCreate` returning 0, so the
+    // navif object never exists, enActivate never runs, no CCA route feeds
+    // the service table, case 5 never passes and the keyboard page (via the
+    // LI mediator) is dead.  Map which of enNavIFCreate's branches fails.
+    // Static layout (0x1c7b4bc, ARM): singleton {+0 navif, +4 handler,
+    // +8 handler2} at anchor 0x2a12818 + 0x2b1c08 = 0x2cc4420; args on the
+    // stack: +0x20 u16 msg-type (must equal 0x80010001 half-pair), +0x24
+    // extra, +0x28 appid.  Decision points probed below.
+    {
+        let singleton = base_address + 0x02cc_4420u32 - ORIGINAL_BASE;
+        for (offset, label) in [
+            (0x01c7_b4bcu32, "c1-entry"),
+            (0x01c7_b4f8u32, "c2-handler2-alive"),
+            (0x01c7_b4e4u32, "c3-no-handler2"),
+            (0x01c7_b47cu32, "c4-appid-check-res"),
+            (0x01c7_b584u32, "c5-msgtype-test"),
+            (0x01c7_b5ecu32, "c6-navif-ctor-res"),
+            (0x01c7_b558u32, "c7-activate-res"),
+            (0x01c7_b50cu32, "c8-ret"),
+            (0x01c7_f6d0u32, "d0-entry"),
+            (0x01c7_f704u32, "d1-fail-path"),
+            (0x01c7_f6ecu32, "d2-x3c-path"),
+            (0x01c7_f700u32, "d3-x3c-check"),
+            (0x01c7_f730u32, "d4-x34-res"),
+            (0x01c7_f758u32, "d5-mutex-res"),
+            // Failure tail of `0x1c7f79c`'s caller (the CCA subscriber
+            // bring-up that produced c7-activate-res): every exit site.
+            (0x01c7_f500u32, "e0-entry"),
+            (0x01c7_f548u32, "e1-x34-res"),
+            (0x01c7_f5b4u32, "e2"),
+            (0x01c7_f5e8u32, "e3"),
+            (0x01c7_f5fcu32, "e4"),
+            (0x01c7_f610u32, "e5"),
+            (0x01c7_f650u32, "e6"),
+            // `0x1c7f670` short-circuits to the success id 0x80010001 when
+            // this OSAL vector veneer (ldr pc,[0x1b0125bc+0x328]) returns
+            // non-zero; f155 shows it returning 0, forcing the long init
+            // path that ends failing in enActivate.  Identify the target
+            // (offset into libosal) to learn what it actually checks.
+            (0x00fb_65b4u32, "c9-osal-vec"),
+            // Return site of `bl 0xfb65b4` in `0x1c7f670`: proves whether the
+            // veneer came back and with what r0 (the whole long-path failure
+            // hinges on this predicate).
+            (0x01c7_f6a0u32, "c10-vec-ret"),
+        ] {
+            let address = base_address + offset - ORIGINAL_BASE;
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:navif-deep", move |uc: &mut Unicorn<'_, Context>| {
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 30 {
+                    return 0;
+                }
+                let r = |reg| uc.reg_read(reg).unwrap_or(0) as u32;
+                let (r0, r4, sp) = (
+                    r(RegisterARM::R0),
+                    r(RegisterARM::R4),
+                    r(RegisterARM::R13),
+                );
+                // Every d*/e* probe also dumps the queue the probed body is
+                // about to post to (its msg-ref header, pinned live at r795:
+                // u32@+0x4 is the target-queue name's NUL-terminated pointer)
+                // and the OSAL queue handle it uses (+0x14): the CCA bring-up
+                // request stalls for ~6.5 s and returns 0 - find out where it
+                // is sent and which answer it waits for.
+                if matches!(
+                    label,
+                    "d4-x34-res" | "d5-mutex-res" | "e0-entry" | "e1-x34-res"
+                ) {
+                    let obj = r(RegisterARM::R6);
+                    let ptr34 = read_u32(uc, obj.wrapping_add(0x34));
+                    let vt = read_u32(uc, ptr34);
+                    log::warn!(
+                        "PROCHMI navif-deep {label}-vfn t={}ms obj={obj:#x} +0x34={ptr34:#x} vt={vt:#x} vfn0={:#x} vfn8={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        read_u32(uc, vt),
+                        read_u32(uc, vt.wrapping_add(8)),
+                    );
+                    let m28 = read_u32(uc, obj.wrapping_add(0x28));
+                    let name = read_cstr(uc, m28, 12);
+                    let m14 = read_u32(uc, obj.wrapping_add(0x14));
+                    log::warn!(
+                        "PROCHMI navif-deep {label}-msg t={}ms tid=[{}] obj={obj:#x} +0x28={m28:#x} name={name:?} +0x14={m14:#x} +0x40={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        read_u32(uc, obj.wrapping_add(0x40)),
+                    );
+                }
+                let sl = r(RegisterARM::R10);
+                let words = match label {
+                    "c1-entry" => {
+                        let msgtype = (read_u32(uc, sp.wrapping_add(0x20)) & 0xffff) as u32;
+                        let extra = read_u32(uc, sp.wrapping_add(0x24));
+                        let appid = read_u32(uc, sp.wrapping_add(0x28));
+                        format!(
+                            " r0={r0:#x} msgtype={msgtype:#010x} extra={extra:#x} appid={appid:#x} sing=[{:#x},{:#x},{:#x}]",
+                            read_u32(uc, singleton),
+                            read_u32(uc, singleton + 4),
+                            read_u32(uc, singleton + 8),
+                        )
+                    }
+                    "c6-navif-ctor-res" => format!(
+                        " r0={r0:#x} navif@{r4:#x}=[{:#x},{:#x},{:#x},{:#x},{:#x},{:#x},{:#x}]",
+                        read_u32(uc, r4),
+                        read_u32(uc, r4 + 4),
+                        read_u32(uc, r4 + 8),
+                        read_u32(uc, r4 + 0xc),
+                        read_u32(uc, r4 + 0x10),
+                        read_u32(uc, r4 + 0x14),
+                        read_u32(uc, r4.wrapping_add(0x4).wrapping_add(0x10)),
+                    ),
+                    "c5-msgtype-test" => {
+                        format!(" sl={sl:#x} r3={:#x}", r(RegisterARM::R3))
+                    }
+                    "c9-osal-vec" => {
+                        let base = 0x02a1_25bcu32;
+                        let mut b4 = [0u8; 4];
+                        let mapped = uc.mem_read((base + 0x328) as u64, &mut b4).is_ok();
+                        format!(
+                            " entry={:#x} mapped={mapped} prev={:#x} next={:#x}",
+                            read_u32(uc, base + 0x328),
+                            read_u32(uc, base + 0x320),
+                            read_u32(uc, base + 0x330),
+                        )
+                    }
+                    "c10-vec-ret" => {
+                        // r795: slot computation fixed - `add ip,pc,#imm`
+                        // imm is ROR (2*rot), so base = pc + 0x1a00000 +
+                        // 0x5c000 lands in the app's own .bss (0x2a125xx,
+                        // next to the 0x2a12818 navif singleton anchor),
+                        // *not* a fixed-mapped 0x1b012xxx page.  Dump the
+                        // live table window to see what filled each slot.
+                        let lo = 0x02a1_28d0u32 + base_address - ORIGINAL_BASE;
+                        let words: Vec<String> =
+                            (0..8).map(|i| format!("{:#x}", read_u32(uc, lo + 4 * i))).collect();
+                        format!(
+                            " r0={r0:#x} table[{:#x}..]=({})",
+                            lo,
+                            words.join(" ")
+                        )
+                    }
+                    "d0-entry" | "d1-fail-path" | "d2-x3c-path" | "d3-x3c-check"
+                    | "d4-x34-res" | "d5-mutex-res" => {
+                        let obj = r(RegisterARM::R6);
+                        format!(
+                            " r0={r0:#x} obj={obj:#x} +0x28={:#x} +0x34={:#x} +0x3c={:#x} +0x45={}",
+                            read_u32(uc, obj.wrapping_add(0x28)),
+                            read_u32(uc, obj.wrapping_add(0x34)),
+                            read_u32(uc, obj.wrapping_add(0x3c)),
+                            read_u32(uc, obj.wrapping_add(0x45)) & 0xff,
+                        )
+                    }
+                    _ => format!(" r0={r0:#x} sl={sl:#x}"),
+                };
+                log::warn!(
+                    "PROCHMI navif-deep {label} t={}ms tid=[{}]{}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    words,
+                );
+                0
+            });
+        }
+    }
     // r790b: after the pool fix bNavIFCreate succeeds but bStartupNavIF still
     // fails - the CCACommandSubscriber construction path is the suspect.
     // Log enActivate args + navif fields, the subscriber ctor args, and every
