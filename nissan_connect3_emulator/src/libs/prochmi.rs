@@ -7685,6 +7685,26 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     uc.get_data().inner.thread_id(),
                 );
+                if label == "f-accept" && cls == 0x45 && svc != 0xffff {
+                    // The pump consumer's own receive popped this answer:
+                    // the completer will dispatch it, so stop re-firing.
+                    crate::libs::libosal_linux::message::note_fi_accepted(
+                        svc as u16, txn as u16,
+                    );
+                }
+            }
+            if label == "g7-vfn18res" && r0 == 0 {
+                // r799k: the startup connector's readiness getter says
+                // NOT-READY while the startup FSM still gates on it.  If the
+                // era's fabricated member answers sit unaccepted (their
+                // first mbx_289 copy was popped-and-dropped by tid-84's
+                // enConnect Wait - late-era runs lose svc-6 txn-2 that way
+                // and sit at state 6 forever), re-push them now: this leg
+                // runs on the pump thread's own tick, so the next receive
+                // (same thread, ~one tick later) finds the answer queued.
+                if matches!(crate::libs::libosal_linux::message::hmi_fsm_state(), 5 | 6) {
+                    crate::libs::libosal_linux::message::refire_fi_era_pending(uc);
+                }
             }
             if label.starts_with("g-fl")
                 || label == "g-s30"

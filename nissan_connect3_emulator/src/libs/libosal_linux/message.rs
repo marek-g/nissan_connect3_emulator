@@ -2601,6 +2601,69 @@ pub fn gps_data_status_answer_body(key: u16) -> Vec<u8> {
     body
 }
 
+/// r799k: member-era completion answers the fabricated-FI route pushed onto
+/// mbx_289 but NOT yet accepted by the navsrv consumer (no `f-accept` pop
+/// observed for their (svc, txn)).  mbx_289 has two legitimate consumers and
+/// tid-84's enConnect Wait pops nearly every message while it is idle
+/// (r799d), so a fabrication pushed long before the connector's pump tick
+/// gets popped-and-dropped by enConnect: late-era runs (f342-vs-g4 era
+/// 27 s vs 34.5 s) lose the svc-6 txn-2 answer that way, the startup
+/// connector never turns READY, `g7-vfn18res` stays 0 and the FSM sits at
+/// state 6 forever.  The answer is re-pushed until the pump consumer's own
+/// receive (`f-accept`, 0x17c_b5ec) pops it - the pump thread is about to
+/// read the queue at that moment, so the answer reaches the completer even
+/// when enConnect ate the earlier copies.  `EMU_FI_ERA_REFIRE=0` disables.
+static FI_ERA_PENDING: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<(u16, u16), (Vec<u8>, u32)>,
+    >,
+> = std::sync::OnceLock::new();
+
+/// Record a fabricated member-era answer as pending re-fire (called by
+/// `fabricate_fi_ready_push` right after its initial post).
+fn note_fi_era_pending(svc: u16, key: u16, body: &[u8]) {
+    let map = FI_ERA_PENDING.get_or_init(Default::default);
+    if let Ok(mut m) = map.lock() {
+        m.insert((svc, key), (body.to_vec(), 0));
+    }
+}
+
+/// The navsrv receive accepted a class-0x45 message with this (svc, txn):
+/// the completer will dispatch it, so stop re-firing that answer.  Called
+/// from the `f-accept` probe in prochmi.rs.
+pub fn note_fi_accepted(svc: u16, txn: u16) {
+    let map = FI_ERA_PENDING.get_or_init(Default::default);
+    if let Ok(mut m) = map.lock() {
+        m.remove(&(svc, txn));
+    }
+}
+
+/// Re-push every still-pending member-era answer once (the g7 gate leg
+/// observed r0==0 while the startup FSM is starved at state 5/6).  Bounded
+/// to 40 re-fires per (svc, txn).  Returns the number re-pushed.
+pub fn refire_fi_era_pending(unicorn: &mut Unicorn<'_, Context>) -> usize {
+    if std::env::var_os("EMU_FI_ERA_REFIRE").is_some_and(|v| v == "0") {
+        return 0;
+    }
+    let map = FI_ERA_PENDING.get_or_init(Default::default);
+    let due: Vec<((u16, u16), Vec<u8>)> = {
+        let Ok(mut m) = map.lock() else { return 0 };
+        m.values_mut().for_each(|(_, n)| *n += 1);
+        m.retain(|_, (_, n)| *n <= 40);
+        m.iter().map(|(k, (b, _))| (*k, b.clone())).collect()
+    };
+    let mut fired = 0usize;
+    for ((svc, key), body) in due {
+        if push_blob_to_mbx_289(unicorn, body) {
+            fired += 1;
+            log::warn!(
+                "[LIBOSAL-MBX] fi-era re-fire: re-pushed ServiceData(svc {svc:#06x} txn {key}) to mbx_289, the enConnect consumer had eaten the earlier copy (EMU_FI_ERA_REFIRE=0 disables)"
+            );
+        }
+    }
+    fired
+}
+
 /// Post an already-built body to mbx_289 as an 8-byte-prefixed blob with
 /// waiter notification (the responder's delivery leg, factored out).
 /// `EMU_FAKE_SENSORFI=0` disables.
