@@ -2193,3 +2193,39 @@ NEXT:
    effect for the dest-entry dialog - identify the tick the tap delivers
    (vDraw re-eval? timer kick?) and feed it flag-gated the same way for the
    Enter Destination dialog.
+
+## r799n2: BOTH spinners share one root cause candidate: mediator timer slot [m+0x24] == NULL
+
+- k19 tap-window decode (t=34399-34411): touch vReleased -> msg-fire x3 ->
+  viewpump n=545 -> SM-PAGE onMessage(sm=0x39e2468 msgid=0x0 type=0x25a
+  sid=0x415) -> performTransition -> stateview leave/enter 0x40003017.  The
+  page SM is MESSAGE-DRIVEN: content was ready but nothing posts it a message
+  until the touch does.  On the real unit the periodic re-check comes from
+  the GUI_ContentFunction mediator timer.
+- Probe evidence (k19): `mediator-timerarm` 23 hits ALL with `tmr=0x0`
+  ([mediator+0x24]=NULL, flags=0x3a); `mediator-timerfire` ZERO hits ever.
+  timerarm (0x1375670) sets flag 0x40 and asks the timer OBJECT
+  [[m+0x20]] vtable+0x10 to start; timerfire (0x13755d8, clears 0x40 and
+  jumps to the bCheckState tail 0x13754b0) can therefore never run ->
+  busy container + dest-entry dialog never re-evaluate.  Same for the
+  r788-era keyboard wait.  THIS is the missing kick for both spinners.
+- Creation chain decoded (all static, prochmi): constructor 0x13746c0
+  (GUI_ContentFunction-sync variant) stores +0x24=0; setter site 0x13751cc
+  `bl 0x136e0d0; str r0,[r5,#0x24]`.  0x136e0d0: new(0x18) + vtable GOT
+  0x2a0abac(&OSAL_s32TimerCreate) + `bl 0x1357218` - and 0x1357218 returns 0
+  iff `bl 0x1357ed8` (timer-manager singleton getter) returns 0.
+  0x1357ed8: instance=[[GOT]]; if NULL -> `bl 0xfb69b0(r0=rel data,
+  r1=rel data, r2=0x4a)` create-attempt then reload; empty instance =>
+  getter NULL forever => [m+0x24]=0 (matches probe) and OSAL_s32TimerCreate
+  is NEVER called (k19 log: zero `sTimerCreate` trace hits - consistent).
+- NEXT (runtime-first, per AGENTS hook rules): page watches on 0x1357000 +
+  0x136e000 + 0x1375000 (dispatch on exact fetch addrs 0x1357ed8/0x1357f2c/
+  0x1357f04-r0/0x136e0d0-r0/0x13751cc-r0) to see WHICH leg dies; decode
+  bl 0xfb69b0 args (two GOT-relative structs, id 0x4a=74) - likely an scd/
+  class-factory lookup for the timer-mngr service that fails in the
+  emulator; fix = make the genuine in-process registration succeed (fidelity
+  OK: this is HMI-internal, not a fabricated IPC answer).
+- Side notes: MAP hard-key (row 17 tap) ALONE opens 0x40002ed1 + SETUP page
+  ac53ffea (no setup key needed); the busy-container content getter fetch
+  (s9gate cl-entry) runs DURING content-view build (34419ms) - data is
+  pulled on demand, not pushed.
