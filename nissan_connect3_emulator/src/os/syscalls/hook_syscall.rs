@@ -199,6 +199,26 @@ pub fn hook_syscall(unicorn: &mut Unicorn<'_, Context>, int_no: u32) {
             args[3],
             pc
         );
+        // r799n6 one-shot diagnostic: PROCNAV startup thread [19] issues cmd
+        // 0xd on the IOSC service (0xd000a) and then self-deletes (exit code
+        // 1) - dump the (encrypted-on-disk, decrypted-in-memory) caller and
+        // wrapper bytes so the call can be disassembled offline.
+        if args[1] == 0x000d_000a && std::env::var_os("EMU_PROCHMI_NAV_TRACE").is_some() {
+            static DUMPED: std::sync::Once = std::sync::Once::new();
+            DUMPED.call_once(|| {
+                for (label, lo, len) in [
+                    ("caller", 0x5ea_3e0u32, 0x190u32),
+                    ("wrapper", 0x62e_f20u32, 0x100u32),
+                ] {
+                    let mut buf = vec![0u8; len as usize];
+                    if unicorn.mem_read(lo as u64, &mut buf).is_ok() {
+                        let hex: String =
+                            buf.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
+                        log::warn!("[r799n6-dump] {label} {lo:#x}: {hex}");
+                    }
+                }
+            });
+        }
         // Who is supposed to answer this request? On the real unit the request is
         // served by the monitor's message pump, so a `svc #6` that nobody wakes is
         // fatal no matter how the resume frame is built. Dump the whole thread list the

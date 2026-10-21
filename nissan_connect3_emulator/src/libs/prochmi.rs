@@ -252,6 +252,11 @@ static VIEW_PAINT_CTXS: [AtomicU32; 4] = [
 // those entry values gone.  r1-r3/r12 must come back too - bGUIMainloop's
 // prologue spills them and later code (fault at 0x133bf04) reloads them.
 static TOUCH_RETURN_PENDING: AtomicU32 = AtomicU32::new(0);
+/// r799n6: the live `clFi_Navi` FI object (0x14bcd74's `this`), stashed by
+/// the event2app-target probe every time the FI-NAVI app dispatches an event
+/// with its guards passed.  The F6/NAV dest-entry-event bridge posts the
+/// keyboard-originated 0x81008089 through it when mbx/pump routes cannot.
+static FI_NAV_OBJ: AtomicU32 = AtomicU32::new(0);
 static TOUCH_RETURN_REGS: [AtomicU32; 7] = [
     AtomicU32::new(0), // r0
     AtomicU32::new(0), // r1
@@ -5215,6 +5220,9 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // probe fires before `ldr r3,[r4]` executes - load vptr ourselves
             let vptr = read_u32(uc, r4);
             let target = read_u32(uc, vptr.wrapping_add(0x3c));
+            // r799n6: stash the live clFi_Navi object (the FI-NAVI app passed
+            // its own guards) for the F6 dest-entry event bridge.
+            FI_NAV_OBJ.store(r4, Ordering::Relaxed);
             log::warn!(
                 "PROCHMI event2app-go t={}ms tid=[{}] event={r7:#x} fi={r4:#x} vptr={vptr:#x} vfn3c={target:#x}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
@@ -5233,11 +5241,25 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         let address = base_address + 0x014b_cd74u32 - ORIGINAL_BASE;
         crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:fi-recv-events", move |uc: &mut Unicorn<'_, Context>| {
             static HITS: AtomicU32 = AtomicU32::new(0);
-            if HITS.fetch_add(1, Ordering::Relaxed) >= 60 {
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 4000 {
                 return 0;
             }
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            // r799n6: per-event throttle - the boot GUARD-FAIL flood for
+            // 0x810080a4 used to exhaust the flat budget before the F6-era
+            // events (0x81008114 / 0x81008089) could be observed.
+            {
+                static FE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, u32>>> =
+                    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                if let Ok(mut m) = FE.lock() {
+                    let c = m.entry(r1).or_insert(0);
+                    *c += 1;
+                    if *c > 8 {
+                        return 0;
+                    }
+                }
+            }
             let f8 = read_u32(uc, r0.wrapping_add(8));
             let f2c = read_u32(uc, r0.wrapping_add(0x2c));
             let f30 = read_u32(uc, r0.wrapping_add(0x30));
@@ -9492,6 +9514,37 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 log::debug!("prochmi: hsa-flag watch not installed");
             }
         }
+        // r799n6: the mode-6 branch of vInitDestinationEntry iterates the
+        // handler's dest-entry element list ([hnd+0x88..0x8c], stride 0x20)
+        // and skips issuing the ReqPrepareDestEnv wait event when it is
+        // empty (proven in n43: list empty, no hsa-setwait hits).  Watch the
+        // list bounds and the HSA wait-mask word ([hsa+0x80]) to name the
+        // writer that must populate/arm them on the real unit.
+        for (label, lo, hi) in [
+            ("de-list", 0x038f_9a38u64, 0x038f_9a40u64), // hnd+0x88/+0x8c
+            ("hsa-mask", 0x0390_8d98u64 + 0x80, 0x0390_8d98u64 + 0x84),
+        ] {
+            use unicorn_engine::unicorn_const::HookType;
+            let res = unicorn.add_mem_hook(
+                HookType::MEM_WRITE,
+                lo,
+                hi,
+                move |_uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                    static HITS: AtomicU32 = AtomicU32::new(0);
+                    if HITS.fetch_add(1, Ordering::Relaxed) < 60 {
+                        let pc = _uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                        let lr = _uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                        log::warn!(
+                            "PROCHMI {label} t={}ms +{:#x} <- {value:#x} (sz {size}) pc={pc:#x} lr={lr:#x}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            address - lo,
+                        );
+                    }
+                    true
+                },
+            );
+            log::info!("prochmi: {label} watch installed: {}", res.is_ok());
+        }
     }
 
     // r788: datapool/GUI registration pairing.  Every mediator-sync state
@@ -13005,8 +13058,42 @@ fn drain_gui_key_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
     // r799n5: real KBD hardware raises FI event 0x81008089 on the NAV key
     // (dest-entry init).  Our vKeyPressed bridge cannot; post the message
     // the HSI layer would have received instead.  EMU_FAKE_DESTENTRY-gated.
-    if delivered && matches!(event, crate::input::KeyEvent::Press(crate::input::HardKey::Nav)) {
-        crate::libs::libosal_linux::message::fabricate_fi_destentry_event(unicorn);
+    if delivered && matches!(event, crate::input::KeyEvent::Press(crate::input::HardKey::Nav))
+        && std::env::var_os("EMU_FAKE_DESTENTRY").is_some_and(|v| v == "1")
+    {
+        // r799n6: mbx/pump routes deliver, but the AIL completer drops the
+        // 0x81008089 completion (no live transaction matches it), so the
+        // event never reaches bEvent2App.  Call the guest's own receiver
+        // instead - the SAME `clFi_Navi::ReceiveEventsFromEvtEng` (0x14bcd74,
+        // vfn+0x3c) the manager dispatches 0x81008114 through, with the
+        // object the event2app-target probe observed live.  Everything
+        // downstream (slot 0x59 -> vInitDestinationEntry(mode 6) -> HSA
+        // request -> PROCNAV) then runs organically.  Bridge class = the
+        // key-injection class: a hardware KBD scan stand-in, logged, flagged.
+        let obj = FI_NAV_OBJ.load(Ordering::Relaxed);
+        if obj != 0 {
+            TOUCH_RETURN_REGS[0].store(
+                unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32,
+                Ordering::Relaxed,
+            );
+            TOUCH_RETURN_PENDING.store(1, Ordering::Relaxed);
+            let ok = guest_call_via_lr(
+                unicorn,
+                resume_pc,
+                base + 0x014b_cd74u32 - ORIGINAL_BASE,
+                [obj, 0x8100_8089, 0, 0],
+                64,
+            );
+            if !ok {
+                TOUCH_RETURN_PENDING.store(0, Ordering::Relaxed);
+            }
+            log::warn!(
+                "PROCHMI: EMU_FAKE_DESTENTRY FI event 0x81008089 -> clFi_Navi({obj:#x}) called={ok} t={}ms",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+            );
+        } else {
+            crate::libs::libosal_linux::message::fabricate_fi_destentry_event(unicorn);
+        }
     }
 }
 

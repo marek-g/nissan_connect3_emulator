@@ -2366,3 +2366,38 @@ r799n5b (same day): wait-entry 0x6b7 CONTENTS decoded (runtime WTBASE probe):
   sibling wait) shows the encoding pattern; 0x50001160/0x50001161 look
   like consecutive content-CLASS ids allocated by the dest-entry/nav
   session bootstrap - they only exist once the session runs.
+
+## r799n6: FI 0x81008089 now reaches vInitDestinationEntry(mode 6) - bridge through the guest's own receiver; blocker moved to the empty dest-entry element list
+
+- PROCNAV status clarified: tid 16's NAVEND park (`monitor-yield(svc 0x350564)`)
+  IS the real unit's idle main loop (docs in monitor.rs); tids 67-83 are live
+  worker waits and tid 72/77 keep ticking - PROCNAV is healthy, it is simply
+  never asked anything.  tid 19 is a one-shot bootstrap that self-deletes
+  (IOSC cmd 0xd000a, then OSAL thread delete(0)=self) - benign; tid 66 died
+  against a null teardown continuation (139) - investigate later, it matches
+  an exited helper on the real unit? (open question).
+- FI receiver is ALIVE: fi-recv per-event throttle (boot 0x810080a4 GUARD-FAIL
+  flood used to eat the flat probe budget) shows the clFi_Navi object
+  0x38f9970 passing guards from ~12 s on (trace=0x38ca510, f2c/f30 set); only
+  the 0x80a4 boot-time calls failed.
+- Injection final form (EMU_FAKE_DESTENTRY=1): host calls the guest's own
+  `clFi_Navi::ReceiveEventsFromEvtEng` 0x14bcd74 via guest_call_via_lr with
+  (FI_NAV_OBJ, 0x81008089); FI_NAV_OBJ is stashed by the event2app-target
+  probe from live 0x81008114 dispatches.  mbx/pump routes stay as fallback.
+  Result (n43): fi-recv PASS -> fidispatch idx 0x59 -> slot b->0x14bfb2c ->
+  `vInitDestinationEntry` 0x15a7228 mode=6 PASS -> 0x1578d88(locinput,1) ->
+  case-6 tail 0x15a73a8.
+- Remaining break (n43/n44): the case-6 tail iterates the handler's
+  dest-entry element list ([hnd 0x38f99b0 +0x88..+0x8c], stride 0x30) and
+  skips issuing the wait event when it is empty; de-list write-watch shows
+  ONLY zeroing writes (clear 0x166681c, pc 0x200fae8/0x200fb60) every ~50 ms
+  in the F6 era - no push/populate ever.  hsa-mask [hsa+0x80] is written only
+  twice, at 2831 ms by 0x1884620 (ctor zero); hsa-setwait (0x18a3394/
+  0x1879af8/0x1879b88) stays at zero hits => no ReqPrepareDestEnv request is
+  ever issued => no srvctrl job => no PROCNAV session => no city list.
+- NEXT: find the list POPULATE site: watch is in; the pusher must write
+  [list+0x1c] (reserve/push at 0x16668xx family does the reverse).  Likely
+  feeders: the CL entries registered via li-elemlist4 (locinput 0x3a24c40,
+  a1=1 ran at 32792!) or hminavserver's element registration leg (r787-era
+  dap/rnw tclManager jobs).  Trace what 0x1578d88(locinput,1) should do with
+  the locinput's own element list and why it adds nothing to hnd+0x88.
