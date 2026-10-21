@@ -9521,7 +9521,8 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         // list bounds and the HSA wait-mask word ([hsa+0x80]) to name the
         // writer that must populate/arm them on the real unit.
         for (label, lo, hi) in [
-            ("de-list", 0x038f_9a38u64, 0x038f_9a40u64), // hnd+0x88/+0x8c
+            ("de-list", 0x038f_9a30u64, 0x038f_9a50u64), // hnd+0x80..0xa0
+            ("hsa-list", 0x0390_8e18u64, 0x0390_8e38u64), // hsa+0x80..0xa0
             ("hsa-mask", 0x0390_8d98u64 + 0x80, 0x0390_8d98u64 + 0x84),
         ] {
             use unicorn_engine::unicorn_const::HookType;

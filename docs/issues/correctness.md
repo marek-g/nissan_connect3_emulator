@@ -2401,3 +2401,12 @@ r799n5b (same day): wait-entry 0x6b7 CONTENTS decoded (runtime WTBASE probe):
   a1=1 ran at 32792!) or hminavserver's element registration leg (r787-era
   dap/rnw tclManager jobs).  Trace what 0x1578d88(locinput,1) should do with
   the locinput's own element list and why it adds nothing to hnd+0x88.
+
+r799n6b: hnd+0x80..0xa0 stays untouched after the ctor (n45: de-list writes
+only until t=2678ms; F6-era = zero); hsa-waitstate getter (0x18928e0) no
+longer runs at all in this era (the r788 busy-dialog evaluation is gone),
+so the HSA base 0x3908d98 could not be re-confirmed live - hsa-list watch
+(0x3908e18..0x38) added; it fired zero writes in n46, suspect the ctor site
+0x1884620 family builds the HSA (writes [r7+0x80]=0,[r7+0x8c]=8) but the
+base identity needs a live capture (NEXT: stash r7 at 0x1884620 once into a
+static and re-point both watches dynamically at runtime).
