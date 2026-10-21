@@ -2695,3 +2695,42 @@ static and re-point both watches dynamically at runtime).
 - Note: procmapengine code is ARM (not Thumb); earlier Thumb sweeps on it
   were void.  The runtime codedump technique (mem_read around pc/lr from a
   trap) works for any stripped binary.
+
+## r799n14: answer leg CLOSED (13/14 svc-0x1e answers delivered) - two root causes, both emulator-side
+
+- The resolver fallback 0x383adc does NOT read the stamped word3: it calls
+  IOSC route-open-by-app, which lands in the guest's own
+  `OSAL_s32MessageQueueOpen("mbx_22")`.  Our QUEUE_OPEN trap found the entry
+  but left r2's out slot untouched, so the route open returned -1 and the
+  frozen `queue=0xffffffff` posts followed.  Fix in fallback_open_to_create
+  (gated to procmapengine + mbx_22): complete the open from the process's
+  own guest table (guest_table_handle word-scan) and return to the CALLER's
+  lr - the trap sits on the open's `push {...lr}` (first instruction), so
+  skip-to-addr+4 runs the body and pops a never-pushed frame (n88: tid 60
+  resumed at pc=0x0).  Broad skips regress boot (n85 procbaselx/DAPI stall,
+  n86 map medium never active: the stub's retry open path is what later
+  delivers the adapter chan-head route-open).
+- With the route open fixed, the resolver returns 0x4002b9e0 and all 14
+  answer posts carry it - but none reached tid 72 (AE_16, the PROCNAV
+  STAT/app-22 entity): the queue backlog histogram showed `42:N` frozen
+  while 0x45s drained.  Priority inversion: OSAL 0 is the HIGHEST rank
+  (mq = 7 - osal) and the fabricated sensorfi GPS/posfi providers posted at
+  0, while real AIL traffic posts at 2 (bPostIpcMessage wrapper r3=2).  The
+  synthetic feed outranked every answer sharing mbx_22.  Providers now post
+  at 2 (procnav.rs).
+- n93: 12 STAT requests, 14 answers resolved+posted, 13 delivered to AE_16
+  (8-byte refs `00 04 16 00 18 00 00 00 02 00 00 42 ...`); the
+  queue=0xffffffff failures are gone.  The STAT<->PROCMAP loop is genuinely
+  live end-to-end with NO reply fabrication.
+- Still open downstream: `s9gate cl-entry` for the city-list entry 0x8076000
+  (obj=0x2950 CMNAVI) still reports obj+4=0 - other entries DO have data
+  (0x80b9000 obj+4=0x038f_9b0-ish live value at t=37968), so the CL feed
+  works generally but the 0x8076000 content never gets written.  Answers
+  are header-only (0x18 body, class 0x42, no data blob) - consistent with a
+  status ack; the DATA for 0x8076000 evidently comes from another leg.
+- NEXT: identify the genuine writer of the 0x8076000 entry content: MEM_WRITE
+  watch on 0x8076000..+0x100 in the PROCNAV VM (entry objects live beside the
+  CL datapool), and compare against 0x80b9000 - find which code fills THAT
+  one (pc/lr tells the supplier path) and why the same path skips 0x8076000
+  (likely the dest-entry/city-list content request leg, svc/regid different
+  from the STAT 0x1e loop).
