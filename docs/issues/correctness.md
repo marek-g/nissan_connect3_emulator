@@ -2229,3 +2229,61 @@ NEXT:
   ac53ffea (no setup key needed); the busy-container content getter fetch
   (s9gate cl-entry) runs DURING content-view build (34419ms) - data is
   pulled on demand, not pushed.
+
+## r799n4: F6 "Starting navigation." popup wait FULLY decoded - it waits on a 0x1-domain datapool element that nobody writes
+
+User-visible bug: pressing F6 (NAV) opens the Navigation screen and the
+grey "Starting navigation." sysdlg; it never closes.  Root cause chase
+(n1..n17, nav-only key flow, stuck objects stable at med=0x3a03128 /
+desc=0x3970005 / content 0x25b0114 id 0x40003630):
+
+- Popup identity: dynstack-op `sm=0x39e1fc0 op=0x42b popup=0x5da kind=0
+  prio=0xca slot[0x5da]=0x39f8d78 child{id=0x40003c2c view=0x25f}`.
+- Close path: msg type 0x49 (`ldr r0,[msg+4]; bl 0x1364044` at 0x1376190,
+  handler 0x1376088) closes popup [msg+4]&~0xf8000000.  sysdlg-49 probe:
+  type-0x49 flows freely (129x content 0x5a) but 0xc00005da NEVER appears.
+- Wait machine: GUI_StatePseudoMediatorSync for content 0x40003630,
+  constructor 0x1374f30 (medsctor probe) seeds [m+0x28] from ([content+4]&0xf):
+  kind0->0(+err 0xb7), 1->1, 2->7, 3->2.  The F6 popup row is kind 3
+  (write-watch caught `0x1374fd4` storing 2).  Heartbeat (SM tick, caller
+  0x13716ec) runs every ~25-40ms: wrapper 0x13757cc (or 0x13756ec after a
+  data-update via 0x13706f4) sets 0x20/0x10, calls Start 0x1375150, vStop
+  0x1375140, tail-jumps vCheckFire 0x13754b0.  Write-watch (medflags) shows
+  the flags cycle 0x2a->0x3a->0x1a->0x2a forever; bit 0 (timer mode) is
+  NEVER set for kind 3 => Start (0x1375174 tst #1) never creates the timer -
+  BY DESIGN.  The 0x10/0x20 re-arms are no-ops (0x137567c tst #1 pop-eq).
+- THE decision: vCheckFire with (flags&0x1d0)==0x10 and bit1 set takes
+  0x137559c: `bl 0x1374e4c([content+8])`; `cmp r0,#1` == 1 => 0x13754f0 leg
+  (count dispatch, wait satisfied, popup pops).  Probe at 0x13755a8:
+  `ANSWER=0x0 content=0x25b0114 c8=0x3970005` on EVERY tick - never 1.
+- 0x1374e4c decoded: `r1=[[data]+0]`; only ids with domain nibble 0x1
+  (0x1xxxxxxx datapool elements) are dispatched to the element-handler
+  (vfn+4 exists, vfn+8 count).  ANY other value => `mov r0,#0` straight
+  away.  [0x3970005+0] = 0x3970005 (self-pointer, never written after
+  construction - medflags watch) => the wait's element binding is EMPTY.
+- Datapool evidence (dpset-filter widened to the 0x1 domain): 0x1xxxxxxx
+  element writes happen ONLY during boot (0x100c000/0x101d000/... at 3.1s,
+  v0=0, writer bt 0x13cb834); ZERO 0x1-domain writes around or after F6
+  (28.4s+).  The "navigation initialization finished" element transition
+  that a real unit gets (from the navsrv/CL feed) never happens here -
+  exactly the same missing CL pump as the dest-entry spinner (r788:
+  bdp_Register 0x08076000 zero) and the busy container (r799n2).
+- r799n3 contradiction RESOLVED: Start IS reached for this mediator via an
+  indirect `mov lr,pc; ldr pc,[r3]` thunk - the narrow/page probe on
+  0x1375150 missed it (unicorn HOOK_EXISTS_BOUNDED quirk, AGENTS design.md);
+  the write-watch on [m+0x24..2c] is the trustworthy observer.  Factory +
+  timer-mngr singleton are healthy (tmfac: returns non-zero, tmngr inst
+  0x2cb94cc) - timers ARE created for kind-1/2 mediators (0x13751cc hits).
+
+NEXT:
+1. Identify the element id the wait row expects: dump rows around
+   0x25b0114 and the sibling desc 0x397003d for a 0x1xxxxxxx word (the boot
+   writes prove the pump exists at 0x13cb834; the popup's element was bound
+   to NOTHING - [0x3970005]=self).
+2. Find the binder that should store the element id into [desc+0] (writes
+   to 0x3970005 after t=3507ms: medflags watch shows NONE) - likely the
+   same LI/IOSC session bootstrap that starves the dest-entry CL pump:
+   fix the PROCNAV session precondition ONCE and all three waits
+   (F6 popup, dest-entry spinner, busy container) should resolve.
+3. Re-check: sysdlg-49 must then see pid=0xc00005da and the popup frame
+   must vanish from the dump within a tick.

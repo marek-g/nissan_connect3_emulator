@@ -4782,12 +4782,31 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // (domain byte 0x08 - the log's hex display hid the leading zero),
             // not 0x80xxxxxx.
             let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
-            let band = (r1 & 0xff00_0000) == 0x0800_0000
-                && matches!(r1 & 0x00f0_0000, 0x0000_0000 | 0x0010_0000 | 0x0070_0000);
+            let band = matches!(
+                r1 >> 24,
+                // r799n4c: also watch the 0x01 domain - the mediator-sync
+                // data-exists waits (0x137586c) only dispatch on 0x1xxxxxxx
+                // element ids; the F6 "Starting navigation." popup waits on
+                // one such element.
+                0x08 | 0x01
+            );
             if !band {
                 return 0;
             }
-            if HITS.fetch_add(1, Ordering::Relaxed) >= 80 {
+            // per-element dedup so early boot traffic cannot eat the budget
+            // before the late nav-init writes show up.
+            {
+                static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+                    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+                let mut show = true;
+                if let Ok(mut s) = SEEN.lock() {
+                    show = s.insert(r1);
+                }
+                if !show {
+                    return 0;
+                }
+            }
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 400 {
                 return 0;
             }
             let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
@@ -7416,11 +7435,14 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
     // (+0x28) and the timer slot (+0x24) to catch every writer with pc+bt.
     {
         use unicorn_engine::unicorn_const::HookType;
-        for med in [0x03a0_3128u32] {
+        // 0x3970005 = the F6 popup wait descriptor ([content+8]); its [0]
+        // must name a datapool element for 0x1374e4c to dispatch at all.
+        for med in [0x03a0_3128u32, 0x0397_0000u32] {
+            let last = if med == 0x0397_0000u32 { 0x10 } else { 0x2c };
             let res = unicorn.add_mem_hook(
                 HookType::MEM_WRITE,
                 med as u64,
-                (med + 0x2c) as u64,
+                (med + last) as u64,
                 move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
                     static H: AtomicU32 = AtomicU32::new(0);
                     if H.fetch_add(1, Ordering::Relaxed) >= 600 {
@@ -7484,6 +7506,8 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     0x0137_57cc,
                     0x0137_580c,
                     0x0137_57f8,
+                    0x0137_55a8,
+                    0x0137_4e84,
                 ]
                 .as_slice(),
             ),
@@ -7530,6 +7554,28 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     let f10 = rd(vt + 0x10);
                     let f14 = rd(vt + 0x14);
                     format!(" reg={r0:#x} hnd={ip:#x} vt={vt:#x} f4={f4:#x} f10={f10:#x} f14={f14:#x}")
+                } else if off == 0x0137_4e84u32 as u64 {
+                    // 0x1374e4c data-ready query, right before its handler
+                    // vfn+0x4 dispatch: r0 = the content data-handler object.
+                    let rtbase = addr as u32 - 0x0137_4e84u32;
+                    let rd = |va: u32| {
+                        if va >= 0x0300_0000 {
+                            read_u32(uc, va) // heap pointer: already runtime
+                        } else {
+                            read_u32(uc, va.wrapping_sub(ORIGINAL_BASE).wrapping_add(rtbase))
+                        }
+                    };
+                    let vt = rd(r0);
+                    let f4 = rd(vt + 4);
+                    format!(" QHND={r0:#x} vt={vt:#x} f4={f4:#x}")
+                } else if off == 0x0137_55a8u32 as u64 {
+                    // vCheckFire kind-3 branch, just after the data-ready
+                    // query bl 0x1374e4c(content+8): r0 == 1 closes the
+                    // wait (=> popup may pop).  Log the answer + content.
+                    let rtbase = addr as u32 - 0x0137_55a8u32;
+                    let rd = |va: u32| read_u32(uc, va.wrapping_sub(ORIGINAL_BASE).wrapping_add(rtbase));
+                    let cnt = read_u32(uc, r5.wrapping_add(0x20));
+                    format!(" ANSWER={r0:#x} content={cnt:#x} c8={:#x}", rd(cnt.wrapping_add(8)))
                 } else {
                     String::new()
                 };
