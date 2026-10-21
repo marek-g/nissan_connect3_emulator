@@ -820,6 +820,7 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ("probe-sd-deliver", PROBE_SD_DELIVER, 2),
         ("probe-regsvc", PROBE_REGSVC, 2),
         ("probe-scd", PROBE_SCD, 2),
+        ("probe-scd-res", 0x0034_f0c2 - ORIGINAL_BASE, 2),
         ("probe-msgreg", PROBE_MSGREG, 2),
         ("probe-msgconf", PROBE_MSGCONF, 2),
     ] {
@@ -830,6 +831,20 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         // `probe-sd-regres` (fabricate the sensorfi CCA reference).
         if !crate::libs::procmapengine::render_trace_enabled()
             && name != "power-repost"
+            && !(std::env::var_os("EMU_STAT_CHASE")
+                .is_some_and(|v| !v.is_empty() && v != "0")
+                && (name.starts_with("probe-sd")
+                    || matches!(
+                        name,
+                        "probe-dispatcher"
+                            | "probe-regprobe"
+                            | "probe-regobj"
+                            | "probe-scd"
+                            | "probe-scd-res"
+                            | "probe-regsvc"
+                            | "probe-msgreg"
+                            | "probe-msgconf"
+                    )))
             && !matches!(
                 name,
                 "probe-sd-bentry" | "probe-sd-binit" | "probe-sd-refres" | "probe-sd-regres"
@@ -1504,6 +1519,20 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0);
                     log::info!(
                         "PROCNAV[{tid}] probe-scd: svc={r0:#x} out={r1:#010x} flag={r2:#x}"
+                    );
+                }
+                "probe-scd-res" => {
+                    // Common tail of the STAT service-data getter: r4 = out
+                    // word ptr, r5 = flag u16 ptr, r7 = service id (all set
+                    // at function entry); [r4]/[r5] hold the answer the
+                    // caller receives.
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                    log::info!(
+                        "PROCNAV[{tid}] probe-scd-res: svc={r7:#x} out={} flag={}",
+                        word(uc, r4).unwrap_or(0),
+                        halfword(uc, r5).unwrap_or(0),
                     );
                 }
                 "probe-msgreg" | "probe-msgconf" => {

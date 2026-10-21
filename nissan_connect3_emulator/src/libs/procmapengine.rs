@@ -1453,6 +1453,8 @@ crate::os::code_stub::trap_site(unicorn, repair_addr, crate::os::code_stub::Trap
 
     add_street_coord_buffer_probe_hooks(unicorn, base_address);
 
+    add_svc_dataset_fill_watch(unicorn);
+
     add_natural_map_engine_start_hooks(unicorn, base_address);
 
     let handler_hook_addr = base_address + PORTCONTROL_HANDLER_RESULT;
@@ -4958,14 +4960,24 @@ crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::A
                     };
                     let is_status = offset == 0x0066_963c - ORIGINAL_BASE && admin == 2;
                     let is_conf = offset == 0x0066_82bc - ORIGINAL_BASE;
+                    // r799n15: arm the step tracer once for the STAT
+                    // svc-0x1e/regid-0x17 request leg (admin type 5) too, to
+                    // catch the data lookup that leaves the answer header-only.
+                    let hdr = read_u32_or_invalid(uc, message.wrapping_add(4));
+                    let is_stat = offset == 0x0066_963c - ORIGINAL_BASE
+                        && admin == 5
+                        && read_u16_or_invalid(uc, hdr.wrapping_add(0x14)) == 0x1e
+                        && read_u16_or_invalid(uc, hdr.wrapping_add(0x16)) == 0x17;
                     let budget_ok = if is_conf {
                         CONF_TRACE_ARMS.fetch_add(1, Ordering::Relaxed) < 2
+                    } else if is_stat {
+                        CONF_TRACE_ARMS.fetch_add(100, Ordering::Relaxed) < 102
                     } else {
                         EXAMINE_TRACE_ARMS.fetch_add(1, Ordering::Relaxed) < 2
                     };
-                    if (is_status && budget_ok) || (is_conf && budget_ok) {
+                    if (is_status && budget_ok) || (is_conf && budget_ok) || (is_stat && budget_ok) {
                         EXAMINE_TRACE_TID.store(uc.get_data().inner.thread_id(), Ordering::Relaxed);
-                        EXAMINE_TRACE_STEPS.store(500, Ordering::Relaxed);
+                        EXAMINE_TRACE_STEPS.store(if is_stat { 1500 } else { 500 }, Ordering::Relaxed);
                         if is_conf {
                             // Dump the sync-answer list (`*this + 0x5c`) that the
                             // conf handler gates the reference append on.
@@ -11827,5 +11839,54 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
                 }
             }
     }
+    }
+}
+
+/// r799n15: who (if anybody) fills the svc-0x1e answer dataset?
+/// The STAT client (app 0x16, PROCNAV) re-asks `svc=0x1e regid=0x17`
+/// every second; the procmapengine server half answers header-only
+/// (body word6=3 = data-not-ready) because the dataset vector of the
+/// administration reference it consults is empty: the `ExamineInfluence`
+/// probe shows ref 0xa0fc70 with `+0x14 == +0x18` (begin==end, storage
+/// 0xd9caf0, capacity word +0x1c=1) from t=12539 on.  Watch the vector
+/// head (begin/end/capacity) AND the first storage slots so every push
+/// names its writer, and the init/clear paths name theirs; zero writes
+/// past init proves the producer message itself is missing (not a lost
+/// insert).  Addresses are heap-deterministic for this process (adapter
+/// 0xa07970 family, n94 census); the ExamineInfluence probe line prints
+/// ref+words each run so a drift is immediately visible.
+fn add_svc_dataset_fill_watch(unicorn: &mut Unicorn<'_, Context>) {
+    for (lo, hi, label) in [
+        (0x00a0_fc84u64, 0x00a0_fc8fu64, "head"),
+        (0x00d9_caf0u64, 0x00d9_cb2fu64, "store"),
+    ] {
+        let res = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            lo,
+            hi,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if HITS.fetch_add(1, Ordering::Relaxed) < 150 {
+                    let pc = uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                    let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCMAPENGINE svc-dataset-{} WRITE t={}ms tid=[{}] addr={:#x} size={size} value={:#x} pc={:#x} lr={:#x}",
+                        label,
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        address,
+                        value,
+                        pc,
+                        lr,
+                    );
+                }
+                true
+            },
+        );
+        log::info!(
+            "PROCMAPENGINE svc-dataset-{} write-watch installed: {}",
+            label,
+            res.is_ok()
+        );
     }
 }
