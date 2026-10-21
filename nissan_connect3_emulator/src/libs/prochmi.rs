@@ -4787,8 +4787,9 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // r799n4c: also watch the 0x01 domain - the mediator-sync
                 // data-exists waits (0x137586c) only dispatch on 0x1xxxxxxx
                 // element ids; the F6 "Starting navigation." popup waits on
-                // one such element.
-                0x08 | 0x01
+                // one such element.  0x90 = mediator-sync content ids (the
+                // popup's ROM row binds wait-id 0x900006b7).
+                0x08 | 0x01 | 0x90
             );
             if !band {
                 return 0;
