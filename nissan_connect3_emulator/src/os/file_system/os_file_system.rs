@@ -88,7 +88,29 @@ impl FileSystem for OsFileSystem {
 
         log::debug!("Opening: {}, flags: {:?}", full_path_name.display(), flags);
 
-        let open_options = self.get_open_options(flags);
+        // r799n8: real open(2) semantics for directory paths.  The
+        // procbaselx SPM-slave pool loader probes its pool directories
+        // (e.g. .../datapool/fff0) with O_RDWR and treats -EISDIR ("dir
+        // present") differently from -ENOENT ("volume absent"); answering
+        // ENOENT for an existing directory aborted that bring-up path.
+        let is_dir = full_path_name.is_dir();
+        if is_dir {
+            if flags.intersects(OpenFileFlags::WRITE) {
+                return Err(OpenFileError::IsDirectory);
+            }
+        } else if flags.intersects(OpenFileFlags::DIRECTORY) && full_path_name.exists() {
+            // resolution finds the file first on a real kernel; ENOTDIR
+            // only applies once the (existing) target turns out regular
+            return Err(OpenFileError::NotDirectory);
+        }
+        let open_options = if is_dir {
+            // a directory fd may only be taken read-only
+            let mut opts = OpenOptions::new();
+            opts.read(true);
+            opts
+        } else {
+            self.get_open_options(flags)
+        };
 
         if let Ok(file) = open_options.open(full_path_name) {
             let opened_file_data = OpenedFileData { file };

@@ -25,6 +25,11 @@ pub enum OpenFileError {
     NoSuchFileOrDirectory,
     FileExists,
     NoPermission,
+    /// open(2) on a directory path with a write access mode (real kernels
+    /// answer -EISDIR; the guest distinguishes it from -ENOENT)
+    IsDirectory,
+    /// O_DIRECTORY set but the path is not a directory (real -ENOTDIR)
+    NotDirectory,
 }
 
 #[derive(Debug, Clone, PartialEq)]

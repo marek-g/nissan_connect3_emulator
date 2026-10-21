@@ -33,6 +33,8 @@ impl SysCallError for OpenFileError {
             OpenFileError::NoSuchFileOrDirectory => -2i32 as u32, // -ENOENT
             OpenFileError::FileExists => -17i32 as u32,          // -EEXIST
             OpenFileError::NoPermission => -1i32 as u32,         // -EPERM
+            OpenFileError::IsDirectory => -21i32 as u32,         // -EISDIR
+            OpenFileError::NotDirectory => -20i32 as u32,        // -ENOTDIR
         }
     }
 }

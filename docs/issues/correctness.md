@@ -2438,3 +2438,39 @@ static and re-point both watches dynamically at runtime).
   The poster lives HMI-side behind the 0x187a230 vfn+4 miss or the RNW
   client's CCA subscription - trace the DAPI worker wake (GetWorker zero
   hits since boot in F6 era = nothing posts, not a worker-lookup failure).
+
+## r799n8: open(2) directory semantics (EISDIR/ENOTDIR) + r788b "domain 0x80 cannot mount" theory DEAD
+
+- procbaselx SPM-slave pool loader opens existing directories
+  (.../datapool/fff0, /001c) with O_RDWR|O_CLOEXEC; our FS returned ENOENT
+  where a real kernel answers EISDIR.  open(2) now mirrors Linux: write
+  access on a dir -> -EISDIR, read-only dir open succeeds (fd for
+  stat/readdir), O_DIRECTORY on an existing regular file -> -ENOTDIR
+  (OpenFileError::{IsDirectory,NotDirectory}, fcntl.rs ARM flags verified
+  against arch/arm/include/asm/fcntl.h: O_DIRECTORY=0o40000=0x4000 was
+  already correct).  Loader proceeds through all pool subdirs now;
+  vSetError(0x72008) count 15->9.  .tmp probe ENOENTs are genuine
+  (fresh-flash units lack them too; pool persistence is not the blocker -
+  DP* files exist nowhere in firmware/SD, and PDATA_MNGR_LM.DAT was
+  self-bootstrapped by prochmi to 122 KB).
+- dp-configure re-read (n50): mounted cfg is built at runtime (0x2a1ed1c
+  differs from file bytes), 52 domains incl. 0xdf and 0x105 - domain ids
+  are NOT capped by count (r788b conclusion was wrong).  Decisive evidence
+  against the whole "domain missing" theory: sibling element 0x8070000,
+  SAME domain 0x80, resolves to a live pointer object (obj=0x38f99b0
+  obj+4=ptr) through the same adapter 0x38eee88 while 0x8076000 returns
+  obj=0x2950 obj+4=0.  Mounting works; the VALUE was simply never written.
+- clFi_Navi instantiates in-run (13.9 s, lr 0x15f7db0) - late, but the
+  pool config predates it at 2.7 s and sibling elements still work, so
+  late FI creation is not the data blocker either.
+- Remaining single root cause (unchanged from r799n7): nobody writes
+  0x8076000 (dest-env prepare result).  Writer chain = hnd+0x80 descriptor
+  map (empty since ctor -> case-6 tail never issues
+  vSetWaitEv_ReqPrepareDestEnvMap) -> HSA mask 0x100000 -> srvctrl type-4/6
+  jobs -> PROCNAV MQB sessions -> CL write.  The map INSERTS never execute:
+  de-list watch (now filtered to guest-code pc, cap 200) shows zero
+  post-ctor writes.  NEXT: find the insert-caller for the hnd+0x88/+0x8c
+  vector - static scan of stores to [r,#0x8c] with stride-0x20 growth in
+  the hminavserver init range (0x15e8xxx..0x15f0xxx), and check whether it
+  is gated on a CCA/registry flag the emulator's registry_compat.reg
+  already fakes (pattern of the r790e USE_CCA_SRV_* publication).
