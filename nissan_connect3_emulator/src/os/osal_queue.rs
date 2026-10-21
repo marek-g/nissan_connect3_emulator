@@ -78,7 +78,31 @@ pub(crate) fn finish_guest_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, no
     };
 
     match message {
-        Some(message) if materialize => {
+        Some(mut message) if materialize => {
+            // r799n12: kernel stamp for the service-data reply-queue field.
+            // The routing/wire body carries the poster's reply queue at
+            // body word 3 (blob offset 8+0x0c); the real kernel stamps it at
+            // route time (senders build it as 0xffffffff - the STAT side of
+            // procmapengine cannot know its own handle), and the receiving
+            // server port stores it into [port+0x20] to post its
+            // ServiceData answers (svc-0x1e answer leg: queue=-1 failures).
+            // Stamp exactly like the kernel: the handle of `mbx_{src}` from
+            // our own queue-handle table.  Only touch bodies that still read
+            // the -1 placeholder.
+            if message.data.len() >= 0x28
+                && message.data[0x14..0x18] == [0xff, 0xff, 0xff, 0xff]
+            {
+                let src_app = u16::from_le_bytes([message.data[8], message.data[9]]);
+                if src_app != 0 {
+                    let name = format!("mbx_{src_app}");
+                    let handle = crate::rtos::monitor::osal_mbx_handle(&name);
+                    message.data[0x14..0x18].copy_from_slice(&handle.to_le_bytes());
+                    log::info!(
+                        "[{}] [LIBOSAL-MBX] kernel reply-queue stamp: src app {src_app:#x} -> {name:?} handle {handle:#x}",
+                        tid
+                    );
+                }
+            }
             match crate::libs::libosal_linux::message::deliver_snapshot_message(
                 unicorn,
                 &message.data,
@@ -117,6 +141,23 @@ pub(crate) fn finish_guest_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, no
                             rd16(0x16),
                             rd32(0x18),
                         );
+                        // r799n11c: the svc-0x1e ServiceData answer leg dies on
+                        // the reply-queue handle stored from this body (the
+                        // server's port slot +0x20 stays -1, so its answer
+                        // posts to handle 0xffffffff and fails).  Dump the full
+                        // header to locate the reply-queue field the receiver
+                        // should bind, and diff against an answered svc-0x300
+                        // request that uses the same class-0x45 envelope.
+                        if (rd16(0x14) == 0x1e || rd16(0x14) == 0x300) && body.len() >= 0x80 {
+                            let words: Vec<String> = (0..0x20usize)
+                                .map(|w| format!("{:08x}", rd32(w * 4)))
+                                .collect();
+                            log::info!(
+                                "[LIBOSAL-MBX]   svc{:03x} body words: {}",
+                                rd16(0x14),
+                                words.join(" ")
+                            );
+                        }
                     }
                     set_runnable_with_result(unicorn, tid, result);
                 }

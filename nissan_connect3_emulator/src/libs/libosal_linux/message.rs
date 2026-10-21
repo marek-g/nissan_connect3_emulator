@@ -464,6 +464,49 @@ suppress_synthetic_message_delete(uc, addr as u32, base_address);
                 }
             }
         }
+        // r799n9f: one-shot dump of the guest libosal queue table at t>=16 s
+        // (r799n9e NEXT): entries {in-use @+0x08, handle @+0x0c, name @+0x38}
+        // stride 0x5c at libosal .bss 0x484d8000+0x25220 - shows which queues
+        // procmapengine's own AIL believes it owns and with what handles,
+        // pinning whether the STAT sender's -1 reply-queue field is a table
+        // hole or a builder-side skip.
+        {
+            static DUMPED: AtomicU32 = AtomicU32::new(0);
+            if crate::libs::dapi::emu_t0_elapsed_ms() >= 16_000
+                && uc.get_data().elf_path.contains("procmapengine")
+                && DUMPED.fetch_add(1, Ordering::Relaxed) == 0
+            {
+                let core_struct = read_u32_or_invalid(uc, 0x4856_79e0);
+                let core = read_u32_or_invalid(uc, core_struct);
+                let table = core.wrapping_add(0x25220);
+                log::warn!("LIBOSAL qtable core_struct={core_struct:#x} core={core:#x} table={table:#x}");
+                for i in 0..0x1000u32 {
+                    let a = table.wrapping_add(i * 4);
+                    let w = read_u32_or_invalid(uc, a);
+                    // little-endian "mbx_" or "Dp00"/"MQ" name starts
+                    if w == 0x5f78626d || (w & 0xffff) == 0x7044 {
+                        let nm = read_cstr(uc, a, 24);
+                        let prev: Vec<String> = (1..12u32)
+                            .rev()
+                            .map(|j| {
+                                format!(
+                                    "{:#x}",
+                                    read_u32_or_invalid(uc, a.wrapping_sub(j * 4))
+                                )
+                            })
+                            .collect();
+                        log::warn!(
+                            "LIBOSAL qtable str {nm:?} @ {a:#x} prev={}",
+                            prev.join(" ")
+                        );
+                    }
+                }
+                let raw: Vec<String> = (0..16u32)
+                    .map(|j| format!("{:#x}", read_u32_or_invalid(uc, table + j * 4)))
+                    .collect();
+                log::warn!("LIBOSAL qtable raw head: {}", raw.join(" "));
+            }
+        }
         if !matches!(r1, 10 | 0xb) {
             return 0;
         }
@@ -820,6 +863,13 @@ fn fallback_open_to_create(
     if handle_ptr == 0 || handle_ptr > 0xf000_0000 || flags > 4 {
         return;
     }
+    // r799n10: patch already-live mbx_ entries before the redirect (the
+    // create path below returns via the guest routine, so its fresh entry
+    // is patched on the NEXT open of the same name - opens repeat per
+    // thread, so every queue converges within bring-up).
+    if name.starts_with("mbx_") {
+        fixup_mbx_entry_handles(unicorn, core_global);
+    }
 
     if osal_queue_exists(
         unicorn,
@@ -830,6 +880,18 @@ fn fallback_open_to_create(
         OSAL_QUEUE_ENTRY_IN_USE_OFFSET,
         OSAL_QUEUE_ENTRY_NAME_OFFSET,
     ) {
+        // r799n10: the entry exists, but entries brought up through this
+        // fallback (and the CCA-internal queue creation) carry 0xffffffff
+        // in the kernel-handle slot (entry+0x10, i.e. name-0x28) where
+        // natively created queues like mbx_28 carry a real kernel object
+        // pointer.  The AIL answer leg reads exactly that slot to post
+        // (bPostIpcMessage's queue argument) and dies on -1 - the svc-0x1e
+        // ServiceData answers to procmapengine's STAT side.  The real
+        // kernel fills the handle at queue creation; hand out our monitor
+        // handle for every live mbx_ entry that still reads -1.
+        if name.starts_with("mbx_") {
+            fixup_mbx_entry_handles(unicorn, core_global);
+        }
         return;
     }
 
@@ -936,6 +998,43 @@ fn osal_queue_exists(
     }
 
     false
+}
+
+/// r799n10: fill the kernel-handle slot (entry+0x10) of every live `mbx_`
+/// entry in the process's OSAL queue table that still reads 0xffffffff.
+/// Queues created through the CCA-internal path carry -1 there while
+/// natively created ones (mbx_28) carry a kernel object pointer; the AIL
+/// answer leg (bPostIpcMessage's queue argument, adapter+0x20 pass-through)
+/// reads exactly that slot, so the svc-0x1e ServiceData answers die before
+/// the kernel ever sees them.  The handle we hand out is the same monitor
+/// handle every other path uses, keeping the namespace consistent.
+fn fixup_mbx_entry_handles(unicorn: &mut Unicorn<'_, Context>, core_global: u32) {
+    let Some(core) = osal_core_base(unicorn, core_global) else {
+        return;
+    };
+    let table = core.wrapping_add(0x25220);
+    for index in 0..0x100u32 {
+        let entry = table.wrapping_add(index * 0x5c);
+        let name = read_cstr(unicorn, entry + 0x38, 0x20);
+        if !name.starts_with("mbx_") {
+            continue;
+        }
+        // Kernel-handle slot at entry+0x14 (n60 word-scan: mbx_28's live
+        // kernel pointer 0x90538490 sits name-0x24 there; the CCA-created
+        // mbx_ entries read 0xffffffff at the same offset).
+        if read_u32_or_invalid(unicorn, entry + 0x14) != 0xffff_ffff {
+            continue;
+        }
+        let handle = crate::rtos::monitor::osal_mbx_handle(&name);
+        if unicorn
+            .mem_write((entry + 0x14) as u64, &handle.to_le_bytes())
+            .is_ok()
+        {
+            log::info!(
+                "[LIBOSAL-MBX] queue-table fixup: {name:?} entry {entry:#x} handle slot -1 -> {handle:#x}"
+            );
+        }
+    }
 }
 
 fn osal_core_base(unicorn: &Unicorn<'_, Context>, core_global: u32) -> Option<u32> {

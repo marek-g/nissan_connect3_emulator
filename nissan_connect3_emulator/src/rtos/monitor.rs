@@ -1459,13 +1459,31 @@ fn complete_osal_service(
             let (src_app, dst_app) = (w0 & 0xffff, (w0 >> 16) & 0xffff);
             static SENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if n < 8 && (1..=0xff).contains(&dst_app) && dst_app != src_app {
+            // r799n12: the routing body's word 3 (body+0x0c) is the reply-
+            // queue slot the *kernel* stamps with the posting application's
+            // queue handle - the receiver stores it into its server port
+            // (+0x20) and posts service-data answers through it.  We used to
+            // forward the body verbatim (word 3 = 0xffffffff), so every
+            // answer leg died on `ail_bIpcMessagePost(app, queue=-1)` and the
+            // svc-0x1e ServiceData replies never left procmapengine - the
+            // same kernel stamp also covers app ids above 0xff (`mbx_1024`
+            // is decimal app 1024), so the dst range check becomes "any
+            // non-self app".  The stamp comes from our own queue table, i.e.
+            // it is exactly the value the real kernel would know.
+            if n < 40 && dst_app != 0 && dst_app != src_app {
                 let namespace = unicorn.get_data().namespace.clone();
                 let mut guard = namespace.lock().unwrap();
                 let queue = format!("mbx_{dst_app}");
                 crate::common::osal_queues::OsalQueueService::ensure_queue(&mut guard.mq, &queue);
                 let mut content = vec![0u8; 0x18];
                 let blob = if unicorn.mem_read(body as u64, &mut content).is_ok() {
+                    let src_queue = format!("mbx_{src_app}");
+                    crate::common::osal_queues::OsalQueueService::ensure_queue(
+                        &mut guard.mq,
+                        &src_queue,
+                    );
+                    let handle = osal_mbx_handle(&src_queue);
+                    content[0x0c..0x10].copy_from_slice(&handle.to_le_bytes());
                     let mut b = Vec::with_capacity(8 + 0x18);
                     b.extend_from_slice(&1u32.to_le_bytes());
                     b.extend_from_slice(&0x18u32.to_le_bytes());
@@ -2305,7 +2323,7 @@ fn dump_wait_stack(unicorn: &mut Unicorn<'_, Context>, thread: u32, tag: &str) {
 
 /// Handle token for a named queue (stable per name, allocated on first use by
 /// either the create or the open path so both agree on the same value).
-fn osal_mbx_handle(name: &str) -> u32 {
+pub fn osal_mbx_handle(name: &str) -> u32 {
     let mut state = osal_state().lock().unwrap();
     match state.mbx_handles.get(name).copied() {
         Some(handle) => handle,

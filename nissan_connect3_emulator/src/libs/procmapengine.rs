@@ -3782,6 +3782,63 @@ crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::A
             .unwrap();
     }
 
+    // r799n11: write-watch on the answer-leg port slot adapter+0x20 of the
+    // class-0x42 ServiceData port (the -1 the failing bPostIpcMessage posts
+    // to; adapter 0xa07970 stable across runs n56-n62).  Catching WHO writes
+    // -1 there (and with what pc) pins the missing bind step - the table
+    // handle fixup (r799n10) did not change the failures, so the -1 is a
+    // stored value, not a read-time lookup.
+    {
+        use unicorn_engine::unicorn_const::HookType;
+        const SLOT: u64 = 0xa079_70 + 0x20;
+        unicorn
+            .add_mem_hook(
+                HookType::MEM_WRITE,
+                SLOT,
+                SLOT + 3,
+                move |uc, _t, address, size, value| {
+                    static COUNT: AtomicU32 = AtomicU32::new(0);
+                    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+                    if n >= 40 {
+                        return true;
+                    }
+                    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                    let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCMAPENGINE de-slot WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x} lr={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        address,
+                        size,
+                        value,
+                        pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                        lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                    );
+                    // r799n11b: procmapengine.out's ELF phdrs are stripped,
+                    // so file-based disasm offsets are unreliable - dump the
+                    // runtime bytes around the writing pc instead.
+                    if n < 2 {
+                        for (tag, a) in [("pc", pc), ("lr", lr)] {
+                            let start = a.wrapping_sub(0x60) & !3;
+                            let mut buf = [0u8; 0x100];
+                            match uc.mem_read(start as u64, &mut buf) {
+                                Ok(()) => log::warn!(
+                                    "PROCMAPENGINE de-slot codedump[{tag}] {a:#x} @{start:#x}: {}",
+                                    buf.iter()
+                                        .map(|b| format!("{b:02x}"))
+                                        .collect::<String>()
+                                ),
+                                Err(e) => {
+                                    log::warn!("PROCMAPENGINE de-slot codedump[{tag}] err {e:?}")
+                                }
+                            }
+                        }
+                    }
+                    true
+                },
+            )
+            .unwrap();
+    }
     // r611: the conf-triggered directory publish is popped by whichever engine
     // thread services `mbx_1024` first - r610 showed a pop by a consumer that
     // does not run the administration walk, so the pair was silently swallowed
