@@ -616,7 +616,13 @@ fn dump_window_pixels(backend: &mut Backend) {
         return;
     }
     let n = WINDOW_DUMPS.fetch_add(1, Ordering::Relaxed);
-    if n >= 40 {
+    // r799n: budget knob - 1 s-granular sweeps of the setup tree need more
+    // than the default 40 frames (EMU_MAP_DUMP_BUDGET).
+    let budget: u32 = std::env::var("EMU_MAP_DUMP_BUDGET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
+    if n >= budget {
         return;
     }
     if let Ok(mut next) = WINDOW_NEXT.lock() {

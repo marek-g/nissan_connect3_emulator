@@ -2148,3 +2148,48 @@ NEXT (in order):
    the fix target reverts to r788's: register/feed the dest-entry data
    provider (getter 0x206 / bdp element 0x08076000) - via PROCNAV's
    session per fidelity rules, NOT a synthetic event.
+
+## r799n: GPS CURRENT POSITION page REACHED in emulator; setup-tree recipe decoded; spinner flakiness pattern
+
+Self-generated ground truth (scripted keys+taps + 1 s window dumps, k1..k20
+in /home/marek/Temp, PNGs /tmp/opencode/sp1[0-9]/,sp2[0-7]/):
+
+- Hard-key model refinement (completes r799i): a SINGLE EMU_KEY_TEST entry =
+  one Press; row-18 tap content (HK_BACK_LONG) only navigates back - from the
+  nav/map function pages that lands ON the SETUP page (0x40002ed1).  The
+  HK_SETTINGS_PRESS content needs the hold suffix, and the page CLOSES on
+  Release - so the working recipe holds the key long:
+  `EMU_KEY_TEST="1.2:nav,1.4:nav,2.2:map,2.4:map,3.2:setup+15"`
+  (nav+map pairs first so 0x40003c2c exists for BACK_LONG to bounce from).
+- SETUP page (Audio/System/Navigation/Telephone&Bluetooth) then renders
+  (ac53ffea); tap Navigation (180,252) -> NAVIGATION SETUP content view
+  0x40003017 renders FULLY with live CL data: Route Options / Guidance & Map
+  Settings / MyPOI Settings / Distance Units / Show Position Information.
+  Deeper: (180,112)->OPTIONS (Route Mode Fastest, Minimis...), (180,240)->
+  POI SETTINGS (Download MyPOIs Now...), Distance Units row toggles km->Miles
+  (write path proven!).  => the CL pump + navsrv data path WORKS for the
+  setup tree; the dest-entry spinner (r799m) is NOT a global data outage.
+- CURRENT POSITION page 0x400030aa OPENS from Show Position Information
+  (180,425): titlebar CURRENT POSITION + Lc/La/Alt rows + Save button render
+  (window_0035 sp26/sp27) - BUT a grey "Starting navigation." system dialog
+  covers the values and survives plain taps; dismissing it is the open item.
+- Spinner-vs-content flakiness pattern (k10-20, same recipe 3x pass 5x fail):
+  the 0x40002ed1 busy container resolves to content ONLY if a tap lands on
+  the list area (y~240-252) WHILE the spinner shows (~B9+6 s).  A tap at
+  y=425 or (2,2) there never resolves it.  Strong hint for r799m: the
+  content-view fetch is driven by the touch/pump tick, not by the CL push
+  alone -> the dest-entry dialog likely needs the same missing tick, not
+  missing data.  (Touch-tap #0 in every EMU_TOUCH_TEST run fires clamped at
+  B9-arrival, later taps keep their 6 s spacing.)
+- Tooling: EMU_MAP_DUMP_BUDGET knob added (gpu/mod.rs); 1 s dumps + stateview
+  id timeline + per-tap now=33;ms logs are enough to drive the whole GUI
+  headless.  Guest-ms ~ dump-seconds + ~5 s.
+
+NEXT:
+1. Find what dismisses the "Starting navigation." sysdlg (both string cases
+   have read-hooks installed but the 40.5 s hit was not logged - check hook
+   budget/branch) and whether Lc/La/Alt then show the Krakow fix values.
+2. r799m spinner bug: try reproducing the "tap-on-spinner resolves content"
+   effect for the dest-entry dialog - identify the tick the tap delivers
+   (vDraw re-eval? timer kick?) and feed it flag-gated the same way for the
+   Enter Destination dialog.
