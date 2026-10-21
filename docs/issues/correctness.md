@@ -2562,3 +2562,25 @@ static and re-point both watches dynamically at runtime).
   fabricable and per AGENTS is a legitimate fabrication surface: regid 0x17
   must map to a serving app).  Compare against the 2 messages that DID get
   answered (svc=0x300) to find the discriminator.
+
+## r799n9b: the ServiceData death point - DAPI's answer leg fails in ail_bIpcMessagePost with queue=0xffffffff
+
+- tid[61] (DAPI mbx/ServiceData consumer, waits mbx_1024 handle 0x400939f8)
+  wakes on every svc-0x1e request, then posts the ANSWER back
+  (message content word0=0x00160400 = src 0x400 -> dst 0x16): 8x
+  OSAL_vSetError(0xffffffff)+queue=0xffffffff (lr 0x660eec,
+  OSAL_IOWrite h=0x40034dcc) at t=16617 - exactly the 6 unanswered
+  svc-0x1e requests + retries.  A different post to the SAME app 0x400
+  succeeds minutes earlier (queue=0x40093a20), and the 2 answered svc=0x300
+  requests do get replies - the discriminator is per-message, not global.
+- The failure surfaces via the libosal IO-write driver method (r799e probe
+  site 0x484f0a50), i.e. the IOSC/AIL app-directory -> queue-handle
+  resolution for this message shape returns -1 host-side.
+- NEXT (entry pinned, cheap): decode what ail_bIpcMessagePost looks up for
+  the failing vs succeeding post (same lr 0x660eec): dump both message
+  contents fully + trace the monitor-side queue lookup (monitor.rs
+  pump-post only maps dst 1..=0xff -> mbx_{dst}; check whether the answer
+  for dst=0x16 needs a REGISTRATION id (regid=0x17) -> queue mapping the
+  CCA directory fabricates - and whether the 2 answered svc=0x300 requests
+  differ in regid).  Fix = fabricate/complete the registration-id
+  directory entry (legitimate fabrication surface per AGENTS), logged.
