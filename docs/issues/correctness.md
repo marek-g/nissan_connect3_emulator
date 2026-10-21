@@ -2349,3 +2349,20 @@ FI 0x81008089 injection (EMU_FAKE_DESTENTRY=1, default off, logged):
   chain shows the GUI action table posts the event, and today's action is
   unbound because the dest-entry dynamic list config (getter 0x206) is
   still empty - i.e. keep chasing the CL provider registration.
+
+r799n5b (same day): wait-entry 0x6b7 CONTENTS decoded (runtime WTBASE probe):
+- Wait table base 0x28f1718 (file), 0x14d2+ entries, stride 12:
+  entry = {type, id1, id2}.  [0x6b7] = {0xa, 0x50001161, 0x400000b2} - a
+  type-0xa two-element wait: domain-5 element 0x50001161 AND domain-4
+  0x400000b2 (content-class membership pair; compare [0x1a2]={0xc,
+  0x700000f5, 0x10000001}).
+- Neither 0x50001161 nor 0x400000b2 is EVER queried (tmq QID=0 hits) and
+  domain-5 queries stop at 0x5000006d.  The whole 0x6b7 subtree is simply
+  never re-evaluated: satisfaction is push-based (pool write -> notify ->
+  mediator wake), and the writer is the navsrv/CL data path.  Closing the
+  popup genuinely therefore REQUIRES the data (matches the user's goal:
+  the city list needs the same feed); no framework kick exists.
+- Domain-4 ids that ARE queried: [0x6b6]={0xa,0x50001160,0x90000726} (the
+  sibling wait) shows the encoding pattern; 0x50001160/0x50001161 look
+  like consecutive content-CLASS ids allocated by the dest-entry/nav
+  session bootstrap - they only exist once the session runs.

@@ -7643,7 +7643,16 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // table limit cmp).  Log ONLY queries for the F6 popup wait id
             // 0x6b7: hits-with-QRES0 => framework asks, data answer is false;
             // zero hits => the wait is never even re-evaluated (starved).
-            (0x013a_5000u32, "tmwt", [0x013a_5040u32].as_slice()),
+            (0x013a_5000u32, "tmwt", [0x013a_5040u32, 0x013a_5068].as_slice()),
+            // r799n5: FI-event -> clHSIMngr glue adapters (each: obj =
+            // 0x1827810(); obj->vfn+0x18(obj, {0,0,msg,lit}).  Dump the msg
+            // struct they carry so the F6 event 0x81008089 can be posted the
+            // same way the genuine producers do.
+            (
+                0x0135_a000u32,
+                "tmevt",
+                [0x0135_a71cu32, 0x0135_a6c4, 0x0135_a76c].as_slice(),
+            ),
             // r799n4e: dynstack wrapper entry (r0 = content pid 0xc0000xxx,
             // lr = the caller that drives push/close).  The startup-era
             // REMOVE of the "Starting navigation." popup (0xc00005da) runs
@@ -7716,14 +7725,46 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     let f10 = rd(vt + 0x10);
                     let f14 = rd(vt + 0x14);
                     format!(" reg={r0:#x} hnd={ip:#x} vt={vt:#x} f4={f4:#x} f10={f10:#x} f14={f14:#x}")
+                } else if off == 0x0135_a71cu32 as u64
+                    || off == 0x0135_a6c4u32 as u64
+                    || off == 0x0135_a76cu32 as u64
+                {
+                    // FI-event glue entry: r1 = event message pointer.
+                    let r1v = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let mut w = String::from(" MSG[");
+                    for i in 0..6u32 {
+                        w.push_str(&format!(
+                            "{:#x} ",
+                            read_u32(uc, r1v.wrapping_add(i * 4))
+                        ));
+                    }
+                    w.push(']');
+                    format!(" EVTIN r0={r0:#x} r1={r1v:#x}{w}")
                 } else if off == 0x0136_4044u32 as u64 {
                     // dynstack wrapper entry: r0 = content pid, r1 = stack op
                     // kind-ish argument; lr names the driving caller.
                     let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
                     format!(" WRAP lr={lr:#x}")
+                } else if off == 0x013a_5068u32 as u64 {
+                    // wait-table lookup, right after `ldr r1,[r1,r2]`:
+                    // r1 = entry-table base.  Once: dump base + the F6
+                    // popup's entry (idx 0x6b7, stride 12) + the table limit.
+                    static SEEN1: AtomicU32 = AtomicU32::new(0);
+                    let r1v = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    if SEEN1.fetch_add(1, Ordering::Relaxed) == 0 {
+                        let e = r1v.wrapping_add(0x6b7 * 12);
+                        format!(
+                            " WTBASE={r1v:#x} lim={:#x} e6b7=[{:#x} {:#x} {:#x}] id={r0:#x}",
+                            read_u32(uc, 0x013a_5070u32),
+                            read_u32(uc, e),
+                            read_u32(uc, e + 4),
+                            read_u32(uc, e + 8),
+                        )
+                    } else {
+                        String::new()
+                    }
                 } else if off == 0x013a_5040u32 as u64 {
-                    // wait-table lookup entry: r0 = raw wait id.  Only the
-                    // F6 popup's 0x900006b7 is of interest here.
+                    // wait-table lookup entry: log only the F6 popup's id.
                     if r0 & 0x07ff_ffff != 0x6b7 {
                         return;
                     }
