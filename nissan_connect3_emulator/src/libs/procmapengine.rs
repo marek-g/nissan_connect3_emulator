@@ -6595,6 +6595,7 @@ crate::os::code_stub::trap_site(unicorn, cca_get_block_ids_vcall, crate::os::cod
         });
     let send_request_entry = base_address + MAP_DATA_CCA_SEND_REQUEST_ENTRY;
     add_dapi_register_diag_hooks(unicorn, base_address);
+    add_claim_leg_repair_hook(unicorn, base_address);
     if std::env::var_os("EMU_REG_CHASE").is_some() {
         add_reg_chase_hooks(unicorn, base_address);
     }
@@ -9950,6 +9951,202 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
     }
 }
 
+/// Register the posfi stand-in in the administration request-list at
+/// `app_iface+0x5c`, the list the STAT svc-0x1e claim walk in
+/// `ail_bHandleMsgServiceData` (case r1=3, leg 0x66a114) actually consults.
+/// Its comparator (0x66e5e0/0x66e6b0) matches 36-byte admin items by
+/// `{+0xc server, +0xe service, +0x10 unique, +0x12 register-id, +0x14
+/// msg+0x1c, +0x20 msg+0x24, +0x22 msg+0x2c byte}` against the live request -
+/// nothing matched because the engine registered nothing for svc 0x1e, so
+/// every STAT request returned "not claimed" and was reposted.  The opaque
+/// words (+0x1c / +0x24 / +0x2c) are copied from the live request because
+/// their semantics are unknown; the semantic fields (server 0x16 = STAT,
+/// service 0x1e, register-id 0x17) are the constants the posfi stand-in is
+/// registered under everywhere else, so no answer is invented - the engine
+/// still builds and delivers the reply itself.
+fn ensure_posfi_admin_registration(unicorn: &mut Unicorn<'_, Context>, obj: u32, msg: u32) {
+    static ADMIN_NODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let mut list = read_u32_or_invalid(unicorn, obj.wrapping_add(0x5c));
+    if list >= 0xf000_0000 || list == 0 {
+        // The administration request-list was never built either (the ctor
+        // leg creating it is not taken, same as for the +0x50 list).  Build
+        // it exactly like the engine's own list ctor 0x6604b0: 16-byte
+        // object {vtable 0x6e2bb8, head, tail, size}.
+        let mmu_arc = {
+            let data = unicorn.get_data();
+            data.mmu.clone()
+        };
+        let addr = match mmu_arc.lock().unwrap().heap_alloc(
+            unicorn,
+            16,
+            Prot::READ | Prot::WRITE,
+            "[admin-req-list]",
+        ) {
+            0 => return,
+            a => a,
+        };
+        let mut init = vec![0u8; 16];
+        init[0..4].copy_from_slice(&0x006e_2bb8u32.to_le_bytes());
+        if unicorn.mem_write(addr as u64, &init).is_err() {
+            return;
+        }
+        if !write_u32(unicorn, obj + 0x5c, addr) {
+            return;
+        }
+        log::warn!(
+            "PROCMAPENGINE: fabricated administration request-list {addr:#x} at app_iface {obj:#x}+0x5c (vtable 0x6e2bb8) - STAT svc-0x1e claims consult it"
+        );
+        list = addr;
+    }
+    let content = read_u32_or_invalid(unicorn, msg.wrapping_add(4));
+    if content >= 0xf000_0000 {
+        return;
+    }
+    // Only stamp the posfi service requests this registration answers.
+    if read_u16_or_invalid(unicorn, content.wrapping_add(0x14)) != 0x1e {
+        return;
+    }
+    let mut node = ADMIN_NODE.load(Ordering::Relaxed);
+    if node != 0 {
+        // Already built: cheap membership check, re-link if the guest dropped it.
+        let mut walk = read_u32_or_invalid(unicorn, list + 4);
+        let mut steps = 0u32;
+        while (0x1000..0xf000_0000).contains(&walk) && steps < 16 {
+            if walk == node {
+                return;
+            }
+            walk = read_u32_or_invalid(unicorn, walk + 4);
+            steps += 1;
+        }
+    } else {
+        let mmu_arc = {
+            let data = unicorn.get_data();
+            data.mmu.clone()
+        };
+        let addr = match mmu_arc
+            .lock()
+            .unwrap()
+            .heap_alloc(unicorn, 48, Prot::READ | Prot::WRITE, "[posfi-admin-ref]")
+        {
+            0 => return,
+            a => a,
+        };
+        ADMIN_NODE.store(addr, Ordering::Relaxed);
+        node = addr;
+    }
+    let mut bytes = vec![0u8; 48];
+    // item (node + 8) per the ctor leg at 0x66e538: type 1 at item+4.
+    bytes[8 + 4] = 1;
+    bytes[8 + 0x0c] = 0x16; // server: STAT application
+    bytes[8 + 0x0e] = 0x1e; // service: posfi
+    let uniq = (read_u32_or_invalid(unicorn, content.wrapping_add(0x0c)) >> 16) as u16;
+    bytes[8 + 0x10..8 + 0x12].copy_from_slice(&uniq.to_le_bytes());
+    bytes[8 + 0x12] = 0x17; // register-id the provider registered under
+    let w1c = read_u16_or_invalid(unicorn, content.wrapping_add(0x1c));
+    bytes[8 + 0x14..8 + 0x16].copy_from_slice(&w1c.to_le_bytes());
+    let w24 = read_u16_or_invalid(unicorn, content.wrapping_add(0x24));
+    bytes[8 + 0x20..8 + 0x22].copy_from_slice(&w24.to_le_bytes());
+    bytes[8 + 0x22] = (read_u32_or_invalid(unicorn, content.wrapping_add(0x2c)) & 0xff) as u8;
+    if unicorn.mem_write(node as u64, &bytes).is_err() {
+        return;
+    }
+    // Link into the list {head@+4, tail@+8, size@+0xc} (see vAdd 0x65e830).
+    let head = read_u32_or_invalid(unicorn, list + 4);
+    let tail = read_u32_or_invalid(unicorn, list + 8);
+    let size = read_u32_or_invalid(unicorn, list + 0xc);
+    let size = if size >= 0x0010_0000 { 0 } else { size };
+    if head >= 0xf000_0000 || head == 0 {
+        if !write_u32(unicorn, node, 0) || !write_u32(unicorn, node + 4, 0) {
+            return;
+        }
+        if !write_u32(unicorn, list + 4, node) || !write_u32(unicorn, list + 8, node) {
+            return;
+        }
+    } else if tail < 0xf000_0000 && tail != 0 {
+        bytes[0..4].copy_from_slice(&tail.to_le_bytes());
+        if unicorn.mem_write(node as u64, &bytes).is_err() {
+            return;
+        }
+        if !write_u32(unicorn, tail + 4, node) || !write_u32(unicorn, list + 8, node) {
+            return;
+        }
+    } else {
+        return;
+    }
+    if !write_u32(unicorn, list + 0xc, size + 1) {
+        return;
+    }
+    log::warn!(
+        "PROCMAPENGINE: registered posfi admin reference {{srv 0x16, svc 0x1e, reg 0x17, uniq {uniq:#x}, w1c {w1c:#x}, w24 {w24:#x}}} in list {list:#x} (node {node:#x}, size {size} -> {}) - STAT svc-0x1e claims need it",
+        size + 1
+    );
+}
+
+/// Repair the client-reference bookkeeping right before the administration's
+/// claim walk in `ail_bHandleMsgServiceData` (the list read at 0x669c9c).
+/// The engine's boot never built the `+0x50` list (constructor leg 0x660804
+/// not taken) nor a posfi reference, so every STAT svc-0x1e request walked a
+/// NULL list, returned "not claimed" and was reposted forever.  All three
+/// helpers are idempotent no-ops once the objects exist.
+fn add_claim_leg_repair_hook(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    // The client-list leg ends with `b 0x669f3c` (0x66a218) whenever it did
+    // not claim - the one entry point every service-data message passes.
+    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let site = base_address + (0x0066_9f3cu32 - ORIGINAL_BASE);
+    crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:claim-repair", move |uc: &mut Unicorn<'_, Context>| {
+        let this = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+        let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+        let msg = read_u32_or_invalid(uc, sp.wrapping_add(0x18));
+        if this >= 0xf000_0000 || msg >= 0xf000_0000 {
+            return 0;
+        }
+        let app = read_u32_or_invalid(uc, this);
+        if !(0x1000..0xf000_0000).contains(&app) {
+            return 0;
+        }
+        let content = read_u32_or_invalid(uc, msg.wrapping_add(4));
+        let svc = read_u16_or_invalid(uc, content.wrapping_add(0x14));
+        let seen = SEEN.fetch_add(1, Ordering::Relaxed);
+        if seen < 4 {
+            // One-shot dump of the two lists this dispatch consults, so the
+            // "which list does the claim actually read" question is settled
+            // from live data and not from static reading.
+            let l50 = read_u32_or_invalid(uc, app + 0x50);
+            let l5c = read_u32_or_invalid(uc, app + 0x5c);
+            log::info!(
+                "PROCMAPENGINE: claim-leg probe svc={svc:#x} app={app:#x} list50={l50:#x}[head {:#x} tail {:#x} size {}] list5c={l5c:#x}[head {:#x} tail {:#x} size {}]",
+                read_u32_or_invalid(uc, if l50 < 0xf000_0000 { l50 + 4 } else { 0 }),
+                read_u32_or_invalid(uc, if l50 < 0xf000_0000 { l50 + 8 } else { 0 }),
+                read_u32_or_invalid(uc, if l50 < 0xf000_0000 { l50 + 0xc } else { 0 }),
+                read_u32_or_invalid(uc, if l5c < 0xf000_0000 { l5c + 4 } else { 0 }),
+                read_u32_or_invalid(uc, if l5c < 0xf000_0000 { l5c + 8 } else { 0 }),
+                read_u32_or_invalid(uc, if l5c < 0xf000_0000 { l5c + 0xc } else { 0 }),
+            );
+        }
+        ensure_posfi_admin_registration(uc, app, msg);
+        0
+    });
+    let site = base_address + (0x0066_9c9cu32 - ORIGINAL_BASE);
+    crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:claim-repair", move |uc: &mut Unicorn<'_, Context>| {
+        let this = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+        let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+        let msg = read_u32_or_invalid(uc, sp.wrapping_add(0x18));
+        if this < 0xf000_0000 {
+            let app = read_u32_or_invalid(uc, this);
+            if (0x1000..0xf000_0000).contains(&app) {
+                ensure_client_ref_list(uc, app);
+                insert_posfi_service_reference(uc, 0);
+                ensure_posfi_ref_linked(uc, app);
+                ensure_dapi_map_service_reference(uc, app);
+                if msg < 0xf000_0000 {
+                    ensure_posfi_admin_registration(uc, app, msg);
+                }
+            }
+        }
+        0
+    });
+}
+
 /// r799n16: walk the decision legs of `vtbl+0x58` (0x664c60), the async
 /// service-registration creator the engine's `vRegisterService` calls for
 /// svc 0x26.  The u16RegisterService-style diagnostics never fire for it, so
@@ -9978,13 +10175,83 @@ fn add_reg_chase_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
         (0x004d_edf0, "mdm-branch (byte+0x29 [sp+0x24] obj+0x4c)"),
         (0x004d_ef24, "mdm-branch-taken+0x29leg"),
         (0x004d_eec0, "mdm-entry (r0)"),
+        (0x0066_e3d0, "bIsDataSet-entry (r0=item r1 r2 r3)"),
+        (0x0066_c568, "claim-cmp (r4=node)"),
+        (0x0066_96dc, "sdata-semgate-ret (r0, sem=[app+0x2c])"),
+        (0x0066_98d4, "sdata-semfail-return0"),
+        (0x0066_96e4, "sdata-postsem (r4)"),
+        (0x0066_96fc, "sdata-srvlist58 (r3)"),
+        (0x0066_978c, "sdata-walk-iter (r6=node)"),
+        (0x0066_97a8, "sdata-notself (r4=node+8)"),
+        (0x0066_9750, "sdata-answer-decide (r0)"),
+        (0x0066_9c8c, "sdata-sp3c-check (r0)"),
+        (0x0066_ce30, "exm-zero-after-66963c (r7=msg)"),
+        (0x0066_a128, "sdata-leg5c-size (r0=[+0x5c].size)"),
+        (0x0066_a2f0, "claim5c-cmp (r0=node+8)"),
+        (0x0066_a36c, "claim-walk-hit (bIsDataSet true)"),
+        (0x0066_a390, "claim-walk-success (returns 1)"),
+        (0x0066_9bcc, "leg5-gate (r0: opcode ok)"),
+        (0x0066_9c1c, "leg5-candlist (r0: nonempty?)"),
+        (0x0066_9c3c, "leg5-port (r0=port from 0x66df4c)"),
+        (0x0066_9c58, "leg5-post-res (r0=1 means OK)"),
+        (0x0066_a21c, "leg5-answered-log"),
     ] {
         let address = base_address + (offset - ORIGINAL_BASE);
         crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:reg-chase", {
             let label = label.to_string();
             move |uc: &mut Unicorn<'_, Context>| {
                 static N: AU32 = AU32::new(0);
-                let n = N.fetch_add(1, Ordering::Relaxed);
+                // r799n16: bIsDataSet runs for every serviced message; only
+                // the svc-0x1e claim tuples matter here, so filter and keep a
+                // dedicated budget for them.
+                let filter_posfi = label.contains("bIsDataSet") || label.contains("claim-cmp");
+                let filter_sdata = label.contains("sdata-")
+                    || label.contains("exm-zero")
+                    || label.contains("claim5c")
+                    || label.contains("leg5-");
+                if filter_sdata {
+                    static NS: AU32 = AU32::new(0);
+                    let msg = if label.contains("exm-zero") {
+                        uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32
+                    } else {
+                        let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                        read_u32_or_invalid(uc, sp.wrapping_add(0x18))
+                    };
+                    // svc lives in the message *content* ([msg + 4]), not the
+                    // message object itself.
+                    let content = read_u32_or_invalid(uc, msg.wrapping_add(4));
+                    if read_u16_or_invalid(uc, content.wrapping_add(0x14)) != 0x1e {
+                        return 0;
+                    }
+                    if NS.fetch_add(1, Ordering::Relaxed) >= 60 {
+                        return 0;
+                    }
+                }
+                if filter_posfi {
+                    static NB: AU32 = AU32::new(0);
+                    let item = if label.contains("bIsDataSet") {
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32
+                    } else {
+                        uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32 + 8
+                    };
+                    let svc = if label.contains("bIsDataSet") {
+                        uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff
+                    } else {
+                        0
+                    };
+                    let srv = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32 & 0xffff;
+                    if svc != 0x1e && srv != 0x16 && read_u16_or_invalid(uc, item) != 0x1e {
+                        return 0;
+                    }
+                    if NB.fetch_add(1, Ordering::Relaxed) >= 40 {
+                        return 0;
+                    }
+                }
+                let n = if filter_posfi || filter_sdata {
+                    0
+                } else {
+                    N.fetch_add(1, Ordering::Relaxed)
+                };
                 if n < 80 {
                     let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
                     let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
@@ -10002,6 +10269,66 @@ fn add_reg_chase_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                         let b29 = read_u8_or_invalid(uc, sl.wrapping_add(0x29));
                         let w4c = read_u32_or_invalid(uc, sl.wrapping_add(0x4c));
                         format!(" sl={sl:#x} r4={r4:#x} [sp+0x24]={v24:#x} [sl+0x29]={b29:#x} [sl+0x4c]={w4c:#x}")
+                    } else if label.contains("bIsDataSet") {
+                        let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                        let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                        let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                        let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                        let u = read_u16_or_invalid(uc, r0.wrapping_add(8));
+                        let w = read_u32_or_invalid(uc, sp.wrapping_add(4));
+                        format!(
+                            " item[{:04x},{:04x},{:04x},{:04x},{:04x}] msg(svc={r1:#x},srv={r2:#x},reg={r3:#x},uniq={:#x})",
+                            read_u16_or_invalid(uc, r0),
+                            read_u16_or_invalid(uc, r0.wrapping_add(2)),
+                            read_u16_or_invalid(uc, r0.wrapping_add(4)),
+                            read_u16_or_invalid(uc, r0.wrapping_add(6)),
+                            u,
+                            w & 0xffff,
+                        )
+                    } else if label.contains("sdata-") || label.contains("claim-walk") {
+                        let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                        let msg = read_u32_or_invalid(uc, sp.wrapping_add(0x18));
+                        let content = read_u32_or_invalid(uc, msg.wrapping_add(4));
+                        let obj = read_u32_or_invalid(uc, r8);
+                        let sem = read_u32_or_invalid(uc, obj.wrapping_add(0x2c));
+                        let mut extra = String::new();
+                        if label.contains("claim5c") {
+                            // Tuple the comparator 0x66e5e0 consumes: the item
+                            // fields (+0xc server, +0xe svc, +0x10 unique,
+                            // +0x12 reg-id, +0x14 msg+0x1c) must equal these.
+                            let item = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                            extra = format!(
+                                " want srv={:#06x} svc={:#06x} uniq={:#06x} reg={:#06x} w1c={:#06x} w24={:#06x} b2c={:#04x} | item[4]={:#04x} c={:04x},e={:04x},10={:04x},12={:04x},14={:04x},20={:04x}",
+                                read_u16_or_invalid(uc, content),
+                                read_u16_or_invalid(uc, content.wrapping_add(0x14)),
+                                read_u16_or_invalid(uc, content.wrapping_add(0x0e)),
+                                read_u16_or_invalid(uc, content.wrapping_add(0x16)),
+                                read_u16_or_invalid(uc, content.wrapping_add(0x1c)),
+                                read_u16_or_invalid(uc, content.wrapping_add(0x24)),
+                                read_u32_or_invalid(uc, content.wrapping_add(0x2c)) & 0xff,
+                                read_u32_or_invalid(uc, item.wrapping_add(4)) & 0xff,
+                                read_u16_or_invalid(uc, item.wrapping_add(0xc)),
+                                read_u16_or_invalid(uc, item.wrapping_add(0xe)),
+                                read_u16_or_invalid(uc, item.wrapping_add(0x10)),
+                                read_u16_or_invalid(uc, item.wrapping_add(0x12)),
+                                read_u16_or_invalid(uc, item.wrapping_add(0x14)),
+                                read_u16_or_invalid(uc, item.wrapping_add(0x20)),
+                            );
+                        }
+                        format!(
+                            " msg={msg:#x} content={content:#x} this={r8:#x} obj=[this]={obj:#x} sem=[obj+0x2c]={sem:#x} state[obj+0x30]={:#x}{extra}",
+                            read_u32_or_invalid(uc, obj.wrapping_add(0x30))
+                        )
+                    } else if label.contains("claim-cmp") {
+                        let item = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32 + 8;
+                        format!(
+                            " item@{item:#x} [{:04x},{:04x},{:04x},{:04x},{:04x}]",
+                            read_u16_or_invalid(uc, item.wrapping_add(8)),
+                            read_u16_or_invalid(uc, item.wrapping_add(0xa)),
+                            read_u16_or_invalid(uc, item.wrapping_add(0xc)),
+                            read_u16_or_invalid(uc, item.wrapping_add(0xe)),
+                            read_u16_or_invalid(uc, item.wrapping_add(0x10)),
+                        )
                     } else {
                         String::new()
                     };
@@ -10098,7 +10425,65 @@ static POSFI_REF_INSERTED: AtomicU32 = AtomicU32::new(0);
 // watchdog walk fails to find the node; the node body (+8..+20) already
 // carries the tuple fields, so only the prev/next links and list tail are
 // rewritten.  Safe to run from any hook: the emulator is serialized.
+/// The engine's one-thread app-interface should own a client service-reference
+/// list at `+0x50`, built by the constructor leg at 0x660804 (16-byte object,
+/// vtable 0x6e2bb8, `{first, last, count} = {0,0,0}`).  The engine's boot-time
+/// config switch never took that case in this emulator, so `+0x50` stayed 0
+/// and every consumer - the STAT svc-0x1e claim walk in
+/// `ail_bHandleMsgServiceData` (0x669c9c reads `[obj+0x50]`, NULL-skips the
+/// whole walk), the conf handler's reference append, and our own posfi /
+/// DAPI-map reference bookkeeping - silently found "no references".  Create
+/// the list the way the constructor would, once, loudly.  This is pure
+/// registration bookkeeping (same class as the fabricated posfi reference it
+/// holds); no protocol answer is invented, so no data error can hide behind
+/// it - a broken SD database still fails further down the parsers.
+fn ensure_client_ref_list(unicorn: &mut Unicorn<'_, Context>, app_iface: u32) {
+    static LIST_BLOB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let list = read_u32_or_invalid(unicorn, app_iface + 0x50);
+    if list < 0xf000_0000 && list != 0 {
+        return;
+    }
+    if read_u32_or_invalid(unicorn, app_iface + 0x2c) == 0 {
+        // Not the one-thread app-interface (that holds its table semaphore
+        // there); nothing to repair on this object.
+        return;
+    }
+    let known = LIST_BLOB.load(Ordering::Relaxed);
+    let mmu_arc = {
+        let data = unicorn.get_data();
+        data.mmu.clone()
+    };
+    let addr = if (0x1000..0xf000_0000).contains(&known) {
+        known
+    } else {
+        match mmu_arc.lock().unwrap().heap_alloc(
+            unicorn,
+            16,
+            Prot::READ | Prot::WRITE,
+            "[client-ref-list]",
+        ) {
+            0 => return,
+            a => {
+                LIST_BLOB.store(a, Ordering::Relaxed);
+                a
+            }
+        }
+    };
+    let mut init = vec![0u8; 16];
+    init[0..4].copy_from_slice(&0x006e_2bb8u32.to_le_bytes()); // list vtable (ctor literal 0x660a24)
+    if unicorn.mem_write(addr as u64, &init).is_err() {
+        return;
+    }
+    if !write_u32(unicorn, app_iface + 0x50, addr) {
+        return;
+    }
+    log::warn!(
+        "PROCMAPENGINE: fabricated client service-reference list {addr:#x} (vtable 0x6e2bb8) at app_iface {app_iface:#x}+0x50 - the ctor leg 0x660804 never ran; claim walks and reference appends need it"
+    );
+}
+
 fn ensure_posfi_ref_linked(unicorn: &mut Unicorn<'_, Context>, app_iface: u32) {
+    ensure_client_ref_list(unicorn, app_iface);
     let node = POSFI_REF_BLOB.load(Ordering::Relaxed);
     if node == 0 || node >= 0xf000_0000 {
         return;
@@ -10107,6 +10492,8 @@ fn ensure_posfi_ref_linked(unicorn: &mut Unicorn<'_, Context>, app_iface: u32) {
     if list >= 0xf000_0000 {
         return;
     }
+    // List layout {vtable, head@+4, tail@+8, size@+0xc} (see the note in
+    // `insert_posfi_service_reference`).
     let mut walk = read_u32_or_invalid(unicorn, list + 4);
     let mut steps = 0u32;
     while (0x1000..0xf000_0000).contains(&walk) && walk != list && steps < 16 {
@@ -10171,10 +10558,13 @@ fn ensure_dapi_map_service_reference(unicorn: &mut Unicorn<'_, Context>, app_ifa
         // entry with a register id DAPI never handed out gets "unknown register" back.
         return;
     }
+    ensure_client_ref_list(unicorn, app_iface);
     let list = read_u32_or_invalid(unicorn, app_iface + 0x50);
     if list >= 0xf000_0000 {
         return;
     }
+    // List layout {vtable, head@+4, tail@+8, size@+0xc} (see the note in
+    // `insert_posfi_service_reference`).
     let count = read_u32_or_invalid(unicorn, list + 0xc);
     if count >= 0x0010_0000 {
         return;
@@ -10248,6 +10638,7 @@ fn insert_posfi_service_reference(unicorn: &mut Unicorn<'_, Context>, _original_
     }
     let base_address = PROCMAP_BASE.load(Ordering::Relaxed);
     let app = read_u32_or_invalid(unicorn, base_address + MAP_ENGINE_GLOBAL);
+    ensure_client_ref_list(unicorn, app);
     let list = read_u32_or_invalid(unicorn, app + 0x50);
     if app >= 0xf000_0000 || list >= 0xf000_0000 {
         log::warn!("PROCMAPENGINE: posfi service-reference insert skipped (app={app:#x} list={list:#x})");
@@ -10268,11 +10659,13 @@ fn insert_posfi_service_reference(unicorn: &mut Unicorn<'_, Context>, _original_
         node = addr;
         POSFI_REF_BLOB.store(addr, Ordering::Relaxed);
     }
-    let count = read_u32_or_invalid(unicorn, list + 0xc);
-    if count >= 0x0010_0000 {
-        log::warn!("PROCMAPENGINE: posfi service-reference insert skipped (list {list:#x} count {count:#x})");
-        return;
-    }
+    // Real list layout (guest ctor 0x660804 zeroes +4/+8/+0xc):
+    // {vtable, walk-entry@+4, X@+8, Y@+0xc}.  The claim walk at 0x669cb4
+    // reads `node = [[obj+0x50] + 4]` - the walk-entry slot - so that is
+    // where the head node belongs, and the guest's own append legs keep the
+    // tail at +8 (0x660824/0x660828) with +0xc holding the size.  An earlier
+    // revision wrote first@+8/count@+4, which made the walk read count 0 and
+    // silently stop before the very first bIsDataSet compare.
     let last = read_u32_or_invalid(unicorn, list + 8);
     let mut bytes = vec![0u8; 24];
     bytes[0x08] = 0x1e; // item service id: posfi
@@ -10284,9 +10677,21 @@ fn insert_posfi_service_reference(unicorn: &mut Unicorn<'_, Context>, _original_
     bytes[0x0a] = 0x16;
     bytes[0x0c] = 0x17; // item register-id (matches provider messages)
     bytes[0x0e] = 0x00; // item service state: AVAILABLE
-    bytes[0x10..0x18].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-    if count == 0 {
-        // first = last = node, prev = next = 0, count = 1
+    // Unique-id slot (bIsDataSet param compares the message's u16 at
+    // content+0x0e against item+0x08).  The kernel reply-queue stamp
+    // (r799n12, `osal_queue.rs`) writes STAT's 32-bit reply-queue handle
+    // into content+0x0c, so the compared high half is always the emulator
+    // handle's magic `0x4002` - mirror it here so the STAT svc-0x1e claim
+    // matches.  (The engine's own svc-0x26 requests carry 0 there and the
+    // DAPI-map reference keeps unique 0 for that reason.)
+    bytes[0x10] = 0x02;
+    bytes[0x11] = 0x40;
+    bytes[0x12..0x18].copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    let head = read_u32_or_invalid(unicorn, list + 4);
+    let size = read_u32_or_invalid(unicorn, list + 0xc);
+    let size = if size >= 0x0010_0000 { 0 } else { size };
+    if head >= 0xf000_0000 || head == 0 {
+        // empty list: head = tail = node, prev = next = 0, size = 1
         if !write_u32(unicorn, node, 0) || !write_u32(unicorn, node + 4, 0) {
             return;
         }
@@ -10294,7 +10699,7 @@ fn insert_posfi_service_reference(unicorn: &mut Unicorn<'_, Context>, _original_
             return;
         }
     } else if last < 0xf000_0000 {
-        // append behind the current last node (mirrors vAdd's second branch)
+        // append behind the current tail node
         bytes[0x00..0x04].copy_from_slice(&last.to_le_bytes());
         if !write_u32(unicorn, last + 4, node) {
             return;
@@ -10309,14 +10714,13 @@ fn insert_posfi_service_reference(unicorn: &mut Unicorn<'_, Context>, _original_
         log::warn!("PROCMAPENGINE: failed to write posfi service reference node at {node:#x}");
         return;
     }
-    if !write_u32(unicorn, list + 0xc, count + 1) {
+    if !write_u32(unicorn, list + 0xc, size + 1) {
         return;
     }
     POSFI_REF_INSERTED.store(1, Ordering::Relaxed);
     log::info!(
-        "PROCMAPENGINE: linked posfi service reference {{svc 0x1e, reg-id 0x17, state AVAILABLE}} into list {list:#x} (node {node:#x}, count {} -> {})",
-        count,
-        count + 1
+        "PROCMAPENGINE: linked posfi service reference {{svc 0x1e, reg-id 0x17, state AVAILABLE}} into list {list:#x} (node {node:#x}, size {size} -> {})",
+        size + 1
     );
 
     // The body thread's very first receive (wait + u32GetFromMessageQueue on
