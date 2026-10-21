@@ -7320,6 +7320,231 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             Err(e) => log::warn!("PROCHMI: v24body page watch failed: {e}"),
         }
     }
+    // r799n4: the "Starting navigation." sysdlg (dynstack popup id 0x5da,
+    // view 0x25f companion, prio 0xca) never closes.  Close path decoded:
+    // handler 0x1376088 dispatches msg word [msg+0xc]; type 0x49 closes the
+    // popup whose id sits at [msg+4] (0x1376190 `ldr r0,[r1,#4]; bl
+    // 0x1364044`).  Watch handler entry + close site (page dispatch).
+    {
+        let page = (base_address + 0x0137_6000u32 - ORIGINAL_BASE) as u64;
+        let ent = (base_address + 0x0137_6088u32 - ORIGINAL_BASE) as u64;
+        let cls = (base_address + 0x0137_6190u32 - ORIGINAL_BASE) as u64;
+        let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
+            let is_ent = addr == ent;
+            if !is_ent && addr != cls {
+                return;
+            }
+            static V: AtomicU32 = AtomicU32::new(0);
+            if V.fetch_add(1, Ordering::Relaxed) >= 3000 {
+                return;
+            }
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+            let typ = read_u32(uc, r1.wrapping_add(0xc)) & 0xffff;
+            let pid = read_u32(uc, r1.wrapping_add(4));
+            let mut bt = String::new();
+            for i in 0..8u32 {
+                let w = read_u32(uc, sp.wrapping_add(i * 4));
+                if (0x00fb_7080..0x023b_eb1b).contains(&w) {
+                    bt.push_str(&format!(" {w:#x}"));
+                }
+            }
+            let tag = if is_ent { "ent" } else { "close" };
+            log::warn!(
+                "PROCHMI sysdlg-49 {tag} t={}ms tid=[{}] msg={r1:#x} type={typ:#x} pid={pid:#x} bt:{bt}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+        });
+        match result {
+            Ok(_) => log::info!("PROCHMI: sysdlg-49 page watch installed"),
+            Err(e) => log::warn!("PROCHMI: sysdlg-49 page watch failed: {e}"),
+        }
+    }
+    // r799n4: the constructor GUI_StatePseudoMediatorSync::C2 (0x1374f30)
+    // seeds [m+0x28] from ([content+4] & 0xf): kind 0 -> flags 0 + error
+    // 0xb7, kind 1 -> 1, kind 2 -> 7, kind 3 -> 2.  Start (0x1375150) only
+    // creates the timer when the OLD flags carry bit 0, so a kind-3 mediator
+    // NEVER owns a timer and its wait can only be re-checked by external
+    // events - matching the stuck sync mediator (flags 0x3a, tmr=0).  Log
+    // every construction with the content head to identify the stuck one.
+    {
+        let page = (base_address + 0x0137_4000u32 - ORIGINAL_BASE) as u64;
+        let ent = (base_address + 0x0137_4f30u32 - ORIGINAL_BASE) as u64;
+        let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
+            if addr != ent {
+                return;
+            }
+            static M: AtomicU32 = AtomicU32::new(0);
+            if M.fetch_add(1, Ordering::Relaxed) >= 2000 {
+                return;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let c4 = read_u32(uc, r1.wrapping_add(4));
+            let c0 = read_u32(uc, r1);
+            // Mediators are re-constructed on every page re-entry; log each
+            // object address only once so the budget covers late content.
+            {
+                static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+                    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+                match SEEN.lock() {
+                    Ok(mut s) => {
+                        if !s.insert(r0) {
+                            return;
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+            log::warn!(
+                "PROCHMI medsctor t={}ms tid=[{}] med={r0:#x} content={r1:#x} c[0]={c0:#x} c[4]={c4:#x} kind={}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                c4 & 0xf,
+            );
+        });
+        match result {
+            Ok(_) => log::info!("PROCHMI: medsctor page watch installed"),
+            Err(e) => log::warn!("PROCHMI: medsctor page watch failed: {e}"),
+        }
+    }
+    // r799n4b: the stuck sync mediator (nav-only flow: 0x3a03128, content
+    // 0x40003630) is CONSTRUCTED with kind 1 (flags=1) yet at 28 s carries
+    // flags 0x3a - bit 0 gone, bit 8 (started) present although Start
+    // (0x1375150) provably never fetches for it.  Write-watch the flag word
+    // (+0x28) and the timer slot (+0x24) to catch every writer with pc+bt.
+    {
+        use unicorn_engine::unicorn_const::HookType;
+        for med in [0x03a0_3128u32] {
+            let res = unicorn.add_mem_hook(
+                HookType::MEM_WRITE,
+                med as u64,
+                (med + 0x2c) as u64,
+                move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                    static H: AtomicU32 = AtomicU32::new(0);
+                    if H.fetch_add(1, Ordering::Relaxed) >= 600 {
+                        return true;
+                    }
+                    let pc = uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                    let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                    let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    let mut bt = String::new();
+                    for i in 0..8u32 {
+                        let w = read_u32(uc, sp.wrapping_add(i * 4));
+                        if (0x00fb_7080..0x023b_eb1b).contains(&w) {
+                            bt.push_str(&format!(" {w:#x}"));
+                        }
+                    }
+                    log::warn!(
+                        "PROCHMI medflags t={}ms tid=[{}] m+{:#x} <- {:#x} (sz {}) pc={pc:#x} lr={lr:#x} bt:{bt}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        address as u32 - med,
+                        value & 0xffff_ffff,
+                        size,
+                    );
+                    true
+                },
+            );
+            match res {
+                Ok(_) => log::info!("PROCHMI: medflags watch installed"),
+                Err(e) => log::warn!("PROCHMI: medflags watch failed: {e}"),
+            }
+        }
+    }
+    // r799n3: the GUI_ContentFunction mediator timer slot [m+0x24] is NULL
+    // in every run (r799n2), which is the missing re-check kick behind BOTH
+    // spinners.  Decode WHICH leg of the creation chain dies:
+    //   0x1357ed8 timer-mngr singleton getter entry
+    //   0x1357f2c   create-attempt path (singleton was NULL)
+    //   0x1357f04   post-create: instance = [[r4+r5]]
+    //   0x136e0d0 timer-object factory entry; 0x136e0e0 new() result;
+    //   0x136e118 inner 0x1357218 result
+    //   0x13751cc mediator setter: r0 = factory result stored to [m+0x24]
+    // Also dump the PLT slot 0xfb69b0 targets at 0x6d56a40 once (identifies
+    // the library owning the factory).
+    {
+        for (page_off, name, addrs) in [
+            (0x0135_7000u32, "tmngr", [0x0135_7ed8u32, 0x0135_7f2c, 0x0135_7f04].as_slice()),
+            (0x0136_e000u32, "tmfac", [0x0136_e0d0u32, 0x0136_e0e0, 0x0136_e118].as_slice()),
+            // r799n3b: also Start 0x1375150 (early-return on bit3) and the
+            // caller leg 0x1375650 (flags of r5 read live at both).
+            // r799n4b: 0x13757cc/0x137580c = kind-3 heartbeat wrapper entry
+            // (r0 = mediator) and right after its handler vfn+0x10 call
+            // (r0 = the data handler's answer, >0 => popup may close).
+            (
+                0x0137_5000u32,
+                "tmset",
+                [
+                    0x0137_51ccu32,
+                    0x0137_5150,
+                    0x0137_5650,
+                    0x0137_517c,
+                    0x0137_57cc,
+                    0x0137_580c,
+                    0x0137_57f8,
+                ]
+                .as_slice(),
+            ),
+        ] {
+            let page = (base_address + page_off - ORIGINAL_BASE) as u64;
+            let addrs: Vec<u64> = addrs
+                .iter()
+                .map(|o| (base_address + *o - ORIGINAL_BASE) as u64)
+                .collect();
+            let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
+                if !addrs.contains(&addr) {
+                    return;
+                }
+                static V: AtomicU32 = AtomicU32::new(0);
+                if V.fetch_add(1, Ordering::Relaxed) >= 4000 {
+                    return;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                let mut extra = String::new();
+                let off = addr - base_address as u64 + ORIGINAL_BASE as u64;
+                if off == 0x0135_7f04u32 as u64 {
+                    let inst = read_u32(uc, r4.wrapping_add(r5));
+                    extra = format!(" inst={inst:#x}");
+                }
+                if off == 0x0135_7ed8u32 as u64 {
+                    let img = addr - (0x0135_7ed8u64 - ORIGINAL_BASE as u64);
+                    let plt = read_u32(uc, (img + 0x06d4_ea40u64 - ORIGINAL_BASE as u64) as u32);
+                    extra = format!(" plt={plt:#x}");
+                }
+                let fl = read_u32(uc, r5.wrapping_add(0x28));
+                // r799n4b: at the heartbeat entry r0 is the mediator; dump
+                // the domain handler object's vtable function addresses so
+                // the wait-evaluation implementation can be disassembled.
+                let extra2 = if off == 0x0137_57f8u32 as u64 {
+                    // Directly after the wrapper's registry-table lookup:
+                    // r0 = registry base, ip = the domain-4 handler object.
+                    let rtbase = addr as u32 - 0x0137_57f8u32;
+                    let rd = |va: u32| read_u32(uc, va.wrapping_sub(ORIGINAL_BASE).wrapping_add(rtbase));
+                    let ip = uc.reg_read(RegisterARM::R12).unwrap_or(0) as u32;
+                    let vt = rd(ip);
+                    let f4 = rd(vt + 4);
+                    let f10 = rd(vt + 0x10);
+                    let f14 = rd(vt + 0x14);
+                    format!(" reg={r0:#x} hnd={ip:#x} vt={vt:#x} f4={f4:#x} f10={f10:#x} f14={f14:#x}")
+                } else {
+                    String::new()
+                };
+                log::warn!(
+                    "PROCHMI {name} t={}ms tid=[{}] pc={off:#x} r0={r0:#x} r4={r4:#x} r5={r5:#x} fl={fl:#x}{extra}{extra2}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                );
+            });
+            match result {
+                Ok(_) => log::info!("PROCHMI: {name} page watch installed"),
+                Err(e) => log::warn!("PROCHMI: {name} page watch failed: {e}"),
+            }
+        }
+    }
     // r799g: v24body proved the leg vfn returns 1 (both name operands NULL
     // -> 0x1feb7dc r0=1) at 27.8 s while the startup state stayed 8 - the
     // store-9 at 0x17c7c1c must then run and be rewound (or never run:
