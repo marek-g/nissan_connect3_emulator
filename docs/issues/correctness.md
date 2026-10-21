@@ -2584,3 +2584,26 @@ static and re-point both watches dynamically at runtime).
   CCA directory fabricates - and whether the 2 answered svc=0x300 requests
   differ in regid).  Fix = fabricate/complete the registration-id
   directory entry (legitimate fabrication surface per AGENTS), logged.
+
+## r799n9c: app 0x400 = procmapengine itself (mbx_1024!); failing posts are class-0x42 self-targeted, successes class-0x45/0x49
+
+- The "PROCMAPENGINE" probes fire in tid 60/61 - the SERVICEData consumer
+  IS procmapengine (opens mbx_1024=app 1024=0x400 AND mbx_22 for its
+  client side).  Wire src=0x16 requests ask procmapengine for data;
+  procmapengine answers succeed for class 0x49 svc 0x16/0x20 (queue
+  0x40093a20, 8 posts, tid 60) and class 0x45 svc=0x22 regid-dir posts
+  succeed (queue 0x40094718/0x400943f8), but ALL 14 posts of shape
+  `type=1442816(0x160400=1024 dec) content=[00160400 00000018 42000002
+  0000ffff msgid 0017001e|ffff0300 ...]` (class 0x42, svc=0x1e, regid=0x17,
+  subid 0xffff, dst-app 0x400) resolve queue=-1.
+- 0x160400 decimal hint: ail_bIpcMessagePost resolves dst APP 1024 to
+  "mbx_1024" by DECIMAL name while the emulator registers queues per
+  opening process; the two shapes that resolve use non-1024 targets.  The
+  resolution goes through the IOSC/OSAL service channel (the
+  0xa0064-cmd-0xa family answers all-zero words around these posts).
+- NEXT (concrete): find where the guest asks the monitor for "queue for
+  app id" (log all OSAL-service cmds with their answers during one failure
+  burst, t~16617 tid 60/61) and make the answer return the real queue id
+  for mbx_1024 (legitimate emulation-side fix - it is OUR queue table).
+  If the lookup is name-based decimal-string formatting, verify our
+  ensure_queue("mbx_1024") table name matches byte-for-byte.
