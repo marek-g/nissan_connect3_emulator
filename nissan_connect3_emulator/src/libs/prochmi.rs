@@ -9367,6 +9367,37 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     uc.get_data().inner.thread_id(),
                 );
+                // r799n8b: healthy-sibling control.  The keyboard page
+                // works, so watch the KEYBRD/SPM instances' element
+                // containers (a0+0x80..0xa0, the layout vInit reads for
+                // NAVI at hnd+0x88/+0x8c): if the healthy classes DO get
+                // post-ctor pushes, the logging pc names the generic
+                // insert helper and tells us why NAVI's never runs.
+                if name == "inst-keybrd" || name == "inst-spm" {
+                    let lo = r0 as u64 + 0x80;
+                    let hi = r0 as u64 + 0xa0;
+                    let _ = uc.add_mem_hook(
+                        unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                        lo,
+                        hi,
+                        move |uc2: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                            static WH: AtomicU32 = AtomicU32::new(0);
+                            let pc = uc2.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                            if pc >= 0x3000_0000 {
+                                return true;
+                            }
+                            if WH.fetch_add(1, Ordering::Relaxed) < 80 {
+                                let lr = uc2.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                                log::warn!(
+                                    "PROCHMI sib-list {name} t={}ms +{:#x} <- {value:#x} (sz {size}) pc={pc:#x} lr={lr:#x}",
+                                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                                    address - lo,
+                                );
+                            }
+                            true
+                        },
+                    );
+                }
                 0
             });
         }

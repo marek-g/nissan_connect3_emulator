@@ -2474,3 +2474,28 @@ static and re-point both watches dynamically at runtime).
   the hminavserver init range (0x15e8xxx..0x15f0xxx), and check whether it
   is gated on a CCA/registry flag the emulator's registry_compat.reg
   already fakes (pattern of the r790e USE_CCA_SRV_* publication).
+
+## r799n8b: prochmi_out.out is THUMB-2 - all prior static ARM-word scans (bl scans, store patterns) were void
+
+- Full linear Thumb disassembly recipe (capstone, resume +2 on invalid):
+  saved listing /tmp/opencode/full_t.txt (9.45M insns, code range
+  0xfb7080..0x23beb1b).  Re-scan for stride-0x20 push (store [r,#0xc] near
+  lsl #5): only 6 hits, all jump-table garbage -> the container's push is
+  a generic helper not pattern-matchable this way.
+- Runtime facts unchanged and STRONG (MEM_WRITE watches are trustworthy):
+  container at hnd+0x80 {begin +0x88, end +0x8c, stride 0x20} receives zero
+  post-ctor pushes; class API located (0x1661dc4 set-entry-key-by-idx,
+  0x1661df4/0x1661e5c/0x1661e8c get-by-idx field +8/+0x10, 0x1661e90 find,
+  0x16620fc keyed find, 0x1661da4 reset(+0x90.. sentinel mvn)).
+- The r788 inst-probe anchors for keybrd/spm (0x13e7000/0x1469a08) are
+  garbage mid-table sites (never fire); inst-navi/inst-hsa-nav-constr do
+  fire.  clFi instances actually materialize via clFiFactory::CreateFi
+  (r784: KEYBRD id 51), not via those pclGetInstance sites - the KEYBRD
+  sibling-container watch (sib-list, kept) therefore stays silent; note
+  the keyboard page does not use the CL element-container machinery at
+  all, so it is not a valid healthy-sibling control anyway.
+- NEXT: find the CL content PROVIDER registration behind getter 0x206
+  (r788) inside the hminavserver code range in prochmi - grep full_t.txt
+  for stores of 0x206 / for 0x40003630 (dest-entry content id) references
+  to reach the registration function, then check which precondition
+  (CCA service start / registry_compat flag) gates it.
