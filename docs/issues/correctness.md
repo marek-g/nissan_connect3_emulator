@@ -2734,3 +2734,33 @@ static and re-point both watches dynamically at runtime).
   one (pc/lr tells the supplier path) and why the same path skips 0x8076000
   (likely the dest-entry/city-list content request leg, svc/regid different
   from the STAT 0x1e loop).
+
+## r799n14b: post-delivery census - answers arrive but are header-only (data-content gap is next)
+
+- tid 72 (AE_16, the STAT/`app 22` pump living in the PROCNAV image) really
+  consumes the 13 delivered class-0x42 svc-0x1e answers (monitor pop logs
+  `pop class=0x42`, backlog histogram 42:N now drains).
+- The STAT client (probe-sd-refres, refs `0a 00 0a 00 01 80 01 00 ff ff 01 00`
+  = svc 10 / prop 1 / op 1) keeps re-requesting: the answer is a 0x18-byte
+  header with word6=3 (an ack/status, NOT a data payload).  The responder
+  (procmapengine server half) answers from its own containers - and those
+  are the r799n9 empty set: the DATA behind svc-0x1e is still not produced.
+- Also answered class-0x42 bodies on other legs carry `fe ff` (regid 0xfffe
+  livelock family) - shape differs from the svc-0x300 ack (sub12=0x66f8).
+- The HMI datapool mediator element 0x8076000 still gets only the byte
+  dp_set v0=7 (t=12041); no pod -> get_podp()==0 -> dest-entry writes die.
+  dp-add census: exactly ONE element ever added (0xc0fa000, single virtual
+  call site 0x138173c vfn+0x18 -> add_element).  On the unit the CL
+  provisioning adds many elements; ours never starts that loop.
+- Static notes: `cldp_datapool::add_element` (0x1388180) has exactly one
+  branch-to from 0x13883c0 (search of BL/BLX immediates over the whole RX
+  segment); the runtime lr 0x1381740 = vtable+0x18 caller.  Element id
+  0x8076000 occurs in prochmi rodata at 8 sites (0x182c840, 0x182e890,
+  0x1831f70, 0x18320c0, 0x18374d4, 0x1837adc, 0x1837c28, 0x18937c8) -
+  tables, no direct xrefs (aggregate bases).
+- NEXT: find the provisioning pass that walks those element-id tables and
+  calls the vfn+0x18 add per entry (likely a mediation-list init keyed off
+  a service-connected event); watch vfn+0x18 (the add wrapper entry near
+  0x1388240) for attempted elems, and diff against the svc-0x1e responder:
+  identify which container the server reads when building the answer and
+  why word6=3 (data-not-ready) instead of a payload round.
