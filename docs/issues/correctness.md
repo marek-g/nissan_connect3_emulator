@@ -2764,3 +2764,76 @@ static and re-point both watches dynamically at runtime).
   0x1388240) for attempted elems, and diff against the svc-0x1e responder:
   identify which container the server reads when building the answer and
   why word6=3 (data-not-ready) instead of a payload round.
+
+## r799n15-n16: svc-0x1e dataset census + CCA directory answers every client
+
+- `ExamineInfluence` probe: the procmapengine server half answers svc-0x1e
+  from admin-ref 0xa0fc70 whose dataset vector is empty (`+0x14 == +0x18`,
+  storage 0xd9caf0, capacity 1) from t=12539 on - the DATA producer, not a
+  lost insert, is missing.  `add_svc_dataset_fill_watch` names every writer
+  of head/storage (init/clear only -> zero pushes all run).
+- `observe_cca_directory` extended (kill-switch `EMU_NO_APP_INFO_SYNTH`):
+  the LPM stand-in now answers every client's ApplicationInfoRegister on
+  mbx_0, not just the HMI - the engine's svc-0x26 (DAPI map service)
+  registration starts exactly like the HMI's, and without the
+  ApplicationInfoStatus its deferred REGISTER never executed.  n109 proved
+  the genuine chain: LPM class-49 -> engine posts real ServiceRegister ->
+  DAPI RegisterConf -> directory stamps `MAP_DATA_REGISTER_ID` ->
+  `OnUpdateServiceStateDAPIFastmap` runs (variance later, see n19).
+
+## r799n17/n17b: STAT claim path = admin-5 leg; list layout; claim-repair A/B
+
+- STAT svc-1e requests are served by dispatcher 0x66963c with r1=5 (wire
+  class-0x45 -> leg 0x669ba0): opcode gate 0x386c60, answer built by
+  0x388860 (class-0x42, fills only through +0x16), port over `[app+0x54]`
+  via 0x66df4c, posted by 0x660ea0 mode 2.  `r0=1` from 0x660ea0 is
+  SUCCESS (0x72000 = OSAL success code, not a failure!).
+- Client-reference list layout (guest vAdd 0x65e830):
+  `{vtable, head@+4, tail@+8, size@+0xc}`; posfi admin registration item
+  is 36B, comparator legs 0x66e5e0/0x66e6b0 read `{+4 type=1, +0xc server,
+  +0xe svc, +0xe unique? +0x10, +0x12 regid, +0x14 msg+0x1c, +0x20 msg+0x24,
+  +0x22 msg+0x2c-byte}` in `[app+0x5c]`.  n122 proved the engine's genuine
+  class-0x42 flows to mbx_22 and STAT rtdisp (target 0x46) consumes it.
+- A/B (`EMU_NO_CLAIM_REPAIR=1`): the claim-repair bookkeeping silences the
+  DAPI/echo storm that kept STAT threads spinning; with it OFF, STAT stays
+  alive but the repost storms return.  Dynamic stamping of admin-item
+  fields from live requests is over-matching (masking) - replace with real
+  registration preconditions when the producer is found.
+
+## r799n18: TSE flag wake made FIFO-fair (f01a98e)
+
+`TSE_FLG_WAIT` now queues `(tid, pattern)` per flag and wakes the EARLIEST
+waiter whose pattern is satisfied (an earlier waiter with a satisfied
+pattern would steal the event anyway).  Before, the first thread polled by
+the scheduler consumed every set and STAT thread [72] survived only by poll
+order luck.  (The queue introduced two host panics - see n19.)
+
+## r799n19 (4e10784): two host-thread panics were the entire "run variance"
+
+- monitor.rs TSE serve path sliced `queue[..usize::MAX]` when a thread
+  re-entered WAIT without a queue entry -> panic at t~7s -> the guest
+  thread's host execution died -> PROCNAV boot legs, STAT workers 70/72
+  and HMI app 0x26 silently never spawned.  ALL of n126-n132 hit it;
+  n122/n123/n125 "good runs" predate f01a98e.  Fix: fall back to
+  `queue.len()`.
+- procmapengine.rs:10113 `copy_from_slice` u32-reader into 2 bytes (r799n17
+  filler) panicked the engine host thread at t~13s.  Fix: cast u16.
+- Lesson: a missing guest thread after ~t=12s was host death, not guest
+  logic.  Check `panicked` in EVERY log before believing variance.
+- n134 first clean run: CCA fanout flush 40 replies, 55 answered
+  ServiceRegisters, HMI opens mbx_38 (app 0x0026),
+  `OnUpdateServiceStateDAPIFastmap` RUNS (t=12645ms state=1) and opens
+  fastmap channels 4/5/6; class-0x45 svc-0x26 requests reach DAPI mbx_7,
+  DAPI spawns AE threads (apps 1, 22).
+- Static facts: only caller of 0x512400 OnUpdateServiceStateDAPIFastmap is
+  vtable slot 0x4b9fdc (gates `*0x7907ac in {1,2,3}`, arg =
+  MDM-object([0x7907c8]=0xaa4950) byte +0x21 - the 0x48 "phantom" was that
+  byte, a pointer's second byte at the old wrong watch 0xaa4970).  App
+  interface 0xa07970 state word +0x30: 0->1->3 (vtable+0x30 leg 0x667d04)
+  ->2 demotion (vtable+0xe8 = 0x66163c, entry thunk 0x65d76c lr=0x65d77c)
+  at t~4.07s, same window as fmstate 1->2 (predicate leg 0x51db60).
+- NEXT: (1) why does STAT thread [72] still not activate (n122 had it);
+  (2) the engine's class-0x42 answer status word content+0x18 stays 3
+  (data-not-ready) - who must write the real status/dataset once DAPI
+  answers the fastmap channel loads; (3) then popup 0x5da close + city
+  list WITHOUT EMU_FAKE_DESTENTRY.
