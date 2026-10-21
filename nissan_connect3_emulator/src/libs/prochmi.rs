@@ -5163,14 +5163,38 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         let address = base_address + 0x0135_2930u32 - ORIGINAL_BASE;
         crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:event2app-decision", move |uc: &mut Unicorn<'_, Context>| {
             static HITS: AtomicU32 = AtomicU32::new(0);
-            if HITS.fetch_add(1, Ordering::Relaxed) >= 60 {
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 8000 {
                 return 0;
             }
             let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
             let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+            // per-event throttle: boot floods the small ids; keep the
+            // 0x8100xxxx FI family verbose-cap 8, everything else 3.
+            {
+                static EV: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, u32>>> =
+                    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                let cap = if r7 & 0xff00_0000 == 0x8100_0000 { 8 } else { 3 };
+                if let Ok(mut m) = EV.lock() {
+                    let c = m.entry(r7).or_insert(0);
+                    *c += 1;
+                    if *c > cap {
+                        return 0;
+                    }
+                }
+            }
             let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            // r799n5: stack-scan backtrace - names the FI-event producer
+            // (the place where a real unit raises the F6 event 0x81008089).
+            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+            let mut bt = String::from(" bt:");
+            for i in 0..32u32 {
+                let w = read_u32(uc, sp.wrapping_add(i * 4));
+                if (0x00fb_7080..0x023b_eb1b).contains(&w) {
+                    bt.push_str(&format!(" {w:#x}"));
+                }
+            }
             log::warn!(
-                "PROCHMI event2app t={}ms tid=[{}] event={r7:#x} fiobj={r4:#x} {} lr={lr:#x}",
+                "PROCHMI event2app t={}ms tid=[{}] event={r7:#x} fiobj={r4:#x} {} lr={lr:#x}{bt}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
                 uc.get_data().inner.thread_id(),
                 if r4 == 0 { "DROP(no fi)" } else { "dispatch" },
@@ -7494,41 +7518,73 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             }
         }
     }
-    // r799n4e: raw instruction-trace of page 0x1375000 while the F6 popup
-    // mediator (0x3a03128) is live - settles at last which vCheckFire legs
-    // execute per heartbeat tick (fetch hooks vs the trap's view).
+    // r799n4g: MEM_WRITE watch on the dynstack SM cursor pair (begin @+0x30,
+    // end @+0x34) of sm 0x39e1fc0.  Every push/pop of popup 0x5da moves the
+    // end cursor; the writing pc names the genuine close driver that the
+    // fetch-based tr5/tmwrap watches could not observe (trap-poisoned TBs).
     {
-        let page = (base_address + 0x0137_5000u32 - ORIGINAL_BASE) as u64;
+        use unicorn_engine::unicorn_const::HookType;
+        let sm = 0x039e_1fc0u32;
+        let lo = (sm + 0x2c) as u64;
+        let hi = (sm + 0x3c) as u64;
+        let result = unicorn.add_mem_hook(HookType::MEM_WRITE, lo, hi, move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+            static W: AtomicU32 = AtomicU32::new(0);
+            if W.fetch_add(1, Ordering::Relaxed) >= 800 {
+                return true;
+            }
+            let pc = uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            let off = address as u32 - sm;
+            log::warn!(
+                "PROCHMI smslot t={}ms tid=[{}] sm+{:#x} <- {:#x} (sz {}) pc={pc:#x} lr={lr:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                off,
+                value & 0xffff_ffff,
+                size,
+            );
+            true
+        });
+        match result {
+            Ok(_) => log::info!("PROCHMI: smslot watch installed"),
+            Err(e) => log::warn!("PROCHMI: smslot watch failed: {e}"),
+        }
+    }
+    // r799n4f: the REMOVE (kind=1) of the F6 popup 0x5da is a cascade from
+    // inside the dynstack core 0x1377370 (the 0x49 wrapper 0x1364044 rejects
+    // ids >= 0x300), lr 0x1364094 on those ops is stale.  Instruction-trace
+    // the msg-handler + dynstack pages around the popup's id in the two eras
+    // where a REMOVE happens (startup ~12-14s, post-nav ~29-34s) to name the
+    // genuine close driver.
+    for poff in [0x0137_6000u32, 0x0137_7000] {
+        let page = (base_address + poff - ORIGINAL_BASE) as u64;
         let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
             static H: AtomicU32 = AtomicU32::new(0);
             if H.fetch_add(1, Ordering::Relaxed) >= 4000 {
                 return;
             }
-            if crate::libs::dapi::emu_t0_elapsed_ms() < 13_300 {
-                return;
-            }
-            if crate::libs::dapi::emu_t0_elapsed_ms() > 14_200 {
-                H.fetch_add(1, Ordering::Relaxed);
-                H.fetch_add(1, Ordering::Relaxed);
-                H.fetch_add(1, Ordering::Relaxed);
+            let t = crate::libs::dapi::emu_t0_elapsed_ms();
+            if !(11_900..14_100).contains(&t) && !(29_000..34_000).contains(&t) {
                 return;
             }
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
-            let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
-            if r0 != 0x03a0_3128u32 && r5 != 0x03a0_3128u32 {
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            if r0 != 0x039e_1fc0u32 && r1 != 0x5da && r2 != 0x5da && r1 != 0x1e9 && r1 != 0x208 {
                 return;
             }
             let off = addr - base_address as u64 + ORIGINAL_BASE as u64;
             log::warn!(
-                "PROCHMI tr5 t={}ms tid=[{}] pc={:#x} r0={r0:#x} r5={r5:#x}",
+                "PROCHMI tr5 t={}ms tid=[{}] pc={:#x} r1={r1:#x} r2={r2:#x} lr={:#x}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
                 uc.get_data().inner.thread_id(),
                 off,
+                uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
             );
         });
         match result {
-            Ok(_) => log::info!("PROCHMI: tr5 page trace installed"),
-            Err(e) => log::warn!("PROCHMI: tr5 page trace failed: {e}"),
+            Ok(_) => log::info!("PROCHMI: tr5 page trace {poff:#x} installed"),
+            Err(e) => log::warn!("PROCHMI: tr5 page trace {poff:#x} failed: {e}"),
         }
     }
     // r799n3: the GUI_ContentFunction mediator timer slot [m+0x24] is NULL
@@ -7578,7 +7634,16 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // before the wait-id handler's vfn+0x4 call (r0 = handler object
             // for the id domain, r1 = wait id), 0x1374e90 right after
             // (r0 = ready answer; 1 => the F6 popup's wait is satisfied).
-            (0x0137_4000u32, "tmq", [0x0137_4e4cu32, 0x0137_4e70, 0x0137_4e84, 0x0137_4e90].as_slice()),
+            (
+                0x0137_4000u32,
+                "tmq",
+                [0x0137_4e4cu32, 0x0137_4e70, 0x0137_4e7c, 0x0137_4e84, 0x0137_4e90].as_slice(),
+            ),
+            // r799n5: wait-table lookup (0x13a5040: entry = id & ~0xf8000000,
+            // table limit cmp).  Log ONLY queries for the F6 popup wait id
+            // 0x6b7: hits-with-QRES0 => framework asks, data answer is false;
+            // zero hits => the wait is never even re-evaluated (starved).
+            (0x013a_5000u32, "tmwt", [0x013a_5040u32].as_slice()),
             // r799n4e: dynstack wrapper entry (r0 = content pid 0xc0000xxx,
             // lr = the caller that drives push/close).  The startup-era
             // REMOVE of the "Starting navigation." popup (0xc00005da) runs
@@ -7656,6 +7721,13 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     // kind-ish argument; lr names the driving caller.
                     let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
                     format!(" WRAP lr={lr:#x}")
+                } else if off == 0x013a_5040u32 as u64 {
+                    // wait-table lookup entry: r0 = raw wait id.  Only the
+                    // F6 popup's 0x900006b7 is of interest here.
+                    if r0 & 0x07ff_ffff != 0x6b7 {
+                        return;
+                    }
+                    format!(" WTQRY id={r0:#x}")
                 } else if off == 0x0137_4e4cu32 as u64 {
                     // 0x1374e4c entry: r0 = content+8; print the wait id it
                     // is about to dispatch on.
@@ -7664,6 +7736,28 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     // vCheckFire kind-3 leg entry: r0 = mediator.
                     let cnt = read_u32(uc, r0.wrapping_add(0x20));
                     format!(" LEG3 cnt={cnt:#x} c8={:#x}", read_u32(uc, cnt.wrapping_add(8)))
+                } else if off == 0x0137_4e7cu32 as u64 {
+                    // registry object selected, ip = id domain: dump the
+                    // whole 16-slot per-domain handler table once per
+                    // registry to learn which wait domains are registered.
+                    let ip = uc.reg_read(RegisterARM::R12).unwrap_or(0) as u32;
+                    static TABS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+                        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+                    let fresh = match TABS.lock() {
+                        Ok(mut s) => s.insert(r0),
+                        Err(_) => false,
+                    };
+                    let extra_tab = if fresh {
+                            let mut t = format!(" TAB dom={ip:#x} [");
+                            for i in 0..16u32 {
+                                t.push_str(&format!("{:#x} ", read_u32(uc, r0.wrapping_add(i * 4))));
+                            }
+                            t.push(']');
+                            t
+                    } else {
+                        String::new()
+                    };
+                    format!(" QDOM={ip:#x}{extra_tab}")
                 } else if off == 0x0137_4e84u32 as u64 {
                     // 0x1374e4c non-{0,1}-domain leg, right before the wait
                     // handler vfn+0x4 dispatch.  r0 = the domain handler
@@ -12867,6 +12961,12 @@ fn drain_gui_key_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
         "PROCHMI: key {name} {event:?} delivered={delivered} t={}ms",
         crate::libs::dapi::emu_t0_elapsed_ms(),
     );
+    // r799n5: real KBD hardware raises FI event 0x81008089 on the NAV key
+    // (dest-entry init).  Our vKeyPressed bridge cannot; post the message
+    // the HSI layer would have received instead.  EMU_FAKE_DESTENTRY-gated.
+    if delivered && matches!(event, crate::input::KeyEvent::Press(crate::input::HardKey::Nav)) {
+        crate::libs::libosal_linux::message::fabricate_fi_destentry_event(unicorn);
+    }
 }
 
 /// Headless verification path (`EMU_KEY_TEST="24:back,30:map,36:zoomin"`):

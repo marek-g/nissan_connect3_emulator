@@ -2693,6 +2693,73 @@ pub fn push_blob_to_mbx_289(unicorn: &mut Unicorn<'_, Context>, body: Vec<u8>) -
     false
 }
 
+/// Push one fabricated body onto an arbitrary named OSAL queue (blob layout
+/// `[u32 1][u32 len][body]`, same as the mbx_289 helper).
+fn push_blob_to_named_queue(unicorn: &mut Unicorn<'_, Context>, name: &str, body: Vec<u8>) -> bool {
+    let mut blob = Vec::with_capacity(8 + body.len());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&body);
+    let mut state = unicorn.get_data().namespace.lock().unwrap();
+    if let Some(q) = state.mq.queue_id_for_name(name) {
+        state.mq.grow_msgsize(q, blob.len() as i64);
+        if OsalQueueService::guest_post(&mut state.mq, name, blob, 0) {
+            state.notify_waiters();
+            return true;
+        }
+    }
+    false
+}
+
+/// r799n5: the F6/NAV hard-key raises FI event 0x81008089 on the real unit
+/// (clHSI keyboard -> `clHmiNavServerHandler::vInitDestinationEntry(mode=6)`,
+/// r789 trace; the SAME event the r787-era tap chain produced).  Our hard-key
+/// bridge injects at `GUI_KeyInjector_vKeyPressed` and cannot produce that
+/// event, so the dest-entry session, the CL feed and the city list never
+/// start (r799m) and the "Starting navigation." sysdlg never is satisfied
+/// genuinely.  The KBD hardware path is a legitimate emulation surface
+/// (AGENTS: devices/providers may be simulated), so on a NAV *press* post an
+/// FI-shaped message carrying msgid 0x81008089 (the HSI layer forwards the
+/// msgid verbatim as the FI event id, r757) to the HMI queue mbx_265 and let
+/// `clHSIMngr::bEvent2App` -> `clFi_Navi::ReceiveEventsFromEvtEng` dispatch
+/// it organically.  Body shape mirrors `gps_data_status_answer_body`, which
+/// demonstrably reaches event2app as 0x81008114.  `EMU_FAKE_DESTENTRY=1`
+/// required (off by default - diagnostic runs stay genuine); always logged.
+pub fn fabricate_fi_destentry_event(unicorn: &mut Unicorn<'_, Context>) -> bool {
+    if !std::env::var_os("EMU_FAKE_DESTENTRY").is_some_and(|v| v == "1") {
+        return false;
+    }
+    // Shape == gps_data_status_answer_body (proven to arrive at
+    // bEvent2App as 0x81008114 via the navsrv consumer on mbx_289), only
+    // the msgid (the forwarded FI event id) differs.
+    let payload = crate::libs::procnav::gps_wire_body();
+    let mut body = vec![0u8; 0x20 + payload.len()];
+    body[0..2].copy_from_slice(&0x0015u16.to_le_bytes()); // src SENSORFI (FI side)
+    body[2..4].copy_from_slice(&0x0121u16.to_le_bytes()); // dst navi srv
+    let total_len = body.len() as u32;
+    body[4..8].copy_from_slice(&total_len.to_le_bytes());
+    body[8..10].copy_from_slice(&2u16.to_le_bytes());
+    body[0xb] = 0x45;
+    body[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
+    body[0x10..0x14].copy_from_slice(&0x8100_8089u32.to_le_bytes()); // the FI event id
+    body[0x14..0x16].copy_from_slice(&0x000au16.to_le_bytes()); // svc (navsrv)
+    stamp_registration_id("mbx_289", &mut body);
+    body[0x18..0x1a].copy_from_slice(&0x0f02u16.to_le_bytes()); // same func as 0x81008114
+    body[0x1a] = 9; // server OPTYPE like the working 0x81008114 shape
+    body[0x1b] = 1;
+    body[0x1c..0x1e].copy_from_slice(&3u16.to_le_bytes()); // healthy gate ordinal
+    body[0x20..].copy_from_slice(&payload);
+    // The pump queue route (native guest post, r799d) is the proven way to
+    // reach the navsrv pump consumer without the mbx_289 enConnect theft;
+    // fall back to the queue post.
+    let posted = pump_push_completion(unicorn, body.clone())
+        || push_blob_to_named_queue(unicorn, "mbx_289", body);
+    log::warn!(
+        "[EMU_FAKE_DESTENTRY] FI event 0x81008089 KBD-scan substitute posted (pump/mbx): {posted}"
+    );
+    posted
+}
+
 /// r798b: the navsrv connector words of the 8-byte events tid 84's consumer
 /// r798b: latest value of the HMI startup FSM (`[proc+0x30]`), published by
 /// the startup-step watch in prochmi.rs.  `0xffff_ffff` until first observed.

@@ -2287,3 +2287,65 @@ NEXT:
    (F6 popup, dest-entry spinner, busy container) should resolve.
 3. Re-check: sysdlg-49 must then see pid=0xc00005da and the popup frame
    must vanish from the dump within a tick.
+
+## r799n5: popup close-cascade decoded; probe VA-bug fixed; FI 0x81008089 injection built (flag) but the HSI event route is still closed
+
+Corrections to r799n4 (probe bugs, not guest bugs):
+- The tmset/ANSWER probes' `rd()` shifted every static read by 0x8000
+  (runtime VA == file VA for this image, base_address == ORIGINAL_BASE):
+  `c8=0x3970005` was garbage read from 0x25a811c.  The wait desc IS the ROM
+  row 0x25b0114 itself and `[desc+8]` is the STATIC 0x900006b7 (raw reads in
+  the old mediator-sync probe show it all along).  No "empty binding".
+- The shared probe budget (4000) was exhausted at ~13.7 s, silently
+  discarding all late-era hits; now 60000 with a per-(pc,r0,r1) throttle
+  (F6 ids 0x900006b7 / mediators 0x3a03128 / pid 0xc00005da get cap 12).
+
+Close cascade (nav-keys flow, n28..n34):
+- Popup 0x5da DOES get removed twice per run: startup era ~13.7 s and
+  post-F6 era ~29.8-30.0 s (`dynstack-op kind=1`), and is even re-pushed
+  under op 0x208.  Close driver (MEM_WRITE watch on sm+0x2c..0x3c):
+  pc=0x1376e88 inside the SM purge loop 0x1376e00 - for each stack record
+  it calls `bl 0x13a6740(smmgr, recOp, recKey)`, which returns true iff a
+  wait-list entry {op,key} exists with `[entry+0x15]==0` AND the domain
+  registry has an object for the key with `[obj+0x46]!=0` (GUI-content
+  ready flag); the entry flag is then set.  So the REMOVE is a GUI-content
+  readiness gate, NOT the data wait: the heartbeat wait on content
+  0x40003630 (mediator 0x3a03128, wait 0x900006b7) keeps ticking after the
+  popup visually pops.  Cosmetic close != the user's goal.
+- Wait 0x900006b7 is never evaluated at all: `tmq` watch shows 0x1374e4c
+  runs 1128x for other ids (0x900000xx, 0x1xxxxxxx, 0x5xxxxxxx), QHND
+  dispatches domains 5/7/8 via handler objects 0x391a210/0x391a230/
+  0x391a250 (domain table slot 9 = 0x391a250, vfn+4=0x13a6288), but for
+  0x6b7 neither the 0x1374e4c leg nor the wait-table lookup 0x13a5040
+  (tmwt watch, filter id&0x7ffffff==0x6b7) is EVER reached.  Satisfaction
+  is push-based (data write -> pool notify -> vOnDataUpdate wakes the
+  wait); nobody writes the nav-init element, so the wait just sleeps.
+- 0x49 close-handler (`sysdlg-49`) closes ids < 0x300 only (wrapper
+  0x1364044 `bic/cmp #0x300/bhs`), 0x5da is out of range by design; lr
+  0x1364094 on its dynstack ops is stale (cascade from inside 0x1377370).
+- The kind-3 satisfaction leg 0x137559c/0x13755a8 (the old ANSWER probe)
+  never executes in n24+ runs while it DID in n13-n22 => mid-TB fetch-hook
+  dispatch depends on TB-translation history (AGENTS unicorn quirk); stop
+  trusting fetch probes for 0x13754xx/0x13755xx, use the write-watch.
+
+FI 0x81008089 injection (EMU_FAKE_DESTENTRY=1, default off, logged):
+- `fabricate_fi_destentry_event` posts a gps_data_status_answer_body-shaped
+  class-0x45 message carrying msgid 0x81008089 on NAV key press: routes
+  tried = mbx_265, mbx_289, pump_push_completion (native guest post).  All
+  post succeed but event2app (0x1352930, per-event throttled now) never
+  sees 0x81008089: the pump completer forwards only msgids completing a
+  live transaction; 0x81008114 arrives this way via the gate's own
+  txn-ordinal-3 request.  Event producers are in-process (bt at the
+  event2app trap: frames 0x180a984/0x18641a0/0x18b0b38/0x1827b64 +
+  consumer adapters 0x135a70x/0x135a75x/0x135a7ax reading through the
+  0x1827810 singleton's vfn+0x18); no static bl-callers exist for any of
+  these (function-pointer glue), so the genuine post site must be found
+  from the CONSUMER side at runtime.
+- NEXT: probe the consumer adapters (page 0x135a000 watch, targets
+  0x135a728/0x135a74c: after `bl 0x1827810` dump r0 and the message body
+  at r1) to learn the in-process FIFO record shape, then either (a) call
+  the manager's post vfn via guest_call_via_lr on NAV press (bridge class,
+  same as key injection), or (b) fix the real producer: the r787-era tap
+  chain shows the GUI action table posts the event, and today's action is
+  unbound because the dest-entry dynamic list config (getter 0x206) is
+  still empty - i.e. keep chasing the CL provider registration.
