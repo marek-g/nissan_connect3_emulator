@@ -4306,9 +4306,27 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             } else {
                 String::new()
             };
+            // r799n4e: for the F6 "Starting navigation." popup record WHO
+            // drives every dynstack operation on it (stack scan for return
+            // addresses) - the startup-era REMOVE has a driver we can copy.
+            let bt = if r2 == 0x5da {
+                let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                let mut s = String::from(" bt:");
+                for i in 0..24u32 {
+                    let w = read_u32(uc, sp.wrapping_add(i * 4));
+                    if (0x00fb_7080..0x023b_eb1b).contains(&w) {
+                        s.push_str(&format!(" {w:#x}"));
+                    }
+                }
+                s
+            } else {
+                String::new()
+            };
             log::warn!(
-                "PROCHMI dynstack-op t={}ms sm={r0:#x} op={r1:#x} popup={r2:#x} kind={r3:#x} prio={prio:#x} top={top} lr={lr:#x} slots={slots}",
+                "PROCHMI dynstack-op t={}ms sm={r0:#x} op={r1:#x} popup={r2:#x} kind={r3:#x} prio={prio:#x} top={top} lr={lr:#x} slots={}{}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
+                slots,
+                bt,
                 lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
             );
             0
@@ -7476,6 +7494,43 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             }
         }
     }
+    // r799n4e: raw instruction-trace of page 0x1375000 while the F6 popup
+    // mediator (0x3a03128) is live - settles at last which vCheckFire legs
+    // execute per heartbeat tick (fetch hooks vs the trap's view).
+    {
+        let page = (base_address + 0x0137_5000u32 - ORIGINAL_BASE) as u64;
+        let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
+            static H: AtomicU32 = AtomicU32::new(0);
+            if H.fetch_add(1, Ordering::Relaxed) >= 4000 {
+                return;
+            }
+            if crate::libs::dapi::emu_t0_elapsed_ms() < 13_300 {
+                return;
+            }
+            if crate::libs::dapi::emu_t0_elapsed_ms() > 14_200 {
+                H.fetch_add(1, Ordering::Relaxed);
+                H.fetch_add(1, Ordering::Relaxed);
+                H.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+            if r0 != 0x03a0_3128u32 && r5 != 0x03a0_3128u32 {
+                return;
+            }
+            let off = addr - base_address as u64 + ORIGINAL_BASE as u64;
+            log::warn!(
+                "PROCHMI tr5 t={}ms tid=[{}] pc={:#x} r0={r0:#x} r5={r5:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                off,
+            );
+        });
+        match result {
+            Ok(_) => log::info!("PROCHMI: tr5 page trace installed"),
+            Err(e) => log::warn!("PROCHMI: tr5 page trace failed: {e}"),
+        }
+    }
     // r799n3: the GUI_ContentFunction mediator timer slot [m+0x24] is NULL
     // in every run (r799n2), which is the missing re-check kick behind BOTH
     // spinners.  Decode WHICH leg of the creation chain dies:
@@ -7508,10 +7563,27 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     0x0137_580c,
                     0x0137_57f8,
                     0x0137_55a8,
-                    0x0137_4e84,
+                    0x0137_559c,
+                    0x0137_54d0,
+                    0x0137_54d4,
+                    0x0137_54e8,
+                    0x0137_54f0,
                 ]
                 .as_slice(),
             ),
+            // r799n4d: the row binder C4 lives on page 0x136f000 (the BIND
+            // target sat on the wrong page-watch before => zero hits).
+            (0x0136_f000u32, "tmbind", [0x0136_ff40u32].as_slice()),
+            // r799n4d: 0x1374e4c's non-{0,1}-domain leg: 0x1374e84 sits right
+            // before the wait-id handler's vfn+0x4 call (r0 = handler object
+            // for the id domain, r1 = wait id), 0x1374e90 right after
+            // (r0 = ready answer; 1 => the F6 popup's wait is satisfied).
+            (0x0137_4000u32, "tmq", [0x0137_4e4cu32, 0x0137_4e70, 0x0137_4e84, 0x0137_4e90].as_slice()),
+            // r799n4e: dynstack wrapper entry (r0 = content pid 0xc0000xxx,
+            // lr = the caller that drives push/close).  The startup-era
+            // REMOVE of the "Starting navigation." popup (0xc00005da) runs
+            // without any 0x49 close for it - lr here names its real driver.
+            (0x0136_4000u32, "tmwrap", [0x0136_4044u32].as_slice()),
         ] {
             let page = (base_address + page_off - ORIGINAL_BASE) as u64;
             let addrs: Vec<u64> = addrs
@@ -7523,7 +7595,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     return;
                 }
                 static V: AtomicU32 = AtomicU32::new(0);
-                if V.fetch_add(1, Ordering::Relaxed) >= 4000 {
+                if V.fetch_add(1, Ordering::Relaxed) >= 60000 {
                     return;
                 }
                 let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
@@ -7531,6 +7603,29 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
                 let mut extra = String::new();
                 let off = addr - base_address as u64 + ORIGINAL_BASE as u64;
+                // r799n4d: heartbeat lines repeat identically for every tick
+                // and starved the old flat budget; throttle per (pc, r0, r1)
+                // while keeping the F6 popup wait (id 0x900006b7) verbose.
+                {
+                    let r1v = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    static KEYS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(u32, u32, u32), u32>>> =
+                        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                    let cap = if r1v == 0x0900_06b7
+                        || r0 == 0x03a0_3128
+                        || r0 == 0x0c00_05da
+                    {
+                        12
+                    } else {
+                        4
+                    };
+                    if let Ok(mut m) = KEYS.lock() {
+                        let c = m.entry((off as u32, r0, r1v)).or_insert(0);
+                        *c += 1;
+                        if *c > cap {
+                            return;
+                        }
+                    }
+                }
                 if off == 0x0135_7f04u32 as u64 {
                     let inst = read_u32(uc, r4.wrapping_add(r5));
                     extra = format!(" inst={inst:#x}");
@@ -7548,35 +7643,74 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     // Directly after the wrapper's registry-table lookup:
                     // r0 = registry base, ip = the domain-4 handler object.
                     let rtbase = addr as u32 - 0x0137_57f8u32;
-                    let rd = |va: u32| read_u32(uc, va.wrapping_sub(ORIGINAL_BASE).wrapping_add(rtbase));
+                    let _ = rtbase; // runtime VA == file VA for this image
+                    let rd = |va: u32| read_u32(uc, va);
                     let ip = uc.reg_read(RegisterARM::R12).unwrap_or(0) as u32;
                     let vt = rd(ip);
                     let f4 = rd(vt + 4);
                     let f10 = rd(vt + 0x10);
                     let f14 = rd(vt + 0x14);
                     format!(" reg={r0:#x} hnd={ip:#x} vt={vt:#x} f4={f4:#x} f10={f10:#x} f14={f14:#x}")
+                } else if off == 0x0136_4044u32 as u64 {
+                    // dynstack wrapper entry: r0 = content pid, r1 = stack op
+                    // kind-ish argument; lr names the driving caller.
+                    let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                    format!(" WRAP lr={lr:#x}")
+                } else if off == 0x0137_4e4cu32 as u64 {
+                    // 0x1374e4c entry: r0 = content+8; print the wait id it
+                    // is about to dispatch on.
+                    format!(" QID={:#x}", read_u32(uc, r0))
+                } else if off == 0x0137_559cu32 as u64 {
+                    // vCheckFire kind-3 leg entry: r0 = mediator.
+                    let cnt = read_u32(uc, r0.wrapping_add(0x20));
+                    format!(" LEG3 cnt={cnt:#x} c8={:#x}", read_u32(uc, cnt.wrapping_add(8)))
                 } else if off == 0x0137_4e84u32 as u64 {
-                    // 0x1374e4c data-ready query, right before its handler
-                    // vfn+0x4 dispatch: r0 = the content data-handler object.
-                    let rtbase = addr as u32 - 0x0137_4e84u32;
-                    let rd = |va: u32| {
-                        if va >= 0x0300_0000 {
-                            read_u32(uc, va) // heap pointer: already runtime
-                        } else {
-                            read_u32(uc, va.wrapping_sub(ORIGINAL_BASE).wrapping_add(rtbase))
-                        }
-                    };
-                    let vt = rd(r0);
-                    let f4 = rd(vt + 4);
-                    format!(" QHND={r0:#x} vt={vt:#x} f4={f4:#x}")
+                    // 0x1374e4c non-{0,1}-domain leg, right before the wait
+                    // handler vfn+0x4 dispatch.  r0 = the domain handler
+                    // object, r1 = the wait id.
+                    let vt = read_u32(uc, r0);
+                    let f4 = read_u32(uc, vt + 4);
+                    format!(
+                        " QHND={r0:#x} vt={vt:#x} f4={f4:#x} id={:#x}",
+                        uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32
+                    )
+                } else if off == 0x0137_4e90u32 as u64 {
+                    // just after that vfn+0x4 call: r0 == 1 satisfies the
+                    // kind-3 wait (vCheckFire 0x13755a8 cmp #1) => popup pops
+                    format!(" QRES={r0:#x}")
+                } else if off == 0x0136_ff40u32 as u64 {
+                    // the row binder C4(content, id, data, r3): r3 is what
+                    // lands in [content+8]; r1 the wait-id (0x90xxxxxx).
+                    let r1v = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let r2v = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    let r3v = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                    let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                    format!(" BIND id={r1v:#x} data={r2v:#x} r3={r3v:#x} lr={lr:#x}")
                 } else if off == 0x0137_55a8u32 as u64 {
                     // vCheckFire kind-3 branch, just after the data-ready
                     // query bl 0x1374e4c(content+8): r0 == 1 closes the
                     // wait (=> popup may pop).  Log the answer + content.
                     let rtbase = addr as u32 - 0x0137_55a8u32;
-                    let rd = |va: u32| read_u32(uc, va.wrapping_sub(ORIGINAL_BASE).wrapping_add(rtbase));
+                    let _ = rtbase; // runtime VA == file VA for this image
+                    let rd = |va: u32| read_u32(uc, va);
                     let cnt = read_u32(uc, r5.wrapping_add(0x20));
-                    format!(" ANSWER={r0:#x} content={cnt:#x} c8={:#x}", rd(cnt.wrapping_add(8)))
+                    static ONCE: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(true);
+                    let dump = if ONCE.swap(false, Ordering::Relaxed) {
+                        let mut s = String::from(" DUMP6970[");
+                        for i in 0..24u32 {
+                            s.push_str(&format!("{:#x} ", read_u32(uc, 0x0396_ffc0u32 + i * 4)));
+                        }
+                        s.push_str("] AC0[");
+                        for i in 0..12u32 {
+                            s.push_str(&format!("{:#x} ", read_u32(uc, 0x039f_3ac0u32 + i * 4)));
+                        }
+                        s.push(']');
+                        s
+                    } else {
+                        String::new()
+                    };
+                    format!(" ANSWER={r0:#x} content={cnt:#x} c8={:#x}{dump}", rd(cnt.wrapping_add(8)))
                 } else {
                     String::new()
                 };
