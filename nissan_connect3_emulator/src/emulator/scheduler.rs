@@ -468,7 +468,9 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
                 // a TSE wait wakes on its condition (semaphore count / flag pattern),
                 // which any other thread's sig_sem/set_flg just updated; the deadline
                 // below is only its µITRON timeout
-                if let Some(status) = crate::rtos::monitor::poll_tse_wait(unicorn, service, block) {
+                if let Some(status) =
+                    crate::rtos::monitor::poll_tse_wait(unicorn, service, block, tid)
+                {
                     set_runnable(unicorn, tid, Some(status));
                     continue;
                 }
@@ -478,7 +480,8 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
                     continue;
                 }
                 if deadline.map(|until| until <= now).unwrap_or(false) {
-                    let status = crate::rtos::monitor::complete(unicorn, service, block);
+                    let status =
+                        crate::rtos::monitor::complete_for(unicorn, service, block, tid);
                     log::debug!(
                         "[{}] monitor: yield on service {:#x} ended with {:#x}",
                         tid,

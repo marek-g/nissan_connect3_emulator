@@ -89,8 +89,17 @@ pub fn trace_tr_core_uw_trace_out(unicorn: &mut Unicorn<'_, Context>) -> u32 {
         log_trace_stack(unicorn, thread);
         log_trace_payload(unicorn, thread, r3 as u32, r2 as u32, r1 as u32);
     }
+    // r799n20: direct TR_*/UTIL_* callers only test for <0 (see r788 runs,
+    // returning 0 was always fine for them).  The libosal trace-DEVICE path
+    // used to arrive here too and failed - it is now stubbed upstream at
+    // TRACE_s32IOWrite's device entry (libs/libosal_linux/message.rs), so the
+    // old 0 return stays for the direct callers.
     0u32
 }
+
+/// TR_core_uwTraceBinOutput is never imported by libosal (its PLT slot
+/// 0x4856751c resolves back to TRACE_s32IOWrite itself), so no stub there is
+/// needed - see the r799n20 note in trace_tr_core_uw_trace_out.
 
 fn log_trace_payload(unicorn: &mut Unicorn<'_, Context>, thread: u32, ptr: u32, len: u32, id: u32) {
     if ptr == 0 {

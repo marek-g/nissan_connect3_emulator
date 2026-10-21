@@ -735,7 +735,7 @@ pub fn yield_thread(unicorn: &mut Unicorn<'_, Context>, args: [u32; 4]) -> bool 
     // unlock racing ahead of its lock) finishes in place too. Writing `R0` and letting the
     // `svc` retire reproduces a non-blocking completion exactly.
     let immediate = if object == TSE_OBJECT {
-        complete_tse(unicorn, service, block, true)
+        complete_tse(unicorn, service, block, true, None)
     } else if object == OSAL_IO_OBJECT {
         // The io-object commands (open/close/create/remove/ioctl/read/write) are the
         // registry client's leaf calls. On the unit the triton side answers them in
@@ -972,6 +972,22 @@ fn trace_scd_lookup(unicorn: &mut Unicorn<'_, Context>) {
 /// block, and R0 carries the status the continuation branches on (`cmp r0, #0` with the
 /// out-parameter read for `r0 >= 0`).
 pub fn complete(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) -> u32 {
+    complete_inner(unicorn, service, block, None)
+}
+
+/// Deadline/expiry completion for a specific blocked thread, invoked by the
+/// scheduler's `advance_blocked` outside that thread's quantum - the TSE arms
+/// need the real waiter id (see `complete_tse`, r799n20).
+pub fn complete_for(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32, tid: u32) -> u32 {
+    complete_inner(unicorn, service, block, Some(tid))
+}
+
+fn complete_inner(
+    unicorn: &mut Unicorn<'_, Context>,
+    service: u32,
+    block: u32,
+    waiter: Option<u32>,
+) -> u32 {
     trace_scd_lookup(unicorn);
     // The OSAL service object (0x64) dispatches on `cmd = service >> 16` through the 99-entry
     // table blob0 registers; each cmd is answered like the pool/bank services above - by
@@ -996,7 +1012,7 @@ pub fn complete(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) ->
     // as an expiry rather than parked a second time. Commands that still refuse to answer
     // (the mbx family) keep falling through to the catch-all.
     if service & 0xff == TSE_OBJECT {
-        if let Some(status) = complete_tse(unicorn, service, block, false) {
+        if let Some(status) = complete_tse(unicorn, service, block, false, waiter) {
             return status;
         }
     }
@@ -1652,8 +1668,22 @@ fn complete_osal_service(
 /// A wait on an id that was never created answers `E_OBJ` right away instead of parking -
 /// that is what a real µITRON kernel says, and it keeps a caller holding a stale id from
 /// sleeping forever. The lock is never held across a memory map or a guest write.
-fn complete_tse(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32, at_entry: bool) -> Option<u32> {
-    let thread = unicorn.get_data().thread_id();
+fn complete_tse(
+    unicorn: &mut Unicorn<'_, Context>,
+    service: u32,
+    block: u32,
+    at_entry: bool,
+    waiter: Option<u32>,
+) -> Option<u32> {
+    // r799n20: the scheduler's `poll_tse_wait`/deadline re-checks run in the
+    // process loop, NOT in the blocked thread's quantum - `thread_id()` there
+    // names whatever thread last ran, so per-thread queue bookkeeping (FIFO
+    // wake, r799n18) looked up the wrong key and no parked flag waiter was
+    // ever released (n140: STAT creator [16] starved on flag 1 behind thread
+    // [71]'s stale queue entry -> worker [72] never spawned -> mbx_22 had no
+    // pump -> svc-0x1e answers were never consumed).  The polling callers now
+    // pass the blocked thread id explicitly.
+    let thread = waiter.unwrap_or_else(|| unicorn.get_data().thread_id());
     match service {
         TSE_SEM_CREATE => {
             let id = {
@@ -1790,7 +1820,15 @@ fn complete_tse(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32, at
                 Some(0)
             } else if at_entry {
                 if me.is_none() {
-                    queue.push((thread, pattern));
+                    // A thread can be parked exactly once: drop any stale
+                    // entry of it from other flags' queues (a deadline wake
+                    // taken through the generic completion path does not run
+                    // this arm's sibling, and a stale entry would keep the
+                    // FIFO gate closed for everyone behind it, r799n20).
+                    for (_, q) in state.tse_flag_waiters.iter_mut() {
+                        q.retain(|(t, _)| *t != thread);
+                    }
+                    state.tse_flag_waiters.entry(flag).or_default().push((thread, pattern));
                     log::info!(
                         "monitor: TSE[{thread}] flag {flag} pattern {pattern:#x} parked (bits {bits:#x}, ahead {my_idx})",
                     );
@@ -1811,11 +1849,16 @@ fn complete_tse(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32, at
 /// Re-check a parked TSE wait from the scheduler: `Some(0)` once the semaphore can be taken
 /// or the flag pattern matches (and the unit is consumed), `None` while it must keep waiting.
 /// Only the two wait services are looked at; everything parked elsewise is untouched.
-pub fn poll_tse_wait(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32) -> Option<u32> {
+pub fn poll_tse_wait(
+    unicorn: &mut Unicorn<'_, Context>,
+    service: u32,
+    block: u32,
+    tid: u32,
+) -> Option<u32> {
     if !matches!(service, TSE_SEM_WAIT | TSE_FLG_WAIT) {
         return None;
     }
-    complete_tse(unicorn, service, block, true)
+    complete_tse(unicorn, service, block, true, Some(tid))
 }
 
 /// Host-side raise of a TSE flag pattern (the emulator playing the role of a sender that

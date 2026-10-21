@@ -368,6 +368,26 @@ pub fn hook_message_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     // 0x484f0a6c and fails there or on the device-id check.  Log handle,
     // driver, channel and the id the driver reports.
     const IOWRITE_DISPATCH: u32 = 0x484f0a50 - 0x484d8000;
+    // r799n20: the trace device's write method (table slot -> 0x484eff30) is
+    // TRACE_s32IOWrite's secondary entry: it shuffles args and tail-jumps to
+    // 0x484eff04, which calls TR_core_uwTraceOut and crushes the result to
+    // 0/-1.  OSAL_s32IOWrite's success leg for flag-clear devices (r799n20
+    // dumps: dev+0x24==0, param_3=0x10) needs 0x10 <= ret <= 0x72000, which
+    // that squashing can never satisfy -> EVERY guest trace write failed
+    // (0x72014).  procmapengine's AIL error leg then RE-POSTED the in-flight
+    // service message: 37k-142k msg/s self-storm on mbx_1024 that starved the
+    // fastmap/dataset chain.  Patching this libosal device entry (a library,
+    // per the fidelity rule) to report success is the faithful place: the
+    // real device's write cannot fail in this configuration either (trace is
+    // telemetry; nothing consumes the return beyond the error test).
+    const TRACE_DEV_WRITE: u32 = 0x484eff30 - 0x484d8000;
+    crate::os::code_stub::add_code_stub(
+        unicorn,
+        "LIBOSAL",
+        base_address + TRACE_DEV_WRITE,
+        "osal_trace_dev_write",
+        trace_dev_write,
+    );
     {
         crate::os::code_stub::trap_site(unicorn, (base_address + IOWRITE_DISPATCH), crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/message.rs:osal_iow", move |uc: &mut Unicorn<'_, Context>| {
             static HITS: AtomicU32 = AtomicU32::new(0);
@@ -380,8 +400,30 @@ pub fn hook_message_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
                 let ch = read_u32_or_invalid(uc, r5.wrapping_add(0x10));
                 let id = read_u32_or_invalid(uc, r7.wrapping_add(0x20));
                 let nm = read_cstr(uc, r7.wrapping_add(0x28), 24);
+                // r799n19: the real OSAL_s32IOWrite (decompiled) pulls the dev
+                // object from handle+4 and calls dev[7] (=[dev+0x1c]) - the
+                // driver write method.  Dump the method pointer (whose code is
+                // it: libosal generic or engine-owned?), the handle's exapp-id
+                // u16 @+8 (the 0x7201d mismatch check) and dev words so the
+                // svc-0x300/0x26 write-failure loop names its owner.
+                let dev = read_u32_or_invalid(uc, r5.wrapping_add(4));
+                let h8 = read_u32_or_invalid(uc, r5.wrapping_add(8));
+                let wfn = if dev != 0 && dev < 0xf000_0000 {
+                    read_u32_or_invalid(uc, dev.wrapping_add(0x1c))
+                } else {
+                    0xffff_ffff
+                };
+                let dw0 = read_u32_or_invalid(uc, r7);
+                let dw24 = read_u32_or_invalid(uc, r7.wrapping_add(0x24));
+                // r799n20: sl = r10 = OSAL_s32IOWrite's 3rd parameter; the
+                // success leg (flag==0) requires param_3 <= method result, so
+                // its value decides what the trace method must return.
+                let r10 = uc.reg_read(RegisterARM::R10).unwrap_or(0);
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0);
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0);
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0);
                 log::warn!(
-                    "[LIBOSAL-MBX] OSAL_IOWrite dispatch t={}ms tid=[{}] h={r5:#x} ch={ch:#x} drv={r7:#x} drv0={id:#x} len={r8:#x} nm={nm:?}",
+                    "[LIBOSAL-MBX] OSAL_IOWrite dispatch t={}ms tid=[{}] h={r5:#x} ch={ch:#x} drv={r7:#x} drv0={id:#x} len={r8:#x} nm={nm:?} dev={dev:#x} h8={h8:#x} wfn={wfn:#x} drv.w0={dw0:#x} drv.w24={dw24:#x} r0={r0:#x} r1={r1:#x} r2={r2:#x} sl={r10:#x}",
                     crate::libs::dapi::emu_t0_elapsed_ms(),
                     uc.get_data().inner.thread_id(),
                 );
@@ -5274,4 +5316,30 @@ pub fn u32_open_msg_queue(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     unicorn.mem_write(arg2, &pack_u32(1)).unwrap();
     log::warn!("queue_name: {}, arg2: {:#x}", queue_name, arg2);
     1u32
+}
+
+/// Stub for the libosal trace device's write method entry (0x484eff30, see
+/// TRACE_DEV_WRITE).  Logs the transfer struct at trace level and answers the
+/// OSAL success code, which OSAL_s32IOWrite's flag-clear success leg accepts
+/// (param_3 <= 0x72000 <= 0x72000).
+fn trace_dev_write(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+    let r0 = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+    let r1 = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+    let r2 = unicorn.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+    let mut words = [0u8; 16];
+    let hdr = if r1 > 0x1000 && r1 < 0xf000_0000 && unicorn.mem_read(r1 as u64, &mut words).is_ok()
+    {
+        words
+            .chunks_exact(4)
+            .map(|w| format!("{:#x}", u32::from_le_bytes(w.try_into().unwrap())))
+            .collect::<Vec<String>>()
+            .join(" ")
+    } else {
+        "unreadable".into()
+    };
+    log::trace!(
+        "[{}] [LIBOSAL-MBX] trace_dev_write(r0={r0:#x} r1={r1:#x} r2={r2:#x}) [{hdr}] => 0x72000",
+        unicorn.get_data().inner.thread_id(),
+    );
+    0x72000
 }
