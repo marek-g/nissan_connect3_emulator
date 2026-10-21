@@ -2607,3 +2607,29 @@ static and re-point both watches dynamically at runtime).
   for mbx_1024 (legitimate emulation-side fix - it is OUR queue table).
   If the lookup is name-based decimal-string formatting, verify our
   ensure_queue("mbx_1024") table name matches byte-for-byte.
+
+## r799n9d: answer-leg deep-dive - queue=-1 is read from the caller's own memory (not a runtime lookup), and the app-directory does not know app 0x400
+
+- Timeline (n55): valid-handle posts (queue=0x40093a20) run at t~2-3 s
+  (boot churn) and once each at t=14.3/54.3 s (svc-0x300 answers, which
+  DO go out: wire class=0x45 src=0x400 svc=0x300 func=0x200x); the 14
+  queue=-1 failures span t=11..55 s for the class-0x42 svc-0x1e shape -
+  a never-bound, never-late-binding slot, not a startup race.
+- The `-1` is the r1 ARGUMENT of ail_bIpcMessagePost (probe at 0x660ea0
+  logs r1 before the call) -> the guest read it from its own port/adapter
+  object; fixing this is NOT an emulator-side post-routing fix, it is
+  making the guest's own bind step write a real handle there.
+- Registry cross-check: no APPID 0x400 exists in the decoded hives; the
+  cca directory emulation answers ApplicationInfoStatus only to HMI-state
+  queries; the scd lookup answers service->app (0x1e -> POSFI 0x15) but
+  the requester clearly routes the request to 0x400 (PROCMAP per
+  StartConfigDefault CONFIG/PROCMAP). procmapengine registered svc 0x1e
+  WITH server 0x15 and got conf+status answered (live 2) - yet the answer
+  leg needs a queue handle for 0x400 nobody ever registers.
+- NEXT (one cheap round): at bPostIpcMessage entry, for the class-0x42
+  failing shape dump the adapter registers (r0..r4) and the candidate
+  queue-handle slots [r0+0x10..+0x30]; compare with the svc-0x300 success
+  (lr 0x669c58 wrapper) to find WHICH guest step must write the handle
+  into the port (bind on connect-conf? self-register?) and which message
+  that step waits for. That message is the emulator-side hole to plug -
+  not the post itself.
