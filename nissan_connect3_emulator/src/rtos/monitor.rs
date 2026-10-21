@@ -1482,7 +1482,7 @@ fn complete_osal_service(
                         &mut guard.mq,
                         &src_queue,
                     );
-                    let handle = osal_mbx_handle(&src_queue);
+                    let handle = osal_kernel_handle(&src_queue);
                     content[0x0c..0x10].copy_from_slice(&handle.to_le_bytes());
                     let mut b = Vec::with_capacity(8 + 0x18);
                     b.extend_from_slice(&1u32.to_le_bytes());
@@ -2323,6 +2323,22 @@ fn dump_wait_stack(unicorn: &mut Unicorn<'_, Context>, thread: u32, tag: &str) {
 
 /// Handle token for a named queue (stable per name, allocated on first use by
 /// either the create or the open path so both agree on the same value).
+/// r799n13b: the kernel handle format of a native OSAL queue.  Guest-side
+/// opens/creates of `mbx_<n>` return `0x40090000 + n` (decimal id in the low
+/// half): procmapengine's binder wrote 0x40093a20 for `mbx_1024` (1024 =
+/// 0x400) and the answer-leg route record compares the low half.  The AIL
+/// route records and the reply-queue stamp must speak this exact namespace -
+/// monitor-side 0x4000_00xx handles are unknown to the guest's post path.
+/// Non-numeric queue names keep the monitor handle namespace.
+pub fn osal_kernel_handle(name: &str) -> u32 {
+    if let Some(id) = name.strip_prefix("mbx_") {
+        if let Ok(n) = id.parse::<u32>() {
+            return 0x4009_0000 + n;
+        }
+    }
+    osal_mbx_handle(name)
+}
+
 pub fn osal_mbx_handle(name: &str) -> u32 {
     let mut state = osal_state().lock().unwrap();
     match state.mbx_handles.get(name).copied() {

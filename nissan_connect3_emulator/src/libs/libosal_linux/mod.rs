@@ -49,7 +49,7 @@ fn read_u16_at(unicorn: &Unicorn<'_, Context>, addr: u32) -> Option<u16> {
         .map(|_| u16::from_le_bytes(buf))
 }
 
-fn read_cstr_at(unicorn: &Unicorn<'_, Context>, addr: u32, limit: usize) -> String {
+pub(crate) fn read_cstr_at(unicorn: &Unicorn<'_, Context>, addr: u32, limit: usize) -> String {
     if addr == 0 {
         return String::new();
     }

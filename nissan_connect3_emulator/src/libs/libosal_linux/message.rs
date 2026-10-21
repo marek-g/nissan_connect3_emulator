@@ -868,7 +868,7 @@ fn fallback_open_to_create(
     // is patched on the NEXT open of the same name - opens repeat per
     // thread, so every queue converges within bring-up).
     if name.starts_with("mbx_") {
-        fixup_mbx_entry_handles(unicorn, core_global);
+        fixup_mbx_entry_handles(unicorn, core_global, &name);
     }
 
     if osal_queue_exists(
@@ -890,7 +890,7 @@ fn fallback_open_to_create(
         // kernel fills the handle at queue creation; hand out our monitor
         // handle for every live mbx_ entry that still reads -1.
         if name.starts_with("mbx_") {
-            fixup_mbx_entry_handles(unicorn, core_global);
+            fixup_mbx_entry_handles(unicorn, core_global, &name);
         }
         return;
     }
@@ -1008,31 +1008,92 @@ fn osal_queue_exists(
 /// reads exactly that slot, so the svc-0x1e ServiceData answers die before
 /// the kernel ever sees them.  The handle we hand out is the same monitor
 /// handle every other path uses, keeping the namespace consistent.
-fn fixup_mbx_entry_handles(unicorn: &mut Unicorn<'_, Context>, core_global: u32) {
+/// r799n10/r799n13: keep the process's OSAL queue table faithful to the
+/// kernel's view for every `mbx_` queue this process opened:
+/// - entries that exist but read 0xffffffff in the kernel-handle slot
+///   (entry+0x14 = name-0x24) get the native handle value;
+/// - `mbx_` queues created through the monitor path (queue create(ptr),
+///   e.g. mbx_22 by the CCA bring-up thread) never went through a native
+///   create and are *absent* from the table, so route resolution for their
+///   app id fails (-1) - insert an entry at the first unused slot.
+/// The handle format is the native `0x40090000 + decimal id`; the AIL
+/// answer-leg resolver and the reply-queue stamp read exactly this table.
+fn fixup_mbx_entry_handles(unicorn: &mut Unicorn<'_, Context>, core_global: u32, opened: &str) {
     let Some(core) = osal_core_base(unicorn, core_global) else {
         return;
     };
     let table = core.wrapping_add(0x25220);
-    for index in 0..0x100u32 {
-        let entry = table.wrapping_add(index * 0x5c);
-        let name = read_cstr(unicorn, entry + 0x38, 0x20);
-        if !name.starts_with("mbx_") {
-            continue;
+    // Collect existing mbx_ names by word-scan (the MSGQ block layout is
+    // not a flat stride-0x5c array) and remember a free aligned slot.
+    let mut seen: std::collections::HashSet<String> = Default::default();
+    let mut free_slot: Option<u32> = None;
+    let mut w = [0u8; 4];
+    let mut pos = 0u32;
+    while pos < 0x8000 {
+        let a = table.wrapping_add(pos);
+        if unicorn.mem_read(a as u64, &mut w).is_err() {
+            break;
         }
-        // Kernel-handle slot at entry+0x14 (n60 word-scan: mbx_28's live
-        // kernel pointer 0x90538490 sits name-0x24 there; the CCA-created
-        // mbx_ entries read 0xffffffff at the same offset).
-        if read_u32_or_invalid(unicorn, entry + 0x14) != 0xffff_ffff {
-            continue;
-        }
-        let handle = crate::rtos::monitor::osal_mbx_handle(&name);
-        if unicorn
-            .mem_write((entry + 0x14) as u64, &handle.to_le_bytes())
-            .is_ok()
+        if w == [0x6d, 0x62, 0x78, 0x5f] {
+            let name = crate::libs::libosal_linux::read_cstr_at(unicorn, a, 0x20);
+            if name.starts_with("mbx_") {
+                seen.insert(name.clone());
+                let slot = a.wrapping_sub(0x38);
+                if read_u32_or_invalid(unicorn, a.wrapping_sub(0x24)) == 0xffff_ffff {
+                    // Self-pointer recipe: decode_queue_handle resolves a
+                    // queue handle as info=[handle+0xc], name=[info+0x38].
+                    // Entries created through the monitor path have no
+                    // native control block, so point the handle at the
+                    // table entry itself: [entry+0x0c]=entry makes the
+                    // entry its own info block (the name already sits at
+                    // entry+0x38), and the same value lands in the
+                    // kernel-handle slot (entry+0x14) that the AIL answer
+                    // leg and the reply-queue stamp read.
+                    if unicorn
+                        .mem_write((slot + 0x0c) as u64, &slot.to_le_bytes())
+                        .is_ok()
+                        && unicorn
+                            .mem_write((slot + 0x14) as u64, &slot.to_le_bytes())
+                            .is_ok()
+                    {
+                        log::info!(
+                            "[LIBOSAL-MBX] queue-table fixup: {name:?} entry {slot:#x} handle -1 -> self {slot:#x}"
+                        );
+                    }
+                }
+            }
+        } else if w == [0; 4]
+            && free_slot.is_none()
+            && (0x200..0x7fa4).contains(&pos)
+            && pos % 4 == 0
         {
-            log::info!(
-                "[LIBOSAL-MBX] queue-table fixup: {name:?} entry {entry:#x} handle slot -1 -> {handle:#x}"
-            );
+            // candidate: a zero run far enough past the block header
+            // (entries live from ~+0x170; +0x200 is safely inside the array)
+            // and with the whole entry window zeroed.
+            let mut clean = true;
+            for j in 0..0x5cu32 {
+                if read_u32_or_invalid(unicorn, table.wrapping_add(pos + j)) != 0 {
+                    clean = false;
+                    break;
+                }
+            }
+            if clean {
+                free_slot = Some(table.wrapping_add(pos));
+            }
+        }
+        pos += 4;
+    }
+    // Insert the opened-but-absent queue once.
+    if opened.starts_with("mbx_") && !seen.contains(opened) {
+        if let Some(slot) = free_slot {
+            let mut blob = vec![0u8; 0x5c];
+            blob[0x08] = 1; // in use
+            blob[0x0c..0x10].copy_from_slice(&slot.to_le_bytes()); // self info
+            blob[0x14..0x18].copy_from_slice(&slot.to_le_bytes()); // kernel handle
+            blob[0x38..0x38 + opened.len()].copy_from_slice(opened.as_bytes());
+            if unicorn.mem_write(slot as u64, &blob).is_ok() {
+                log::info!("[LIBOSAL-MBX] queue-table insert: {opened:?} entry {slot:#x}");
+            }
         }
     }
 }

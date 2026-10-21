@@ -2660,3 +2660,38 @@ static and re-point both watches dynamically at runtime).
   body (find the field's offset by diffing a request that got answered,
   svc-0x300, in the same table) and find why the STAT side leaves it -1
   (likely the same CCA admin-state gate r796 unwound for prochmi).
+
+## r799n10-n13: guest OSAL queue-table completion + kernel reply-queue stamp; remaining gap = AIL route-record q-field frozen at creation
+
+- procmapengine's libosal queue table (core = [[0x485679e0]], block at
+  core+0x25220, NOT a flat stride-0x5c array - word-scan it) had two holes:
+  entries created via the monitor's queue-create(ptr) path carry 0xffffffff
+  in the kernel-handle slot (name-0x24) and `mbx_22` (created by tid 71
+  CCA bring-up before procmapengine booted) was ABSENT from procmapengine's
+  table entirely.  `fixup_mbx_entry_handles` now patches the -1 slots and
+  inserts the opened-but-missing mbx_ queue, using a SELF-POINTER recipe:
+  entry+0x0c = entry makes the entry its own info block for
+  decode_queue_handle (name at +0x38), and entry+0x14 carries the handle.
+- Kernel stamp: the materializer (os/osal_queue.rs) now fills wire word 3
+  (blob+0x14 = body+0x0c, the reply-queue field senders build as -1) with
+  the source app's queue handle read from the receiver's own guest table,
+  so the value is always one the receiver's OSAL can decode.  Verified:
+  10 svc-0x1e requests arrive with word3=0x4002b9e0 (mbx_22 self-handle).
+- STILL broken: the answer leg does NOT take the queue from the message.
+  Resolver chain fully mapped: wrapper 0x669c38 bl 0x66df4c (app, msgtype,
+  msg) -> channel-record walk (16-byte records, key {u16 lo, u16 hi @+0 =
+  queue halves, u16 @+4 msgtype}, getters 0x66e820/0x66e83c, creator
+  0x664260 stores R1 = LITERAL -1 from its pool) -> the only record for
+  the answer shape (created t=4061, lr 0x664300) keeps q=0xffff forever.
+  On the unit some step must re-bind that record's q halves (u16 stores,
+  not yet located); the stamped word3 is evidently NOT that source.
+- NEXT: find the record re-binder - scan procmapengine file (PLAIN text,
+  ARM mode, VA-0x8000 = file offset works even though phdrs are PT_NULL)
+  for `strh rX,[rY]` / `strh rX,[rY,#2]` sites whose context loads a queue
+  handle (0x4009-style or [obj+4]); correlate with reception of a stamped
+  request (the rebind may read a DIFFERENT field of the 744-B body, e.g.
+  the amt envelope header, not word 3 - diff an answered svc-0x300 request
+  body fully, both halves of word0-vs-word3 usage).
+- Note: procmapengine code is ARM (not Thumb); earlier Thumb sweeps on it
+  were void.  The runtime codedump technique (mem_read around pc/lr from a
+  trap) works for any stripped binary.

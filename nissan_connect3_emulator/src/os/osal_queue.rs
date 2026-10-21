@@ -5,6 +5,63 @@ use crate::emulator::utils::pack_u32;
 use std::time::Instant;
 use unicorn_engine::Unicorn;
 
+/// r799n13: read the kernel-handle field (entry+0x14) of `name` from the
+/// current process's libosal queue table (core double-pointer at
+/// libosal .bss 0x485679e0, table at core+0x25220, stride 0x5c, name at
+/// +0x38 - same layout `fallback_open_to_create` writes).  Returns None
+/// when libosal is not mapped or the queue has no entry.
+fn guest_table_queue_handle(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32> {
+    let mut w = [0u8; 4];
+    unicorn.mem_read(0x4856_79e0, &mut w).ok()?;
+    let core_struct = u32::from_le_bytes(w);
+    if core_struct == 0 || core_struct > 0xf000_0000 {
+        log::warn!("[LIBOSAL-MBX] guest-table lookup {name:?}: core_struct {core_struct:#x} bad");
+        return None;
+    }
+    unicorn.mem_read(core_struct as u64, &mut w).ok()?;
+    let core = u32::from_le_bytes(w);
+    if core == 0 || core > 0xf000_0000 {
+        log::warn!("[LIBOSAL-MBX] guest-table lookup {name:?}: core {core:#x} bad");
+        return None;
+    }
+    let table = core.wrapping_add(0x25220);
+    // The MSGQ block is not a flat stride-0x5c array (r799n13: names sit at
+    // irregular offsets inside it) - scan word-wise for the name bytes
+    // (word reads tolerate unmapped gaps, a bulk read does not).  The kernel
+    // handle of an entry is at name-0x24 (mbx_28's live pointer
+    // 0x90538490 and the mbx_1024 placeholder both proved the offset).
+    let mut w4 = [0u8; 4];
+    let mut pos = 0u32;
+    while pos < 0x8000 {
+        let a = table.wrapping_add(pos);
+        if unicorn.mem_read(a as u64, &mut w4).is_ok() {
+            if w4 == [0x6d, 0x62, 0x78, 0x5f] {
+                // "mbx_"
+                let nm = crate::libs::libosal_linux::read_cstr_at(unicorn, a, 0x20);
+                log::warn!("[LIBOSAL-MBX] guest-table scan hit {nm:?} @ {a:#x}");
+                if nm == name {
+                    let addr = a.wrapping_sub(0x24);
+                    if unicorn.mem_read(addr as u64, &mut w).is_ok() {
+                        let h = u32::from_le_bytes(w);
+                        if h != 0 && h != 0xffff_ffff {
+                            return Some(h);
+                        }
+                    }
+                    log::warn!(
+                        "[LIBOSAL-MBX] guest table entry {name:?} at {a:#x} carries no usable handle"
+                    );
+                    return None;
+                }
+            }
+        }
+        pos += 4;
+    }
+    log::warn!(
+        "[LIBOSAL-MBX] guest-table lookup {name:?}: no name hit in table {table:#x} (0x8000)"
+    );
+    None
+}
+
 /// Re-evaluate a guest thread blocked inside an intercepted OSAL queue wait.
 ///
 /// This is the Unicorn/threading glue around the pure OSAL queue model: the
@@ -95,12 +152,18 @@ pub(crate) fn finish_guest_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, no
                 let src_app = u16::from_le_bytes([message.data[8], message.data[9]]);
                 if src_app != 0 {
                     let name = format!("mbx_{src_app}");
-                    let handle = crate::rtos::monitor::osal_mbx_handle(&name);
-                    message.data[0x14..0x18].copy_from_slice(&handle.to_le_bytes());
-                    log::info!(
-                        "[{}] [LIBOSAL-MBX] kernel reply-queue stamp: src app {src_app:#x} -> {name:?} handle {handle:#x}",
-                        tid
-                    );
+                    // r799n13: take the handle from this process's guest
+                    // queue table (the value its own OSAL post path can
+                    // decode); when the table has no entry, leave the
+                    // placeholder untouched rather than inject a handle the
+                    // guest cannot resolve.
+                    if let Some(handle) = guest_table_queue_handle(unicorn, &name) {
+                        message.data[0x14..0x18].copy_from_slice(&handle.to_le_bytes());
+                        log::info!(
+                            "[{}] [LIBOSAL-MBX] kernel reply-queue stamp: src app {src_app:#x} -> {name:?} handle {handle:#x}",
+                            tid
+                        );
+                    }
                 }
             }
             match crate::libs::libosal_linux::message::deliver_snapshot_message(
