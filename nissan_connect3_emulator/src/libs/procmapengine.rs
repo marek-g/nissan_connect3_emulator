@@ -2855,6 +2855,26 @@ crate::os::code_stub::trap_site(unicorn, b_post_ipc, crate::os::code_stub::TrapM
                         read_u32_or_invalid(uc, r0 + i * 4)
                     ));
                 }
+                // r799n13: walk the channel list of the message object
+                // (resolver 0x66df4c head = [msg+4], records
+                // {queue @+0, sub @+2, msgtype @+4}) so the exact -1 record
+                // serving the failing shape (msgtype 0x17001e) is identified
+                // by pointer.  The wrapper passes r3 = msg object.
+                let mut node = read_u32_or_invalid(uc, r3 + 4);
+                for i in 0..8u32 {
+                    if node == 0 || node == 0xffff_ffff || node > 0xf000_0000 {
+                        break;
+                    }
+                    let rec = read_u32_or_invalid(uc, node);
+                    if rec == 0 || rec > 0xf000_0000 {
+                        break;
+                    }
+                    let q = read_u32_or_invalid(uc, rec);
+                    let sub = read_u32_or_invalid(uc, rec + 2) & 0xffff;
+                    let ty = read_u32_or_invalid(uc, rec + 4) & 0xffff;
+                    obj.push_str(&format!(" | ch{i}@{rec:#x} q={q:#x} sub={sub:#x} ty={ty:#x}"));
+                    node = read_u32_or_invalid(uc, node + 4);
+                }
             }
             log::info!(
                 "PROCMAPENGINE: bPostIpcMessage svc={:#x} r0={:#x} r2={:#x} msg={:#x} lr={:#x} thread=[{}] trace={}{}",
@@ -2871,7 +2891,71 @@ crate::os::code_stub::trap_site(unicorn, b_post_ipc, crate::os::code_stub::TrapM
             0
         });
 
+    // r799n13: channel-record creator veneer (store stub 0x66e83c) - every
+    // AIL channel record gets {queue, sub, app, msgtype} frozen here.  The
+    // answer-leg resolver reads exactly these records; watching the creator
+    // names the caller path that froze -1 for the class-0x42 answer shape.
+    {
+        let create = base_address + (0x0066_e83cu32 - ORIGINAL_BASE);
+        crate::os::code_stub::trap_site(unicorn, create, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:chan-create", move |uc: &mut Unicorn<'_, Context>| {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 80 {
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32 & 0xffff;
+                let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                let ty = read_u32_or_invalid(uc, sp + 8) & 0xffff;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                let tid = uc.get_data().inner.thread_id();
+                log::warn!(
+                    "PROCMAPENGINE chan-create t={}ms tid=[{tid}] rec={r0:#x} q={r1:#x} app={r2:#x} type={ty:#x} lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                );
+            }
+            0
+        });
+    }
+
     let ipc_post_trace = base_address + AIL_POST_IPC_MESSAGE;
+
+    // r799n12c: the answer-leg queue resolution runs through the PLT veneer
+    // at procmapengine+0x3825e4 (jump to libosal's fn table, return leg at
+    // +0x3825f0).  Watch both ends: request msgtype in, resolved queue out -
+    // this is the exact call whose -1 the answer leg posts to.  Budgeted.
+    {
+        let enter = base_address + (0x0038_25e4u32 - ORIGINAL_BASE);
+        crate::os::code_stub::trap_site(unicorn, enter, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:resolve-enter", move |uc: &mut Unicorn<'_, Context>| {
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if r0 == 0x0017_001e || n < 40 || n % 5000 == 0 {
+                log::warn!(
+                    "PROCMAPENGINE resolve-enter t={}ms tid=[{}] arg={r0:#x} (n={})",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    n + 1,
+                );
+            }
+            0
+        });
+        let leave = base_address + (0x0038_25f0u32 - ORIGINAL_BASE);
+        crate::os::code_stub::trap_site(unicorn, leave, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:resolve-leave", move |uc: &mut Unicorn<'_, Context>| {
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if r0 == 0xffff_ffff || n < 40 || n % 5000 == 0 {
+                log::warn!(
+                    "PROCMAPENGINE resolve-leave t={}ms tid=[{}] result={r0:#x} (n={})",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    n + 1,
+                );
+            }
+            0
+        });
+    }
     
 crate::os::code_stub::trap_site(unicorn, ipc_post_trace, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:2661", move |uc: &mut Unicorn<'_, Context>| {
             let count = AIL_IPC_POST_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -3790,7 +3874,15 @@ crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::A
     // stored value, not a read-time lookup.
     {
         use unicorn_engine::unicorn_const::HookType;
+        // r799n12b: the answer leg resolves the queue through the channel
+        // list (resolver 0x66df4c matches a 16-byte record {u32 queue @+0,
+        // u16 sub @+2, u16 msgtype @+4} built by the creator veneer at
+        // 0x66e83c); the frozen -1 channel for the class-0x42 answer shape
+        // has never been observed being written.  Watch the adapter's
+        // channel-list head [adapter+0x04] (0xa07974, holds 0x40093a20) for
+        // record pushes to catch the -1 write and its pc.
         const SLOT: u64 = 0xa079_70 + 0x20;
+        const SLOT2: u64 = 0xa079_70 + 0x04;
         unicorn
             .add_mem_hook(
                 HookType::MEM_WRITE,
@@ -3814,24 +3906,45 @@ crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::A
                         pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
                         lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
                     );
-                    // r799n11b: procmapengine.out's ELF phdrs are stripped,
-                    // so file-based disasm offsets are unreliable - dump the
-                    // runtime bytes around the writing pc instead.
-                    if n < 2 {
-                        for (tag, a) in [("pc", pc), ("lr", lr)] {
-                            let start = a.wrapping_sub(0x60) & !3;
-                            let mut buf = [0u8; 0x100];
-                            match uc.mem_read(start as u64, &mut buf) {
-                                Ok(()) => log::warn!(
-                                    "PROCMAPENGINE de-slot codedump[{tag}] {a:#x} @{start:#x}: {}",
-                                    buf.iter()
-                                        .map(|b| format!("{b:02x}"))
-                                        .collect::<String>()
-                                ),
-                                Err(e) => {
-                                    log::warn!("PROCMAPENGINE de-slot codedump[{tag}] err {e:?}")
-                                }
-                            }
+                    true
+                },
+            )
+            .unwrap();
+        unicorn
+            .add_mem_hook(
+                HookType::MEM_WRITE,
+                SLOT2,
+                SLOT2 + 3,
+                move |uc, _t, address, size, value| {
+                    static COUNT2: AtomicU32 = AtomicU32::new(0);
+                    let n = COUNT2.fetch_add(1, Ordering::Relaxed);
+                    if n >= 60 {
+                        return true;
+                    }
+                    let pc = uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32;
+                    let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCMAPENGINE chan-head WRITE t={}ms thread=[{}] addr={:#x} size={} value={:#x} pc={:#x} lr={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        address,
+                        size,
+                        value,
+                        pc.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                        lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                    );
+                    // r799n12b: dump the freshly written record (the value
+                    // is the record pointer) so the frozen -1 channel can be
+                    // identified by its msgtype.
+                    if n < 30 && (0x9000_0000..0xa000_0000).contains(&value) {
+                        let mut buf = [0u8; 16];
+                        if uc.mem_read(value as u64, &mut buf).is_ok() {
+                            log::warn!(
+                                "PROCMAPENGINE chan-head record @{value:#x}: {}",
+                                buf.iter()
+                                    .map(|b| format!("{b:02x}"))
+                                    .collect::<String>()
+                            );
                         }
                     }
                     true
