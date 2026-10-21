@@ -393,9 +393,9 @@ pub fn hook_message_code(unicorn: &mut Unicorn<'_, Context>, base_address: u32) 
     
 crate::os::code_stub::trap_site(unicorn, (base_address + QUEUE_OPEN), crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/message.rs:334", move |uc: &mut Unicorn<'_, Context>| {
             let addr = (base_address + QUEUE_OPEN) as u64;
-                fallback_open_to_create(uc, addr as u32, base_address, QUEUE_CREATE);
-            
-            0
+                // r799n14: propagate the resume address (existing-queue
+                // completions skip the stub; creates redirect via PC).
+                fallback_open_to_create(uc, addr as u32, base_address, QUEUE_CREATE)
         });
 
     
@@ -826,7 +826,7 @@ fn fallback_open_to_create(
     addr: u32,
     base_address: u32,
     create_offset: u32,
-) {
+) -> u32 {
     const OSAL_QUEUE_TABLE_OFFSET: u32 = 0x25220;
     const OSAL_QUEUE_ENTRY_SIZE: u32 = 0x5c;
     const OSAL_QUEUE_ENTRY_IN_USE_OFFSET: u32 = 0x08;
@@ -858,10 +858,10 @@ fn fallback_open_to_create(
     );
     pwr_proxy::register_app_queue_open(&name);
     let Some((max_msg, msg_size)) = fallback_create_params(&name) else {
-        return;
+        return 0;
     };
     if handle_ptr == 0 || handle_ptr > 0xf000_0000 || flags > 4 {
-        return;
+        return 0;
     }
     // r799n10: patch already-live mbx_ entries before the redirect (the
     // create path below returns via the guest routine, so its fresh entry
@@ -869,6 +869,39 @@ fn fallback_open_to_create(
     // thread, so every queue converges within bring-up).
     if name.starts_with("mbx_") {
         fixup_mbx_entry_handles(unicorn, core_global, &name);
+    }
+
+    // r799n14c: the answer-leg case must not depend on the flat stride scan
+    // below - the MSGQ block is not a flat array (queue-table inserts land
+    // at irregular offsets), so the freshly inserted mbx_22 entry is
+    // invisible to it and every resolver re-open took the create branch.
+    // Consult the process's own guest table (word scan, same source the
+    // handle is read from) and complete the open there.  Gated to
+    // procmapengine's answer-leg queue mbx_22: broader skips regressed the
+    // boot sequence (n85: DAPI/procbaselx bring-up stalled; n86: the
+    // mbx_1024 open stub's retry path is what later delivers the adapter
+    // chan-head route-open, so it must run untouched).
+    if caller.contains("procmapengine") && name == "mbx_22" {
+        if let Some(handle) = crate::os::osal_queue::guest_table_handle(unicorn, &name) {
+            if unicorn
+                .mem_write(handle_ptr as u64, &handle.to_le_bytes())
+                .is_ok()
+            {
+                let _ = unicorn.reg_write(RegisterARM::R0, 0);
+                log::info!(
+                    "0x{:x} [{}] [LIBOSAL] OSAL_s32MessageQueueOpen({name:?}) existing -> handle {handle:#x} at {handle_ptr:#x}",
+                    addr - base_address + 0x484d8000,
+                    thread,
+                );
+                // r799n14d: the trap sits on the function's FIRST
+                // instruction (push {r4,r5,r6,r7,r8,sb,sl,fp,lr}), so a
+                // skip-to-addr+4 would run the body and pop a frame that
+                // was never pushed (n88: tid-60 resumed at pc=0x0).  The
+                // stack is still intact at trap time - return straight to
+                // our lr, exactly as if the real open had completed.
+                return lr;
+            }
+        }
     }
 
     if osal_queue_exists(
@@ -891,8 +924,12 @@ fn fallback_open_to_create(
         // handle for every live mbx_ entry that still reads -1.
         if name.starts_with("mbx_") {
             fixup_mbx_entry_handles(unicorn, core_global, &name);
+            // r799n14: the answer-leg completion for mbx_22 now lives in
+            // the guest-table pre-check above (the flat scan never saw the
+            // irregular inserts); everything else keeps the historical
+            // fall-through behaviour.
         }
-        return;
+        return 0;
     }
 
     let sp = unicorn.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
@@ -902,7 +939,7 @@ fn fallback_open_to_create(
             .mem_write(sp as u64, &handle_ptr.to_le_bytes())
             .is_err()
     {
-        return;
+        return 0;
     }
 
     log::info!(
@@ -921,6 +958,9 @@ fn fallback_open_to_create(
     unicorn
         .reg_write(RegisterARM::PC, (base_address + create_offset) as u64)
         .unwrap();
+    // Returning 0 lets the dispatcher honour the PC we just rewrote to the
+    // guest's native create.
+    0
 }
 
 fn fallback_create_params(name: &str) -> Option<(u32, u32)> {
@@ -4245,6 +4285,19 @@ fn bridge_mbx_queue(
                     OsalQueueService::guest_post(&mut state.mq, name, blob, prio_or_prio_ptr);
                 if accepted {
                     state.notify_waiters();
+                }
+                if accepted && name == "mbx_22" {
+                    // TEMP r799n14: confirm the answer blob really is in the
+                    // shared queue right after acceptance.
+                    static Q22: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if Q22.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                        let qid = state.mq.queue_id_for_name(name);
+                        let pending = qid
+                            .and_then(|id| state.mq.queues.get(&id))
+                            .map(|q| q.messages.len())
+                            .unwrap_or(usize::MAX);
+                        log::info!("[LIBOSAL-MBX] mbx_22 accepted, pending={pending}");
+                    }
                 }
                 accepted
             };

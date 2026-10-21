@@ -2561,6 +2561,54 @@ fn complete_osal_mbx_wait(
                 queue_id,
                 usize::MAX,
             );
+            if name == "mbx_22" {
+                // TEMP r799n14: the 14 class-0x42 svc-0x1e answers were
+                // accepted into mbx_22 but no delivery of them was ever
+                // logged - dump what the AE pump actually sees.  The 0x42s
+                // may sit behind a boot-era backlog of 0x45 publications
+                // (pending grows 59 -> 68), so also name the queue's class
+                // histogram whenever a 0x42 leaves the queue.
+                static P22: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                static P22_BUCKET: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(u32::MAX);
+                let popped_class = message
+                    .as_ref()
+                    .map(|m| m.data.get(0x13).copied().unwrap_or(0xff))
+                    .unwrap_or(0);
+                let t_ms = crate::libs::dapi::emu_t0_elapsed_ms();
+                let deep_look = popped_class != 0x45
+                    || P22_BUCKET.swap((t_ms / 5000) as u32, std::sync::atomic::Ordering::Relaxed)
+                        != (t_ms / 5000) as u32;
+                if popped_class == 0x42 || deep_look || P22.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    let pending = guard
+                        .mq
+                        .queues
+                        .get(&queue_id)
+                        .map(|q| q.messages.len())
+                        .unwrap_or(usize::MAX);
+                    let hist = guard
+                        .mq
+                        .queues
+                        .get(&queue_id)
+                        .map(|q| {
+                            let mut c42 = 0usize;
+                            let mut c45 = 0usize;
+                            let mut other = 0usize;
+                            for m in &q.messages {
+                                match m.data.get(0x13).copied().unwrap_or(0) {
+                                    0x42 => c42 += 1,
+                                    0x45 => c45 += 1,
+                                    _ => other += 1,
+                                }
+                            }
+                            format!("42:{c42} 45:{c45} o:{other}")
+                        })
+                        .unwrap_or_default();
+                    log::info!(
+                        "monitor: OSAL[{thread}] mbx_22 pop class={popped_class:#x} pending_after={pending} backlog[{hist}]"
+                    );
+                }
+            }
             if message.is_some() {
                 guard.notify_waiters();
             }

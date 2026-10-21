@@ -2918,6 +2918,101 @@ crate::os::code_stub::trap_site(unicorn, b_post_ipc, crate::os::code_stub::TrapM
         });
     }
 
+    // r799n14: creator function 0x664260 entry + its gate return point.
+    // Entry args are {obj=r0, msgtype=r1, sub=r2}; the gate at 0x664278
+    // (bl 0x66d1ec) may veto creation, and an empty [obj+0x58] list sends
+    // the creator away at 0x66432c/0x66446c before the record stub runs.
+    // Logging both ends names which precondition starves the svc-0x1e
+    // answer record (only the svc-0x300 one is ever created).
+    {
+        let ent = base_address + (0x0066_4260u32 - ORIGINAL_BASE);
+        crate::os::code_stub::trap_site(unicorn, ent, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:chan-maker", move |uc: &mut Unicorn<'_, Context>| {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 60 {
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32 & 0xffff;
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                let tid = uc.get_data().inner.thread_id();
+                log::warn!(
+                    "PROCMAPENGINE chan-maker ENTER t={}ms tid=[{tid}] obj={r0:#x} msgtype={r1:#x} sub={r2:#x} lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                );
+            }
+            0
+        });
+        let gate = base_address + (0x0066_427cu32 - ORIGINAL_BASE);
+        crate::os::code_stub::trap_site(unicorn, gate, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:chan-maker-gate", move |uc: &mut Unicorn<'_, Context>| {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 60 {
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                let list = read_u32_or_invalid(uc, r7.wrapping_add(0x58));
+                let msgtype = read_u32_or_invalid(uc, r7.wrapping_add(0x10)) & 0xffff;
+                let tid = uc.get_data().inner.thread_id();
+                log::warn!(
+                    "PROCMAPENGINE chan-maker GATE t={}ms tid=[{tid}] gate={r0:#x} obj={r7:#x} list={list:#x} objtype={msgtype:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                );
+            }
+            0
+        });
+    }
+
+    // r799n14: the answer-leg resolver 0x66df4c(r0=list-owner, r1=svc,
+    // r2=context) with its leaf return 0x66dfcc (r0 = queue returned to
+    // bPostIpcMessage's wrapper).  Correlating (svc, returned queue) names
+    // why the svc-0x1e leg resolves -1 while the svc-0x300 leg gets a
+    // bound handle from the very same call site.
+    {
+        static LAST_RESOLVER_SVC: std::sync::LazyLock<
+            std::sync::Mutex<std::collections::HashMap<u32, u32>>,
+        > = std::sync::LazyLock::new(|| std::sync::Mutex::new(Default::default()));
+        let ent = base_address + (0x0066_df4cu32 - ORIGINAL_BASE);
+        crate::os::code_stub::trap_site(unicorn, ent, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:resolver", move |uc: &mut Unicorn<'_, Context>| {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            if n < 120 && (r1 == 0x1e || r1 == 0x300 || crate::libs::dapi::emu_t0_elapsed_ms() >= 10_000) {
+                let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+                let tid = uc.get_data().inner.thread_id();
+                if let Ok(mut m) = LAST_RESOLVER_SVC.lock() {
+                    m.insert(tid, r1);
+                }
+                log::warn!(
+                    "PROCMAPENGINE resolver ENTER t={}ms tid=[{tid}] owner={r0:#x} svc={r1:#x} ctx={r2:#x} lr={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
+                );
+            }
+            0
+        });
+        let ext = base_address + (0x0066_dfccu32 - ORIGINAL_BASE);
+        crate::os::code_stub::trap_site(unicorn, ext, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:resolver-out", move |uc: &mut Unicorn<'_, Context>| {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            if n < 120 {
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let tid = uc.get_data().inner.thread_id();
+                let svc = LAST_RESOLVER_SVC
+                    .lock()
+                    .ok()
+                    .and_then(|m| m.get(&tid).copied())
+                    .unwrap_or(0);
+                log::warn!(
+                    "PROCMAPENGINE resolver OUT t={}ms tid=[{tid}] svc={svc:#x} queue={r0:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                );
+            }
+            0
+        });
+    }
+
     let ipc_post_trace = base_address + AIL_POST_IPC_MESSAGE;
 
     // r799n12c: the answer-leg queue resolution runs through the PLT veneer

@@ -5,12 +5,16 @@ use crate::emulator::utils::pack_u32;
 use std::time::Instant;
 use unicorn_engine::Unicorn;
 
-/// r799n13: read the kernel-handle field (entry+0x14) of `name` from the
-/// current process's libosal queue table (core double-pointer at
-/// libosal .bss 0x485679e0, table at core+0x25220, stride 0x5c, name at
-/// +0x38 - same layout `fallback_open_to_create` writes).  Returns None
-/// when libosal is not mapped or the queue has no entry.
-fn guest_table_queue_handle(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32> {
+/// r799n13: read the queue handle of `name` from the current process's
+/// libosal queue table (core double-pointer at libosal .bss 0x485679e0,
+/// table at core+0x25220).  The MSGQ block is not a flat stride array
+/// (r799n13: names sit at irregular offsets) - scan word-wise for the name
+/// bytes (word reads tolerate unmapped gaps, a bulk read does not).  The
+/// kernel handle of an entry is at name-0x24; `decode_queue_handle`
+/// resolves a handle as info=[handle+0xc], name=[info+0x38], so the
+/// self-pointer entries the fixup installs decode back to this name.
+/// Returns None when libosal is not mapped or the queue has no entry.
+pub(crate) fn guest_table_handle(unicorn: &mut Unicorn<'_, Context>, name: &str) -> Option<u32> {
     let mut w = [0u8; 4];
     unicorn.mem_read(0x4856_79e0, &mut w).ok()?;
     let core_struct = u32::from_le_bytes(w);
@@ -157,7 +161,7 @@ pub(crate) fn finish_guest_wait(unicorn: &mut Unicorn<'_, Context>, tid: u32, no
                     // decode); when the table has no entry, leave the
                     // placeholder untouched rather than inject a handle the
                     // guest cannot resolve.
-                    if let Some(handle) = guest_table_queue_handle(unicorn, &name) {
+                    if let Some(handle) = guest_table_handle(unicorn, &name) {
                         message.data[0x14..0x18].copy_from_slice(&handle.to_le_bytes());
                         log::info!(
                             "[{}] [LIBOSAL-MBX] kernel reply-queue stamp: src app {src_app:#x} -> {name:?} handle {handle:#x}",

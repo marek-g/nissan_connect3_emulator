@@ -1618,7 +1618,15 @@ fn spawn_gps_provider(unicorn: &mut Unicorn<'_, Context>) {
                         &mut guard.mq,
                         &queue,
                         blob,
-                        0,
+                        // AIL posts component traffic at OSAL priority 2
+                        // (`bPostIpcMessage` passes r3=2) and OSAL 0 is the
+                        // highest rank, so publishing the sensorfi feed at 0
+                        // put every GpsDataStatus ahead of the STAT answers
+                        // sharing mbx_22 - the class-0x42 svc-0x1e replies
+                        // were accepted but never reached the consumer
+                        // (r799n14).  The same rank as AIL traffic keeps the
+                        // queue's arrival order.
+                        2,
                     );
                     if posted {
                         guard.notify_waiters();
@@ -1788,7 +1796,9 @@ fn spawn_posfi_provider(unicorn: &mut Unicorn<'_, Context>) {
                             &mut guard.mq,
                             &queue,
                             blob,
-                            0,
+                            // OSAL 0 is the highest rank and AIL posts at 2
+                            // (see the GPS provider note) - share the AIL rank.
+                            2,
                         );
                         if posted {
                             guard.notify_waiters();
