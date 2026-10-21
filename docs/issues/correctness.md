@@ -2096,3 +2096,55 @@ then supply its ServiceStatus the same way the era gate is fed
 precondition if the owner is PROCNAV (still parked).  The descriptor
 words at file 0x2916f50 are pointers into 0x194xxxx-0x196xxxx (strings?
 vtables?) - decode in the next session.
+
+## r799m: spinner wait decoded to the last instruction; break is ONE level earlier than r788 thought
+
+j1/j2 (state-9 world, tap (150,120) = the Enter Destination hit-box):
+
+- `hsa-set-syncmap` (0x1879b88) decoded: 4 instructions, NO arguments read -
+  it hard-codes `waitmask([hsa+0x80]) = 0x4000000`, `waiting([+0x68]) = 0`.
+  The getter `clHSA_Navigation::ulwWaitSyncState` (0x18928e0) returns "not
+  ready" while the mask is set.  So 0x4000000 is THE dest-entry-prepare wait
+  bit by construction; the dialog = the busy spinner (`GUI_MessageBoxSystem
+  opcode 1001->1002`).
+- BUT the request leg that the real unit issues for this dialog NEVER RUNS
+  here: `hsa-setevent` (0x18a3394) and `hsa-set-destenv`
+  (0x1879af8/vSetWaitEv_ReqPrepareDestEnvMap) have ZERO hits after boot
+  (r788-era had waiting=1 set - today it is 0, the setter never ran);
+  the DAPI `srvctrl GetWorker` probe (still installed, budget 4096) sees
+  ZERO jobs (r787-era: post-tap type-4 dap_map_tclManager/type-6
+  rnw_tclManager churn + PROCNAV IOSC MQB_1/MQB_3 sessions - today PROCNAV
+  is fully parked before the tap and nothing wakes it).
+- Event layer: the FI event 0x81008089 (r789's route to
+  `clHmiNavServerHandler::vInitDestinationEntry(mode=6)`, slot idx 0x59) is
+  absent from the WHOLE run; the tap window shows no `event2app` at all
+  (bEvent2App 0x1352930 never consulted for the action), only the periodic
+  0x810080a8 (44x, unrelated) and the dialog's hsa-event 0x87/0x8e +
+  obs-notify pair.  The opened popup's companion view is cid=0xf6 (246),
+  NOT r787's spinner companion 0x28d (653) nor the keyboard page
+  0x285-area - today's tap opens a *smaller local* busy dialog, not the
+  dest-entry session bootstrap.
+- Interpretation: in the state-9 world the softkey/action behind the hit-box
+  no longer resolves to the dest-entry LIST-action (r786 lead:
+  `dynlistconf_NAVI__DESTENTRY_LIST2/_row_entries` dynamic-list config feeds
+  those buttons, the media analogue is fed by its CCA service).  The
+  request-engine and PROCNAV paths from r787/r788 are NOT the first break
+  anymore - the GUI action binding is.
+
+NEXT (in order):
+1. Ground truth cheap: capture the USER's interactive session log
+   (they see the real button labels in the visible window) - tap Enter
+   Destination + New Address, keep the log; compare the tap-window event/
+   action ids against j1's.  If their flow DOES fire 0x81008089, our
+   scripted coordinates simply hit a different widget and only the
+   visible-window ground truth pins it.
+2. Static: find the action id -> FI event table (GUI_ContentString ids in
+   the action messages, `[1, slot, w2, w3]` pump posts), see which action
+   id posts event 0x81008089 and which content string "ENTER DESTINATION"
+   binds to on the MAP OPTIONS popup page - dynlistconf rows likely come
+   from the missing dest-entry dynamic list (r786 open question), fed by
+   CL data = the same unregistered getter 0x206.
+3. If the action table binds 0x81008089 only when the dynlist is populated,
+   the fix target reverts to r788's: register/feed the dest-entry data
+   provider (getter 0x206 / bdp element 0x08076000) - via PROCNAV's
+   session per fidelity rules, NOT a synthetic event.
