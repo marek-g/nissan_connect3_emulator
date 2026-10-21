@@ -2015,3 +2015,56 @@ User interactive session findings:
 GPS POSITION page: still gated behind Setup-tree navigation - the user
 sees the Setup screen, so once (3)/(1) are sorted, walk it with scripted
 taps (capture the Setup screen first - its layout is unknown).
+
+## r799k/r799k2: state-6 late-era stall FIXED (3d1af7e, d21fa60) - enConnect eats our fabricated mbx_289 answers
+
+Full root-cause chain (g4-vs-g3 era diff, confirmed by forced reproduction):
+1. The era's member/connector completions (svc 0x0006 txn 1/2 via
+   `fabricate_fi_ready_push`, gate svc 0x000a txn 3 via `push_gps_answer`)
+   ride mbx_289, which has TWO legitimate consumers.  tid-84's enConnect
+   Wait pops nearly everything while idle and silently drops class-0x45
+   messages that are not its own transactions (r799d note).
+2. Late-era runs (era 34-38 s, correlates with host load) push the answers
+   up to 1.4 s BEFORE the startup connector's pump tick reads the queue ->
+   enConnect eats them -> `f-accept` never pops txn=2 (h7) or the gate
+   txn=3 (h9) -> the step loop aborts at iteration 3 (conf-store 3/13,
+   members 3..0xa never register) -> `g7-vfn18res` getter stuck 0 (h7/h8)
+   or flips to 1 while the gate entry still waits (h9) -> FSM state 6
+   forever.  Healthy eras win the same race by ~100 ms of margin; the
+   earlier g-m18 re-fire hammer could not help because it lives INSIDE
+   readygate (0x17c2880), which is never reached in this scenario.
+3. Fix: FI_ERA_PENDING map in message.rs tracks every fabricated answer
+   for the navsrv-consumer services {0x0006,0x000a}; `f-accept` (0x17c_b5ec
+   probe) removes (svc,txn) when the pump consumer actually pops it; the
+   startup connector's readiness-getter leg 0x17c7938 (`g7-vfn18res`, fires
+   on every pump tick while the FSM gates on it) re-pushes all still-
+   pending answers while hmi_fsm_state() is 5 or 6 (bounded 40/pair,
+   EMU_FI_ERA_REFIRE=0 disables, every re-push logged).
+   Even healthy eras needed it: i1 re-fired the gate txn-3 3x before the
+   accept - the race is won "by luck" every normal run.
+Verification: i2 = exact h7 stall recipe (late era 37.7 s, taps): state
+7/8/9 close at 37.7 s, 53 re-fires, all 3 taps fired.  i3 late era closed
+at 38.4 s.  Healthy runs (h1,h4-h6,i1): re-fires bounded, state 9 @28 s.
+
+Remaining from r799j-open:
+- Bug 1 (Enter Destination spinner): headless blind-tap repro did NOT find
+  the button - Menu(70,330) opens the MAP OPTIONS popup, but (180,160) AND
+  (180,280) both open page id=0x400024ca titled "MAP SCROLL", and
+  (530,160)/(530,280) do nothing (the popup body is transparent in
+  hmi_raw, so captures cannot locate the button).  NEXT: capture a run
+  WHILE THE USER taps Enter Destination interactively (their GUI session,
+  RUST_LOG=...=info to a file) - then diff the first unanswered
+  transaction right after the tap (responder + f-accept + pumptrace
+  probes are already live).  Suspect stays: address-entry service in the
+  parked PROCNAV.
+- Bug 3 (hardkeys): user says Setup opens on EVERY press (even short) -
+  consistent with `GUI_KeyInjector_vKeyPressed(row)` emitting the +0x0c
+  press content immediately (bypassing the clHSI lp timer, which lives in
+  the real-KBD path we skip).  Back/Esc = same row 18 -> emits SETTINGS
+  then BACK_LONG on release; net "nothing" on the main screen (HK_BACK_LONG
+  is a no-op there; it worked historically on the SD popup which it closes).
+  NEXT: probe 0x1368138 (vKeyPressed) logging the emitted content id per
+  press, then decide: keep (row18 press=SETTINGS IS the real tap content?)
+  vs move Back to a dedicated row / synthesize at KBD-FI scan level
+  (clHSI_CMKeyboard::bExecuteMessage, scan->row table 0x1813620) so the
+  lp timer runs and tap/hold split works for real.
