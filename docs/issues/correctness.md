@@ -2522,3 +2522,14 @@ static and re-point both watches dynamically at runtime).
   read its miss-branch: why does the NAVI__DESTENTRY_LIST2 entry not get
   its dynlist registered (likely the same first-break as the empty hnd
   container - both are fed by that registration).
+
+## r799n8d: the 985 ms dynlistconf read was a FALSE positive (malloc consolidation)
+
+- Stack dump (sp=0x7ff3c728: words 0x183d70, malloc ptrs, libc bases) shows
+  the read happened inside libc malloc/_int_free housekeeping (lr 0x47371944
+  is libc-internal, pc 0x4737e498 = memcpy/consolidation loop) touching a
+  stale heap pointer that pointed INTO the rodata string - not a consumer.
+- Conclusion stands harder: NO code ever reads the dynlistconf NAVI
+  DESTENTRY strings in a full run -> the dynamic-list registration path is
+  never entered at all.  dlc read-watch stays installed (with stack dump)
+  for future capture.

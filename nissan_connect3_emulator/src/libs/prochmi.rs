@@ -9569,8 +9569,26 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         if HITS.fetch_add(1, Ordering::Relaxed) < 30 {
                             let pc = _uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
                             let lr = _uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                            // libc-internal lr is useless - stack-scan for
+                            // guest return addresses (same recipe as the
+                            // event2app probe).
+                            let sp = _uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                            let mut bt = String::from(" bt:");
+                            for i in 0..64u32 {
+                                let w = read_u32(_uc, sp.wrapping_add(i * 4));
+                                if (0x00fb_7080..0x023b_eb1b).contains(&w) {
+                                    bt.push_str(&format!(" {w:#x}"));
+                                }
+                            }
+                            let mut st = String::from(" st:");
+                            for i in 0..10u32 {
+                                st.push_str(&format!(
+                                    " {:#x}",
+                                    read_u32(_uc, sp.wrapping_add(i * 4))
+                                ));
+                            }
                             log::warn!(
-                                "PROCHMI {label} read t={}ms {address:#x} pc={pc:#x} lr={lr:#x}",
+                                "PROCHMI {label} read t={}ms {address:#x} pc={pc:#x} lr={lr:#x} sp={sp:#x}{bt}{st}",
                                 crate::libs::dapi::emu_t0_elapsed_ms(),
                             );
                         }
