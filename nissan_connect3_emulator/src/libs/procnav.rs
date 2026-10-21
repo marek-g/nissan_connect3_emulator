@@ -793,8 +793,8 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ("probe-sd-fits", PROBE_SD_FITS, 2),
         ("probe-sd-malloc", PROBE_SD_MALLOC, 2),
         ("probe-sd-fret", PROBE_SD_FRET, 2),
-        ("probe-sd-procmsg", PROBE_SD_PROCMSG, 2),
-        ("probe-sd-rtdisp", PROBE_SD_RTDISP, 2),
+        ("probe-sd-procmsg", PROBE_SD_PROCMSG, 10),
+        ("probe-sd-rtdisp", PROBE_SD_RTDISP, 10),
         ("probe-dispatcher", PROBE_DISPATCHER, 2),
         ("probe-regprobe", PROBE_REGPROBE, 2),
         ("probe-sd-gate", PROBE_SD_GATE, 2),
@@ -812,12 +812,12 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
         ("probe-sd-cpy1", PROBE_SD_CPY1, 2),
         ("probe-sd-binit", PROBE_SD_BINIT, 2),
         ("probe-sd-build", PROBE_SD_BUILD, 2),
-        ("probe-sd-refcmp", PROBE_SD_REFCMP, 2),
-        ("probe-sd-regcmp", PROBE_SD_REGCMP, 2),
-        ("probe-sd-refres", PROBE_SD_REFRES, 2),
-        ("probe-sd-regres", PROBE_SD_REGRES, 2),
-        ("probe-sd-dlvchk", PROBE_SD_DLVCHK, 2),
-        ("probe-sd-deliver", PROBE_SD_DELIVER, 2),
+        ("probe-sd-refcmp", PROBE_SD_REFCMP, 10),
+        ("probe-sd-regcmp", PROBE_SD_REGCMP, 10),
+        ("probe-sd-refres", PROBE_SD_REFRES, 10),
+        ("probe-sd-regres", PROBE_SD_REGRES, 10),
+        ("probe-sd-dlvchk", PROBE_SD_DLVCHK, 10),
+        ("probe-sd-deliver", PROBE_SD_DELIVER, 10),
         ("probe-regsvc", PROBE_REGSVC, 2),
         ("probe-scd", PROBE_SCD, 2),
         ("probe-scd-res", 0x0034_f0c2 - ORIGINAL_BASE, 2),
@@ -1307,7 +1307,9 @@ pub fn procnav_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                     let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
                     let target = word(uc, ip.wrapping_add(0x14)).unwrap_or(0);
                     log::info!(
-                        "PROCNAV[{tid}] probe-sd-rtdisp: vt={ip:#010x} target={target:#010x} r6={r6:#010x}"
+                        "PROCNAV[{tid}] probe-sd-rtdisp: vt={ip:#010x} target={target:#010x} r6={r6:#010x} area={} ctx={}",
+                        hexdump(uc, r6, 0x18),
+                        hexdump(uc, r6.wrapping_sub(0x18), 0x18),
                     );
                 }
                 "probe-dispatcher" => {

@@ -10089,6 +10089,10 @@ fn ensure_posfi_admin_registration(unicorn: &mut Unicorn<'_, Context>, obj: u32,
 /// NULL list, returned "not claimed" and was reposted forever.  All three
 /// helpers are idempotent no-ops once the objects exist.
 fn add_claim_leg_repair_hook(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    if std::env::var("EMU_NO_CLAIM_REPAIR").is_ok_and(|v| v == "1") {
+        log::warn!("PROCMAPENGINE: claim-leg repair disabled by EMU_NO_CLAIM_REPAIR=1 (A/B diagnostic)");
+        return;
+    }
     // The client-list leg ends with `b 0x669f3c` (0x66a218) whenever it did
     // not claim - the one entry point every service-data message passes.
     static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

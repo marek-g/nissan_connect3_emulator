@@ -36,12 +36,18 @@ pub(crate) fn guest_table_handle(unicorn: &mut Unicorn<'_, Context>, name: &str)
     // 0x90538490 and the mbx_1024 placeholder both proved the offset).
     let mut w4 = [0u8; 4];
     let mut pos = 0u32;
-    while pos < 0x8000 {
+    // r799n17: the MSGQ block moves with the guest heap between runs; a
+    // 0x8000 window found "mbx_22" in some runs and missed it in others,
+    // so the reply-queue stamp (and with it STAT's whole request/reply
+    // dynamic) was a coin flip.  Scan wide and report the farthest hit.
+    let mut last_hit = 0u32;
+    while pos < 0x40_000 {
         let a = table.wrapping_add(pos);
         if unicorn.mem_read(a as u64, &mut w4).is_ok() {
             if w4 == [0x6d, 0x62, 0x78, 0x5f] {
                 // "mbx_"
                 let nm = crate::libs::libosal_linux::read_cstr_at(unicorn, a, 0x20);
+                last_hit = pos;
                 log::warn!("[LIBOSAL-MBX] guest-table scan hit {nm:?} @ {a:#x}");
                 if nm == name {
                     let addr = a.wrapping_sub(0x24);
@@ -61,7 +67,7 @@ pub(crate) fn guest_table_handle(unicorn: &mut Unicorn<'_, Context>, name: &str)
         pos += 4;
     }
     log::warn!(
-        "[LIBOSAL-MBX] guest-table lookup {name:?}: no name hit in table {table:#x} (0x8000)"
+        "[LIBOSAL-MBX] guest-table lookup {name:?}: no name hit in table {table:#x} (0x40000, last mbx_ hit at +{last_hit:#x})"
     );
     None
 }
