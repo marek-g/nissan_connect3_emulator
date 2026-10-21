@@ -2841,14 +2841,31 @@ crate::os::code_stub::trap_site(unicorn, b_post_ipc, crate::os::code_stub::TrapM
             let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
             let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
             let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+            // r799n9e: for the queue==0xffffffff failures dump the caller's
+            // self-handle candidates: r0 (likely the adapter/port object)
+            // and its first words - compare failed class-0x42 shape with
+            // the successful svc-0x300 wrapper to find the missing bind.
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let mut obj = String::new();
+            if r0 != 0 && r2 == 0xffff_ffff {
+                for i in 0..12u32 {
+                    obj.push_str(&format!(
+                        " +{:#x}={:#x}",
+                        i * 4,
+                        read_u32_or_invalid(uc, r0 + i * 4)
+                    ));
+                }
+            }
             log::info!(
-                "PROCMAPENGINE: bPostIpcMessage svc={:#x} r2={:#x} msg={:#x} lr={:#x} thread=[{}] trace={}",
+                "PROCMAPENGINE: bPostIpcMessage svc={:#x} r0={:#x} r2={:#x} msg={:#x} lr={:#x} thread=[{}] trace={}{}",
                 svc,
+                r0,
                 r2,
                 r3,
                 lr,
                 thread,
-                count + 1
+                count + 1,
+                obj
             );
         
             0

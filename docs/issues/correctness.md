@@ -2633,3 +2633,30 @@ static and re-point both watches dynamically at runtime).
   into the port (bind on connect-conf? self-register?) and which message
   that step waits for. That message is the emulator-side hole to plug -
   not the post itself.
+
+## r799n9e: adapter dump pins the -1 to a per-port reply-queue slot; static disasm of procmapengine is dead (stripped phdrs)
+
+- bPostIpcMessage failure dump (r2==0xffffffff): caller object r0=0xa07970
+  {+0x00 vfn 0x685450, +0x04=0x40093a20 (valid mbx_1024 handle!), +0x0c=
+  0x400939f8 (valid mbx_22-handle twin), +0x10=0x400 (own app id), +0x20=
+  0xffffffff <- the slot the failing leg posts to}.  The SUCCESS legs pass
+  r2=[adapter+0x04] (=0x40093a20); the class-0x42 answer leg passes
+  r2=[adapter+0x20].  +0x20 = per-port PEER reply-queue, written from the
+  REQUEST's reply-queue header field when the request was claimed.
+- So the -1 is a pass-through: the STAT sender (same process) wrote -1 as
+  its reply queue into the svc-0x1e request, the server stored it, the
+  answer leg faithfully posts to -1 and dies.  Root = the STAT-side sender
+  never resolves its own reply queue (no QueueCreate logged for tids
+  52/60/61, opens only via fallback).
+- procmapengine.out ELF program headers are zeroed (PT_NULL x8) -> static
+  file disasm impossible; use runtime mem-dump (r799n6-dump pattern) for
+  any code reading there.
+- NEXT: dump procmapengine's GUEST OSAL queue table (libosal .bss table at
+  base+0x25220, stride 0x5c, in-use flag +0x08, name +0x38 - constants in
+  fallback_open_to_create) at t~16 s: confirm which queues the process
+  believes it owns + their handles.  If mbx_22/mbx_1024 entries carry the
+  right handles, the missing link is the sender-side reply-queue field
+  write in the STAT request builder - locate via the request's 744-byte
+  body (find the field's offset by diffing a request that got answered,
+  svc-0x300, in the same table) and find why the STAT side leaves it -1
+  (likely the same CCA admin-state gate r796 unwound for prochmi).
