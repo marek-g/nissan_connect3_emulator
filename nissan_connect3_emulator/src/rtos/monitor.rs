@@ -1194,6 +1194,15 @@ struct OsalState {
     tse_sems: HashMap<u32, u32>,
     /// TSE flag id -> currently set pattern (object `0x13`, `tkse_*_flg`).
     tse_flags: HashMap<u32, u32>,
+    /// TSE flag id -> parked waiters `(thread, pattern)` in arrival order.  A
+    /// set pattern is granted to the earliest waiter it satisfies
+    /// (`poll_tse_wait` may re-check several parked waiters per scheduler
+    /// pass; without this queue whichever thread polled first stole the bits,
+    /// and PROCNAV's STAT thread [72] starved behind the spinning
+    /// [16]/[70]/[71] that all wait on flag 1 pattern 0x1 (r799n18: identical
+    /// binaries, run-to-run poll-order luck decided whether STAT passed its
+    /// startup wait)).
+    tse_flag_waiters: HashMap<u32, Vec<(u32, u32)>>,
     /// The next positive TSE id to hand out.
     tse_next_id: u32,
     /// Per-process bump cursor for the `0x57` message-reference arm's
@@ -1732,6 +1741,7 @@ fn complete_tse(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32, at
         TSE_FLG_SET => {
             let flag = read_word(unicorn, block).unwrap_or(0);
             let pattern = read_word(unicorn, block + 4).unwrap_or(0);
+            log::info!("monitor: TSE[{thread}] set flag {flag} pattern {pattern:#x}");
             let mut state = osal_state().lock().unwrap();
             match state.tse_flags.get_mut(&flag) {
                 Some(bits) => *bits |= pattern,
@@ -1747,24 +1757,46 @@ fn complete_tse(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32, at
             let flag = read_word(unicorn, block).unwrap_or(0);
             let pattern = read_word(unicorn, block + 4).unwrap_or(0);
             let mut state = osal_state().lock().unwrap();
-            match state.tse_flags.get_mut(&flag) {
-                Some(bits) if *bits & pattern == pattern => {
+            if !state.tse_flags.contains_key(&flag) {
+                drop(state);
+                log::warn!("monitor: TSE[{thread}] wait on unknown flag {flag}");
+                return Some(TSE_E_OBJ);
+            }
+            let bits = state.tse_flags.get(&flag).copied().unwrap_or(0);
+            let queue = state.tse_flag_waiters.entry(flag).or_default();
+            let me = queue.iter().position(|(t, _)| *t == thread);
+            let my_idx = me.unwrap_or(usize::MAX);
+            // Wake the earliest waiter whose pattern the bits satisfy: an
+            // earlier waiter only blocks threads whose own pattern is also
+            // satisfied for it (same event -> it gets the wake).  Without the
+            // queue the first thread polled by the scheduler stole every set
+            // (r799n18: STAT thread [72] starved behind spinning [16]/[70]).
+            let ahead_wants_it = queue[..my_idx]
+                .iter()
+                .any(|(_, p)| bits & p == *p);
+            if bits & pattern == pattern && !ahead_wants_it {
+                if let Some(pos) = me {
+                    queue.remove(pos);
+                }
+                if let Some(bits) = state.tse_flags.get_mut(&flag) {
                     *bits &= !pattern;
-                    Some(0)
                 }
-                Some(_) => {
-                    if at_entry {
-                        None
-                    } else {
-                        log::warn!("monitor: TSE[{thread}] flag {flag} pattern {pattern:#x} wait timed out");
-                        Some(TSE_E_TMOUT)
-                    }
+                log::info!("monitor: TSE[{thread}] flag {flag} pattern {pattern:#x} satisfied");
+                Some(0)
+            } else if at_entry {
+                if me.is_none() {
+                    queue.push((thread, pattern));
+                    log::info!(
+                        "monitor: TSE[{thread}] flag {flag} pattern {pattern:#x} parked (bits {bits:#x}, ahead {my_idx})",
+                    );
                 }
-                None => {
-                    drop(state);
-                    log::warn!("monitor: TSE[{thread}] wait on unknown flag {flag}");
-                    Some(TSE_E_OBJ)
+                None
+            } else {
+                if let Some(pos) = me {
+                    queue.remove(pos);
                 }
+                log::warn!("monitor: TSE[{thread}] flag {flag} pattern {pattern:#x} wait timed out");
+                Some(TSE_E_TMOUT)
             }
         }
         _ => None,
