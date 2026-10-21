@@ -18,6 +18,15 @@ const APP_STATE_OFFSET: u32 = 0x30;
 const APP_IN_QUEUE_OFFSET: u32 = 0x0c;
 const APP_IPC_WAIT_PARAM_OFFSET: u32 = 0x78;
 const PWR_PROXY_START_APP_STATE: u32 = 2;
+/// CCA registration fully acknowledged (the directory's REGISTER conf leg the
+/// emulator does not model).  The class-0x44 ServiceStatus dispatch gate
+/// (`0x66cb20`, r799n15) only consumes status messages while this state reads
+/// 3 - with 2 every ServiceStatus (incl. the fabricated DAPI fastmap pair)
+/// takes the silent drop at `0x66c93c`, so the fastmap availability fan-out
+/// (`OnUpdateServiceStateDAPIFastmap` -> channel opens -> dataset fill) never
+/// runs.  `bump_app_state_to_cca_ready` walks the app from 2 to 3 once the
+/// START_CONF handshake has run; EMU_CCA_APP_READY=0 keeps 2 for A/B runs.
+const PWR_PROXY_READY_APP_STATE: u32 = 3;
 const CCA_DISPATCH: u32 = 0x0066_c8e8 - ORIGINAL_BASE;
 const CCA_POWER_HANDLER: u32 = 0x0066_7a30 - ORIGINAL_BASE;
 const PORTCONTROL_AIL_BONINIT_RESULT: u32 = 0x0039_037c - ORIGINAL_BASE;
@@ -697,7 +706,7 @@ crate::os::code_stub::trap_site(unicorn, cca_dispatch_addr, crate::os::code_stub
         
 {
                 // r746: page hook expanded to per-arm svc#0 trap sites.
-                for __arm in [0x0066_cb20u32, 0x0066_c93cu32, 0x0066_cfa8u32, 0x0066_cfccu32] {
+                for __arm in [0x0066_cb20u32, 0x0066_c93cu32, 0x0066_cfa8u32, 0x0066_cfccu32, 0x0066_c9dcu32] {
                     let base_address = base_address.clone();
                     let drop_hits = drop_hits.clone();
                     let examine_hits = examine_hits.clone();
@@ -784,6 +793,30 @@ crate::os::code_stub::trap_site(unicorn, cca_dispatch_addr, crate::os::code_stub
                         r0,
                         content,
                         read_u32_or_invalid(uc, content),
+                        read_u32_or_invalid(uc, content.wrapping_add(0x18)) & 0xff,
+                        count
+                    );
+                } else if original == 0x0066_c9dcu32 {
+                    // Reached only when the dispatcher's class == 0x45
+                    // (`cmp r5,#0x45; bne drop` falls through here): the
+                    // service-register-CONF / service-data leg.  Zero hits in
+                    // every run so far means the RegisterConf the reference
+                    // append waits for never reaches the engine - name what
+                    // DOES arrive.
+                    let count = examine_hits.fetch_add(1, Ordering::Relaxed);
+                    if count >= 40 {
+                        return 0;
+                    }
+                    let msg = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                    let content = read_u32_or_invalid(uc, msg.wrapping_add(4));
+                    log::info!(
+                        "PROCMAPENGINE: CCA class-45 leg t={}ms thread=[{}] content={:#x} head={:#x} svc={:#x} reg={:#x} byte18={:#x} n={}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        content,
+                        read_u32_or_invalid(uc, content),
+                        read_u32_or_invalid(uc, content.wrapping_add(0x14)) & 0xffff,
+                        read_u32_or_invalid(uc, content.wrapping_add(0x16)) & 0xffff,
                         read_u32_or_invalid(uc, content.wrapping_add(0x18)) & 0xff,
                         count
                     );
@@ -2992,6 +3025,60 @@ crate::os::code_stub::trap_site(unicorn, b_post_ipc, crate::os::code_stub::TrapM
                     lr.wrapping_sub(base_address).wrapping_add(ORIGINAL_BASE),
                 );
             }
+            // r799n15: fabricate the CCA "registration acknowledged" step
+            // once the engine is past its power/START_CONF era (first
+            // svc-0x1e answer resolution, t>10 s).  Without it the app
+            // interface state stays 2 and the class-0x44 ServiceStatus
+            // dispatch gate (0x66cb20, `[app+0x30] == 3`) silently drops
+            // every status message, so the fastmap availability fan-out
+            // never runs.  The CCA directory is not an emulated partner, so
+            // this is a legitimate, logged fabrication; EMU_CCA_APP_READY=0
+            // reverts for A/B.
+            {
+                static READY_BUMPED: AtomicBool = AtomicBool::new(false);
+                if r2 == 0x16
+                    && !READY_BUMPED.load(Ordering::Relaxed)
+                    && std::env::var_os("EMU_CCA_APP_READY")
+                        .is_none_or(|v| !v.is_empty() && v != "0")
+                {
+                    let app = read_u32_or_invalid(uc, base_address + MAP_ENGINE_GLOBAL);
+                    if (0x00a0_0000..0x00b0_0000).contains(&app)
+                        && read_u32_or_invalid(uc, app + APP_STATE_OFFSET) == 2
+                    {
+                        if uc
+                            .mem_write(
+                                (app + APP_STATE_OFFSET) as u64,
+                                &PWR_PROXY_READY_APP_STATE.to_le_bytes(),
+                            )
+                            .is_ok()
+                        {
+                            READY_BUMPED.store(true, Ordering::Relaxed);
+                            log::warn!(
+                                "PROCMAPENGINE: fabricated CCA registration ack - map app {app:#x} state 2 -> 3 (class-44 ServiceStatus gate opens; EMU_CCA_APP_READY=0 disables)"
+                            );
+                            // r799n16: the engine's ApplicationInfoRegister
+                            // burst ran at ~t=4.5 s, before this bump, so its
+                            // class-0x50 answers died at the dispatcher's
+                            // `[[this]+0x30] == 3` gate (0x66cd14).  The async
+                            // registration records they were meant to drain
+                            // still sit in app_iface+0x4c; re-publish the
+                            // LPM's RUNNING status for the DAPI map server so
+                            // the *engine's own* vOnServerApplicationStatus ->
+                            // vtbl+0xa8 path executes the deferred REGISTER.
+                            if std::env::var_os("EMU_NO_APP_INFO_SYNTH").is_none() {
+                                const ENGINE_APP: u32 = 0x0400;
+                                const DAPI_MAP_SERVER: u32 = 0x0007;
+                                let ok = crate::libs::libosal_linux::message::post_app_info_status_raw(
+                                    uc, DAPI_MAP_SERVER, ENGINE_APP,
+                                );
+                                log::warn!(
+                                    "PROCMAPENGINE: re-published ApplicationInfoStatus(DAPI {DAPI_MAP_SERVER:#x} RUNNING) to {ENGINE_APP:#x} after ready-bump (posted={ok})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             0
         });
         let ext = base_address + (0x0066_dfccu32 - ORIGINAL_BASE);
@@ -4074,7 +4161,7 @@ crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::A
                             &namespace,
                         );
                     log::info!(
-                        "PROCMAPENGINE: re-posted directory ServiceStatus pair (state 1 then 0) into mbx_1024: {first} {second} round={round}"
+                        "PROCMAPENGINE: re-posted directory ServiceStatus pair (state 1 then 3) into mbx_1024: {first} {second} round={round}"
                     );
                     if FASTMAP_STATUS_APPLIED.load(Ordering::Relaxed) {
                         break;
@@ -6508,6 +6595,9 @@ crate::os::code_stub::trap_site(unicorn, cca_get_block_ids_vcall, crate::os::cod
         });
     let send_request_entry = base_address + MAP_DATA_CCA_SEND_REQUEST_ENTRY;
     add_dapi_register_diag_hooks(unicorn, base_address);
+    if std::env::var_os("EMU_REG_CHASE").is_some() {
+        add_reg_chase_hooks(unicorn, base_address);
+    }
     
 crate::os::code_stub::trap_site(unicorn, send_request_entry, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:5718", move |uc: &mut Unicorn<'_, Context>| {
             // The unit's CCA directory (TE side) never answers the register
@@ -9860,6 +9950,74 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
     }
 }
 
+/// r799n16: walk the decision legs of `vtbl+0x58` (0x664c60), the async
+/// service-registration creator the engine's `vRegisterService` calls for
+/// svc 0x26.  The u16RegisterService-style diagnostics never fire for it, so
+/// name the branch it actually takes: semaphore gate (0x66d1ec, a
+/// `OSAL_s32SemaphoreWait(obj, -1)` thunk), the null-async-list bail, the
+/// table-match legs, and the vtbl+0x5c post that puts the REGISTER on the
+/// wire.  Behind EMU_REG_CHASE because it is a pure diagnostic.
+fn add_reg_chase_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    use std::sync::atomic::AtomicU32 as AU32;
+    for (offset, label) in [
+        (0x0066_4cb4u32, "after-semgate (r0: 0=sem-error-return-1)"),
+        (0x0066_4ccc, "async-list-head (r0=[appintf+0x4c])"),
+        (0x0066_4d70, "post-decide (r5: 1=post 2=miss)"),
+        (0x0066_5060, "null-async-list-bail"),
+        (0x0066_50b4, "vtbl58-post (r0=obj ip=vtbl)"),
+        (0x0066_50ec, "async-miss-create"),
+        (0x0066_0f74, "async-exec-entry"),
+        (0x0066_0fc8, "async-exec-list-nonnull (r3=[+0x70])"),
+        (0x0066_0fe4, "async-exec-vt10-ret (r0)"),
+        (0x0066_1014, "async-exec-walk-node (r4)"),
+        (0x0066_1018, "async-exec-found (r0)"),
+        (0x0066_ccec, "class50-leg (r5=0x50 hit)"),
+        (0x0066_cd1c, "class50-gate-pass -> handler"),
+        (0x0066_8b94, "appinfo->vtbl_a8 (r0 obj vt)"),
+        (0x0066_8bb8, "answer-loop (r4 pair)"),
+        (0x004d_edf0, "mdm-branch (byte+0x29 [sp+0x24] obj+0x4c)"),
+        (0x004d_ef24, "mdm-branch-taken+0x29leg"),
+        (0x004d_eec0, "mdm-entry (r0)"),
+    ] {
+        let address = base_address + (offset - ORIGINAL_BASE);
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:reg-chase", {
+            let label = label.to_string();
+            move |uc: &mut Unicorn<'_, Context>| {
+                static N: AU32 = AU32::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 80 {
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                    let r8 = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+                    let extra = if label.contains("vtbl_a8") {
+                        let vt = read_u32_or_invalid(uc, r0);
+                        let t = read_u32_or_invalid(uc, vt.wrapping_add(0xa8));
+                        format!(" vt={vt:#x} [vt+0xa8]={t:#x}")
+                    } else if label.contains("mdm") {
+                        let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                        let sl = uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32;
+                        let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                        let v24 = read_u32_or_invalid(uc, sp.wrapping_add(0x24));
+                        let b29 = read_u8_or_invalid(uc, sl.wrapping_add(0x29));
+                        let w4c = read_u32_or_invalid(uc, sl.wrapping_add(0x4c));
+                        format!(" sl={sl:#x} r4={r4:#x} [sp+0x24]={v24:#x} [sl+0x29]={b29:#x} [sl+0x4c]={w4c:#x}")
+                    } else {
+                        String::new()
+                    };
+                    log::warn!(
+                        "PROCMAPENGINE reg-chase t={}ms tid=[{}] {label} r0={r0:#x} r5={r5:#x} r6(svc)={r6:#x} r8(server)={r8:#x}{extra} (n={})",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        n + 1,
+                    );
+                }
+                0
+            }
+        });
+    }
+}
+
 /// Stand in for the ADM's RegisterConf for the posfi client registration
 /// (service 0x1e): on the unit PROCNAV's posfi server registers the service
 /// and DAPI's ADM confirms client registrations against it; neither the
@@ -11859,6 +12017,10 @@ fn add_svc_dataset_fill_watch(unicorn: &mut Unicorn<'_, Context>) {
     for (lo, hi, label) in [
         (0x00a0_fc84u64, 0x00a0_fc8fu64, "head"),
         (0x00d9_caf0u64, 0x00d9_cb2fu64, "store"),
+        // The class-0x44 ServiceStatus gate (0x66cb20) only consumes status
+        // messages while the app-interface state word reads 3; every run pins
+        // it at 2, so watch who writes it (and prove nobody writes 3).
+        (0x00a0_79a0u64, 0x00a0_79a3u64, "appstate"),
     ] {
         let res = unicorn.add_mem_hook(
             unicorn_engine::unicorn_const::HookType::MEM_WRITE,
