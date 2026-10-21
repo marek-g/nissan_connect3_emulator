@@ -2533,3 +2533,32 @@ static and re-point both watches dynamically at runtime).
   DESTENTRY strings in a full run -> the dynamic-list registration path is
   never entered at all.  dlc read-watch stays installed (with stack dump)
   for future capture.
+
+## r799n9: container census - ALL 38 element-containers empty; DAPI receives svc-0x1e ServiceData requests but never acts
+
+- de-ctor trap (0x16640dc): the hminavserver init (lr chain 0x15e8a40..
+  0x15e8c2c, stride 0x78 objects 0x38fa470+) builds 38 containers at boot -
+  ALL get end=0 and NONE is ever pushed into (de-end watches, pc only the
+  ctor itself).  So the fill is NOT boot-static - it's demand-driven per
+  content, and NO content in the unit-emulator ever gets data.  The empty
+  dest-entry list is one symptom of a GLOBAL missing data feed.
+- The wire into DAPI exists: procmapengine-side client (app 0x16) posts 6x
+  ServiceData class=0x45 svc=0x1e regid=0x17 func=0x60010/0x60013 (msgid
+  0x15f90) to dst=0x400 and the DAPI queue WAKES ("queue_id=1046 woke with
+  materialized snapshot len=744") - but DAPI produces NO srvctrl worker
+  lookup (zero hits again) and only 2 outgoing answers (svc=0x300 func=0x200).
+  The requests die INSIDE DAPI's ServiceData dispatcher.
+- Handler link-gate theory DEAD: all four vSvcReady guards now read live
+  (+15c=0x38f9970 fsvc=0x29f75b0 +7dc=0x3a241c8 +160=0x38ca510; only the
+  finavi *value* deref is 0) - 0x1576db4's [r6+0x7dc] precondition is met.
+- 0x187a230 is NOT a function (jump-table region, garbage disasm) - the
+  r799n7 note about its vfn+4 was based on the s9gate probe's register
+  dump, keep that data but not the code claim.
+- NEXT: inside DAPI, trace what its ServiceData(0x45) consumer does with
+  the woken message: it reads the job, then must decide to post type-4/6
+  worker jobs.  Find the abort: instrument DAPI's mbx_7/DAPDATASMBX read
+  side after the wake (thread [61]), especially the svc-status/registration
+  check on svc=0x1e (the CCA registration-id directory is emulator-side
+  fabricable and per AGENTS is a legitimate fabrication surface: regid 0x17
+  must map to a serving app).  Compare against the 2 messages that DID get
+  answered (svc=0x300) to find the discriminator.

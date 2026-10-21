@@ -9597,6 +9597,47 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 );
             }
         }
+        // r799n9: census of the element-container class (ctor 0x16640dc,
+        // begin/end/cap at +0x08/+0x0c/+0x10, stride 0x20).  Every instance
+        // built at boot gets a write-watch on its END word (+0xc): a
+        // HEALTHY content's container push (e.g. the working SETUP pages)
+        // names the fill function, and its absence on ours pins whether the
+        // fill loop is globally missing or selectively skipped.
+        {
+            let address = base_address + 0x0166_40dcu32 - ORIGINAL_BASE;
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:de-ctor", move |uc: &mut Unicorn<'_, Context>| {
+                static CTORS: AtomicU32 = AtomicU32::new(0);
+                let n = CTORS.fetch_add(1, Ordering::Relaxed);
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                if n < 60 {
+                    log::warn!(
+                        "PROCHMI de-ctor t={}ms tid=[{}] this={r0:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                    let lo = r0 as u64 + 0xc;
+                    let _ = uc.add_mem_hook(
+                        unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                        lo,
+                        lo + 3,
+                        move |_uc: &mut Unicorn<'_, Context>, _t, _a, size, value| {
+                            static WH: AtomicU32 = AtomicU32::new(0);
+                            if WH.fetch_add(1, Ordering::Relaxed) < 12 {
+                                let pc = _uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                                let lr2 = _uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                                log::warn!(
+                                    "PROCHMI de-end t={}ms this={lo:#x} end<-{value:#x} (sz {size}) pc={pc:#x} lr={lr2:#x}",
+                                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                                );
+                            }
+                            true
+                        },
+                    );
+                }
+                0
+            });
+        }
         // r799n6: the mode-6 branch of vInitDestinationEntry iterates the
         // handler's dest-entry element list ([hnd+0x88..0x8c], stride 0x20)
         // and skips issuing the ReqPrepareDestEnv wait event when it is
