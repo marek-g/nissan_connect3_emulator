@@ -2068,3 +2068,31 @@ Remaining from r799j-open:
   vs move Back to a dedicated row / synthesize at KBD-FI scan level
   (clHSI_CMKeyboard::bExecuteMessage, scan->row table 0x1813620) so the
   lp timer runs and tap/hold split works for real.
+
+## r799l: ENTER DESTINATION found headless + spinner's gate identified (j1/j2)
+
+The blind-tap "missing button" was a capture artifact: `EMU_MAP_DUMP_DIR`
+(window default-framebuffer dumps, r760/r768) shows the same hidden body -
+the popup page really renders no button art (its GUI_Image textures bind
+handles 0xe0000000/0x10000000, the r780 silent no-op pattern), but the
+HIT-BOXES are live.  Tap (150,120) or (180,160) on the page opened after
+Menu(70,330) IS "Enter Destination":
+- stateview enter id=0x400024ca view=0xf6 ("MAP SCROLL" titlebar is just
+  the container's last-set title),
+- `GUI_MessageBoxSystem::parseMessage opcode=1001` then 1002 (the busy
+  dialog the user sees as the spinner),
+- the spinner really animates: repeated GUI_Button vDraw on obj 0x3b1ecf8
+  / 0x3b1ea48 (j2 EMU_VDRAW_LOG 28000:42000, 12+ redrives per tick).
+
+Gate: after the tap NOTHING leaves the HMI - zero routecca-create, zero
+enavi-req-check, zero ail-svc/IPC, zero mbx writes beyond the known FI
+flood.  What it waits on is in-process: `hsa-waitstate hsa=0x3908d98
+waitmask=0x4000000 reqmask=0x0 proxy=0x38eee88` (j1 t=34494) with
+`hsa-set-syncmap a1=0x291ef50` one tick before - the HSA sync-map BIT 26
+(0x4000000) is never set.  NEXT: find which service/entity owns bit 26 of
+the sync-map (walk 0x291ef50 descriptor table -> the bit's service id),
+then supply its ServiceStatus the same way the era gate is fed
+(cca_post_deferred_status / fabricate_fi_data_request) or fix the real
+precondition if the owner is PROCNAV (still parked).  The descriptor
+words at file 0x2916f50 are pointers into 0x194xxxx-0x196xxxx (strings?
+vtables?) - decode in the next session.
