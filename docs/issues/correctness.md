@@ -2499,3 +2499,26 @@ static and re-point both watches dynamically at runtime).
   for stores of 0x206 / for 0x40003630 (dest-entry content id) references
   to reach the registration function, then check which precondition
   (CCA service start / registry_compat flag) gates it.
+
+## r799n8c: dynlistconf string consumers = ZERO; decoded registry hives contain no dynlist keys
+
+- MEM_READ watches on the three rodata strings (dlc-list/_row_entries,
+  dlc-row dynrowconf_, dlc-conf dynlistconf_): the ONLY touch in a full
+  run is ONE byte at t=985 ms of "dynlistconf_NAVI__DESTENTRY_LIST2" from
+  libc code (pc 0x4737e498 lr 0x47371638), immediately after DAPI's
+  FC_LBS registry read burst and just before the finavi-global list-sel
+  write t=990 - the comparison aborts at the first byte and the row-config
+  strings are never read at all: the dest-entry dynamic-list registration
+  dies before consuming its own config name.
+- Firmware registry source hives are DECODED at
+  Firmware/D605_registry/ (ni2k_eur/*, NAVAPP.REG, DAPIAPP.REG, ...) - and
+  NONE contain dynlist* keys, so the rodata defaults-table IS the config
+  source; the registry is not the missing feed (registry_compat.reg needs
+  no dynlist publication).
+- NEXT (entry point is now pinned): trace the consumer context around the
+  t=985 ms libc comparison - stack-scan backtrace from a widened read-watch
+  (read-watch lr is inside libc, so capture sp words like event2app does)
+  to name the guest function performing the default-table lookup, then
+  read its miss-branch: why does the NAVI__DESTENTRY_LIST2 entry not get
+  its dynlist registered (likely the same first-break as the empty hnd
+  container - both are fed by that registration).

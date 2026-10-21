@@ -9545,6 +9545,40 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 log::debug!("prochmi: hsa-flag watch not installed");
             }
         }
+        // r799n8c: who CONSUMES the dynlistconf_NAVI__DESTENTRY_LIST2
+        // family strings (rodata 0x2c8fdb3/0x2df032a/0x2f0f8af)?  No static
+        // pointer to them exists (ADR/ADD-PC referenced), so watch the
+        // strings' bytes being READ - the first reader names the dynamic-
+        // list registration that must fill hnd's element container.
+        {
+            use unicorn_engine::unicorn_const::HookType;
+            for (label, lo, hi) in [
+                ("dlc-list", 0x02c8_fdb0u64, 0x02c8_fdd0u64),
+                ("dlc-row", 0x02df_0328u64, 0x02df_0348u64),
+                ("dlc-conf", 0x02f0_f8a8u64, 0x02f0_f8d0u64),
+            ] {
+                let _ = unicorn.add_mem_hook(
+                    HookType::MEM_READ,
+                    lo & !0xfff,
+                    (lo & !0xfff) + 0xfff,
+                    move |_uc: &mut Unicorn<'_, Context>, _t, address, _size, _value| {
+                        static HITS: AtomicU32 = AtomicU32::new(0);
+                        if address < lo || address >= hi {
+                            return true;
+                        }
+                        if HITS.fetch_add(1, Ordering::Relaxed) < 30 {
+                            let pc = _uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                            let lr = _uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                            log::warn!(
+                                "PROCHMI {label} read t={}ms {address:#x} pc={pc:#x} lr={lr:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                            );
+                        }
+                        true
+                    },
+                );
+            }
+        }
         // r799n6: the mode-6 branch of vInitDestinationEntry iterates the
         // handler's dest-entry element list ([hnd+0x88..0x8c], stride 0x20)
         // and skips issuing the ReqPrepareDestEnv wait event when it is
