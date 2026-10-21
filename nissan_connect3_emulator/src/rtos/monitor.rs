@@ -1765,7 +1765,12 @@ fn complete_tse(unicorn: &mut Unicorn<'_, Context>, service: u32, block: u32, at
             let bits = state.tse_flags.get(&flag).copied().unwrap_or(0);
             let queue = state.tse_flag_waiters.entry(flag).or_default();
             let me = queue.iter().position(|(t, _)| *t == thread);
-            let my_idx = me.unwrap_or(usize::MAX);
+            // A thread re-entering WAIT after its queue entry was consumed (or
+            // the serve path of a wait that never parked) is not in the queue:
+            // treat it as the newest waiter, never slice past the end (r132:
+            // `unwrap_or(usize::MAX)` panicked the host thread right here and
+            // killed the whole process - every n127-n132 run died this way).
+            let my_idx = me.unwrap_or_else(|| queue.len());
             // Wake the earliest waiter whose pattern the bits satisfy: an
             // earlier waiter only blocks threads whose own pattern is also
             // satisfied for it (same event -> it gets the wake).  Without the

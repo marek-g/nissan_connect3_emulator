@@ -1486,7 +1486,7 @@ crate::os::code_stub::trap_site(unicorn, repair_addr, crate::os::code_stub::Trap
 
     add_street_coord_buffer_probe_hooks(unicorn, base_address);
 
-    add_svc_dataset_fill_watch(unicorn);
+    add_svc_dataset_fill_watch(unicorn, base_address);
 
     add_natural_map_engine_start_hooks(unicorn, base_address);
 
@@ -3681,13 +3681,80 @@ fn add_fastmap_channel_trace_hooks(unicorn: &mut Unicorn<'_, Context>, base_addr
     use std::sync::atomic::{AtomicU32, Ordering};
 
     // The MDM globals, at their Ghidra VAs relative to the image base.
-    let global = |va: u32| base_address + (va - ORIGINAL_BASE);
+    let global = {
+        let ba = base_address;
+        move |va: u32| ba + (va - ORIGINAL_BASE)
+    };
     let stop_loading = global(0x0078_f7a0);
     let dataset_id = global(0x0078_f7f0);
     let fastmap_available = global(0x0078_f7f8);
     let channel_info = global(0x0078_f81c);
     let dataset_validated = global(0x0078_f874);
     let channel_number = global(0x0078_f878);
+
+    // r799n19: vtable slot 0x4b9fdc - the only caller of
+    // OnUpdateServiceStateDAPIFastmap (0x512400).  It reads the gate global
+    // *0x7907ac (early-return on 0/4/5), then passes MDM-object([0x7907c8])
+    // byte +0x21 as the state.  Entry trap dumps gate/arg so the missing
+    // producer or the wrong-object case is visible in one line.
+    let site = base_address + (0x004b_9fdcu32 - ORIGINAL_BASE);
+    
+crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3745", move |uc: &mut Unicorn<'_, Context>| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            let n = COUNT.fetch_add(1, Ordering::Relaxed);
+            if n >= 12 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let gate = read_u32_or_invalid(uc, global(0x0079_07ac));
+            let obj = read_u32_or_invalid(uc, global(0x0079_07c8));
+            log::info!(
+                "PROCMAPENGINE fastmap trace mdm-update-leg t={}ms thread=[{}] n={} r0={:#x} gate={:#x} mdm_obj={:#x} obj21={:#x} lr={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                n,
+                r0,
+                gate,
+                obj,
+                if obj != 0 && obj != u32::MAX {
+                    read_u8_or_invalid(uc, obj + 0x21)
+                } else {
+                    0xff
+                },
+                ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1),
+            );
+        
+            0
+        });
+
+    // r799n19: the app-interface state demotion leg (store 2 at 0x661688 is a
+    // vtable slot at 0xf8f20/0x685538/0x6e2e58 entered at 0x66163c).  n129:
+    // state reached 3 at t=3939 but this leg took it back to 2 at t=4057,
+    // closing the class-0x44 consume gate again.  Entry trap names the
+    // caller (lr), the object and the state transition.
+    let site = base_address + (0x0066_163cu32 - ORIGINAL_BASE);
+    
+crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:3718", move |uc: &mut Unicorn<'_, Context>| {
+            static COUNT: AtomicU32 = AtomicU32::new(0);
+            let n = COUNT.fetch_add(1, Ordering::Relaxed);
+            if n >= 12 {
+                return 0;
+            }
+            let this = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            log::info!(
+                "PROCMAPENGINE fastmap trace state-demote-leg t={}ms thread=[{}] n={} this={:#x} port={:#x} old_state={:#x} word84={:#x} lr={:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                n,
+                this,
+                read_u16_or_invalid(uc, this + 8),
+                read_u32_or_invalid(uc, this + 0x30),
+                read_u32_or_invalid(uc, this + 0x84),
+                ((uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32) & !1),
+            );
+        
+            0
+        });
 
     // `map_tclClientServiceHandler::vOnServiceStateChange(uchar)`: the CCA
     // service state fan-in; `this + 4` is the u16 service id, `this + 0xe` the
@@ -10042,9 +10109,9 @@ fn ensure_posfi_admin_registration(unicorn: &mut Unicorn<'_, Context>, obj: u32,
     let uniq = (read_u32_or_invalid(unicorn, content.wrapping_add(0x0c)) >> 16) as u16;
     bytes[8 + 0x10..8 + 0x12].copy_from_slice(&uniq.to_le_bytes());
     bytes[8 + 0x12] = 0x17; // register-id the provider registered under
-    let w1c = read_u16_or_invalid(unicorn, content.wrapping_add(0x1c));
+    let w1c = read_u16_or_invalid(unicorn, content.wrapping_add(0x1c)) as u16;
     bytes[8 + 0x14..8 + 0x16].copy_from_slice(&w1c.to_le_bytes());
-    let w24 = read_u16_or_invalid(unicorn, content.wrapping_add(0x24));
+    let w24 = read_u16_or_invalid(unicorn, content.wrapping_add(0x24)) as u16;
     bytes[8 + 0x20..8 + 0x22].copy_from_slice(&w24.to_le_bytes());
     bytes[8 + 0x22] = (read_u32_or_invalid(unicorn, content.wrapping_add(0x2c)) & 0xff) as u8;
     if unicorn.mem_write(node as u64, &bytes).is_err() {
@@ -12421,14 +12488,30 @@ fn add_street_coord_buffer_probe_hooks(unicorn: &mut Unicorn<'_, Context>, base_
 /// insert).  Addresses are heap-deterministic for this process (adapter
 /// 0xa07970 family, n94 census); the ExamineInfluence probe line prints
 /// ref+words each run so a drift is immediately visible.
-fn add_svc_dataset_fill_watch(unicorn: &mut Unicorn<'_, Context>) {
+fn add_svc_dataset_fill_watch(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
+    let rel = |va: u32| -> u64 { (base_address + (va - ORIGINAL_BASE)) as u64 };
     for (lo, hi, label) in [
         (0x00a0_fc84u64, 0x00a0_fc8fu64, "head"),
         (0x00d9_caf0u64, 0x00d9_cb2fu64, "store"),
         // The class-0x44 ServiceStatus gate (0x66cb20) only consumes status
-        // messages while the app-interface state word reads 3; every run pins
-        // it at 2, so watch who writes it (and prove nobody writes 3).
+        // messages while the app-interface state word reads 3.  n129 showed
+        // the word DOES reach 3 (t=3939, setter 0x667d04 behind vtable call
+        // 0x667cf8) but is demoted to 2 at t=4057 by the leg entered at
+        // 0x66163c (store 0x661688) - the entry trap there names the caller.
         (0x00a0_79a0u64, 0x00a0_79a3u64, "appstate"),
+        // r799n19 (corrected n129): the MDM global `ms_bFastmapServiceAvailable`
+        // is 0x78f7f8 (the probe reads it directly), NOT the map-data object
+        // byte earlier watched at 0xaa4970 (that was an unrelated pointer:
+        // its byte+1 read 0x48, explaining the phantom fastmap_avail=1
+        // discrepancy).  Watch the real global + channel_count 0x78f878.
+        (rel(0x0078_f7f8), rel(0x0078_f7fb), "fmavail"),
+        (rel(0x0078_f878), rel(0x0078_f87b), "fmchan"),
+        // r799n19: the vtable leg 0x4b9fdc is the only caller of
+        // OnUpdateServiceStateDAPIFastmap; it gates on *0x7907ac (skip when
+        // 0/4/5) and passes MDM-object([0x7907c8])+0x21 as the state.  Watch
+        // both globals so the missing producer names itself.
+        (rel(0x0079_07ac), rel(0x0079_07af), "fmstate"),
+        (rel(0x0079_07c8), rel(0x0079_07cb), "fmobj"),
     ] {
         let res = unicorn.add_mem_hook(
             unicorn_engine::unicorn_const::HookType::MEM_WRITE,
