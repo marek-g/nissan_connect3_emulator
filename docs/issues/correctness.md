@@ -2410,3 +2410,31 @@ so the HSA base 0x3908d98 could not be re-confirmed live - hsa-list watch
 0x1884620 family builds the HSA (writes [r7+0x80]=0,[r7+0x8c]=8) but the
 base identity needs a live capture (NEXT: stash r7 at 0x1884620 once into a
 static and re-point both watches dynamically at runtime).
+
+## r799n7: CMNAVI 0x2950 poll decoded - it DOES ask the CL adapter; the answer stays "not ready" because nobody writes 0x8076000
+
+- de-list/hsa-list watches (post-ctor): both element vectors are dead from
+  their constructor on (writes only 2.6-2.8 s, ctor + vector-init 0x16640dc
+  lr 0x15e87c8 + periodic clears); hsa ctor captured live at 0x18844dc
+  (a0=0x3908d98 - static base was right after all).
+- clHSI_CMNAVI::bExecuteMessage(msg type 0x2950, polled ~30 ms): consumer
+  0x1881644, this 0x390ff48; [this+0xc] = CL adapter 0x38eee88 IS installed
+  (cmnavi-obj watch: written 2836 ms by 0x180a9e8 lr 0x180a9e8 - earlier
+  "null sub-object" reading was WRONG).  Path: adapter vfn+0x14(1,&byte) x2
+  readiness polls (byte results 0/0), then 0x187a230 -> vfn+4 with the
+  0x8076000 entry (s9gate cl-entry r0=0x38eee88 r1=0x8076000) -> outputs all
+  zero (obj+4=0 = value not set) -> message answered d0=0 - the poll loop
+  IS the genuine re-evaluation machinery, starving only on the value.
+- So the wait chain from the HMI side is FULLY ALIVE end-to-end (event ->
+  vInitDestinationEntry -> CMNAVI poll -> CL entry lookup).  What no
+  emulator run ever produced: the WRITE of 0x8076000 (dest-env prepare
+  result) by the RNW/DAPI->PROCNAV leg (r787-era type-4 dap_map_tclManager
+  / type-6 rnw_tclManager srvctrl jobs + MQB_1/MQB_3 IOSC sessions).  That
+  write is also what fills wait 0x6b7's pair (0x50001161/0x400000b2) and
+  feeds the city list (getter 0x206) - one fix, three symptoms.
+- NEXT: on the DAPI side, dap_map/rnw_tclManager workers ARE registered
+  (srvctrl types [0x2 0x18 0xc 0x6 0x16 0x4 0x17 0xe]); find what client
+  must POST a type-4 job for ReqPrepareDestEnv (r787: the tap chain did).
+  The poster lives HMI-side behind the 0x187a230 vfn+4 miss or the RNW
+  client's CCA subscription - trace the DAPI worker wake (GetWorker zero
+  hits since boot in F6 era = nothing posts, not a worker-lookup failure).

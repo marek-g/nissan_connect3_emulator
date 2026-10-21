@@ -9524,6 +9524,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             ("de-list", 0x038f_9a30u64, 0x038f_9a50u64), // hnd+0x80..0xa0
             ("hsa-list", 0x0390_8e18u64, 0x0390_8e38u64), // hsa+0x80..0xa0
             ("hsa-mask", 0x0390_8d98u64 + 0x80, 0x0390_8d98u64 + 0x84),
+            ("cmnavi-obj", 0x0390_ff48u64, 0x0390_ff5cu64),
         ] {
             use unicorn_engine::unicorn_const::HookType;
             let res = unicorn.add_mem_hook(
@@ -9532,8 +9533,13 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 hi,
                 move |_uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
                     static HITS: AtomicU32 = AtomicU32::new(0);
-                    if HITS.fetch_add(1, Ordering::Relaxed) < 60 {
-                        let pc = _uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                    let pc = _uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                    // allocator/libc churn (pc in the 0x4xxxxxxx libs) is
+                    // noise; only guest application code matters here.
+                    if pc >= 0x3000_0000 {
+                        return true;
+                    }
+                    if HITS.fetch_add(1, Ordering::Relaxed) < 200 {
                         let lr = _uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
                         log::warn!(
                             "PROCHMI {label} t={}ms +{:#x} <- {value:#x} (sz {size}) pc={pc:#x} lr={lr:#x}",
