@@ -2622,6 +2622,13 @@ static FI_ERA_PENDING: std::sync::OnceLock<
 /// Record a fabricated member-era answer as pending re-fire (called by
 /// `fabricate_fi_ready_push` right after its initial post).
 fn note_fi_era_pending(svc: u16, key: u16, body: &[u8]) {
+    // Only the startup-connector route's services complete through the
+    // navsrv consumer's `f-accept` leg (g3 pops: svc 0x0006/0x000a only);
+    // other fabricated member answers (0x1f, 0x1e, ...) are legitimately
+    // eaten by tid-84's enConnect resolution and would never clear.
+    if !matches!(svc, 0x0006 | 0x000a) {
+        return;
+    }
     let map = FI_ERA_PENDING.get_or_init(Default::default);
     if let Ok(mut m) = map.lock() {
         m.insert((svc, key), (body.to_vec(), 0));
@@ -2866,6 +2873,11 @@ pub fn push_gps_answer(unicorn: &mut Unicorn<'_, Context>, key: u16) -> &'static
     }
     let body = gps_data_status_answer_body(key);
     if push_blob_to_mbx_289(unicorn, body.clone()) {
+        // r799k: track it for the anti-theft re-fire too - the gate entry's
+        // step-loop iteration waits on exactly this answer, and in late-era
+        // runs tid-84's enConnect Wait ate the first copy (h7/h8: the step
+        // loop stalled at iteration 3, members 3..0xa never registered).
+        note_fi_era_pending(0x000a, key, &body);
         return "mbx";
     }
     if pump_push_completion(unicorn, body) {
@@ -2947,6 +2959,7 @@ pub fn fabricate_fi_ready_push(unicorn: &mut Unicorn<'_, Context>, service: u16,
                 "[LIBOSAL-MBX] fabricated FI ServiceData(svc {service:#06x} txn {key}) push to mbx_289 to complete the CL transaction (EMU_FAKE_FI_READY_PUSH=0 disables)"
             );
             state.notify_waiters();
+            note_fi_era_pending(service, key, &body);
         }
     }
 }

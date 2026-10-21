@@ -7693,15 +7693,17 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     );
                 }
             }
-            if label == "g7-vfn18res" && r0 == 0 {
-                // r799k: the startup connector's readiness getter says
-                // NOT-READY while the startup FSM still gates on it.  If the
-                // era's fabricated member answers sit unaccepted (their
-                // first mbx_289 copy was popped-and-dropped by tid-84's
-                // enConnect Wait - late-era runs lose svc-6 txn-2 that way
-                // and sit at state 6 forever), re-push them now: this leg
+            if label == "g7-vfn18res" {
+                // r799k: startup-FSM era tick.  If any member-era answer
+                // is still unaccepted (its mbx_289 copy was popped-and-
+                // dropped by tid-84's enConnect Wait - late-era runs lose
+                // svc-6 txn-2 AND the gate's svc-0xa GpsDataStatus that
+                // way: h7/h8 stalled at state 6, h9 flipped the getter but
+                // still waited on the gate entry), re-push it now: this leg
                 // runs on the pump thread's own tick, so the next receive
                 // (same thread, ~one tick later) finds the answer queued.
+                // r0 here may already be 1 - the gate entry completes on a
+                // later tick (h9), so do NOT condition on r0.
                 if matches!(crate::libs::libosal_linux::message::hmi_fsm_state(), 5 | 6) {
                     crate::libs::libosal_linux::message::refire_fi_era_pending(uc);
                 }
