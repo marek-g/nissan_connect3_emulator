@@ -881,6 +881,31 @@ fn sub_walk(
     out
 }
 
+/// r799n33f: host-side pRetrieveRequest clone (0x1c7ddac): the table at
+/// [holder+8] is a fw_List of MapNode{u16 key @node+8, element ptr
+/// @node+12}; returns the element (DispatchTableElement) or 0.
+fn cl_retrieve(
+    unicorn: &Unicorn<'_, Context>,
+    holder: u32,
+    key: u32,
+) -> u32 {
+    let tbl = read_u32(unicorn, holder.wrapping_add(8));
+    if tbl <= 0x1000 || tbl >= 0xf000_0000 {
+        return 0;
+    }
+    let mut node = read_u32(unicorn, tbl.wrapping_add(8));
+    for _ in 0..128 {
+        if node <= 0x1000 || node >= 0xf000_0000 {
+            break;
+        }
+        if read_u16(unicorn, node.wrapping_add(8)) == (key & 0xffff) {
+            return read_u32(unicorn, node.wrapping_add(0xc));
+        }
+        node = read_u32(unicorn, node.wrapping_add(4));
+    }
+    0
+}
+
 /// r799n33d: resolve the cookie (subscriber ID, see pFindSubscriber) for
 /// one svcdone leg.  Order: bound mint cookie (execcmd capture) -> the
 /// service dispatcher's first live subscriber (cached) -> 0xfffe stand-in.
@@ -896,20 +921,29 @@ fn resolve_done_cookie(
             return c;
         }
     }
-    let svc = if svc <= 1 {
-        svc
-    } else {
-        MINT_INFO
+    // r799n33f: the dispatcher slot comes from the LIVE pending entry
+    // (element+0xc) - trio-2 style requests registered against the OTHER
+    // dispatcher would be answered into the wrong subscriber when blindly
+    // defaulting to slot 0.
+    let mut svc = svc;
+    if !(svc <= 1) {
+        svc = match MINT_INFO
             .lock()
             .ok()
             .and_then(|m| m.get(&key).copied())
             .map(|(s, _)| s)
-            // r799n33e: EVERY CL property entry carries dispatcher slot
-            // 0 at entry+0xc (n222 `found`: w12=0 for all keys) - default
-            // the first svcdone leg to slot 0 so its VALUE reaches
-            // subscriber 0x...ef8 id 1 instead of dying 'no subscriber'.
-            .unwrap_or(0)
-    };
+        {
+            Some(s) if s <= 1 => s,
+            _ => {
+                let e = cl_retrieve(unicorn, holder, key);
+                if e > 0x1000 && e < 0xf000_0000 {
+                    read_u16(unicorn, e.wrapping_add(0xc))
+                } else {
+                    0
+                }
+            }
+        };
+    }
     if svc <= 1 && holder > 0x1000 && holder < 0xf000_0000 {
         // pGetDispatcher 0x1c7cf28 (verified): disp = [[med + 0xc +
         // slot*4] + 4]; [med+0x14] is the ControlBase, NOT an array
@@ -7535,6 +7569,14 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // r799n33f: BEFORE the handler call - r1 = the subscriber
             // object, so its vtable and the [vt+0x1c] target can be named.
             (0x01c7_c850u32, "subpre", 120),
+            // r799n33f: the cmp1f-b block (0x17c6748) is the SECOND ISpeech
+            // trio (server [+0x14] getters 0x1620a14/0x1620a04/0x1620a34);
+            // it issues vfn+0x24 x3 then polls vfn+0x18 x3 - which poll
+            // returns 0 and exits the cascade?  Probe the three
+            // post-poll `cmp` points (r0 = poll result, r4 = server).
+            (0x017c_67c8u32, "sp2a", 150),
+            (0x017c_67e4u32, "sp2b", 150),
+            (0x017c_6800u32, "sp2c", 150),
         ] {
             let address = base_address + off - ORIGINAL_BASE;
             crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:pumptrace", move |uc: &mut Unicorn<'_, Context>| {
