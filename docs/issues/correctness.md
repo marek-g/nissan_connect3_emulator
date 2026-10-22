@@ -3123,3 +3123,55 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
 - NEXT: instrument the dynsm event-post leg feeding SM-DEC (find what posts
   r9 triggers and which trigger ID transition-to-0x484 listens for); the
   SM-PAGE doTransition probe already names trans IDs per event.
+
+## r799n29: the 30 s startup-FSM sleep decoded (state 4); blocker moved to the state-9 property gate
+
+- The "navsrv era starts at t=34 s" mystery (n172/173/174 all): the startup
+  FSM (`enavi_tclProcEnaviStartup::bRunWhenRunning` 0x17c73c0, jump table one
+  slot off - `addls pc,pc,r3 lsl 2` at 0x17c73e0 makes state k land on the
+  entry at 0x17c73e8+4k, confirming the documented state-6 handler 0x17c7908)
+  stalls in STATE 4 for ~30.0 s (n174: state=4 @4329 ms -> state=5 @34309 ms;
+  n172/173 identical within 100 ms) and then runs 5->6->7->8->9 in 0.7 s.
+- State 4 handler 0x17c755c: `r4 = enavi_tclRegistry::u32GetHmiNavServerThreadWait()`
+  (0x169e558; opens a registry key, default literal 0x2710 = 10000 on the
+  key-open-fail path, queried U32 returned on success; no matching value
+  exists in the shipped D605_registry .reg files) then `OSAL_s32ThreadWait(r4)`
+  at 0x17c7590 - the thread parks as `blocked(sleep)` (NOT a futex: there is
+  no SHM-WAIT for tid 65; the t=34180 SHM-WAKE line lists tid 65 as the
+  CALLER, and the same-millisecond `forced HMI framework app state` line is
+  the standing per-tick force, not the wakeup cause).  bStartupNavIF
+  (lr=0x17c75a8) then runs and the FSM advances.
+- Interpretation: this is the GUEST's own startup delay (~30 s observed,
+  ~3x the getter default - tick scaling or queried value unresolved), and
+  the real unit plausibly boots just as slowly ("Starting navigation." for
+  tens of seconds is the product behaviour).  It is NOT a missing-precondition
+  stall: do not try to shrink it.  Test flows that want a READY navsrv must
+  press the nav key AFTER ~35 s, not at 2 s.
+- Consequence for the popup chase: with NAVIF up at 34.4 s the whole CL
+  property plane DOES run (pumptrace: 13 registrations STOREd, keys 1-0xd);
+  the state-9 leg `bRegisterPropertiesAfterDatasetIsAvailable` (0x17c6330,
+  per-svc cascade gated by `bIsCCAServiceRequired`) still never sets its
+  out-byte, and the g7-gate aggregate probe (holder 0x3a25270, obj 0x3a254b8,
+  vfn+0x24 = `enavi_tclAction::bRun` 0x1719458) stays rdy=0.  bRun on
+  state==1 re-runs vfn+0x44 and on state==2 re-runs vfn+0x20 (0x17194f0):
+  state==2 -> bIsDone true; state 1/0 keep the timer re-arming.
+- Key-collision suspect for the gate (from the n174 STORE/lookup/REMOVE
+  chronology): the request table (mediator 0x392dfb8, map 0x392e6b0) is
+  keyed by ONE IDFactory, and the STOREd ids carry the minted key in their
+  low byte (id 0x3a00004 -> key 4, id 0xa -> key 0xa).  The gate registration
+  (gate 0x3a254b8, svc 0x000a func 0x0f02, reg-leg 0x1719ccc at t=34446) was
+  key 3; at t=34467 a svc-0x0006 func-0 optype-9 ANSWER stamped key=3 HIT and
+  REMOVEd that entry (pRetrieveRequest matches key only), so every later
+  GpsDataStatus answer for the gate (t=34494/34563/34730 key=3, then
+  34769/34874/35019 key=0x5aa5 after bRun re-minted) missed.  Our fabricated
+  svc-6 pushes (`fabricated FI ServiceData(svc 0x0006 txn N)` + materialized
+  mbx_289 snapshots + fi-era re-fire) enumerate txns independently of the
+  minted keys - the duplicate/stale-key flood is hack-generated and is the
+  working hypothesis for the stuck state-9.
+- NEXT (subtract hacks): capture the genuine client request frames the HMI
+  posts (reg-leg 0x1719cc0 / IOWrite on the navsrv queues) and answer each
+  EXACTLY ONCE echoing its own txn@+0x1c/func@+0x18/svc/regid; drop the
+  blind-txn FI pushes and the snapshot re-materialization once the single-shot
+  echo path proves out.  Expect the gate entry to reach state 2, the g7
+  aggregate rdy=1, state-9 byte=1 -> state 0 -> 1 (DAPI SetDefaultDevice) and
+  the golden popup-close cascade to start on its own.
