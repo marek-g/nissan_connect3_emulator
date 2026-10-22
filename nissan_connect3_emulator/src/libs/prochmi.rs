@@ -12662,8 +12662,20 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                     bb[0x1c..0x1e].copy_from_slice(&(key as u16).to_le_bytes());
                     // r799n33f: fan the pair out to every live subscriber
                     // (see alt_done_cookies - only the owner flips).
+                    // r799n33q: also throw the low cookies {1,2,3} blind.
+                    // n254: GOOD removed member keys with cookie=0x2 (the
+                    // owning sub) while every BAD leg carried only the
+                    // resolved 0x1 - alt_done_cookies saw one subscriber,
+                    // the completer's slot lives in another dispatcher, and
+                    // 16 legs hit nothing.  A leg against a cookie that
+                    // owns no entry is a harmless pRetrieveRequest miss.
                     let mut cookies = vec![cookie];
                     cookies.extend(alt_done_cookies(unicorn, holder, cookie));
+                    let extra = [1u32, 2, 3]
+                        .into_iter()
+                        .filter(|c| !cookies.contains(c))
+                        .collect::<Vec<_>>();
+                    cookies.extend(extra);
                     for c in cookies.iter().copied() {
                         bb[0x0e..0x10]
                             .copy_from_slice(&(c as u16).to_le_bytes());
