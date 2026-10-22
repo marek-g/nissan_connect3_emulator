@@ -2100,6 +2100,94 @@ pub fn spawn_guest_call(
     tid
 }
 
+/// r799n32: direct delivery of a property-plane SVC DATA conf completion.
+/// `navif_tclIFMediator::bHandleResponseSVCData` (0x01c7d110) is the exact
+/// leg the pump-event completer runs once a CCASERVER answer is decoded
+/// (0x1c7ed50 decompile: `pRetrieveRequest([holder+8], reqid)` ->
+/// `pGetDispatcher([entry+0xc])` -> `ControlDispatch::bHandleResponseSVCData`
+/// -> the entry's completion + `enRemoveRequest`).  In state 9 no dispatcher
+/// thread pops the answers (tid 65 sleeps, tid 81's drain posts only
+/// content-less 8-byte wake events, n203/n204), so the leg is invoked as a
+/// guest call.  AAPCS stack args (`[sp]`=optype byte, `[sp+4]`=svcdata)
+/// cannot be preset through [`spawn_guest_call`] (its SP is allocated
+/// inside), so a tiny ARM trampoline first re-loads SP with a prepared
+/// child stack, then jumps to the leg with r0..r3 from literal pools.
+/// Fabrication - the CSMA property server is not an emulated process -
+/// visible in the log and gated by `EMU_FAKE_SVCDONE=0`.
+pub fn guest_call_bhandle_svcdone(
+    unicorn: &mut Unicorn<'_, Context>,
+    holder: u32,
+    cookie: u32,
+    key: u32,
+    func: u32,
+    optype: u32,
+    body: &[u8],
+) -> bool {
+    if std::env::var_os("EMU_FAKE_SVCDONE").is_some_and(|v| v == "0") {
+        return false;
+    }
+    if holder == 0 || body.len() < 0x1e {
+        return false;
+    }
+    let mmu_arc = unicorn.get_data().mmu.clone();
+    let body_mem = mmu_arc.lock().unwrap().heap_alloc(
+        unicorn,
+        0x40,
+        Prot::READ | Prot::WRITE,
+        "[svcdone-body]",
+    );
+    let child = mmu_arc.lock().unwrap().heap_alloc(
+        unicorn,
+        0x4000,
+        Prot::READ | Prot::WRITE,
+        "[svcdone-stack]",
+    );
+    let tramp = mmu_arc.lock().unwrap().heap_alloc(
+        unicorn,
+        0x40,
+        Prot::READ | Prot::WRITE | Prot::EXEC,
+        "[svcdone-tramp]",
+    );
+    if body_mem == 0 || child == 0 || tramp == 0 {
+        return false;
+    }
+    let sp = (child + 0x4000 - 8) & !7;
+    if unicorn.mem_write(body_mem as u64, body).is_err() {
+        return false;
+    }
+    // Quiet the frame area the callee pushes into, then the AAPCS args.
+    unicorn.mem_write((sp - 0x200) as u64, &[0u8; 0x200]).ok();
+    for (off, val) in [(sp, optype), (sp.wrapping_add(4), body_mem)] {
+        if unicorn
+            .mem_write(off as u64, &(val as u32).to_le_bytes())
+            .is_err()
+        {
+            return false;
+        }
+    }
+    const LEG: u32 = 0x01c7_d110; // bHandleResponseSVCData (ARM mode)
+    let code: [u32; 14] = [
+        0xe59d_d018, // ldr  sp, [pc, #24]   -> [8] child sp
+        0xe59d_0018, // ldr  r0, [pc, #24]   -> [9] holder (mediator+0x38)
+        0xe59d_1018, // ldr  r1, [pc, #24]   -> [10] cookie
+        0xe59d_2018, // ldr  r2, [pc, #24]   -> [11] request key
+        0xe59d_3018, // ldr  r3, [pc, #24]   -> [12] func
+        0xe59d_e018, // ldr  lr, [pc, #24]   -> [13] leg address
+        0xe12f_ff1e, // bx   lr
+        0xe320_f000, // nop
+        sp, holder, cookie, key, func, LEG,
+    ];
+    let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+    if unicorn.mem_write(tramp as u64, &bytes).is_err() {
+        return false;
+    }
+    let tid = spawn_guest_call(unicorn, tramp & !1, [0; 4], 0x1000);
+    log::warn!(
+        "MONITOR svcdone: bHandleResponseSVCData(holder={holder:#x}, cookie={cookie:#x}, key={key:#x}, func={func:#x}, optype={optype}) guest-call tid {tid} (EMU_FAKE_SVCDONE=0 disables)"
+    );
+    true
+}
+
 /// Read and start one OSAL thread CB (`{ name, len, stack, entry, argument }`, see the
 /// `OSAL_THREAD_*` docs). Returns the new thread id, or `-1` when the CB carries no entry -
 /// the callers (`OSAL_bInitAsyncIO` among them) branch on exactly that.

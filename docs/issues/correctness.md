@@ -3291,3 +3291,38 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
   consumer than the FSM runner.  Next iteration of the wake driver should
   post the runner's own wake object once the rx45walk identifies the real
   completer delivery; do NOT fabricate the completion dispatch itself.
+
+## r799n32: the state-9 dispatcher anatomy is fully decoded (n203/n204 disasm + Ghidra)
+
+- `0x17c1c50` (tid 65, HMINavServerLib_1 pump): per queue object - drains
+  via `0x17cb574` (OSAL receive 8B from `[obj+8]`, class-0x45 gate at
+  content+0xb), decodes with `0x16fbb54/0x16fb63c`, then
+  `bProcessMessage 0x1c80298` -> `bHandleSVCData 0x1c7ed50` ->
+  `bHandleResponseSVCData 0x1c7d110(holder=[mediator+0x38], r1=cookie,
+  r2=reqid, r3=func, [sp]=optype, [sp+4]=svcdata)`:
+  `pRetrieveRequest([holder+8], reqid)` -> entry; `pGetDispatcher([entry+0xc])`
+  -> `ControlDispatch::bHandleResponseSVCData` (vfn+0x10 / per-subscriber
+  vfn+0x1c / vfn+0x14) -> `enRemoveRequest(reqid)` (the REMOVE we probe).
+  Cookie matching is SKIPPED for entry type 3 (all subscribers notified).
+- `0x17c1c30` (tid 81, mbx_289 consumer): ONLY calls `0x17cb6b0` - a drain
+  that parses each message (the `NAVIF <<<<< CCASERVER SVCDATA=` traces
+  prove our frames ARE parsed there) and posts an 8-byte internal event
+  with data = 0 (`0x17cb668`, r2=0) - which tid 65's `0x17cb574` receive
+  reads back as content=[sp+4]=0 and drops (n203 rx45body: content=0).
+  There is NO path from tid 81's drain to the completer leg: the genuine
+  in-era completions ran through the synchronous bCmdWait legs of tid 65
+  while it was still awake (states 6-7).  All 20 echo shapes of n185-n204
+  die exactly here.
+- Fix (n205): `monitor::guest_call_bhandle_svcdone` - guest-calls the
+  genuine `0x1c7d110` leg (unpatched guest code, ARM trampoline re-loads
+  SP so the AAPCS stack args `[sp]=8/[sp+4]=svcdata` land) once per fresh
+  0x1f conf at the conf-store site.  Holder captured from the last genuine
+  connector lookup (CL_TABLE_HOLDER, pump-kick legs svc 0x000a excluded),
+  key = the entry's IDFactory ordinal, func = entry+0x18.  Logged as
+  `MONITOR svcdone: ...`, `EMU_FAKE_SVCDONE=0` disables.  Rationale: the
+  CSMA property server is not an emulated process, we already fabricate
+  its ANSWER; in state 9 no emulated thread can deliver it (the delivery
+  wake on the real unit comes FROM that server's side), so the answer is
+  handed to prochmi's own handler verbatim instead of being traced 20 more
+  times.  Replaces the earlier note "do NOT fabricate the completion
+  dispatch itself" - that held while the real lane was assumed reachable.

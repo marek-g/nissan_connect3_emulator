@@ -802,6 +802,14 @@ static FI_READY_ANSWERED: std::sync::LazyLock<
 /// service's entry could pre-empt a genuine completion (r799n29 lesson).
 static LAST_MINTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// r799n32: r0 (the mediator's +0x38 slot object, `[r0+8]` = the dispatch
+/// table holding the minted keys) captured at the LAST genuine
+/// `bHandleResponseSVCData` lookup leg (probe `lookup`) for a small key and
+/// a connector service (the 1 Hz pump kick - svc 0x000a, key 0x5aa5 - runs
+/// on the pump connector's own object and is excluded).  Used as the holder
+/// argument of the svcdone guest-call (state 9 has no live dispatcher).
+static CL_TABLE_HOLDER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// r799n31: runtime VA (+1, Thumb) of `enavi_tclAction::vSignalSelf`
 /// (prochmi 0x0171915c) stashed by the `navif-create` probe.  The FSM calls
 /// it (vtable slot 0x60) after EVERY successful state transition: it posts
@@ -7084,6 +7092,38 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                 crate::libs::libosal_linux::message::fabricate_fi_conf_complete(
                                     uc, svc as u16, ordinal, f18 as u16,
                                 );
+                                // r799n32: the property plane has no live
+                                // dispatcher in state 9 (tid 65 sleeps,
+                                // tid 81's drain only posts content-less
+                                // wake events) - invoke the completion leg
+                                // the genuine CCASERVER answer would drive,
+                                // directly.  See monitor::guest_call_bhandle_svcdone.
+                                if svc == 0x001f {
+                                    let holder =
+                                        CL_TABLE_HOLDER.load(Ordering::Relaxed);
+                                    let f18b =
+                                        read_u16(uc, entry.wrapping_add(0x18));
+                                    let mut bb = [0u8; 0x22];
+                                    bb[0xb] = 0x45;
+                                    bb[0x0e..0x10]
+                                        .copy_from_slice(&0xfffeu16.to_le_bytes());
+                                    bb[0x14..0x16]
+                                        .copy_from_slice(&(svc as u16).to_le_bytes());
+                                    bb[0x18..0x1a]
+                                        .copy_from_slice(&f18b.to_le_bytes());
+                                    bb[0x1a] = 8;
+                                    bb[0x1c..0x1e]
+                                        .copy_from_slice(&ordinal.to_le_bytes());
+                                    crate::rtos::monitor::guest_call_bhandle_svcdone(
+                                        uc,
+                                        holder,
+                                        0xfffe,
+                                        ordinal as u32,
+                                        f18b as u32,
+                                        8,
+                                        &bb,
+                                    );
+                                }
                             }
                         }
                     }
@@ -7619,6 +7659,11 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
                     let optype = read_u32(uc, sp) & 0xff;
                     let msgobj = read_u32(uc, sp.wrapping_add(4));
+                    // r799n32: capture the connector-plane holder for the
+                    // svcdone guest-call (see CL_TABLE_HOLDER).
+                    if r2 & 0xffff <= 0x100 && r1 & 0xffff != 0x000a && r0 != 0 {
+                        CL_TABLE_HOLDER.store(r0, Ordering::Relaxed);
+                    }
                     // r799n27: dump the answer's content header so misses can
                     // be paired with their originating request (msgid/uniq).
                     let md = read_u32(uc, msgobj.wrapping_add(4));
