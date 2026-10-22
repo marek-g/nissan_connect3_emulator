@@ -3527,3 +3527,31 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
   re-issue loop (bNotifyWhenRunning 0x8000000e re-arm path mints new
   ids every pass) re-registers under the NEW key while our legs answer
   the CL-table key from the found-probe - key pairs diverge.
+
+## r799n33i/j: the command-plane keys and the 0xfffe cookie killer
+
+- `rqadd` probes (`vAdd(map1/map2,key,action)` inside
+  `CCACommandSubscriber::requestCommand` 0x17b94b8, sites 0x17b9550 /
+  0x17b95c0) gave the missing ground truth (n245_1): every state-9 action
+  registers under a sequential era key - trio-1 = 0xb..0xd (svc 0x1f,
+  func 0xd62/0xd65/0xd70), the guidance proc = 0x1a.. (func 0x106
+  DataCarrierRequest first, then 0x121/0x103/0x141/0x105/0x143/0x122/
+  0x1a1/0x181/0x152/0x150/0x151/0x3/0x4/0x198/0x191/0x5/0x104/0x8000).
+  Those keys DO reach our legs (SVCDONE_PENDING inserts) - the bug was
+  the cookie, not the routing.
+- `resolve_done_cookie` conflated two planes: MINT_INFO stores the FI
+  SERVICE id (0x1f), while the dispatcher SLOT is entry+0xc (0 here).
+  The `svc<=1` gate saw 0x1f, skipped the live-entry walk and returned
+  the 0xfffe stand-in.  A 0xfffe leg still hits `pRetrieveRequest` (any
+  cookie passes it), runs the dispatcher with NO subscriber match, and
+  `enRemoveRequest` deletes the entry table-wide - so by the time the
+  owning subscriber (id 0x1, enavi_tclCCACommandSubscriber) could be
+  addressed, the entry was gone, `onRequestCommand`'s pPop found nothing
+  and the action stayed RUNNING forever.  That is exactly trio-2
+  (0x3a29868/func 0x106): legs every second, zero `bonr`, zero state
+  writes.
+- Fix: (a) resolve now ALWAYS reads the slot from the live entry
+  (cl_retrieve) - authoritative, mirroring pGetDispatcher(entry+0xc);
+  (b) `rqadd` binds MINT_COOKIES[key] = subscriber id (u16 at sub+4)
+  the moment the map binding is made, so the very first leg carries the
+  owning cookie.
