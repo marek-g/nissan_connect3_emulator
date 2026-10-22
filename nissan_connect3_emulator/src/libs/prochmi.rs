@@ -3017,6 +3017,169 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
             "PROCHMI dpmount write-watch installed: {}",
             watch_res_dpmnt.is_ok()
         );
+        // r799n33u: READ-watch the pages holding the element-handler ROM
+        // tables (the rows that begin with element 0x8076000 at 0x182c840,
+        // 0x182e890, 0x1831f70, 0x18320c0, 0x18374d4, 0x1837adc, 0x1837c28,
+        // 0x18937c8).  If the CL provisioning pass ever runs, its table walk
+        // names itself here via pc; a zero-hit run proves no consumer exists
+        // for the whole table family (same class of dead pass as the
+        // dynlistconf DESTENTRY strings).
+        {
+            let mut ok_n = 0usize;
+            for page in [
+                0x0182_c000u64,
+                0x0182_e000,
+                0x0183_1000,
+                0x0183_2000,
+                0x0183_7000,
+                0x0189_3000,
+            ] {
+                let res = unicorn.add_mem_hook(
+                    unicorn_engine::unicorn_const::HookType::MEM_READ,
+                    page,
+                    page + 0xfff,
+                    move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                        static H: AtomicU32 = AtomicU32::new(0);
+                        if H.fetch_add(1, Ordering::Relaxed) < 300 {
+                            log::warn!(
+                                "PROCHMI elem-read t={}ms tid=[{}] addr={address:#x} size={size} value={value:#x} pc={:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                uc.get_data().inner.thread_id(),
+                                uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32,
+                            );
+                        }
+                        true
+                    },
+                );
+                if res.is_ok() {
+                    ok_n += 1;
+                }
+            }
+            log::info!("PROCHMI elem-read watches installed: {ok_n}/6");
+        }
+        // r799n33u: the clHSI_CMNAVI::bExecuteMessage leaf that writes CL
+        // element 0x8076000 (vfn+0x1c(this+0xc, 0x8076000, &local_7=6, 1,
+        // 0)) - witnessed running at t=12.06s by the elem-read watches.
+        // Page-dispatched probes (narrow hooks can silently die, see
+        // AGENTS): 0x182cef8 = leaf entry (r7 = msg ptr, id = [r7+4],
+        // arg = [r7+8]); 0x182cf34 = the vfn+0x1c call site (r0 = CL dp
+        // obj, r1 = elem, r2 = value ptr, r3 = len); 0x182cf38 = right
+        // after (r0 = u32dp_set result).  This names the exact msg ids
+        // driving the write and why the stored value never lands.
+        {
+            let page = 0x0182_c000u64;
+            let cef8 = page + 0xef8u64;
+            let c34 = page + 0xf34u64;
+            let c38 = page + 0xf38u64;
+            let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
+                if addr == cef8 {
+                    static H: AtomicU32 = AtomicU32::new(0);
+                    if H.fetch_add(1, Ordering::Relaxed) >= 60 {
+                        return;
+                    }
+                    let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI cmleaf leaf t={}ms tid=[{}] msg={r7:#x} id={:#x} arg={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        read_u32(uc, r7.wrapping_add(4)),
+                        read_u32(uc, r7.wrapping_add(8)),
+                    );
+                } else if addr == c34 {
+                    static H: AtomicU32 = AtomicU32::new(0);
+                    if H.fetch_add(1, Ordering::Relaxed) >= 60 {
+                        return;
+                    }
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI cmleaf set-call t={}ms tid=[{}] dp={r0:#x} elem={r1:#x} val={:#x} vt={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        read_u32(uc, r2),
+                        read_u32(uc, r0),
+                    );
+                } else if addr == c38 {
+                    static H: AtomicU32 = AtomicU32::new(0);
+                    if H.fetch_add(1, Ordering::Relaxed) >= 60 {
+                        return;
+                    }
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI cmleaf set-ret t={}ms tid=[{}] res={r0:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                }
+            });
+            match result {
+                Ok(_) => log::info!("PROCHMI: cmleaf page watch installed"),
+                Err(e) => log::warn!("PROCHMI: cmleaf page watch failed: {e}"),
+            }
+        }
+        // r799n33u: cldp add-wrapper entry 0x1381700 (r1 = element id, the
+        // only site whose vfn+0x18 reaches cldp_datapool::add_element; the
+        // dp-add census saw just ONE call with elem 0xc0fa000).  Log every
+        // attempt with lr + sp-scan backtrace: if 0x8076000 is ever ATTEMPTED
+        // but dies on the singleton-null (r12==0 -> 0x13817f8) or arg5==0
+        // (0x13817dc) legs, the missing precondition is now named.
+        {
+            let page = 0x0138_1000u64;
+            let ent = page + 0x700u64;
+            let s_null = page + 0x7f8u64;
+            let s_a5 = page + 0x7dcu64;
+            let s_ok = page + 0x740u64;
+            let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
+                if addr == ent {
+                    static H: AtomicU32 = AtomicU32::new(0);
+                    if H.fetch_add(1, Ordering::Relaxed) >= 200 {
+                        return;
+                    }
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                    let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    let mut bt = String::new();
+                    for i in 0..10u32 {
+                        let w = read_u32(uc, sp.wrapping_add(i * 4));
+                        if (0x00fb_7080..0x023b_eb1b).contains(&w) {
+                            bt.push_str(&format!(" {w:#x}"));
+                        }
+                    }
+                    log::warn!(
+                        "PROCHMI addwrap enter t={}ms tid=[{}] elem={r1:#x} lr={lr:#x} bt:{bt}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if addr == s_null || addr == s_a5 || addr == s_ok {
+                    static H: AtomicU32 = AtomicU32::new(0);
+                    if H.fetch_add(1, Ordering::Relaxed) >= 200 {
+                        return;
+                    }
+                    let tag = if addr == s_null {
+                        "singleton-NULL"
+                    } else if addr == s_a5 {
+                        "arg5-zero"
+                    } else {
+                        "add-OK"
+                    };
+                    let r1 = if addr == s_ok {
+                        uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32
+                    } else {
+                        uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32
+                    };
+                    log::warn!(
+                        "PROCHMI addwrap {tag} t={}ms tid=[{}] elem/obj={r1:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                }
+            });
+            match result {
+                Ok(_) => log::info!("PROCHMI: addwrap page watch installed"),
+                Err(e) => log::warn!("PROCHMI: addwrap page watch failed: {e}"),
+            }
+        }
         // r757: watch the clHMIMngr framework state byte (+0x670) and its
         // pending flag (+0x671) from t=0.  The object sits at 0x38eee60
         // (heap layout has been deterministic across runs fix77..fix80).
@@ -9031,8 +9194,20 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     Err(_) => {}
                 }
             }
+            // r799n33t: name the BUILDER of each mediator row (sp code-word
+            // scan like hsa-event) - the popup-row builder is the missing
+            // provisioning pass we are hunting.
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+            let mut bt = String::new();
+            for i in 0..12u32 {
+                let w = read_u32(uc, sp.wrapping_add(i * 4));
+                if (0x00fb_7080..0x023b_eb1b).contains(&w) {
+                    bt.push_str(&format!(" {w:#x}"));
+                }
+            }
             log::warn!(
-                "PROCHMI medsctor t={}ms tid=[{}] med={r0:#x} content={r1:#x} c[0]={c0:#x} c[4]={c4:#x} kind={}",
+                "PROCHMI medsctor t={}ms tid=[{}] med={r0:#x} content={r1:#x} c[0]={c0:#x} c[4]={c4:#x} kind={} lr={lr:#x} bt:{bt}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
                 uc.get_data().inner.thread_id(),
                 c4 & 0xf,
@@ -9041,6 +9216,58 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         match result {
             Ok(_) => log::info!("PROCHMI: medsctor page watch installed"),
             Err(e) => log::warn!("PROCHMI: medsctor page watch failed: {e}"),
+        }
+    }
+    // r799n33u: GUI_StateMachineFactory builders (ARM island 0x1372xxx).
+    // vCreateSyncMediators (0x13727b8) / vCreateDataUpdateMediators
+    // (0x13726ac) install every ROM mediator row into the SM object's
+    // m_apStates[ (row[4] & 0x3ffff) >> 4 ] - the popup row (content
+    // 0x40003630, word4 0x12649081 -> slot 0x908) is provisioned here.
+    // Witness WHICH SM object each builder runs for (r0: size=[r0],
+    // states=[r0+8]) and which slot/med each store writes, so the popup
+    // mediator's owning SM and state slot become concrete.
+    {
+        let page = (base_address + 0x0137_2000u32 - ORIGINAL_BASE) as u64;
+        let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
+            let (e_sync, e_dupd) = (page + 0x7b8u64, page + 0x6acu64);
+            let (s_sync, s_dupd) = (page + 0x848u64, page + 0x73cu64);
+            if addr == e_sync || addr == e_dupd {
+                static H: AtomicU32 = AtomicU32::new(0);
+                if H.fetch_add(1, Ordering::Relaxed) >= 64 {
+                    return;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCHMI mbuild {}-entry t={}ms tid=[{}] sm={r0:#x} size={:#x} states={:#x} lr={lr:#x}",
+                    if addr == e_sync { "sync" } else { "dataupd" },
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    read_u32(uc, r0),
+                    read_u32(uc, r0 + 8),
+                );
+            } else if addr == s_sync || addr == s_dupd {
+                static H: AtomicU32 = AtomicU32::new(0);
+                if H.fetch_add(1, Ordering::Relaxed) >= 1300 {
+                    return;
+                }
+                let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                let r8 = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+                let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                let w0 = read_u32(uc, r5);
+                let w4 = read_u32(uc, r5 + 4);
+                let idx = (w4 & 0x3_ffff) >> 4;
+                log::warn!(
+                    "PROCHMI mbuild {}-store t={}ms row={r5:#x} w0={w0:#x} w4={w4:#x} kind={} idx={idx} med={r8:#x} slot={r3:#x}",
+                    if addr == s_sync { "sync" } else { "dataupd" },
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    w4 & 0xf,
+                );
+            }
+        });
+        match result {
+            Ok(_) => log::info!("PROCHMI: mbuild page watch installed"),
+            Err(e) => log::warn!("PROCHMI: mbuild page watch failed: {e}"),
         }
     }
     // r799n4b: the stuck sync mediator (nav-only flow: 0x3a03128, content
@@ -9297,6 +9524,27 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     let f10 = rd(vt + 0x10);
                     let f14 = rd(vt + 0x14);
                     format!(" reg={r0:#x} hnd={ip:#x} vt={vt:#x} f4={f4:#x} f10={f10:#x} f14={f14:#x}")
+                } else if off == 0x0137_5150u32 as u64 {
+                    // r799n33u: SyncMediator::vInitialize entry.  Name the
+                    // caller (bt) and the ROM row (content/element) so the
+                    // activation sweep for the popup row 0x40003630 becomes
+                    // visible - or its absence is witnessed per starter.
+                    let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                    let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    let mut bt = String::new();
+                    for i in 0..8u32 {
+                        let w = read_u32(uc, sp.wrapping_add(i * 4));
+                        if (0x00fb_7080..0x023b_eb1b).contains(&w) {
+                            bt.push_str(&format!(" {w:#x}"));
+                        }
+                    }
+                    let row = read_u32(uc, r0.wrapping_add(0x20));
+                    format!(
+                        " INIT lr={lr:#x} bt:{bt} row={row:#x} w0={:#x} w4={:#x} fl={:#x}",
+                        read_u32(uc, row),
+                        read_u32(uc, row.wrapping_add(4)),
+                        read_u32(uc, r0.wrapping_add(0x28)),
+                    )
                 } else if off == 0x0135_a71cu32 as u64
                     || off == 0x0135_a6c4u32 as u64
                     || off == 0x0135_a76cu32 as u64

@@ -3607,3 +3607,84 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
   in a SECOND dispatcher whose subscriber BAD's resolve never sees.
   Fix: the re-fire loop also throws cookies {1,2,3} blind (misses =
   harmless pRetrieveRequest warns).
+
+## r799n33t/u: the popup IS a dyn-popup on op 489; the 0x8076000 write leg RUNS but the element was never added
+
+Static breakthroughs (Ghidra + capstone, ARM islands - prochmi mixes ARM
+(0x137xxxx, 0x138xxxx, 0x13a7xxx, 0x182xxxx, 0x184xxxx code) with Thumb; the
+old "everything is Thumb" belief made prior scans blind):
+
+- medsctor bt (r799n33t): ALL 596 sync-mediator + 6 dataupdate-mediator rows
+  are built by GUI_StateMachineFactory::vCreateSyncMediators (0x13727b8, ARM)
+  / vCreateDataUpdateMediators (0x13726ac) called from s_vCreateStateMachines
+  (hit-probe) with a ROM-template SM object {size=[r0], states=[r0+8]}:
+  mediator slot idx = ([row+4] & 0x3ffff) >> 4, kind = row+4 & 0xf.
+  ROM state count = 1594, so mediator slots (1595..2364) live ABOVE the real
+  states in the instance table - they are pseudo-states, never named by any
+  transition path.  Popup row (content 0x40003630, elem 0x12649081, kind 1)
+  -> slot 2312, med built t=3894 lr=0x137286c, stored slot=0x39e4dc0 of the
+  states table 0x39e29a0 of SM instance 0x39e2778, and BOUND t=3927 by
+  tmbind lr=0x1372c84.  So the popup mediator exists and is bound every run;
+  only its vInitialize (0x1375150) never runs.
+- vInitialize runtime callers (INIT bt, n259_4): ALL 36 Starts in a run come
+  from GUI_StatePseudoMediatorSync::vActivate's tail (0x137583c), driven by
+  the propagator 0x13a77d0 (ARM): per activated op it calls the domain
+  handler vfn+0x1c for [op+0x18] then walks the med list [op+0x14] calling
+  vfn+0x24 (activate) / vfn+0x28 (deactivate).  The activated med set ==
+  meds linked on the ops the SM cascade enters; the popup mediator's op was
+  never activated this way (its slot-2312 table position is NOT what drives
+  activation).
+- The "Starting navigation." popup identity is now concrete: dyn popup
+  0x5da (state objects 0x39f8d78=1499 hide, 0x39f8dc8=1498 show, content
+  0x40003c2c, view 0x25f) on dynsm 0x39e1fc0, ASSOCIATED TO op 0x1e9=489:
+  every dynstack-op line carries op=0x1e9.  GOOD n258_1: push kind=0 at
+  12122, whole popup family kind=1 sweep at 14688-14693 (top=empty), then
+  0x5da RE-PUSHED at 14698 prio=0xca - because state 489 is still in the
+  decision path at 14718.  The popup therefore closes exactly when the nav
+  cascade LEAVES 489 (nav-init-done) - one fix, three symptoms confirmed.
+  (484 IS entered in GOOD n258_1 from 12028 on; old "never enters 0x484"
+  belief was from an early-era log.)
+- The 0x8076000 write leg is ALIVE (elem-read + cmleaf probes, n259_7):
+  clHSI_CMNAVI::bExecuteMessage = FUN_0182b7e0 (ARM, msgid = [msg+4]).
+  msg id 0x2950 (the readiness poll, ~19 leaf hits/run at t=12.03-14.74,
+  tid 50) reaches the leaf 0x182cef8: arg([msg+8]) != 1 -> vProcessNextRequest
+  + u32dp_set via vfn+0x1c(dp=0x38eee88, elem=0x8076000, &byte=7, 1, 0) at
+  0x182cf34.  The call RETURNS res=1 = FAILED (element not in pool), so the
+  poll answers d0=0 forever.  set-ret probe witnesses this every run.
+- Who must add 0x8076000: NOT the cldp add-wrapper 0x1381700 (addwrap probe:
+  3 calls/run, ALL elem=0xc0fa000 - the HMI creates only its own 0xc0-domain
+  wait-event elements via hardcoded SM-condition checkers, e.g. 0x1840168
+  reads [sp+0xf]==2 && [sp+0xe]==6 then returns 1 - bl scans over the ARM
+  islands found 138 wrapper call sites, all literals 0xc0fa000/0xc101000/
+  0xc0f8000.../0x2e01e000-class ids, ZERO for 0x8076000).  There is also NO
+  direct bl/blx to cldp_datapool::add_element anywhere - every add goes
+  through pool-vtable +0x18.  The 0x80-domain element creator must be the
+  CL/mediation provisioning keyed off the service-connected event (r799n14
+  hypothesis intact), i.e. the mediation method-registry pass whose handler
+  tables ({elem u32, i32 handler-delta} rows, 0x8076000 first at 0x182c840,
+  0x182e890, 0x1831f70, 0x18320c0, 0x18374d4, 0x1837adc, 0x1837c28,
+  0x18937c8) are only referenced from 16-byte method-descriptor entries
+  {table, count, 0xc0012, id} (e.g. 0x1ca734={0x1831f80,0x150,...}).
+  elem-read watches prove those pages ARE read at t=12.06-14.7 by the
+  bExecuteMessage dispatch itself (pool literals), but the METHOD tables
+  are never walked (no add for any 0x80/0x81 elem, dp-add census stays 1).
+- The walk of those mediation tables is (per r799n9 lineage) gated behind
+  the hminavserver answer plane that dies with the EMPTY pump pending table
+  ("bHandleResp: Request not found in Table -> message lost!", r799n27).
+  pumptbl watch (t>=32s) DOES see writers (pc=0x191c44c/0x191e78c write
+  state=5 + node ptrs at 35.3s) - so the insert leg exists but inserts only
+  late/different keys; the 12s-era requests never land.  NEXT: lift the
+  t<32s filter, correlate request-leg inserts vs completer lookups by
+  (svc,key,func) and find the gate that skips insertion in the startup era.
+- Side facts: aGetStateROMData=0x25a13cc (1594 rows), sync ROM rows
+  0x25ad4a0 (596x0x14), change 0x25ac224 (168), dataupd 0x25b0344 (6x0x1c);
+  state rows contain content+wait-id words, no name ptrs.  Mediator ctor
+  stores row at [med+0x20], flags [med+0x28] (kind0->5,1->2,2->7,3->1).
+  MEM_READ hooks report value=0 always (READ_AFTER carries the value) - do
+  not believe value fields there.
+
+Probes added: mbuild (page 0x1372000: builder entries + store sites),
+INIT bt on tmset 0x1375150, elem-read MEM_READ watches (6 table pages),
+cmleaf (page 0x182c000 code hook: leaf/set-call/set-ret of the CMNAVI
+0x2950 write leg), addwrap (page 0x1381000: wrapper entry + singleton-null
+/ arg5-zero / add-OK legs).
