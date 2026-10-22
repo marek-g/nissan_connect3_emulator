@@ -2978,7 +2978,15 @@ pub fn fabricate_fi_conf_complete(
     body[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
     let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed) as u32;
     body[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
-    body[0x14..0x16].copy_from_slice(&service.to_le_bytes());
+    // r799n32: the mbx_289 consumer only reaches the CL completer for
+    // frames classed as svc 0x0006 (n203: our svc-6-stamped confs removed
+    // keys 1,2,7,9 while the 0x001f-stamped confs for keys 0xb/0xd with
+    // the SAME shape were eaten unmatched - the dispatcher filters by the
+    // svc field at +0x14 BEFORE the table leg).  The property confs are
+    // stamped 0x0006 for the wire; the completer matches on the key at
+    // +0x1c (unique, n174), so only the property entry can be hit.
+    let wire_svc = if service == 0x001f { 0x0006 } else { service };
+    body[0x14..0x16].copy_from_slice(&wire_svc.to_le_bytes());
     body[0x16..0x18].copy_from_slice(&0xffffu16.to_le_bytes());
     stamp_registration_id("mbx_289", &mut body);
     body[0x18..0x1a].copy_from_slice(&func.to_le_bytes());
@@ -3330,11 +3338,22 @@ pub fn pump_push_completion(unicorn: &mut Unicorn<'_, Context>, mut body: Vec<u8
     // The consumer hands the completer the BODY start as `data`
     // ([data+8]>>24 == class 0x45), so the slot carries the body itself.
     if unicorn.mem_write(slot as u64, &body).is_err() {
-        static W: AtomicU32 = AtomicU32::new(0);
-        if W.fetch_add(1, Ordering::Relaxed) < 3 {
-            log::warn!("[LIBOSAL-MBX] pump completion: slot {slot:#x} mem_write failed");
+        // r799n32: the region IS mapped ([pump-completion-pool] 0x95752000
+        // +0x2000 RW) yet writes to higher slots failed mid-run (n203:
+        // idx 9/10 of the property refire pair, guest-call posts idx 0-7
+        // fine).  Retry once (transient engine-busy?), then log with time.
+        std::thread::yield_now();
+        if unicorn.mem_write(slot as u64, &body).is_err() {
+            static W: AtomicU32 = AtomicU32::new(0);
+            if W.fetch_add(1, Ordering::Relaxed) < 8 {
+                log::warn!(
+                    "[LIBOSAL-MBX] pump completion: slot {slot:#x} mem_write failed t={}ms len={:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    body.len(),
+                );
+            }
+            return false;
         }
-        return false;
     }
     // The r1 argument of the native post: a 16-byte OSAL message struct
     // `[1, pool-slot, w2, w3]` (w2/w3 stashed from live post8s), posted with
