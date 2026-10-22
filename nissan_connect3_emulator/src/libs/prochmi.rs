@@ -843,6 +843,17 @@ static LAST_EXEC_COOKIE: std::sync::atomic::AtomicU64 =
 
 /// r799n33d: mint key -> request cookie (non-type-3 legs complete through
 /// `pFindSubscriber(cookie)`; 0xfffe = unknown, stand-in).
+/// r799n33o: once the FSM has been through state 9, the startup proc may
+/// RE-WALK from state 0 at any moment (n247_4/n252_2: 9 -> 0 after the
+/// cascade stores out-byte=1).  All svcdone machinery must keep serving
+/// mints during that re-walk, hence this window instead of bare
+/// `hmi_fsm_state() == 9` gates.
+static S9_DONE: AtomicBool = AtomicBool::new(false);
+fn svcdone_window() -> bool {
+    let st = crate::libs::libosal_linux::message::hmi_fsm_state();
+    st == 9 || (st == 0 && S9_DONE.load(Ordering::Relaxed))
+}
+
 static MINT_COOKIES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u32, u32>>,
 > = std::sync::LazyLock::new(Default::default);
@@ -7282,8 +7293,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                 | 0x000d
                                 | 0x007d
                         )
-                        && crate::libs::libosal_linux::message::hmi_fsm_state()
-                            == 9
+                        && svcdone_window()
                     {
                         let lm = LAST_MINTED.load(Ordering::Relaxed);
                         let mint_t = (lm >> 32) as u64;
@@ -7461,9 +7471,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                         | 0x0018
                                         | 0x000d
                                         | 0x007d
-                                ) && crate::libs::libosal_linux::message::hmi_fsm_state(
-                                        )
-                                        == 9
+                                ) && svcdone_window()
                                 {
                                     let holder =
                                         CL_TABLE_HOLDER.load(Ordering::Relaxed);
@@ -8286,8 +8294,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             .store((t_ms << 32) | r0 as u64, Ordering::Relaxed);
                         // r799n33c: state-9 mints are tracked for the
                         // guaranteed-answer sweep (STATE9_MINTS).
-                        if crate::libs::libosal_linux::message::hmi_fsm_state()
-                            == 9
+                        if svcdone_window()
                         {
                             if let Ok(mut m) = STATE9_MINTS.lock() {
                                 if m.len() < 512 {
@@ -8479,8 +8486,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         holder,
                     );
                     if label == "rqadd"
-                        && crate::libs::libosal_linux::message::hmi_fsm_state()
-                            == 9
+                        && svcdone_window()
                         && r1k != 0
                         && holder > 0x1000
                         && holder < 0xf000_0000
@@ -12574,7 +12580,6 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
     // (an ungated kick during the state-4 era derailed the FSM into the
     // 4->1 retry loop, n179).  `EMU_FAKE_SENSORFI=0` disables.
     {
-        static S9_DONE: AtomicBool = AtomicBool::new(false);
         thread_local! {
             static TICKER_NEXT: std::cell::RefCell<Option<Instant>> =
                 const { std::cell::RefCell::new(None) };
@@ -12584,14 +12589,7 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             Some(next) => now >= next,
         });
         if due
-            && (crate::libs::libosal_linux::message::hmi_fsm_state() == 6
-                || (crate::libs::libosal_linux::message::hmi_fsm_state() == 0
-                    // r799n33m: state 0 is ALSO the pre-FSM boot value -
-                    // kicking from t=0 replays the early-registration BAD
-                    // boot (n249: 5x BAD).  Re-tick state 0 only after the
-                    // FSM has been through state 9 once (the genuine
-                    // post-cascade re-walk of n247_4).
-                    && S9_DONE.load(Ordering::Relaxed)))
+            && crate::libs::libosal_linux::message::hmi_fsm_state() == 6
             && std::env::var_os("EMU_FAKE_SENSORFI").map_or(true, |v| v != "0")
         {
             // r799n33l: state 0 joins the re-tick.  With trio-2 answered
@@ -12621,7 +12619,7 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             });
         }
         if due
-            && crate::libs::libosal_linux::message::hmi_fsm_state() == 9
+            && svcdone_window()
             && std::env::var_os("EMU_FAKE_SENSORFI").map_or(true, |v| v != "0")
         {
             S9_DONE.store(true, Ordering::Relaxed);
