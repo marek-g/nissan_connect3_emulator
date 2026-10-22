@@ -906,6 +906,43 @@ fn cl_retrieve(
     0
 }
 
+/// r799n33f: the state=2 flip happens in the action's OWN response
+/// handler (stspy caught pc=0x171aa54 for trio-1), which the dispatcher
+/// only reaches through the request's registered subscriber - the CL
+/// remove is table-wide but the vfn+0x1c leg scans the subscriber's own
+/// pending list.  A leg with the wrong cookie removes the entry and
+/// silently never flips the state (n233: trio-2 removed, still RUNNING).
+/// Collect every OTHER live subscriber id so the pair can be fired into
+/// all of them (a non-owning subscriber just no-ops).
+fn alt_done_cookies(unicorn: &Unicorn<'_, Context>, holder: u32, primary: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    if holder <= 0x1000 || holder >= 0xf000_0000 {
+        return out;
+    }
+    for slot in 0..4u32 {
+        let ctrl = read_u32(unicorn, holder.wrapping_add(0xc + (slot << 2)));
+        if ctrl <= 0x1000 || ctrl >= 0xf000_0000 {
+            continue;
+        }
+        let disp = read_u32(unicorn, ctrl.wrapping_add(4));
+        if disp <= 0x1000 || disp >= 0xf000_0000 {
+            continue;
+        }
+        for (_, id) in sub_walk(unicorn, disp) {
+            if id != 0 && id != 0xfffe && id != primary && !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    if !out.is_empty() {
+        log::warn!(
+            "PROCHMI svcdone: key extra cookies {:?} (all-live-subscriber fan-out, EMU_FAKE_SVCDONE=0 disables)",
+            out.iter().map(|c| format!("{c:#x}")).collect::<Vec<_>>(),
+        );
+    }
+    out
+}
+
 /// r799n33d: resolve the cookie (subscriber ID, see pFindSubscriber) for
 /// one svcdone leg.  Order: bound mint cookie (execcmd capture) -> the
 /// service dispatcher's first live subscriber (cached) -> 0xfffe stand-in.
@@ -6042,31 +6079,31 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         uc.get_data().inner.thread_id(),
                     );
                 }
-                if name.starts_with("sp2") || name.starts_with("sp1") {
+                if matches!(name, "sp1s1" | "sp2s1") {
                     // r799n33f: catch WHO writes the state word that
-                    // bIsComplete polls ([obj+4] == 2).  trio-1's action
-                    // flips 1->2 within 40 ms (n232/n233), trio-2's stays
-                    // RUNNING forever - the writer PC of the trio-1 flip
-                    // names the completion function whose preconditions
-                    // trio-2 fails.
+                    // bIsComplete polls.  trio-1's own object flips 1->2
+                    // (stspy sp1, pc=0x171aa54 = the action response
+                    // handler); the trio-2 owner is a proc-object whose
+                    // FIRST sub-action (the polled one, bRunWhenRunning
+                    // runs bRun on proc+0x30) lives at proc+0x30 with its
+                    // state at +0x34.
                     static SPY1: AtomicU32 = AtomicU32::new(0);
                     static SPY2: AtomicU32 = AtomicU32::new(0);
-                    let seen = if name == "sp1s1" {
-                        SPY1.swap(r0, Ordering::Relaxed)
+                    let (lo, lbl, slot) = if name == "sp1s1" {
+                        (r0, "sp1", &SPY1)
                     } else {
-                        SPY2.swap(r0, Ordering::Relaxed)
+                        (r0.wrapping_add(0x30), "sp2", &SPY2)
                     };
-                    if seen == 0 && r0 > 0x1000 && r0 < 0xf000_0000 {
-                        let lbl: &'static str =
-                            if name == "sp1s1" { "sp1" } else { "sp2" };
+                    let seen = slot.swap(lo, Ordering::Relaxed);
+                    if seen == 0 && lo > 0x1000 && lo < 0xf000_0000 {
                         use unicorn_engine::unicorn_const::HookType;
                         let res = uc.add_mem_hook(
                             HookType::MEM_WRITE,
-                            r0 as u64,
-                            (r0 + 8) as u64,
+                            lo as u64,
+                            (lo + 8) as u64,
                             move |uc2, _t, address, size, value| {
                                 static N: AtomicU32 = AtomicU32::new(0);
-                                if N.fetch_add(1, Ordering::Relaxed) < 30 {
+                                if N.fetch_add(1, Ordering::Relaxed) < 40 {
                                     let pc = uc2
                                         .reg_read(RegisterARM::PC)
                                         .unwrap_or(0)
@@ -6083,7 +6120,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             },
                         );
                         log::warn!(
-                            "PROCHMI stspy {lbl} hook on {r0:#x} ok={}",
+                            "PROCHMI stspy {lbl} hook on {lo:#x} ok={}",
                             res.is_ok(),
                         );
                     }
@@ -6092,9 +6129,13 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
                     let st = if matches!(name, "sp2s1" | "sp1s1") {
                         let vt = read_u32(uc, r0);
+                        // r799n33f: sp2s1's r0 is the PROC object; the
+                        // state the walk polls belongs to sub-action
+                        // proc+0x30 (state at +0x34).
+                        let soff = if name == "sp2s1" { 0x34 } else { 4 };
                         format!(
                             " action={r0:#x} state={} vt={vt:#x} vfn24={:#x} svc={:#x} func={:#x} req={:#x}",
-                            read_u32(uc, r0.wrapping_add(4)),
+                            read_u32(uc, r0.wrapping_add(soff)),
                             read_u32(uc, vt.wrapping_add(0x24)) & !1,
                             read_u16(uc, r0.wrapping_add(8)),
                             read_u16(uc, r0.wrapping_add(0x22)),
@@ -7444,25 +7485,38 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                     // vfn+0x1c), not only the conf-
                                     // removal - mimic DAPI's completion
                                     // pair: data(9) then conf(8).
-                                    crate::rtos::monitor::guest_call_bhandle_svcdone(
-                                        uc,
-                                        holder,
-                                        cookie,
-                                        ordinal as u32,
-                                        f18b as u32,
-                                        9,
-                                        &bb,
-                                    );
-                                    bb[0x1a] = 8;
-                                    crate::rtos::monitor::guest_call_bhandle_svcdone(
-                                        uc,
-                                        holder,
-                                        cookie,
-                                        ordinal as u32,
-                                        f18b as u32,
-                                        8,
-                                        &bb,
-                                    );
+                                    // r799n33f: fire the pair into every
+                                    // live subscriber - only the owning
+                                    // one flips (see alt_done_cookies).
+                                    let mut cookies = vec![cookie];
+                                    cookies.extend(alt_done_cookies(
+                                        uc, holder, cookie,
+                                    ));
+                                    for c in cookies.iter().copied() {
+                                        bb[0x0e..0x10].copy_from_slice(
+                                            &(c as u16).to_le_bytes(),
+                                        );
+                                        crate::rtos::monitor::guest_call_bhandle_svcdone(
+                                            uc,
+                                            holder,
+                                            c,
+                                            ordinal as u32,
+                                            f18b as u32,
+                                            9,
+                                            &bb,
+                                        );
+                                        bb[0x1a] = 8;
+                                        crate::rtos::monitor::guest_call_bhandle_svcdone(
+                                            uc,
+                                            holder,
+                                            c,
+                                            ordinal as u32,
+                                            f18b as u32,
+                                            8,
+                                            &bb,
+                                        );
+                                        bb[0x1a] = 9;
+                                    }
                                     // r799n33: re-fire until the remove
                                     // probe confirms (see SVCDONE_PENDING).
                                     if holder != 0 {
@@ -12381,13 +12435,22 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                     bb[0x1a] = 9;
                     bb[0x1c..0x1e]
                         .copy_from_slice(&(key as u16).to_le_bytes());
-                    crate::rtos::monitor::guest_call_bhandle_svcdone(
-                        unicorn, holder, cookie, key, func, 9, &bb,
-                    );
-                    bb[0x1a] = 8;
-                    crate::rtos::monitor::guest_call_bhandle_svcdone(
-                        unicorn, holder, cookie, key, func, 8, &bb,
-                    );
+                    // r799n33f: fan the pair out to every live subscriber
+                    // (see alt_done_cookies - only the owner flips).
+                    let mut cookies = vec![cookie];
+                    cookies.extend(alt_done_cookies(unicorn, holder, cookie));
+                    for c in cookies.iter().copied() {
+                        bb[0x0e..0x10]
+                            .copy_from_slice(&(c as u16).to_le_bytes());
+                        crate::rtos::monitor::guest_call_bhandle_svcdone(
+                            unicorn, holder, c, key, func, 9, &bb,
+                        );
+                        bb[0x1a] = 8;
+                        crate::rtos::monitor::guest_call_bhandle_svcdone(
+                            unicorn, holder, c, key, func, 8, &bb,
+                        );
+                        bb[0x1a] = 9;
+                    }
                 }
                 if !again.is_empty() {
                     log::warn!(
@@ -12430,13 +12493,22 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                         bb[0x1a] = 9;
                         bb[0x1c..0x1e]
                             .copy_from_slice(&(key as u16).to_le_bytes());
-                        crate::rtos::monitor::guest_call_bhandle_svcdone(
-                            unicorn, holder, cookie, key, 0, 9, &bb,
-                        );
-                        bb[0x1a] = 8;
-                        crate::rtos::monitor::guest_call_bhandle_svcdone(
-                            unicorn, holder, cookie, key, 0, 8, &bb,
-                        );
+                        // r799n33f: fan out to every live subscriber.
+                        let mut cookies = vec![cookie];
+                        cookies
+                            .extend(alt_done_cookies(unicorn, holder, cookie));
+                        for c in cookies.iter().copied() {
+                            bb[0x0e..0x10]
+                                .copy_from_slice(&(c as u16).to_le_bytes());
+                            crate::rtos::monitor::guest_call_bhandle_svcdone(
+                                unicorn, holder, c, key, 0, 9, &bb,
+                            );
+                            bb[0x1a] = 8;
+                            crate::rtos::monitor::guest_call_bhandle_svcdone(
+                                unicorn, holder, c, key, 0, 8, &bb,
+                            );
+                            bb[0x1a] = 9;
+                        }
                     }
                     if !sweep.is_empty() {
                         log::warn!(
