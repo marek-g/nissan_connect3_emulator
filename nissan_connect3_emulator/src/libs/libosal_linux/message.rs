@@ -3104,16 +3104,29 @@ pub fn refire_fi_era_pending(unicorn: &mut Unicorn<'_, Context>) -> usize {
         // reach tid 65's rx pump in state 9) is the delivery lane; fall back
         // to the plain mbx_289 push for the state-5/6 member-era entries
         // whose proven delivery lane is the queue.
-        // r799n31: the pump lane is the WRONG connector for these entries
-        // (its table 0x3b24430 only knows the SENSORFI connector's own
-        // keys like 0x5aa5 - n198: tid 65 wakes and runs cllookup on the
-        // pump table for every kick, the property keys 0xb/0xc/0xd live in
-        // the CL connector table).  The legitimate completer of the
-        // enConnect-routed property legs is tid-81's enReceiveWait on
-        // mbx_289, which matches the answer by its msgid (= the request's
-        // R ordinal = the entry key, fixed in the mbx_36 hook above).
-        // Plain queue re-pushes it until a copy lands.
-        let posted = push_blob_to_mbx_289(unicorn, body);
+        // r799n31: the HMINavServerLib dispatcher (0x17c1c50) walks the
+        // queue object's GUEST-SIDE message list (0x17cb5xx leg reads
+        // msgobj+4 content, class-gate 0x45 at +0xb) and calls the
+        // connector completers for each node - including the CL completer
+        // (n195: a pump-lane 0x5aa5 frame ran a lookup on the CL table in
+        // state 9).  Host `guest_post` frames never enter that guest-side
+        // list, so the mbx_289 pushes are invisible to it (tid 81's OSAL
+        // receive is the enConnect router, which drops them).  Build the
+        // pump copy from the PROVEN kick envelope (gps_data_status_answer_
+        // body, msgid 0x81008114) carrying only the transaction key at
+        // +0x1c - the completer matches loosely (n174) - and push the
+        // data(9)+conf(8) pair like DAPI's genuine completions.
+        let posted = if svc == 0x001f {
+            let mut data = gps_data_status_answer_body(key);
+            data[0x1a] = 9;
+            let mut conf = data.clone();
+            conf[0x1a] = 8;
+            (pump_push_completion(unicorn, data)
+                && pump_push_completion(unicorn, conf))
+                || push_blob_to_mbx_289(unicorn, body)
+        } else {
+            push_blob_to_mbx_289(unicorn, body)
+        };
         if posted {
             fired += 1;
             log::warn!(

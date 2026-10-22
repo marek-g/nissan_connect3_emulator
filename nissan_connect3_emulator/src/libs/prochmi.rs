@@ -790,6 +790,18 @@ static FI_READY_ANSWERED: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<(u16, u16, u32)>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// r799n31: last IDFactory key minted through `enStoreRequest`'s key leg
+/// (storekey probe, r0 = fresh key) and its timestamp.  The state-9
+/// property stores (svc 0x1f) carry an owner-pointer-ish value in r1 at
+/// the conf-store site (n200: r1 & 0x3738 = [entry+0x0c] back-pointer, NOT
+/// the key), so the answer ordinal is taken from the freshest mint when
+/// the wire register is implausible - each requestCommand mints exactly
+/// one key and stores it 1 ms later on the same thread (n199/200: strict
+/// storekey/conf-store interleaving at 35553-35557 / 36226-36228 ms).
+/// Paired ONLY for the 0x1f property plane: a wrong key on another
+/// service's entry could pre-empt a genuine completion (r799n29 lesson).
+static LAST_MINTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// r799n31: runtime VA (+1, Thumb) of `enavi_tclAction::vSignalSelf`
 /// (prochmi 0x0171915c) stashed by the `navif-create` probe.  The FSM calls
 /// it (vtable slot 0x60) after EVERY successful state transition: it posts
@@ -5880,11 +5892,13 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // r0 so every episode is identifiable (0x5aa5 GPS kick vs
                 // our 0x1f property echo).
                 if hit == lo + 0x174 {
-                    let w0 = read_u32(uc, r0);
-                    let w1 = read_u32(uc, r0.wrapping_add(4));
-                    let (src, len, cls, svc, func, optype, key) = if w0 == 1 && w1 != 0 {
-                        // OSAL msg struct [1, body-slot, w2, w3]: dump BODY
-                        let b = w1;
+                    // 0x17cb574(r0=queue obj, r1/r2=out u16s, r3=msgobj):
+                    // content = [r3+4], class = content[0xb] (n202 disasm).
+                    let msgobj = read_u32(uc, uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32);
+                    let r3v = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                    let content = read_u32(uc, r3v.wrapping_add(4));
+                    let b = content;
+                    let (src, len, cls, svc, func, optype, key) = if b != 0 && b < 0xf000_0000 {
                         (
                             read_u16(uc, b),
                             read_u32(uc, b.wrapping_add(4)),
@@ -5895,19 +5909,12 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             read_u16(uc, b.wrapping_add(0x1c)),
                         )
                     } else {
-                        (
-                            read_u16(uc, r0),
-                            read_u32(uc, r0.wrapping_add(4)),
-                            read_u8(uc, r0.wrapping_add(0xb)),
-                            read_u16(uc, r0.wrapping_add(0x14)),
-                            read_u16(uc, r0.wrapping_add(0x18)),
-                            read_u8(uc, r0.wrapping_add(0x1a)),
-                            read_u16(uc, r0.wrapping_add(0x1c)),
-                        )
+                        (0, 0, 0, 0, 0, 0, 0)
                     };
                     log::warn!(
-                        "PROCHMI rx45body t={t}ms tid=[{}] r0={r0:#x} w=[{w0:#x},{w1:#x}] src={src:#x} len={len:#x} class={cls:#x} svc={svc:#x} func={func:#x} optype={optype:#x} key={key:#x}",
+                        "PROCHMI rx45body t={t}ms tid=[{}] q={r0:#x} msgobj={r3v:#x} content={content:#x} src={src:#x} len={len:#x} class={cls:#x} svc={svc:#x} func={func:#x} optype={optype:#x} key={key:#x}",
                         uc.get_data().inner.thread_id(),
+                        msgobj,
                     );
                 }
                 let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
@@ -6919,19 +6926,30 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 let ordinal = {
                     let o1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
                     // r799n31: the state-9 property stores (svc 0x1f,
-                    // lr 0x17b95c4/0x47dc4ec0 burst) carry the ENTRY
-                    // pointer-ish value in r1 (0x7703...), not the minted
-                    // key (n199: their conf-store rows at 35554-35557 ms
-                    // were silently skipped - the OOB budget was spent on
-                    // the earlier svc-6 noise).  The IDFactory key is
-                    // stored IN the entry at +0x0c (r799d `found` probe:
-                    // `+0x0c u16 transaction id`); read it there.
-                    if o1 > 0x100 {
-                        read_u16(uc, entry.wrapping_add(0x0c)) as u32 & 0xffff
+                    // lr 0x17b95c4/0x47dc4ec0 burst) carry the owner
+                    // back-pointer ([entry+0x0c], n200 f0c=0x3a33738) in
+                    // r1 - not the minted key.  Take the freshest IDFactory
+                    // mint (storekey probe, <= 30 ms old, same era) for
+                    // this plane only; leave every other service on the
+                    // r799n29 reject rule.
+                    if o1 > 0x100 && svc == 0x001f {
+                        let lm = LAST_MINTED.load(Ordering::Relaxed);
+                        let mint_t = (lm >> 32) as u64;
+                        let mint_key = (lm & 0xffff) as u32;
+                        let now_ms =
+                            crate::libs::dapi::emu_t0_elapsed_ms() as u64;
+                        if mint_key != 0
+                            && mint_key <= 0x100
+                            && now_ms.saturating_sub(mint_t) <= 30
+                        {
+                            mint_key as u16
+                        } else {
+                            o1 as u16
+                        }
                     } else {
-                        o1
+                        o1 as u16
                     }
-                } as u16;
+                };
                 // r799n29: sanity.  The request table's IDFactory mints
                 // small monotonically increasing keys per era; a captured
                 // r1 far out of that range (n174: 0x5aa5) is a different
@@ -6960,6 +6978,22 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // (f239 g-list-mem: only mem[1] ever won).  One push per
                 // (service, ordinal) still bounds the traffic, and a READY
                 // entry stops re-driving (the state-2 leg never re-sends).
+                if *label == "conf-store" {
+                    // r799n31 diag: one-shot per svc - why does the 0x1f
+                    // property plane not reach the fi-ready branch?
+                    static DIAG: std::sync::LazyLock<
+                        std::sync::Mutex<std::collections::HashSet<u32>>,
+                    > = std::sync::LazyLock::new(Default::default);
+                    if DIAG.lock().unwrap().insert(svc) {
+                        log::warn!(
+                            "PROCHMI conf-store-diag t={}ms tid=[{}] svc={svc:#x} st={st} o1={:#x} ord={ordinal:#x} lm={:#x}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            uc.get_data().inner.thread_id(),
+                            uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff,
+                            LAST_MINTED.load(Ordering::Relaxed),
+                        );
+                    }
+                }
                 if *label == "conf-store" && (st == 0 || st == 1) && ordinal <= 0x100 {
                     // r798b: ordinal 0 stays answerable: two svc-0x06
                     // members register with it (f240) and only a key-0 push
@@ -7635,6 +7669,13 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     // 0x1c7df54: just before the unlock/return; r4 holds the
                     // u16 map key (fresh IDFactory id on the create leg).
                     let r5t = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    // r799n31: record the fresh mint (r0) + timestamp for
+                    // the property-plane ordinal pairing (LAST_MINTED).
+                    if r0 != 0 && r0 <= 0x100 {
+                        let t_ms = crate::libs::dapi::emu_t0_elapsed_ms() as u64;
+                        LAST_MINTED
+                            .store((t_ms << 32) | r0 as u64, Ordering::Relaxed);
+                    }
                     log::warn!(
                         "PROCHMI pumptrace {label} t={}ms tid=[{}] tbl={r5t:#x} key={:#x} r0={r0:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
