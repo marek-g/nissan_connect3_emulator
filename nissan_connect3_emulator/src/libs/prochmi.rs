@@ -8485,8 +8485,16 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         && holder > 0x1000
                         && holder < 0xf000_0000
                     {
+                        // r799n33k: the pending CL entries live in the
+                        // app-level navif IFMediator's table (the one all
+                        // `remove` legs hit) - NOT the per-subscriber
+                        // [sub+8] object (n246_4: legs at holder
+                        // 0x3929a38 never found key 0x1a while every
+                        // remove fired on 0x3920888's table).
+                        let clh = CL_TABLE_HOLDER.load(Ordering::Relaxed);
+                        let pholder = if clh != 0 { clh } else { holder };
                         if let Ok(mut m) = SVCDONE_PENDING.lock() {
-                            m.entry(r1k).or_insert((holder, func, 0));
+                            m.entry(r1k).or_insert((pholder, func, 0));
                         }
                         if let Ok(mut m) = MINT_INFO.lock() {
                             m.insert(r1k, (svc, func));
