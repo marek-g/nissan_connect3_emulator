@@ -5359,10 +5359,20 @@ pub fn u32_open_msg_queue(unicorn: &mut Unicorn<'_, Context>) -> u32 {
 /// TRACE_DEV_WRITE).  Logs the transfer struct at trace level and answers the
 /// OSAL success code, which OSAL_s32IOWrite's flag-clear success leg accepts
 /// (param_3 <= 0x72000 <= 0x72000).
+///
+/// r799n26: surface the record text.  The record layout mirrors the RTOS-side
+/// one the monitor already decodes (`OSAL_TraceOutput` header
+/// `{handle, severity, tag, text ptr}`, see `SERVICE_IO_WRITE` there) - the
+/// applications' own diagnostics are the best window into DAPI's data-server
+/// decisions (`ServiceDataError 0x215/0x218`, dataset catalog).  DAPI alone
+/// wrote ~962k records per run, so per-(tid, text) dedup keeps the log fit:
+/// first three occurrences, then a summary every 2000 repeats.
+/// `EMU_TRACE_TEXT=0` disables the surfacing (the 0x72000 answer stays).
 fn trace_dev_write(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let r0 = unicorn.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
     let r1 = unicorn.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
     let r2 = unicorn.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+    let tid = unicorn.get_data().inner.thread_id();
     let mut words = [0u8; 16];
     let hdr = if r1 > 0x1000 && r1 < 0xf000_0000 && unicorn.mem_read(r1 as u64, &mut words).is_ok()
     {
@@ -5375,8 +5385,95 @@ fn trace_dev_write(unicorn: &mut Unicorn<'_, Context>) -> u32 {
         "unreadable".into()
     };
     log::trace!(
-        "[{}] [LIBOSAL-MBX] trace_dev_write(r0={r0:#x} r1={r1:#x} r2={r2:#x}) [{hdr}] => 0x72000",
-        unicorn.get_data().inner.thread_id(),
+        "[{tid}] [LIBOSAL-MBX] trace_dev_write(r0={r0:#x} r1={r1:#x} r2={r2:#x}) [{hdr}] => 0x72000",
     );
+    // r799n26 layout calibration: first few calls dump r1/r2 candidate
+    // buffers so the record format can be pinned before full decode.
+    {
+        static CAL: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, u32>>> =
+            std::sync::LazyLock::new(Default::default);
+        let show = if let Ok(mut m) = CAL.lock() {
+            let c = m.entry(tid).or_insert(0);
+            *c += 1;
+            *c <= 2
+        } else {
+            false
+        };
+        if show {
+            let dump = |base: u32| -> String {
+                if base > 0x1000 && base < 0xf000_0000 {
+                    let mut b = [0u8; 32];
+                    if unicorn.mem_read(base as u64, &mut b).is_ok() {
+                        b.chunks_exact(4)
+                            .map(|w| format!("{:#x}", u32::from_le_bytes(w.try_into().unwrap())))
+                            .collect::<Vec<String>>()
+                            .join(" ")
+                    } else {
+                        "?".into()
+                    }
+                } else {
+                    "-".into()
+                }
+            };
+            log::warn!(
+                "[{tid}] TRACE-CAL r0={r0:#x} r1={r1:#x} r2={r2:#x} | r1:[{}] | r2:[{}] | hdr:[{hdr}]",
+                dump(r1),
+                dump(r2),
+            );
+        }
+    }
+    if std::env::var_os("EMU_TRACE_TEXT").is_none_or(|v| v != "0")
+        && r2 > 0x1000
+        && r2 < 0xf000_0000
+    {
+        // r799n26 calibration: on this entry the record buffer is the THIRD
+        // argument (a caller-stack transfer struct `{length, 0, tag, fmt
+        // ptr, [arg strs...]}`), the `hdr` at r1 is unreadable.  The 0x8202
+        // tag word carries severity in its low bits (0/1/3 seen, matching
+        // the monitor's severities).
+        for off in [0xcu32, 0x10, 0x14] {
+            let mut ptr_w = [0u8; 4];
+            if unicorn.mem_read(r2.wrapping_add(off) as u64, &mut ptr_w).is_err() {
+                continue;
+            }
+            let text_ptr = u32::from_le_bytes(ptr_w);
+            if text_ptr <= 0x1000 || text_ptr >= 0xf000_0000 {
+                continue;
+            }
+            let mut buf = [0u8; 256];
+            if unicorn.mem_read(text_ptr as u64, &mut buf).is_err() {
+                continue;
+            }
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(0);
+            if end < 4 {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&buf[..end]).into_owned();
+            if !text.is_ascii() {
+                continue;
+            }
+            static SEEN: std::sync::LazyLock<
+                std::sync::Mutex<std::collections::HashMap<(u32, String), u32>>,
+            > = std::sync::LazyLock::new(Default::default);
+            if let Ok(mut m) = SEEN.lock() {
+                let c = m.entry((tid, text.clone())).or_insert(0);
+                *c += 1;
+                let tag = {
+                    let mut sw = [0u8; 4];
+                    if unicorn.mem_read(r2.wrapping_add(8) as u64, &mut sw).is_ok() {
+                        u32::from_le_bytes(sw)
+                    } else {
+                        0xffff
+                    }
+                };
+                if *c <= 3 {
+                    log::info!("[{tid}] [TRACE] tag {tag:#x}: {text} (#{c})");
+                } else if *c % 2000 == 0 {
+                    log::info!("[{tid}] [TRACE] tag {tag:#x}: {text} (repeat #{c})");
+                }
+            }
+            break;
+        }
+    }
     0x72000
 }

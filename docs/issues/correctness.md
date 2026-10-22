@@ -3004,3 +3004,28 @@ order luck.  (The queue introduced two host panics - see n19.)
   mediator-sync 0x1374f30 with content=0x40003630) and what request that
   callback would post - then make that request flow genuine-shaped through
   the SENSORFI responder with the page's ordinal.
+
+## r799n26: application libtrace texts decoded - the emulator's best diagnostic window opened
+
+- The trace device write stub (r799n20) now surfaces record text: on the
+  0x484eff30 entry the transfer struct is the THIRD arg (r2, caller stack /
+  heap): `{length, sub, tag(0x8NNN-ish), fmt ptr, [arg ptrs], len, lr}`;
+  the string at +0x0c is already formatted. Per-(tid,text) dedup (3x +
+  every 2000th) keeps the 849k writes loggable. EMU_TRACE_TEXT=0 disables.
+- n164 findings (2401 lines first pass):
+  * tid 81 CONSUMES our EMU_FAKE_CONNECTCONF pair: 'vHandleSVCRegConf:
+    Service 0xa registration successfull' + 'vHandleSVCStatus: Service 0xa
+    gets available' (SSTATE=0x0, RID=0x3) x2, same for svc 0x2c - the CL
+    client library DOES reach service-available state now.
+  * 'Application 0x0109: vOnServerApplicationStatus() => ServerAppState
+    changed to UNAVAILABLE' (x1) - a server the HMI (0x109) watches is
+    unavailable; candidate blocker for the navsrv pump.
+  * CtrlDisp decodes the DAPI errors: [FID=0xd] 0x218, [FID=0x8000] 0x215,
+    [FID=0x1] 0x218 - the FIDs name which FI consumer received each error.
+  * 'Application 0x001c: Wait on Queue failed 0x72010/0x72015' - app 0x1c
+    (Mmgr per base.reg THREADINFO) polling with timeouts.
+  * engine AIL traces 'Application 0x0400: An asynchronous answer is
+    awaited' + per-message poolspace lines (MsgPool telemetry -12 odd).
+- NEXT: (1) grep the full trace corpus for the navsrv/datapool producers
+  around the F6 page open (t=34s); (2) chase the UNAVAILABLE 0x0109 server;
+  (3) FID->request mapping for the 0x215/0x218 errors.
