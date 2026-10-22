@@ -2972,3 +2972,35 @@ order luck.  (The queue introduced two host panics - see n19.)
   host worker popping mbx_21/36 calling the responder with the request's
   full header; (3) svc-3/type-E DAPI job errors (client 0x0121 visible in
   job hdr word +0x0c) via Ghidra once the cryptcard container loads.
+
+## r799n25: enConnect body decoded (post-only), finavi slots are linker-initialized, popup wait needs a page-era transaction
+
+- `ProxyOutCCA::enConnect` (0x1c83520) is ARM code (prochmi mixes ARM and
+  Thumb in .text!): cs-guard -> queue resolve via `scd_bGetAppIdFromServiceId`
+  0xfc1378 (app at proxy+0xa, svc at +0xc) -> build request -> helper
+  0x1c83178 = plain `OSAL queue post` to [proxy+4] + success trace.  There
+  is NO semaphore in the proxy leg; the earlier `semh` lines belong to a
+  different waiter.  Post succeeds now (n160+), so the client-side connect
+  is complete - completion lives ONLY in the keyed completer (0x1c80adc)
+  fed by class-0x45 ServiceData whose txn ordinal matches entry+0x1c.
+- The three `finavi-global WRITE` hits (r799n22) are ld-linux RELA/GOT
+  initialization (lr 0x47371944 inside /lib/ld-linux.so.3) - the singletons
+  are statically constructed objects, not runtime creations.  The list-sel
+  global 0x2a139f8 is non-null since t=995 ms, so entries registered later
+  (svc-0x0a at t=33.6 s) should land in the re-ticked +0x28 list.
+- envigate `f-accept` accepts our fabricated 0x45 svc-0x0a answers
+  (txn 5, 23205) and `note_fi_accepted` marks them complete - but the
+  popup-era wait (mediator-sync row {0x484,0x40003630,elem 0x12649081,
+  wait 0x900006b7}) never fires: no matching transaction with the popup's
+  ordinal.  The dynstack page's own CL data-open (which should mint that
+  transaction and route the answer to element 0x12649081) never runs; its
+  binding leg is the remaining unknown.
+- Static hunt result: 0x12-domain element ids occur ONLY in the dynstack
+  ROM rows (0x25b00dc..0x25b0154 family {0x12,tab,0x90,idx}); all other
+  code-sightings were f64 constants.  The ids are composed at runtime by
+  the (not-yet-run) CL-table instantiation leg.
+- NEXT: instrument the dynstack open path for content 0x40003630: when the
+  page opens, dump who the CL-bind callback is (constructor callers of the
+  mediator-sync 0x1374f30 with content=0x40003630) and what request that
+  callback would post - then make that request flow genuine-shaped through
+  the SENSORFI responder with the page's ordinal.
