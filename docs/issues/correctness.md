@@ -3346,3 +3346,24 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
   gated to >=500 ms after navif-create so an era-1 mint can never pre-empt
   a member completion.  Expect 0xc/0xe/0x10 removes and the cascade to
   walk the remaining checks {0x1e,0x2c,0x152,0x56,0x300,...}.
+
+## r799n32d: cascade decoded further (n211) - 13 property actions, 11 completed
+
+- `bRegisterPropertiesAfterDatasetIsAvailable` (0x17c6330) structure now
+  fully clear: per service group it walks `bIsCCAServiceRequired(svc)`,
+  then for the enavi-server interface slot (0x1f->[server+0x1c] ISpeech x3
+  actions, 0x1e->[server+0x18] IPresentation x1, 0x2c->[server+0x10]
+  IRouteCalculation x3, 0x0a->[server+0x28] IEDM x6) calls each action's
+  vfn+0x24 (issue registration - deduped while pending, one fresh mint per
+  walk) and vfn+0x18 (poll: 0 = not answered -> early return, retry
+  later).  13 walk iterations in n211 = exactly the 13 actions of the
+  first four groups; keys 0xb..0x17.
+- 11 of 13 removes hit; keys 0x11/0x12 answered against holder=0x1: the
+  CL_TABLE_HOLDER stash was poisoned by a pump-lane leg on the SAME
+  0x1c7d110 probe shape (r0=1, r2=1 - bHandleSVCData's null-content early
+  leg over the raw svcdone body).  Fixed: stash requires r0>0x1000.
+- After the 13th completion no re-walk re-entered (runner asleep, last
+  tid-65 walk 35860 still saw a pending poll because of the 0x11/0x12
+  misses).  With those completing now, expect the walk to reach cmp152 /
+  cmp56 / cmp300 / cmp37 / cmp32 / cmp18 / cmp0d / cmp1f-c / cmp2c-b /
+  cmp06 / cmp7d and finally the out-byte store (`s9cascade final`).
