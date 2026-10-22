@@ -7730,6 +7730,11 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // sub-action (proc+0x30 = 0x...348 region) - a mismatch means
             // the polled sub-action is NOT the registered one.
             (0x0171_9b74u32, "bonr", 400),
+            // r799n33g: requestCommand entry (0x17b94b8): r0=sub,
+            // r1=action, r2=svc, r3=func - does the polled trio-2
+            // sub-action EVER register (and does the navif leg succeed
+            // so the vAdd into map1 runs)?
+            (0x017b_94b8u32, "rqc", 400),
             // r799n33f: the trio-2/sp2 probes moved to the s9cascade PAGE
             // hook - 0x17c6xxx is THUMB code and the trap_site(TrapMode::
             // Arm) breakpoint of the pumptrace table never fires there.
@@ -8436,6 +8441,19 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         read_u16(uc, r1.wrapping_add(4)),
                         read_u16(uc, r0.wrapping_add(0x8)),
                         read_u32(uc, r0.wrapping_add(0x14)),
+                    );
+                } else if label == "rqc" {
+                    // requestCommand entry: r0=sub, r1=action, r2=svc,
+                    // r3=func.
+                    let r1q = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let r3q = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] sub={r0:#x} act={r1q:#x} svc={:#x} func={:#x} st={}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        r2 & 0xffff,
+                        r3q & 0xffff,
+                        read_u32(uc, r1q.wrapping_add(4)),
                     );
                 } else if label == "bonr" {
                     // bOnRequest(action, event*, optype, typebase):
