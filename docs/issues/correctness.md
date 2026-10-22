@@ -2929,3 +2929,46 @@ order luck.  (The queue introduced two host panics - see n19.)
   the NAVI pool is absent (compare boot pool writer's caller table);
   (2) identify the writer that must fill the envigate holder for svc 0xa;
   (3) DAPI svc-3/type-E errors via Ghidra (needs cryptcard container load).
+
+## r799n24: datapool-master located, ARM pool-setter decoded, connect-confirm fabricated (consumed, gate unmoved)
+
+- procbaselx IS the Datapool Master: opens `DpMaster` queue, scans
+  `/var/opt/bosch/dynamic/ffs/datapool/` (`Dp00000001.dat`, `fff0/
+  DpInternData.dat`, `001c/SpmSlvDpConf.dat`) - all zero-length in the
+  emulator's FFS overlay (never persisted), so DPM starts with an empty
+  persisted pool registry.  Not fatal: the runtime default-init sweep covers
+  the element set anyway (below).
+- prochmi contains an ARM-compiled data-adapter section (file delta also
+  0x8000).  `0x13cb5a8` builds a {elem,val,obj} message and calls the
+  object's vfn+0x10; `0x13cb80c` (the `0x13cb834` under every boot dpset
+  bt) is that vfn leg: vfn+0x0c(obj, elem, valptr) - a boolean set.
+- The dp-initwatch probe (budget fixed to log domains {0x01,0x08,0x12,0x90}
+  only, n162): the entire observed set-activity is ONE sweep at t=3.4-4.1 s
+  (232 in-band + ~400 earlier silent) writing defaults across domains
+  0x80/0x21/0x2b/0x18/..., domain 0x01 gets its nine 0x1XXY000 ids.
+  Domain 0x12 (the popup's 0x12649081 family) NEVER appears, boot or late.
+  => the pool is instantiated by a leg that never runs, not merely unwritten.
+- EMU_FAKE_CONNECTCONF (r799n23) works as designed (n160): 8 pairs, svc
+  0x000a pair delivered live x2 to mbx_289, popped by tid 81 - but no
+  downstream movement: srvsetter stays state=0, no 0x1-pool init, popup
+  stays.  Consistent with r796c: the svc-0x000a CL entry never joined the
+  keyed-dispatcher container, so SERVICE_STATUS cannot route to it; the
+  container push leg is the same session-bootstrap we are hunting.
+- SCD service->app attribution is registry-driven
+  (`find_key_by_u32_value_prefer("SERVICEID")`); svc 0xa->0x15 and
+  0x1e->0x15 come from OUR registry_compat.reg seeds (real NAVAPP hive is
+  encrypted ERG), while 0x300/0x1f/0x18/0xd/0x2c -> 0x24 (AB_24,DIM,CSMA)
+  mirror base.reg THREADINFO.  mbx_36 has no consumer: PROCNAV's svc-0x1f
+  requests and part of the engine's unclaimed svc-300 drip target this
+  unhosted app.  Candidate future work: host AB_24 inside procbaselx or
+  answer its service set like the CCA directory.
+- n162 healthy: panics 0, claim-walk MATCH x12, svc-300 census 26k
+  (run variance), fastmap state markers intact.
+- NEXT: (1) statically map ProxyOutCCA::enConnect 0x1c826xx post+sem-wait
+  legs (who posts the sem - a reply-port callback inside libosal's request
+  matcher?); (2) if the matcher keys on the reply-port word (0 in our
+  requests), the provider answer must flow through libosal's own
+  request-response path, not a raw queue post - then the right fix is a
+  host worker popping mbx_21/36 calling the responder with the request's
+  full header; (3) svc-3/type-E DAPI job errors (client 0x0121 visible in
+  job hdr word +0x0c) via Ghidra once the cryptcard container loads.

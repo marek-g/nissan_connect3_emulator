@@ -4854,6 +4854,60 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         });
     }
 
+    // r799n24: the ARM-mode boolean setter wrapper `0x13cb80c` (prochmi has
+    // an ARM-compiled data-adapter section): `subs r2,r0,r0; [r4+0x10] ->
+    // object; ldmib r4,{r1,r3}; vfn+0x0c(obj, elem, valptr)` - the leg whose
+    // return address `0x13cb834` sits under every boot datapool init write
+    // (0x1-domain pools 0x1001000..0x101d000, r799n22).  The dpset filter
+    // only sees the shallow stack there, so watch this site directly with a
+    // deep (20 word) code-word scan to name the subsystem that instantiates
+    // the 0x1-domain pools - the same leg the "Starting navigation." popup's
+    // pool 0x126490xx is waiting for.
+    {
+        let address = base_address + 0x013c_b80cu32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:dp-initwatch", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            let obj = read_u32(uc, r4.wrapping_add(0x10));
+            let elem = read_u32(uc, r4.wrapping_add(4));
+            // The boot sweep initializes thousands of elements across every
+            // domain; only the ones the popup chain waits on (0x1- and
+            // 0x12-domain tables, the 0x08 event pool, 0x90 mediator-sync
+            // contents) are logged, so the budget survives the sweep and
+            // late-era table instantiation (FI-NAVI pool 0x12649x) is seen.
+            let interesting = matches!(elem >> 24, 0x01 | 0x12 | 0x08 | 0x90);
+            if !interesting {
+                if HITS.fetch_add(1, Ordering::Relaxed) % 4096 == 4095 {
+                    log::warn!(
+                        "PROCHMI dp-initwatch t={}ms (silent sweep count {})",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        HITS.load(Ordering::Relaxed),
+                    );
+                }
+                return 0;
+            }
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 30_000 {
+                return 0;
+            }
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+            let mut bt = String::new();
+            for i in 0..20u32 {
+                let w = read_u32(uc, sp.wrapping_add(i * 4));
+                if (0x00fb_7080..0x023b_eb1b).contains(&w) {
+                    bt.push_str(&format!(" {w:#x}"));
+                }
+            }
+            log::warn!(
+                "PROCHMI dp-initwatch t={}ms tid=[{}] r0={r0:#x} obj={obj:#x} elem={elem:#x} lr={lr:#x} bt:{bt}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+
     {
         let address = base_address + 0x0138_7c30u32 - ORIGINAL_BASE;
         crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:dpset-cal", move |uc: &mut Unicorn<'_, Context>| {

@@ -4237,6 +4237,43 @@ fn bridge_mbx_queue(
                 cca_server_answer_data_request_if_unhosted(unicorn, name, &body);
                 cca_server_answer_sensorfi_data_request(unicorn, name, &body);
             }
+            // r799n23: ProxyOutCCA::enConnect connect-registers.  The navsrv
+            // client's FI proxies (enconnect-entry svc 0xa/0x1e -> scd-lookup
+            // -> scd-openq) post class-0x41 ServiceRegister requests onto the
+            // provider queues mbx_21 (SENSORFI 0x0015) and mbx_36 (DIM/CSMA
+            // app 0x0024, registry THREADINFO "AB_24,DIM,CSMA") and then park
+            // on an OSAL semaphore (semh 0x4001bXXX, retried ~9x per run).
+            // Neither provider app is among the emulated processes, so the
+            // connect-confirm is fabricated here per the fidelity rule
+            // (r796 item 4): the RegisterConf+ServiceStatus pair reuses
+            // `cca_server_answer_register`, so the client's own AIL pump
+            // consumes it, the semaphore completes and the LI session
+            // bootstrap - which instantiates the 0x1-domain CL datapool
+            // family the "Starting navigation." popup waits on (element
+            // 0x12649081, r799n22) - can finally run.  Answer once per
+            // (server, client, service); `EMU_FAKE_CONNECTCONF=0` disables.
+            if matches!(name, "mbx_21" | "mbx_36")
+                && body.len() >= 0x18
+                && body[0xb] == 0x41
+                && std::env::var_os("EMU_FAKE_CONNECTCONF").is_none_or(|v| v != "0")
+            {
+                let server_app: u16 = if name == "mbx_21" { 0x0015 } else { 0x0024 };
+                let client = u16::from_le_bytes([body[0], body[1]]);
+                let service = u16::from_le_bytes([body[0x14], body[0x15]]);
+                static ANSWERED: std::sync::LazyLock<
+                    std::sync::Mutex<std::collections::HashSet<(u16, u16, u16)>>,
+                > = std::sync::LazyLock::new(Default::default);
+                let fresh = ANSWERED
+                    .lock()
+                    .unwrap()
+                    .insert((server_app, client, service));
+                if fresh {
+                    log::warn!(
+                        "[LIBOSAL-MBX] EMU_FAKE_CONNECTCONF: standing in for {name}'s absent provider (app {server_app:#06x}), answering enConnect ServiceRegister(client {client:#06x}, svc {service:#06x}) with RegisterConf+ServiceStatus onto mbx_{client} (EMU_FAKE_CONNECTCONF=0 disables)"
+                    );
+                    cca_server_answer_register(unicorn, server_app, client, service);
+                }
+            }
             trace_dapi_map_service_data(name, &body);
             // r755-diag: every mbx_0 post body once per (src, class), so the
             // HMI's AIL traffic shape (svc 0x27 subscribe?) becomes visible.
