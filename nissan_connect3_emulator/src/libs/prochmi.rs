@@ -12768,8 +12768,22 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             // itself; the cascade then re-walks and its leg succeeds as
             // soon as the completer consumes the echoed conf.
             let vsig = VSIGNALSELF_FN.load(Ordering::Relaxed);
+            // r799n33r: the wake must also run for the member-era (svc 6/
+            // 0xa) re-fires, not just the property (0x1f) era.  In BAD
+            // boots tid 65 parks in the OSAL-event sleep (event.rs blocks
+            // event waits as SleepUntil), pump-queue posts do NOT reach an
+            // event sleeper, and vSignalSelf was the ONLY wake proven to
+            // re-tick the enavi startup thread - the old 0x1f-only gate
+            // left the state-6 era with zero wakes (n253/n255: zero tid-65
+            // events for the remaining 50 s while legs kept missing).
+            let svcdone_open = SVCDONE_PENDING
+                .lock()
+                .map(|m| m.values().any(|(_, _, n)| *n < 8))
+                .unwrap_or(false);
             if vsig != 0
-                && crate::libs::libosal_linux::message::fi_era_has_pending(0x001f)
+                && (crate::libs::libosal_linux::message::fi_era_has_pending(
+                    0x001f,
+                ) || svcdone_open)
             {
                 static SIGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 let n = SIGS.fetch_add(1, Ordering::Relaxed);
