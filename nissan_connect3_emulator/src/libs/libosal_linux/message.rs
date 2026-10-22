@@ -2906,6 +2906,28 @@ pub fn note_fi_accepted(svc: u16, txn: u16) {
     }
 }
 
+/// r799n29: drop every pending re-fire.  Called by the `navif-create`
+/// probe when the HMINavServerLib object (and with it the request table's
+/// IDFactory) is (re)constructed: keys are re-minted from 1 in the new
+/// table, so a re-fire stamped with an old-era (svc, txn) would collide
+/// with a live entry of the new era - the exact collision that REMOVEd the
+/// state-9 gate's key-3 entry in n174.
+pub fn fi_era_clear_pending() {
+    let map = FI_ERA_PENDING.get_or_init(Default::default);
+    let n = if let Ok(mut m) = map.lock() {
+        let n = m.len();
+        m.clear();
+        n
+    } else {
+        0
+    };
+    if n != 0 {
+        log::warn!(
+            "[LIBOSAL-MBX] fi-era clear: dropped {n} pending re-fire answers (navsrv table rebuilt, old-era txns would collide with re-minted keys)"
+        );
+    }
+}
+
 /// Re-push every still-pending member-era answer once (the g7 gate leg
 /// observed r0==0 while the startup FSM is starved at state 5/6).  Bounded
 /// to 40 re-fires per (svc, txn).  Returns the number re-pushed.
@@ -3604,8 +3626,17 @@ fn cca_server_answer_sensorfi_data_request(
     body[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
     body[0x14..0x16].copy_from_slice(&service.to_le_bytes());
     body[0x16..0x18].copy_from_slice(&reg_id.to_le_bytes());
-    // +0x18 word: result 0 (no error), +0x19 dynamic-length 0; the function
-    // slot +0x0c stays 0 to match the reference (see comment above).
+    // r799n30: echo the requested function at +0x18.  The old "result 0"
+    // stamp made the answer a func-0 frame; the CL completer (lr 0x1c7eda4)
+    // matches key only and REMOVES the entry on any optype-9 hit, so this
+    // responder's own answer to the gate's f02 request deleted the pending
+    // gate entry (n175 33612ms: func=0 key=3 msgid 0x5000 REMOVE @33623)
+    // before the func-f02 data answer could complete it (33639ms MISS).
+    // The f02 body (`gps_data_status_answer_body`) proved the completer
+    // consumes an echoed func fine.
+    body[0x18..0x1a].copy_from_slice(&function.to_le_bytes());
+    // +0x19 dynamic-length 0; the +0x0c function slot stays 0 to match the
+    // reference (see comment above).
     body[0x1a] = 9; // OPTYPE: server data response
     // r797b (f216/f217): the navsrv pump (0x17cb574) hands the CL completer
     // exactly two halfwords parsed out of every 0x45: byte +0x1b (service

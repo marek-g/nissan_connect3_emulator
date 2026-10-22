@@ -776,6 +776,20 @@ thread_local! {
 static SVC6_TXN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, u16>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// r799n29: the (svc, ordinal, entry) tuples the fi-ready leg already
+/// answered.  Formerly a function-local static; hoisted so the
+/// `navif-create` probe can clear it (together with `SVC6_TXN` and
+/// message.rs's `FI_ERA_PENDING`) whenever the HMINavServerLib object is
+/// (re)constructed.  The request table carries ONE IDFactory; a rebuild
+/// re-mints keys from 1, so ordinals recorded in an earlier era collide
+/// with live entries of the new one - in n174 a stale g-m18 re-fire stamped
+/// svc-6 txn 3 hit the gate's (svc 0x000a) key-3 entry and REMOVEd it,
+/// which is why state 9 never set its out-byte.  Clearing keeps every
+/// fabricated answer era-local.
+static FI_READY_ANSWERED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<(u16, u16, u32)>>,
+> = std::sync::LazyLock::new(Default::default);
+
 pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     PROCHMI_BASE.store(base_address, Ordering::Relaxed);
     // r789d one-shot diagnostic (EMU_PROCHMI_XREF_SCAN=1).  prochmi is
@@ -5727,6 +5741,21 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             }
             let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
             let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            if label == "navif-create" {
+                // r799n29: the HMINavServerLib (and its request table with
+                // the shared IDFactory) is (re)built here.  Wipe every
+                // fabricated-answer bookkeeping keyed by transactions of the
+                // OLD table so no stale stamp can collide with a re-minted
+                // key (n174: stale svc-6 txn 3 REMOVEd the gate's key-3
+                // entry and stuck state 9 forever).
+                if let Ok(mut m) = SVC6_TXN.lock() {
+                    m.clear();
+                }
+                if let Ok(mut s) = FI_READY_ANSWERED.lock() {
+                    s.clear();
+                }
+                crate::libs::libosal_linux::message::fi_era_clear_pending();
+            }
             log::warn!(
                 "PROCHMI navif-chain {label} t={}ms tid=[{}] r0={r0:#x} lr={lr:#x}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
@@ -6653,7 +6682,20 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // EMU_FAKE_FI_READY_PUSH=0 disable the legs.
                 let ordinal =
                     (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff) as u16;
-                if svc == 6 && (st == 0 || st == 1) {
+                // r799n29: sanity.  The request table's IDFactory mints
+                // small monotonically increasing keys per era; a captured
+                // r1 far out of that range (n174: 0x5aa5) is a different
+                // value in r1 at this site, not the transaction ordinal -
+                // answering with it only produces permanent key misses.
+                if ordinal > 0x100 {
+                    static OOB: AtomicU32 = AtomicU32::new(0);
+                    if OOB.fetch_add(1, Ordering::Relaxed) < 8 {
+                        log::warn!(
+                            "PROCHMI conf-store: implausible ordinal {ordinal:#x} for svc {svc:#06x} entry {entry:#x} (IDFactory keys are small per era) - not answering",
+                        );
+                    }
+                }
+                if svc == 6 && (st == 0 || st == 1) && ordinal <= 0x100 {
                     // Record the live transaction ordinal per entry so the
                     // g-m18 starvation leg can re-fire the completion push.
                     if let Ok(mut m) = SVC6_TXN.lock() {
@@ -6668,7 +6710,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // (f239 g-list-mem: only mem[1] ever won).  One push per
                 // (service, ordinal) still bounds the traffic, and a READY
                 // entry stops re-driving (the state-2 leg never re-sends).
-                if *label == "conf-store" && (st == 0 || st == 1) {
+                if *label == "conf-store" && (st == 0 || st == 1) && ordinal <= 0x100 {
                     // r798b: ordinal 0 stays answerable: two svc-0x06
                     // members register with it (f240) and only a key-0 push
                     // can complete them; a wrong-key match is a no-op in the
@@ -6681,6 +6723,19 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             );
                             crate::libs::libosal_linux::message::cca_post_deferred_status(
                                 uc, 0x0015, 0x0121, 0x000a,
+                            );
+                        }
+                        // r799n29: answer EVERY gate registration (once per
+                        // ordinal), not just the first.  When bRun's state-1
+                        // leg re-mints a new key the old single-shot answer
+                        // left the re-stamped entry forever unanswered.
+                        let fresh = FI_READY_ANSWERED
+                            .lock()
+                            .map(|mut s| s.insert((0x000a, ordinal, entry)))
+                            .unwrap_or(true);
+                        if fresh {
+                            log::warn!(
+                                "[LIBOSAL-MBX] gate svc 0x000a txn {ordinal}: GpsDataStatus answer for entry {entry:#x} (one per registration, echoes this store's ordinal)"
                             );
                             crate::libs::libosal_linux::message::fabricate_fi_data_request(
                                 uc, 0x000a, ordinal,
@@ -6713,14 +6768,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         // push shape) drove the gate's READY store.  The
                         // startup entry therefore needs its own event-0
                         // completion like the other unhosted confs.
-                        static ANSWERED: std::sync::OnceLock<
-                            std::sync::Mutex<std::collections::HashSet<(u16, u16, u32)>>,
-                        > = std::sync::OnceLock::new();
-                        let set = ANSWERED.get_or_init(Default::default);
-                        // r798b: keyed by ENTRY too - f240 saw two svc-0x06
-                        // members register with transaction 0, and a
-                        // (svc, ordinal) dedup left one of them starved.
-                        let fresh = set
+                        let fresh = FI_READY_ANSWERED
                             .lock()
                             .map(|mut s| s.insert((svc as u16, ordinal, entry)))
                             .unwrap_or(true);
@@ -8586,9 +8634,17 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     // with the recorded ordinal - each attempt is a fresh
                     // chance against tid 84's Wait on mbx_289, and a READY
                     // entry stops asking (getter != 0 from then on).
+                    // r799n30: restored (removing it in n29 stalled the FSM
+                    // at state 6 in n175 - one push per registration loses
+                    // the mbx_289 race and nothing else completes members).
+                    // Era-safe now: SVC6_TXN is cleared on `navif-create`
+                    // (the table rebuild re-mints keys) and implausible
+                    // ordinals (r1 misreads, n174: 0x5aa5) are not recorded.
                     let m = read_u32(uc, r4);
                     if read_u32(uc, m.wrapping_add(4)) == 1 {
-                        let ord = SVC6_TXN.lock().ok().and_then(|t| t.get(&m).copied());
+                        let ord = SVC6_TXN.lock().ok().and_then(|t| {
+                            t.get(&m).copied().filter(|o| *o <= 0x100)
+                        });
                         static RP: AtomicU32 = AtomicU32::new(0);
                         if let Some(o) = ord {
                             if RP.fetch_add(1, Ordering::Relaxed) < 300 {
