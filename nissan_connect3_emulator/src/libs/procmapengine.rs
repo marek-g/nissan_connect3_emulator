@@ -10032,7 +10032,6 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
 /// registered under everywhere else, so no answer is invented - the engine
 /// still builds and delivers the reply itself.
 fn ensure_posfi_admin_registration(unicorn: &mut Unicorn<'_, Context>, obj: u32, msg: u32) {
-    static ADMIN_NODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let mut list = read_u32_or_invalid(unicorn, obj.wrapping_add(0x5c));
     if list >= 0xf000_0000 || list == 0 {
         // The administration request-list was never built either (the ctor
@@ -10069,11 +10068,33 @@ fn ensure_posfi_admin_registration(unicorn: &mut Unicorn<'_, Context>, obj: u32,
     if content >= 0xf000_0000 {
         return;
     }
-    // Only stamp the posfi service requests this registration answers.
-    if read_u16_or_invalid(unicorn, content.wrapping_add(0x14)) != 0x1e {
+    // r799n20: generalize beyond posfi.  Stamp only requests whose SERVER is
+    // the STAT application (0x16), for the two services this stand-in covers:
+    //   - svc 0x1e (posfi) under register-id 0x17, as everywhere else;
+    //   - svc 0x300 (STAT command service).  The engine's own client
+    //     reference mints op-1 class-0x45 re-examine requests (src=0x400,
+    //     dst=0x16) for it; without the provider's admin item the claim walk
+    //     misses and the AIL spec's "re-post until claimable" leg degenerates
+    //     into a tight self-post loop (54k-152k msg/s on mbx_1024,
+    //     n134-n141).  On the unit these items exist because the provider
+    //     registration crosses the dualOS CCA sync we do not have; claiming
+    //     the item here makes the engine answer/forward for real (the answer
+    //     goes to port [app+0x54] = mbx_22 and STAT processes it itself).
+    let server = read_u16_or_invalid(unicorn, content.wrapping_add(0x02)) as u16;
+    let svc = read_u16_or_invalid(unicorn, content.wrapping_add(0x14)) as u16;
+    if server != 0x16 || !matches!(svc, 0x1e | 0x300) {
         return;
     }
-    let mut node = ADMIN_NODE.load(Ordering::Relaxed);
+    let regid: u16 = if svc == 0x1e {
+        0x17
+    } else {
+        read_u16_or_invalid(unicorn, content.wrapping_add(0x16)) as u16
+    };
+    static NODES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(u16, u16), u32>>> =
+        std::sync::LazyLock::new(Default::default);
+    let key = (svc, regid);
+    let mut nodes = NODES.lock().unwrap();
+    let mut node = nodes.get(&key).copied().unwrap_or(0);
     if node != 0 {
         // Already built: cheap membership check, re-link if the guest dropped it.
         let mut walk = read_u32_or_invalid(unicorn, list + 4);
@@ -10098,17 +10119,18 @@ fn ensure_posfi_admin_registration(unicorn: &mut Unicorn<'_, Context>, obj: u32,
             0 => return,
             a => a,
         };
-        ADMIN_NODE.store(addr, Ordering::Relaxed);
+        nodes.insert(key, addr);
         node = addr;
     }
+    drop(nodes);
     let mut bytes = vec![0u8; 48];
     // item (node + 8) per the ctor leg at 0x66e538: type 1 at item+4.
     bytes[8 + 4] = 1;
-    bytes[8 + 0x0c] = 0x16; // server: STAT application
-    bytes[8 + 0x0e] = 0x1e; // service: posfi
     let uniq = (read_u32_or_invalid(unicorn, content.wrapping_add(0x0c)) >> 16) as u16;
+    bytes[8 + 0x0c..8 + 0x0e].copy_from_slice(&server.to_le_bytes());
+    bytes[8 + 0x0e..8 + 0x10].copy_from_slice(&svc.to_le_bytes());
     bytes[8 + 0x10..8 + 0x12].copy_from_slice(&uniq.to_le_bytes());
-    bytes[8 + 0x12] = 0x17; // register-id the provider registered under
+    bytes[8 + 0x12..8 + 0x14].copy_from_slice(&regid.to_le_bytes());
     let w1c = read_u16_or_invalid(unicorn, content.wrapping_add(0x1c)) as u16;
     bytes[8 + 0x14..8 + 0x16].copy_from_slice(&w1c.to_le_bytes());
     let w24 = read_u16_or_invalid(unicorn, content.wrapping_add(0x24)) as u16;
@@ -10144,7 +10166,7 @@ fn ensure_posfi_admin_registration(unicorn: &mut Unicorn<'_, Context>, obj: u32,
         return;
     }
     log::warn!(
-        "PROCMAPENGINE: registered posfi admin reference {{srv 0x16, svc 0x1e, reg 0x17, uniq {uniq:#x}, w1c {w1c:#x}, w24 {w24:#x}}} in list {list:#x} (node {node:#x}, size {size} -> {}) - STAT svc-0x1e claims need it",
+        "PROCMAPENGINE: registered STAT admin reference {{srv {server:#x}, svc {svc:#x}, reg {regid:#x}, uniq {uniq:#x}, w1c {w1c:#x}, w24 {w24:#x}}} in list {list:#x} (node {node:#x}, size {size} -> {}) - STAT svc-0x1e/0x300 claims need it",
         size + 1
     );
 }
@@ -10291,7 +10313,12 @@ fn add_reg_chase_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     // svc lives in the message *content* ([msg + 4]), not the
                     // message object itself.
                     let content = read_u32_or_invalid(uc, msg.wrapping_add(4));
-                    if read_u16_or_invalid(uc, content.wrapping_add(0x14)) != 0x1e {
+                    // r799n20: also observe svc-0x300 (the STAT
+                    // command-service re-examine storm) - the old 0x1e-only
+                    // filter made every sdata leg blind while the storm
+                    // messages (if they reach it) silently consumed it.
+                    let svc = read_u16_or_invalid(uc, content.wrapping_add(0x14));
+                    if svc != 0x1e && svc != 0x300 {
                         return 0;
                     }
                     if NS.fetch_add(1, Ordering::Relaxed) >= 60 {
@@ -10413,6 +10440,68 @@ fn add_reg_chase_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                 0
             }
         });
+    }
+
+    // r799n20: the mbx_1024 svc-0x300 self-post storm re-posts message refs
+    // through the wrapper at 0x670634 (guest Post census caller
+    // module+0x66869c -> VA 0x67069c, the return site inside it).  Both the
+    // narrow svc-patch trap and its legacy fallback under-reported (5 of
+    // 80k passes - the dead-TB quirk again), so watch the whole 4 KiB page
+    // and dispatch on the exact fetch address (XP_PAGES pattern).
+    {
+        let page = (base_address + (0x0067_0000u32 - ORIGINAL_BASE)) as u64;
+        let result = unicorn.add_code_hook(page, page + 0x1000, move |uc, addr, _| {
+            if addr != (base_address + (0x0067_0634u32 - ORIGINAL_BASE)) as u64 {
+                return;
+            }
+            static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(u32, u32), u32>>> =
+                std::sync::LazyLock::new(Default::default);
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::LR).unwrap_or(0) as u32;
+            // Wrapper(args: r0=0x400-ish id, r1=queue handle, r2=buf,
+            // r3=?); it builds the 8-byte ref from r2 and posts via libosal,
+            // so dump the ref source buffer: [type, content, ...].
+            let w0 = read_u32_or_invalid(uc, r2);
+            let w1 = read_u32_or_invalid(uc, r2.wrapping_add(4));
+            let w2 = read_u32_or_invalid(uc, r2.wrapping_add(8));
+            let content = w1;
+            let class = read_u16_or_invalid(uc, content.wrapping_add(0x0b));
+            let svc = read_u16_or_invalid(uc, content.wrapping_add(0x14));
+            // Every outer leg funnels through the same caller (lr=0x660eec),
+            // so the discriminating information is one frame up: scan the
+            // stack for engine-code return-address candidates.
+            let mut bt: Vec<u32> = Vec::new();
+            for idx in 0..24u32 {
+                let w = read_u32_or_invalid(uc, r2.wrapping_add(idx * 4));
+                if w >= 0x000a_0000 && w < 0x0078_0000 {
+                    bt.push(w);
+                    if bt.len() >= 6 {
+                        break;
+                    }
+                }
+            }
+            let mut seen = SEEN.lock().unwrap();
+            let total: u32 = seen.values().sum();
+            let e = seen.entry((r1, svc)).or_insert(0);
+            *e += 1;
+            if *e > 2 || total > 400 {
+                return;
+            }
+            log::warn!(
+                "PROCMAPENGINE repost-caller t={}ms tid=[{}] wrapper r0={r0:#x} q={r1:#x} buf={r2:#x} r3={r3:#x} buf[0..12)={w0:#x},{w1:#x},{w2:#x} class={class:#x} svc={svc:#x} lr={lr:#x} bt={bt:?} x{} (n={})",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                *e,
+                class,
+            );
+        });
+        match result {
+            Ok(_) => log::info!("PROCMAPENGINE: repost-caller page watch {page:#x}"),
+            Err(error) => log::warn!("PROCMAPENGINE: cannot hook repost page {page:#x}: {error}"),
+        }
     }
 }
 
