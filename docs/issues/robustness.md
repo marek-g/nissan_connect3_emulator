@@ -70,3 +70,32 @@ Gating `add_fastmap_channel_trace_hooks` behind EMU_PROCMAP_TRACE stalled boot
 first try. The cause was functional (`FASTMAP_STATUS_APPLIED` flag written by
 that family's observer), not the removal of per-instruction pacing. Recorded
 so future hook cleanups classify by callback side effects, not naming.
+
+## Flaky boot: state 6 never closes (n234/n240/n241/n242, ~40% of runs)
+
+- Symptom identical across runs: tid 65 reaches state 6 (v36 s) and sleeps
+  forever; the state-6 gate walk (s9gate/g-list on tid 65, ~90 ms period)
+  keeps seeing member actions state=1 until the run dies.
+- Mechanism: the gate walk only POLLS [member+4]; a member flips DONE in
+  bOnRequest/bNotifyWhenRunning when a leg answers it (orca1 pPop hit ->
+  bOnRequest(ev=0) flips via the error-complete LAB 0x171aa50).  In BAD
+  boots several late members (the re-minted registrations around v36.7)
+  get NO answering leg: their (svc 0x06, txn) pushes pile up on mbx_289
+  unconsumed (n241: txn 11 re-fired 60x; n242: txn 4 x18, txn 5 x24),
+  only the timeout legs (ev=0x80000215/0x80000218) reach the action,
+  which RESETS it for retry (bOnRequest warning path) -> never DONE.
+- GOOD boots differ exactly there: every member txn gets a consumed
+  ev=0x0 leg within 1-2 s (n239 bonr: all svc-6 funcs ev=0, + a tolerated
+  0x8000/0x1 straggler).  The consumer that drains mbx_289 in that window
+  is not pinned down yet (tid-81 rx legs vs tid-84 enConnect theft).
+- Mitigations landed (r799n33h): (a) 1 Hz navi-server ServiceStatus
+  re-publish while state 6 (cca_post_deferred_status, bounded 15) for the
+  early-READY-edge variant; (b) the state-9 1 Hz pump-first SENSORFI kick
+  + era re-fire now also run in state 6 - the unit's SENSORFI broadcast
+  re-ticks the FSM for its whole life, and without a pump event nothing
+  drains mbx_289 late in state 6.  (b) fixed the func-0x1 member in n242
+  but not the whole set - the remaining BAD variant is still open.
+- NOT the cause (checked): the state-4 sleep length (normal in n240-242);
+  navsrv-svcready/vSvcReady guards (identical GOOD vs BAD); gate action
+  itself (reaches DONE=2 in n241 while s7 still missing - the blockers
+  are the svc-0x6 members + their parent procs 0x..11670/0x..11498).
