@@ -10031,7 +10031,13 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
 /// service 0x1e, register-id 0x17) are the constants the posfi stand-in is
 /// registered under everywhere else, so no answer is invented - the engine
 /// still builds and delivers the reply itself.
-fn ensure_posfi_admin_registration(unicorn: &mut Unicorn<'_, Context>, obj: u32, msg: u32) {
+fn ensure_posfi_admin_registration(
+    unicorn: &mut Unicorn<'_, Context>,
+    obj: u32,
+    msg: u32,
+    case: u16,
+    walk_r4: u16,
+) {
     let mut list = read_u32_or_invalid(unicorn, obj.wrapping_add(0x5c));
     if list >= 0xf000_0000 || list == 0 {
         // The administration request-list was never built either (the ctor
@@ -10068,35 +10074,37 @@ fn ensure_posfi_admin_registration(unicorn: &mut Unicorn<'_, Context>, obj: u32,
     if content >= 0xf000_0000 {
         return;
     }
-    // r799n20: generalize beyond posfi.  Stamp only requests whose SERVER is
-    // the STAT application (0x16), for the two services this stand-in covers:
-    //   - svc 0x1e (posfi) under register-id 0x17, as everywhere else;
-    //   - svc 0x300 (STAT command service).  The engine's own client
-    //     reference mints op-1 class-0x45 re-examine requests (src=0x400,
-    //     dst=0x16) for it; without the provider's admin item the claim walk
-    //     misses and the AIL spec's "re-post until claimable" leg degenerates
-    //     into a tight self-post loop (54k-152k msg/s on mbx_1024,
-    //     n134-n141).  On the unit these items exist because the provider
-    //     registration crosses the dualOS CCA sync we do not have; claiming
-    //     the item here makes the engine answer/forward for real (the answer
-    //     goes to port [app+0x54] = mbx_22 and STAT processes it itself).
-    let server = read_u16_or_invalid(unicorn, content.wrapping_add(0x02)) as u16;
+    // r799n21: the walk live-dump (n150) pinned the comparator 0x66e650
+    // arguments at the 0x66a2f0 leg: {r1 = request src (msg+0x00), r2 = fp =
+    // request register-id (msg+0x16), r3 = the dispatcher's case code
+    // ([sp+0x24], seen 2..4 and growing), r4 = [sp+0x28] (the request's
+    // u16@msg+0x0e)} - NOT the service.  A statically stamped item therefore
+    // goes stale the moment STAT moves to a new register-id (0x17 -> 0x010c
+    // observed) or case; keep one item per (src,svc) and re-stamp its
+    // compared fields from every request before the walk runs.  This still
+    // fabricates nothing but the registration record (the provider's admin
+    // item, missing here because the dualOS CCA sync is not emulated): the
+    // claim only decides the engine handles the request - the reply is built
+    // and delivered by the engine's own code.
+    let server = read_u16_or_invalid(unicorn, content.wrapping_add(0x00)) as u16;
     let svc = read_u16_or_invalid(unicorn, content.wrapping_add(0x14)) as u16;
-    if server != 0x16 || !matches!(svc, 0x1e | 0x300) {
+    if !(matches!(svc, 0x1e | 0x300) && matches!(server, 0x16 | 0x400)) {
         return;
     }
-    let regid: u16 = if svc == 0x1e {
-        0x17
-    } else {
-        read_u16_or_invalid(unicorn, content.wrapping_add(0x16)) as u16
-    };
+    let regid: u16 = read_u16_or_invalid(unicorn, content.wrapping_add(0x16)) as u16;
     static NODES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(u16, u16), u32>>> =
         std::sync::LazyLock::new(Default::default);
-    let key = (svc, regid);
+    let key = (server, svc);
     let mut nodes = NODES.lock().unwrap();
     let mut node = nodes.get(&key).copied().unwrap_or(0);
     if node != 0 {
-        // Already built: cheap membership check, re-link if the guest dropped it.
+        // Already built: re-stamp the compared fields with this request's
+        // live tuple, then link-check.
+        let mut fresh = [0u8; 8];
+        fresh[0..2].copy_from_slice(&case.to_le_bytes());
+        fresh[2..4].copy_from_slice(&walk_r4.to_le_bytes());
+        fresh[4..6].copy_from_slice(&regid.to_le_bytes());
+        let _ = unicorn.mem_write(node as u64 + 8 + 0x0e, &fresh);
         let mut walk = read_u32_or_invalid(unicorn, list + 4);
         let mut steps = 0u32;
         while (0x1000..0xf000_0000).contains(&walk) && steps < 16 {
@@ -10126,10 +10134,9 @@ fn ensure_posfi_admin_registration(unicorn: &mut Unicorn<'_, Context>, obj: u32,
     let mut bytes = vec![0u8; 48];
     // item (node + 8) per the ctor leg at 0x66e538: type 1 at item+4.
     bytes[8 + 4] = 1;
-    let uniq = (read_u32_or_invalid(unicorn, content.wrapping_add(0x0c)) >> 16) as u16;
     bytes[8 + 0x0c..8 + 0x0e].copy_from_slice(&server.to_le_bytes());
-    bytes[8 + 0x0e..8 + 0x10].copy_from_slice(&svc.to_le_bytes());
-    bytes[8 + 0x10..8 + 0x12].copy_from_slice(&uniq.to_le_bytes());
+    bytes[8 + 0x0e..8 + 0x10].copy_from_slice(&case.to_le_bytes());
+    bytes[8 + 0x10..8 + 0x12].copy_from_slice(&walk_r4.to_le_bytes());
     bytes[8 + 0x12..8 + 0x14].copy_from_slice(&regid.to_le_bytes());
     let w1c = read_u16_or_invalid(unicorn, content.wrapping_add(0x1c)) as u16;
     bytes[8 + 0x14..8 + 0x16].copy_from_slice(&w1c.to_le_bytes());
@@ -10166,7 +10173,7 @@ fn ensure_posfi_admin_registration(unicorn: &mut Unicorn<'_, Context>, obj: u32,
         return;
     }
     log::warn!(
-        "PROCMAPENGINE: registered STAT admin reference {{srv {server:#x}, svc {svc:#x}, reg {regid:#x}, uniq {uniq:#x}, w1c {w1c:#x}, w24 {w24:#x}}} in list {list:#x} (node {node:#x}, size {size} -> {}) - STAT svc-0x1e/0x300 claims need it",
+        "PROCMAPENGINE: registered STAT admin reference {{srv {server:#x}, svc {svc:#x}, reg {regid:#x}, case {case:#x}, r4 {walk_r4:#x}, w1c {w1c:#x}, w24 {w24:#x}}} in list {list:#x} (node {node:#x}, size {size} -> {}) - STAT svc-0x1e/0x300 claims need it",
         size + 1
     );
 }
@@ -10216,7 +10223,9 @@ fn add_claim_leg_repair_hook(unicorn: &mut Unicorn<'_, Context>, base_address: u
                 read_u32_or_invalid(uc, if l5c < 0xf000_0000 { l5c + 0xc } else { 0 }),
             );
         }
-        ensure_posfi_admin_registration(uc, app, msg);
+        let case = read_u16_or_invalid(uc, sp.wrapping_add(0x24)) as u16;
+        let walk_r4 = read_u16_or_invalid(uc, sp.wrapping_add(0x28)) as u16;
+        ensure_posfi_admin_registration(uc, app, msg, case, walk_r4);
         0
     });
     let site = base_address + (0x0066_9c9cu32 - ORIGINAL_BASE);
@@ -10232,7 +10241,9 @@ fn add_claim_leg_repair_hook(unicorn: &mut Unicorn<'_, Context>, base_address: u
                 ensure_posfi_ref_linked(uc, app);
                 ensure_dapi_map_service_reference(uc, app);
                 if msg < 0xf000_0000 {
-                    ensure_posfi_admin_registration(uc, app, msg);
+                    let case = read_u16_or_invalid(uc, sp.wrapping_add(0x24)) as u16;
+                    let walk_r4 = read_u16_or_invalid(uc, sp.wrapping_add(0x28)) as u16;
+                    ensure_posfi_admin_registration(uc, app, msg, case, walk_r4);
                 }
             }
         }
@@ -10280,7 +10291,16 @@ fn add_reg_chase_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
         (0x0066_9c8c, "sdata-sp3c-check (r0)"),
         (0x0066_ce30, "exm-zero-after-66963c (r7=msg)"),
         (0x0066_a128, "sdata-leg5c-size (r0=[+0x5c].size)"),
+        (0x0066_9cf0, "sdata-50walk-miss"),
+        (0x0066_9d18, "sdata-sub2-flag"),
+        (0x0066_9d58, "sdata-resolve-fail"),
+        (0x0066_9d70, "sdata-port-leg (r0=[app+0x54])"),
+        (0x0066_9ddc, "sdata-sp3c-null-bail"),
+        (0x0066_a638, "sdata-resolve0-bail"),
+        (0x0066_9edc, "sdata-50ref-send (r0=send-res)"),
+        (0x0066_a0d0, "sdata-50ref-sent-ok"),
         (0x0066_a2f0, "claim5c-cmp (r0=node+8)"),
+        (0x0066_a2c4, "claim5b-cmp (r0=item)"),
         (0x0066_a36c, "claim-walk-hit (bIsDataSet true)"),
         (0x0066_a390, "claim-walk-success (returns 1)"),
         (0x0066_9bcc, "leg5-gate (r0: opcode ok)"),
@@ -10321,7 +10341,16 @@ fn add_reg_chase_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                     if svc != 0x1e && svc != 0x300 {
                         return 0;
                     }
-                    if NS.fetch_add(1, Ordering::Relaxed) >= 60 {
+                    // r799n21: per-label budget - the hot entry legs used to
+                    // starve the rarer exit-decision probes with a shared
+                    // 400-hit counter.
+                    static NL: std::sync::LazyLock<
+                        std::sync::Mutex<std::collections::HashMap<(String, u32), u32>>,
+                    > = std::sync::LazyLock::new(Default::default);
+                    let mut nl = NL.lock().unwrap();
+                    let c = nl.entry((label.clone(), svc)).or_insert(0);
+                    *c += 1;
+                    if *c >= 16 {
                         return 0;
                     }
                 }
@@ -10383,27 +10412,37 @@ fn add_reg_chase_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                             u,
                             w & 0xffff,
                         )
-                    } else if label.contains("sdata-") || label.contains("claim-walk") {
+                    } else if label.contains("sdata-")
+                        || label.contains("claim-walk")
+                        || label.contains("claim5c")
+                    {
                         let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
                         let msg = read_u32_or_invalid(uc, sp.wrapping_add(0x18));
                         let content = read_u32_or_invalid(uc, msg.wrapping_add(4));
                         let obj = read_u32_or_invalid(uc, r8);
                         let sem = read_u32_or_invalid(uc, obj.wrapping_add(0x2c));
                         let mut extra = String::new();
-                        if label.contains("claim5c") {
-                            // Tuple the comparator 0x66e5e0 consumes: the item
-                            // fields (+0xc server, +0xe svc, +0x10 unique,
-                            // +0x12 reg-id, +0x14 msg+0x1c) must equal these.
-                            let item = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                        if label.contains("claim5") {
+                            // Tuple the comparator 0x66e650 actually receives
+                            // at this call site.  claim5c (0x66a2f0): r0 is
+                            // still the raw node, `add r0,#8` runs one
+                            // instruction later.  claim5b (0x66a2c4, case-2
+                            // leg): the add ran at 0x66a2b0 already.
+                            // r1=[sp+0x20], r2=fp, r3=[sp+0x24] (5c) /
+                            // [sp+0x28] (5b), r4=[sp+0x28] (5c) / [sp] (5b).
+                            // Comparator: +0xc==r1, +0x12==r2, +0x0e==r3,
+                            // +0x10==r4.
+                            let sp2 = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                            let is5b = label.contains("claim5b");
+                            let item = if is5b { r0 } else { r0.wrapping_add(8) };
+                            let r3s = if is5b { 0x28 } else { 0x24 };
+                            let r4s = if is5b { 0x0 } else { 0x28 };
                             extra = format!(
-                                " want srv={:#06x} svc={:#06x} uniq={:#06x} reg={:#06x} w1c={:#06x} w24={:#06x} b2c={:#04x} | item[4]={:#04x} c={:04x},e={:04x},10={:04x},12={:04x},14={:04x},20={:04x}",
-                                read_u16_or_invalid(uc, content),
-                                read_u16_or_invalid(uc, content.wrapping_add(0x14)),
-                                read_u16_or_invalid(uc, content.wrapping_add(0x0e)),
-                                read_u16_or_invalid(uc, content.wrapping_add(0x16)),
-                                read_u16_or_invalid(uc, content.wrapping_add(0x1c)),
-                                read_u16_or_invalid(uc, content.wrapping_add(0x24)),
-                                read_u32_or_invalid(uc, content.wrapping_add(0x2c)) & 0xff,
+                                " args r1={:#06x} r2fp={:#06x} r3={:#06x} r4={:#06x} | item+4={:#04x} c={:04x},e={:04x},10={:04x},12={:04x},14={:04x},20={:04x}",
+                                read_u16_or_invalid(uc, sp2.wrapping_add(0x20)),
+                                uc.reg_read(RegisterARM::R11).unwrap_or(0) as u32 & 0xffff,
+                                read_u16_or_invalid(uc, sp2.wrapping_add(r3s)),
+                                read_u16_or_invalid(uc, sp2.wrapping_add(r4s)),
                                 read_u32_or_invalid(uc, item.wrapping_add(4)) & 0xff,
                                 read_u16_or_invalid(uc, item.wrapping_add(0xc)),
                                 read_u16_or_invalid(uc, item.wrapping_add(0xe)),
@@ -10414,7 +10453,10 @@ fn add_reg_chase_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
                             );
                         }
                         format!(
-                            " msg={msg:#x} content={content:#x} this={r8:#x} obj=[this]={obj:#x} sem=[obj+0x2c]={sem:#x} state[obj+0x30]={:#x}{extra}",
+                            " msg={msg:#x} content={content:#x} svc={:#x} s40={:#x} s44={:#x} this={r8:#x} obj=[this]={obj:#x} sem=[obj+0x2c]={sem:#x} state[obj+0x30]={:#x}{extra}",
+                            read_u16_or_invalid(uc, content.wrapping_add(0x14)),
+                            read_u32_or_invalid(uc, sp.wrapping_add(0x40)),
+                            read_u32_or_invalid(uc, sp.wrapping_add(0x44)),
                             read_u32_or_invalid(uc, obj.wrapping_add(0x30))
                         )
                     } else if label.contains("claim-cmp") {
@@ -10487,7 +10529,7 @@ fn add_reg_chase_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
             let total: u32 = seen.values().sum();
             let e = seen.entry((r1, svc)).or_insert(0);
             *e += 1;
-            if *e > 2 || total > 400 {
+            if *e > 5 || total > 500 {
                 return;
             }
             log::warn!(
@@ -10502,6 +10544,85 @@ fn add_reg_chase_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
             Ok(_) => log::info!("PROCMAPENGINE: repost-caller page watch {page:#x}"),
             Err(error) => log::warn!("PROCMAPENGINE: cannot hook repost page {page:#x}: {error}"),
         }
+    }
+
+    // r799n21: the consumer leg of the app-interface service loop 0x66163c
+    // (the tid-60/61 AIL pump).  Its receive call sits at 0x6616d8
+    // (`bl 0x670868` - unrelocatable, so watch the page and dispatch on the
+    // fetch address).  Dump which queue it waits on plus the object fields
+    // that decide the retry behaviour: [r4+0x08] app id, [r4+0x10] service,
+    // [r4+0x30] state (3 = the retry-later storm state), [r4+0x60] handler,
+    // [r4+0x78] receive queue handle, [r4+0x80/84] semaphore pair.
+    {
+        let page = (base_address + (0x0066_1000u32 - ORIGINAL_BASE)) as u64;
+        let site = base_address + (0x0066_16d8u32 - ORIGINAL_BASE) as u32;
+        let result = unicorn.add_code_hook(page, page + 0x1000, move |uc, addr, _| {
+            if addr != site as u64 {
+                return;
+            }
+            static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(u32, u32), u32>>> =
+                std::sync::LazyLock::new(Default::default);
+            let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            let q = read_u32_or_invalid(uc, r4.wrapping_add(0x78));
+            let mut seen = SEEN.lock().unwrap();
+            let total: u32 = seen.values().sum();
+            let e = seen.entry((r4, q)).or_insert(0);
+            *e += 1;
+            if *e > 3 || total > 60 {
+                return;
+            }
+            log::warn!(
+                "PROCMAPENGINE ail-consumer t={}ms tid=[{}] obj={r4:#x} app={:#x} svc={:#x} state={:#x} handler={:#x} recvq={q:#x} sem={:#x},{:#x} x{}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                read_u16_or_invalid(uc, r4.wrapping_add(0x08)),
+                read_u16_or_invalid(uc, r4.wrapping_add(0x10)),
+                read_u32_or_invalid(uc, r4.wrapping_add(0x30)),
+                read_u32_or_invalid(uc, r4.wrapping_add(0x60)),
+                read_u32_or_invalid(uc, r4.wrapping_add(0x80)),
+                read_u32_or_invalid(uc, r4.wrapping_add(0x84)),
+                *e,
+            );
+        });
+        match result {
+            Ok(_) => log::info!("PROCMAPENGINE: ail-consumer page watch {page:#x}"),
+            Err(error) => log::warn!("PROCMAPENGINE: cannot hook ail-consumer page {page:#x}: {error}"),
+        }
+    }
+
+    // r799n21: the +0x50 client-ref answer leg of ail_bHandleMsgServiceData
+    // (svc-0x300 re-examine family, n156: 300 never reaches the leg-5c walk):
+    // right after 0x66df4c resolved the reply port [app+0x54], r2 holds the
+    // queue handle the follow-up will be posted to.  If that equals the
+    // engine's OWN receive queue (0x400939f8) the STAT-bound send loops back
+    // into mbx_1024 - the self-post storm.  Dump the port object too.
+    {
+        let site = base_address + (0x0066_9ec0u32 - ORIGINAL_BASE);
+        crate::os::code_stub::trap_site(unicorn, site, crate::os::code_stub::TrapMode::Arm, "libs/procmapengine.rs:port-resolve", move |uc: &mut Unicorn<'_, Context>| {
+            static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, u32>>> =
+                std::sync::LazyLock::new(Default::default);
+            let resolved = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let app = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+            let port = read_u32_or_invalid(uc, app.wrapping_add(0x54));
+            let mut seen = SEEN.lock().unwrap();
+            let e = seen.entry(resolved).or_insert(0);
+            *e += 1;
+            if *e > 4 {
+                return 0;
+            }
+            log::warn!(
+                "PROCMAPENGINE port-resolve t={}ms tid=[{}] resolved={resolved:#x} own-app={:#x} port={port:#x} port[0..16)={:x},{:x},{:x},{:x} x{}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+                read_u16_or_invalid(uc, app.wrapping_add(0x10)),
+                read_u32_or_invalid(uc, port),
+                read_u32_or_invalid(uc, port.wrapping_add(4)),
+                read_u32_or_invalid(uc, port.wrapping_add(8)),
+                read_u32_or_invalid(uc, port.wrapping_add(0xc)),
+                *e,
+            );
+            0
+        });
     }
 }
 
