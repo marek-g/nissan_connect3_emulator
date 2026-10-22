@@ -8467,7 +8467,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     let holder = read_u32(uc, r5s.wrapping_add(8));
                     log::warn!(
                         "PROCHMI pumptrace {label} t={}ms tid=[{}] key={:#x} act={r2a:#x} st={} svc={:#x} func={:#x} holder={:#x}",
-                        crate::libs::libosal_linux::message::emu_t0_elapsed_ms(),
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                         r1k,
                         read_u32(uc, r2a.wrapping_add(4)),
