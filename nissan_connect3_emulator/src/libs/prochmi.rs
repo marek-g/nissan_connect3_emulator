@@ -5960,7 +5960,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
     // sites, naming each site's service literal as decoded from the ROM:
     // site -> svc (0x17c63c8 takes 0x152 from the pc-pool at 0x17c7158).
     {
-        const SITES: [(u32, u16, &str); 33] = [
+        const SITES: [(u32, u16, &str); 38] = [
             (0x017c_6358, 0x01f, "cmp1f"),
             (0x017c_6368, 0x01e, "cmp1e-a"),
             (0x017c_6378, 0x01e, "cmp1e-b"),
@@ -5999,6 +5999,16 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             (0x017c_67e4, 0x1f, "sp2b"),
             (0x017c_67ec, 0x1f, "sp2p3"),
             (0x017c_6800, 0x1f, "sp2c"),
+            // r799n33f: trio-1 (ISpeech @ server+0x1c, its polls PASS in
+            // state 9) poll comparators - contrast the action state words
+            // with trio-2's failing sp2p*.
+            (0x017c_6a94, 0x1f, "sp1a"),
+            (0x017c_6ab0, 0x1f, "sp1b"),
+            (0x017c_6acc, 0x1f, "sp1c"),
+            // r799n33f: r0 = the action object right before vfn+0x18 ->
+            // read [action+4] (the state word bIsComplete tests for ==2).
+            (0x017c_67bc, 0x1f, "sp2s1"),
+            (0x017c_6a88, 0x1f, "sp1s1"),
         ];
         let page = (base_address + 0x017c_6000u32 - ORIGINAL_BASE) & !0xfff;
         let _ = unicorn.add_code_hook(
@@ -6032,10 +6042,18 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         uc.get_data().inner.thread_id(),
                     );
                 }
-                if name.starts_with("sp2") {
+                if name.starts_with("sp2") || name.starts_with("sp1") {
                     let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    let st = if matches!(name, "sp2s1" | "sp1s1") {
+                        format!(
+                            " action={r0:#x} state={}",
+                            read_u32(uc, r0.wrapping_add(4))
+                        )
+                    } else {
+                        String::new()
+                    };
                     log::warn!(
-                        "PROCHMI s9cascade {name} t={}ms tid=[{}] r0={r0:#x} r4(owner/last)={r4:#x}",
+                        "PROCHMI s9cascade {name} t={}ms tid=[{}] r0={r0:#x} r4={r4:#x}{st}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                     );
