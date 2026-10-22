@@ -7180,9 +7180,25 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                         .copy_from_slice(&(svc as u16).to_le_bytes());
                                     bb[0x18..0x1a]
                                         .copy_from_slice(&(f18b as u16).to_le_bytes());
-                                    bb[0x1a] = 8;
+                                    bb[0x1a] = 9;
                                     bb[0x1c..0x1e]
                                         .copy_from_slice(&(ordinal as u16).to_le_bytes());
+                                    // r799n33b: Route/EDM actions poll the
+                                    // VALUE (delivered by the optype-9
+                                    // data leg through the subscriber
+                                    // vfn+0x1c), not only the conf-
+                                    // removal - mimic DAPI's completion
+                                    // pair: data(9) then conf(8).
+                                    crate::rtos::monitor::guest_call_bhandle_svcdone(
+                                        uc,
+                                        holder,
+                                        0xfffe,
+                                        ordinal as u32,
+                                        f18b as u32,
+                                        9,
+                                        &bb,
+                                    );
+                                    bb[0x1a] = 8;
                                     crate::rtos::monitor::guest_call_bhandle_svcdone(
                                         uc,
                                         holder,
@@ -11824,9 +11840,13 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                     bb[0x14..0x16].copy_from_slice(&0x001fu16.to_le_bytes());
                     bb[0x18..0x1a]
                         .copy_from_slice(&(func as u16).to_le_bytes());
-                    bb[0x1a] = 8;
+                    bb[0x1a] = 9;
                     bb[0x1c..0x1e]
                         .copy_from_slice(&(key as u16).to_le_bytes());
+                    crate::rtos::monitor::guest_call_bhandle_svcdone(
+                        unicorn, holder, 0xfffe, key, func, 9, &bb,
+                    );
+                    bb[0x1a] = 8;
                     crate::rtos::monitor::guest_call_bhandle_svcdone(
                         unicorn, holder, 0xfffe, key, func, 8, &bb,
                     );
