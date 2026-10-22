@@ -896,7 +896,7 @@ fn resolve_done_cookie(
             return c;
         }
     }
-    let svc = if svc != 0 && svc != 0xffff && svc <= 1 {
+    let svc = if svc <= 1 {
         svc
     } else {
         MINT_INFO
@@ -904,7 +904,11 @@ fn resolve_done_cookie(
             .ok()
             .and_then(|m| m.get(&key).copied())
             .map(|(s, _)| s)
-            .unwrap_or(0xffff)
+            // r799n33e: EVERY CL property entry carries dispatcher slot
+            // 0 at entry+0xc (n222 `found`: w12=0 for all keys) - default
+            // the first svcdone leg to slot 0 so its VALUE reaches
+            // subscriber 0x...ef8 id 1 instead of dying 'no subscriber'.
+            .unwrap_or(0)
     };
     if svc <= 1 && holder > 0x1000 && holder < 0xf000_0000 {
         let arr = read_u32(unicorn, holder.wrapping_add(0x14));
@@ -8070,7 +8074,6 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             let ec =
                                 LAST_EXEC_COOKIE.load(Ordering::Relaxed);
                             let ec_t = ec >> 32;
-                            let ec_svc = (ec >> 16) & 0xffff;
                             let cookie = if t_ms >= ec_t
                                 && t_ms - ec_t <= 60
                             {
@@ -8083,16 +8086,10 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                     m.insert(r0, cookie);
                                 }
                             }
-                            if cookie != 0xfffe && ec_svc != 0 {
-                                if let Ok(mut m) = MINT_INFO.lock() {
-                                    if m.len() < 512 {
-                                        m.insert(
-                                            r0,
-                                            (ec_svc as u32, 0),
-                                        );
-                                    }
-                                }
-                            }
+                            // r799n33e: MINT_INFO is bound by the `found`
+                            // probe from the entry itself (real slot at
+                            // entry+0xc); the execcmd r2 is the FI service,
+                            // NOT the dispatcher slot - do not bind it.
                         }
                     }
                     log::warn!(
