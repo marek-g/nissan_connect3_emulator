@@ -2837,3 +2837,53 @@ order luck.  (The queue introduced two host panics - see n19.)
   (data-not-ready) - who must write the real status/dataset once DAPI
   answers the fastmap channel loads; (3) then popup 0x5da close + city
   list WITHOUT EMU_FAKE_DESTENTRY.
+
+## r799n20 (8407263): trace-device write contract + TSE waiter-id - STAT worker alive
+
+- libosal `TRACE_s32IOWrite` (secondary entry 0x484eff30 of the device stub)
+  crushed `TR_core_uwTraceOut`'s result to 0/-1, so every guest trace write
+  failed the `IOWrite` success contract (`result in [sl, 0x72000]`) with
+  0x72014 - 962k failures/run, engine re-posted in-flight messages.  Fixed by
+  stubbing the device entry (library-level, allowed) to return 0x72000.
+- TSE FIFO poll (`complete_tse` from scheduler poll/deadline context) used
+  `get_data().thread_id()` = wrong thread, parked flag-waiters never woke.
+  `poll_tse_wait`/`complete_for` now pass the blocked tid; parking purges a
+  thread's stale entries from other flags' queues.  n141+: STAT worker [72]
+  activates, opens mbx_22 via monitor service 0x290364, pops its messages.
+
+## r799n20b (ee687b6) + r799n21 (69b2725): the claim tuple was live, not static
+
+- Comparator 0x66e650 at the claim5c leg (0x66a2f0, `add r0,#8` runs one
+  instruction later) consumes {r1=req msg+0x00 SRC, r2=fp=req msg+0x16
+  register-id, r3=[sp+0x24] dispatcher case (= msg+0x1c, observed 2..4),
+  r4=[sp+0x28]} vs item {+0xc,+0x12,+0x0e,+0x10}; the `bl 0x66e650` at
+  0x66a2c4 (case-2 leg) pre-adds at 0x66a2b0 (probe item = r0 there).
+- Static stamps (svc at item+0x0e, reg-id 0x17) matched nothing: the case
+  code and STAT's register-id change per request (0x17 -> 0x010c).  The
+  repair traps at 0x669c9c/0x669f3c now restamp item{+0x0e,+0x10,+0x12}
+  from every request's frame before the walk.  n158: 12/12 MATCH, engine
+  builds real class-0x42 svc-0x1e acks (status byte 3 AND 0 variants seen)
+  and STAT pops them.
+- Storm accounting fixed: repost-caller page-watch BUDGET (not dead-TB) hid
+  the 80k wrapper passes; caller 0x66869c in the Post census is FILE-based
+  (module+off, VA = +0x8000) = wrapper 0x670634's own libosal bl 0x670698.
+- Remaining debt (300 family, ~260/s, was 35k/s): engine self-mints
+  class-0x45 svc-0x300 op-1 requests (src=0x400 dst=0x16) into its own
+  mbx_1024; with [sp+0x40]=[sp+0x44]=0 the dispatcher bails at 0x669df0 to
+  the unclaimed exit 0x669f3c without consulting either comparator leg, and
+  the sync-request helper 0x6612b8 (libosal 0x388e40 return==1 "no waiting
+  requester") re-posts via 0x660ea0.  Consumer page-watch: obj 0xa07970,
+  recvq 0x400939f8 (mbx_1024), handler [obj+0x60]=0xa0fc70, state word
+  ping-pongs 2<->3.  Candidates left: who should park a waiting requester
+  (sync-request timeout leg?) or who fills [sp+0x40/44] on the unit.
+- n158 state: OnUpdateServiceStateDAPIFastmap state=1 t=12.6s (golden-era
+  marker back), HandleMapDataRequest x2 (t=4.8/33.8s, tracks the posfi tick
+  cadence), channels 4/5 open with shm, DAPI cryptnav opens succeed
+  (MEDIUM.CFG, DATASET.CFG, tp_meta.dat, POI_MAPPING.DAT fd=14), STAT
+  still re-asks svc-0x1e at ~4/s (dataset vector of admin-ref 0xa0fc70
+  never pushed).
+- NEXT: find the producer that pushes dataset blocks into the admin-ref
+  0xa0fc70 vector (storage 0xd9caf0, watch `svc-dataset-store`) once the
+  engine's fastmap channel loads complete - i.e. what must answer the
+  engine's GetBlockIDs/LoadBlocks so promotion 1->2 runs; then popup 0x5da
+  close + city list WITHOUT EMU_FAKE_DESTENTRY.
