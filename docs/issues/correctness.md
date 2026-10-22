@@ -3385,3 +3385,39 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
   the property VALUE (subscriber data leg), not just removal.  Fix: every
   svcdone now fires optype-9 (value push through vfn+0x1c) + optype-8
   (conf/remove) - the same pair DAPI's genuine completions form.
+
+## r799n33d: the svcdone cookie is a SUBSCRIBER ID (n217/n218 cmp2c-a stall)
+
+- n217/n218: all Route keys get removed (conf leg, optype-8) but the
+  walk still returns 0 at cmp2c-a, and the guest logs
+  `HResSVCD: no subscriber found -> message lost.` - the optype-9 VALUE
+  leg dies before the subscriber handler, so the Route action's poll
+  never sees a value.
+- Anatomy (Ghidra, prochmi): `navif_tclControlDispatch::
+  bHandleResponseSVCData` 0x1c7c6d4:
+  - `uVar2 = enCheckErrorInformation(disp, func, optype, svcdata)` -> out
+  - `vfn+0x10(disp, out, cookie, reqid, func, svcdata)` (pre-hook)
+  - type-3 entries (bVar4): iterate ALL subscribers
+    ([disp+0xc] list) and call `vfn+0x1c` per subscriber -> that's why
+    the Speech/Presentation trios completed with the 0xfffe stand-in.
+  - non-type-3: `pFindSubscriber(disp[3] = subs-list, cookie)`
+    (impl 0x1c7c070): nodes {item,next}, match `u16 [subscriber+4] ==
+    cookie`.  Miss -> the warn above -> the value is LOST (the entry is
+    still removed afterwards by IFMediator, which is why removals and
+    completion diverge).
+  - `vfn+0x14(disp, out, ...)` (post-hook) runs in both cases.
+- `pGetDispatcher` (0x1c7cf28): direct index,
+  `disp = [[mediator+0x14] + svc*4]` (array of ~0x301 slots, lazy via
+  [mediator]-factory; a NULL slot = the service was never opened -> no
+  subscribers possible).
+- Fix (n219): `resolve_done_cookie(uc, holder, svc, key)`:
+  1. mint-bound cookie from the `execcmd` capture (`[msgptr+0x0e]`, now
+     logged with a 32-byte request-frame dump `execcmd-capture`),
+  2. `found`-probe binding from the pending entry itself
+     (cookie = entry+0x12 = wire body+0x0e, svc = entry+0xc),
+  3. fallback: walk dispatcher(svc)'s LIVE subscriber list and take the
+     first non-zero id (logged `cookie -> live sub`, EMU_FAKE_SVCDONE
+     territory),
+  4. 0xfffe stand-in.
+  0 and 0xfffe are treated as unknown.  New `nosub` probe at 0x1c7c8b4
+  dumps the dispatcher + live subscriber ids at every future warn.
