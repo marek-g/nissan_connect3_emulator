@@ -911,10 +911,12 @@ fn resolve_done_cookie(
             .unwrap_or(0)
     };
     if svc <= 1 && holder > 0x1000 && holder < 0xf000_0000 {
-        let arr = read_u32(unicorn, holder.wrapping_add(0x14));
-        if arr > 0x1000 && arr < 0xf000_0000 {
-            let disp = read_u32(unicorn, arr.wrapping_add(svc << 2));
-            if disp > 0x1000 && disp < 0xf000_0000 {
+        // pGetDispatcher 0x1c7cf28 (verified): disp = [[med + 0xc +
+        // slot*4] + 4]; [med+0x14] is the ControlBase, NOT an array
+        // (n223 walked garbage and silently found nothing).
+        let ctrl = read_u32(unicorn, holder.wrapping_add(0xc + (svc << 2)));
+        let disp = read_u32(unicorn, ctrl.wrapping_add(4));
+        if disp > 0x1000 && disp < 0xf000_0000 {
                 if let Some((sub, id)) =
                     sub_walk(unicorn, disp).into_iter().find(|(_, i)| *i != 0)
                 {
@@ -931,7 +933,6 @@ fn resolve_done_cookie(
                     return id;
                 }
             }
-        }
     }
     0xfffe
 }
