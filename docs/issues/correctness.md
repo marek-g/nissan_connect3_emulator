@@ -3445,3 +3445,27 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
 - Also fixed: the `found` probe bound MINT_INFO/MINT_COOKIES on
   `[sp+0x14]` - which inside bHandleResponseSVCData is the STORED FUNC
   (`str r3,[sp,#0x14]`), not the request id; the key is r7.
+
+## r799n33f: the cookie plumbing WORKS; cmp1f-b is a NULL-owner exit (n224-n228)
+
+- With `sub_walk` on the exact fw_List layout and `pGetDispatcher` as
+  `disp = [[med+0xc+slot*4]+4]`, the resolver hands every svcdone leg the
+  live subscriber (cookie id 1/2, 'cookie -> live sub' log,
+  EMU_FAKE_SVCDONE-flagged): n224 removed the 'no subscriber' warnings
+  (0), the cascade opened cmp1f-b and mints climbed 0x19 -> 0x2c.
+- The subhand probe (0x1c7c878, r4 = handler result): data legs
+  (optype-9) return res=0x0, conf legs (optype-8) carry
+  0x80000000|decoded-error (0x800002a1 for the property funcs) - the
+  handler is reached and answers; the actions still do not flip.
+- Disassembling 0x17c6330 shows the `cmp*` SITES are
+  `bIsCCAServiceRequired(svc)` checks; the work happens in the branch
+  blocks.  cmp1f-b's block (0x17c6748) is the SECOND ISpeech trio:
+  iface=poGetIEnaviServer(), owner=[iface+0x14], getters
+  0x1620a04/a14/a34, issues vfn+0x24 x3 then polls vfn+0x18 x3 - but in
+  n228 NOT ONE poll probe fired: the block exits through the guard
+  (iface==0 or owner==0, r5 cleared at 0x17c680c) before issuing.
+  Probes sp2i (0x17c674c) / sp2o (0x17c6758) pinpoint which pointer dies.
+- resolve_done_cookie now derives the dispatcher slot from the LIVE
+  pending element (`cl_retrieve`, host clone of pRetrieveRequest:
+  node{key@+8, element@+0xc}) instead of defaulting to slot 0, so trio-2
+  style requests hitting dispatcher slot 1 get the id-2 subscriber.
