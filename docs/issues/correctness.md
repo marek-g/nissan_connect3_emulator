@@ -3576,3 +3576,34 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
   kick + era re-fire now run in states {0, 6, 9} (state 4 stays clean,
   n179).  States 1-5 keep their real-event transitions; add them to the
   ticker only if the re-walk demonstrably starves there.
+
+## r799n33q: bRunWhenRunning fully decoded + BAD-member cookie forensics
+
+- Ghidra decompile of `enavi_tclProcEnaviStartup::bRunWhenRunning`
+  (0x17c73c0) - the whole FSM switch:
+  - case 0: issue DAPISetDefaultDevice `(**(*a+0x78)+0x24)(a+0x78, name)`;
+    result 0 -> `OSAL_tclSemaphore::s32Wait(proc+0x1a, 0xffffffff)` (the
+    action-completion semaphore, posted by the DONE-notification side,
+    which then runs vSetDeviceName/bLeave/vfn+0x2c/+0x24/+0x18).
+    vfn+0x18 == 0 -> return (stays); else `param_1[1]=2` (proc state
+    DONE) + optional server-state set.
+  - case 5 gate (5->6): bIsServiceAvailable x bIsCCAServiceRequired for
+    services 0xa, 0x2c, 0x1f, 0x1e, 6, 0x152, 0x3c, 0x37, 0x56.
+  - case 6: DAPISetDefaultDevice vfn+0x1c==1 (ready) -> empty name:
+    vfn+0x30 re-issue; non-empty name: sem-wait + poll vfn+0x18 != 0 ->
+    bRegisterPropertiesBeforeDatasetIsAvailable, byte@sp -> state 7.
+  - case 7: loop u32GetHmiNavServerThreadWait/bGetDapiSupportedDeviceName
+    + enCheckDataMedium == 2 (ACTIVE) per device; fall-through picks 8
+    (flag proc+0x14) or 9.
+  - case 8: sem-wait, bIsNavigationDataAvailable(name) != 0 -> state 9
+    (+ server state 1); == 0 -> sem post + server state 5 + return.
+    -> a GOOD run literally PROVED navi data available == true here.
+  - case 9: bRegisterPropertiesAfterDatasetIsAvailable (the cascade);
+    out-byte 1 -> state 0 re-walk (matches n247_4/n252_2/n254_1).
+- BAD forensics (r799n33p follow-up): legs DO fire in state 6 now
+  (n254_2: 16/leg) but every BAD leg carried cookie=0x1 only; GOOD's
+  removing legs (tids 182-214, 37353+) hit with cookie=0x2 from
+  alt_done_cookies' live-subscriber fan-out - the completer slot lives
+  in a SECOND dispatcher whose subscriber BAD's resolve never sees.
+  Fix: the re-fire loop also throws cookies {1,2,3} blind (misses =
+  harmless pRetrieveRequest warns).
