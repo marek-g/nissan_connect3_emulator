@@ -3138,17 +3138,17 @@ pub fn refire_fi_era_pending(unicorn: &mut Unicorn<'_, Context>) -> usize {
         // body, msgid 0x81008114) carrying only the transaction key at
         // +0x1c - the completer matches loosely (n174) - and push the
         // data(9)+conf(8) pair like DAPI's genuine completions.
-        let posted = if svc == 0x001f {
-            let mut data = gps_data_status_answer_body(key);
-            data[0x1a] = 9;
-            let mut conf = data.clone();
-            conf[0x1a] = 8;
-            (pump_push_completion(unicorn, data)
-                && pump_push_completion(unicorn, conf))
-                || push_blob_to_mbx_289(unicorn, body)
-        } else {
-            push_blob_to_mbx_289(unicorn, body)
-        };
+        // r799n33n: ALL era re-fires go pump-first now (see the long note
+        // above: the queue lane only drains during a client Wait era, and
+        // host-posted blobs are invisible to the pump dispatcher anyway).
+        let _ = svc;
+        let mut data = gps_data_status_answer_body(key);
+        data[0x1a] = 9;
+        let mut conf = data.clone();
+        conf[0x1a] = 8;
+        let posted = (pump_push_completion(unicorn, data)
+            && pump_push_completion(unicorn, conf))
+            || push_blob_to_mbx_289(unicorn, body);
         if posted {
             fired += 1;
             log::warn!(
