@@ -6014,6 +6014,14 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         uc.get_data().inner.thread_id(),
                     );
                 }
+                if matches!(name, "sp2i" | "sp2o") {
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI s9cascade {name} t={}ms tid=[{}] r0(iface)={r0:#x} r4(owner)={r4:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                }
             },
         );
     }
@@ -7577,6 +7585,13 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             (0x017c_67c8u32, "sp2a", 150),
             (0x017c_67e4u32, "sp2b", 150),
             (0x017c_6800u32, "sp2c", 150),
+            // r799n33f: the guards BEFORE trio-2 issues: r0 = interface
+            // from poGetIEnaviServer-ish 0x161f754, r4 = [interface+0x14]
+            // (the trio-2 owner object).  n228: cmp1f-b fires but no sp2
+            // poll does -> one of these is NULL (r5 gets cleared at
+            // 0x17c680c without a single issue).
+            (0x017c_674cu32, "sp2i", 150),
+            (0x017c_6758u32, "sp2o", 150),
         ] {
             let address = base_address + off - ORIGINAL_BASE;
             crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:pumptrace", move |uc: &mut Unicorn<'_, Context>| {
