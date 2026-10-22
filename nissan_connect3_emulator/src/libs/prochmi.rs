@@ -5822,6 +5822,45 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             },
         );
     }
+    // r799n31: who drives `bRunWhenRunning` (0x17c73c0, vtable slot 17 of
+    // the startup FSM object, vtable 0x0291c358)?  No code xrefs exist in
+    // Ghidra (pure vtable dispatch), so capture the return address at the
+    // function entry on a page-range hook (0x017c7000): the caller set is
+    // what must be re-triggered to get a THIRD state-9 cascade tick.
+    {
+        let page = (base_address + 0x017c_7000u32 - ORIGINAL_BASE) & !0xfff;
+        let entry = base_address + 0x017c_73c0u32 - ORIGINAL_BASE;
+        let _ = unicorn.add_code_hook(
+            page as u64,
+            page as u64 + 0x1000,
+            move |uc: &mut Unicorn<'_, Context>, addr, _| {
+                let hit = addr as u32;
+                if hit != entry {
+                    return;
+                }
+                static SEEN: std::sync::LazyLock<
+                    std::sync::Mutex<std::collections::HashMap<u32, u32>>,
+                > = std::sync::LazyLock::new(Default::default);
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                let t = crate::libs::dapi::emu_t0_elapsed_ms();
+                let mut seen = SEEN.lock().unwrap();
+                let total: u32 = seen.values().sum();
+                if total >= 4000 {
+                    return;
+                }
+                let e = seen.entry(lr).or_insert(u32::MAX);
+                if *e != u32::MAX && t.saturating_sub(*e) < 1500 {
+                    return;
+                }
+                *e = t;
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCHMI bwrun-caller t={t}ms tid=[{}] this={r0:#x} lr={lr:#x}",
+                    uc.get_data().inner.thread_id(),
+                );
+            },
+        );
+    }
     for (offset, label) in [
         (0x017c_75a8u32, "startup-navif-result"),
         (0x017c_1e80u32, "navif-create"),
@@ -8691,7 +8730,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // (same thread, ~one tick later) finds the answer queued.
                 // r0 here may already be 1 - the gate entry completes on a
                 // later tick (h9), so do NOT condition on r0.
-                if matches!(crate::libs::libosal_linux::message::hmi_fsm_state(), 5 | 6) {
+                if matches!(crate::libs::libosal_linux::message::hmi_fsm_state(), 5 | 6 | 9) {
                     crate::libs::libosal_linux::message::refire_fi_era_pending(uc);
                 }
             }
@@ -11443,6 +11482,13 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             let route = crate::libs::libosal_linux::message::push_gps_kick_pump_first(
                 unicorn, 0x5aa5,
             );
+            // r799n30: the g7-vfn18res leg that drives the anti-theft
+            // re-fire does not run in state 9 (the FSM thread is parked),
+            // so the unaccepted property conf echoes (svc 0x1f, posted
+            // while tid-84 owns the queue) get no pump-thread pusher.  Do
+            // it on this 1 Hz tick (bounded inside, cleared by the remove
+            // probe once a copy lands).
+            crate::libs::libosal_linux::message::refire_fi_era_pending(unicorn);
             static KICKN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = KICKN.fetch_add(1, Ordering::Relaxed);
             if n < 3 || n % 10 == 0 {

@@ -2894,7 +2894,9 @@ fn note_fi_era_pending(svc: u16, key: u16, body: &[u8]) {
     // r799n30 note: broadening this list floods the pre-navsrv era with
     // re-pushes (n184: the run timeline collapsed into the 10 s sleep era
     // and state 6 died) - keep it at the proven pair.
-    if !matches!(svc, 0x0006 | 0x000a) {
+    if !matches!(svc, 0x0006 | 0x000a)
+        && !(svc == 0x001f && crate::libs::dapi::emu_t0_elapsed_ms() >= 32_000)
+    {
         return;
     }
     let map = FI_ERA_PENDING.get_or_init(Default::default);
@@ -3017,7 +3019,21 @@ pub fn refire_fi_era_pending(unicorn: &mut Unicorn<'_, Context>) -> usize {
     };
     let mut fired = 0usize;
     for ((svc, key), body) in due {
-        if push_blob_to_mbx_289(unicorn, body) {
+        // r799n30: the state-9 property conf echoes (svc 0x001f) must reach
+        // the CL completer on tid 65, but in state 9 tid 65 is parked while
+        // tid-84's enConnect consumer owns mbx_289 and eats every plain
+        // push (n187: 164 re-fires, zero completer lookups).  The pump-queue
+        // route (single consumer, the same path the 0x5aa5 GPS kicks take to
+        // reach tid 65's rx pump in state 9) is the delivery lane; fall back
+        // to the plain mbx_289 push for the state-5/6 member-era entries
+        // whose proven delivery lane is the queue.
+        let posted = if svc == 0x001f {
+            pump_push_completion(unicorn, body.clone())
+                || push_blob_to_mbx_289(unicorn, body)
+        } else {
+            push_blob_to_mbx_289(unicorn, body)
+        };
+        if posted {
             fired += 1;
             log::warn!(
                 "[LIBOSAL-MBX] fi-era re-fire: re-pushed ServiceData(svc {svc:#06x} txn {key}) to mbx_289, the enConnect consumer had eaten the earlier copy (EMU_FI_ERA_REFIRE=0 disables)"
@@ -4462,22 +4478,31 @@ fn bridge_mbx_queue(
                         blob.extend_from_slice(&ans);
                         let mut state = unicorn.get_data().namespace.lock().unwrap();
                         let target = format!("mbx_{client}");
-                        if let Some(q) = state.mq.queue_id_for_name(&target) {
-                            state.mq.grow_msgsize(q, blob.len() as i64);
-                            if OsalQueueService::guest_post(
-                                &mut state.mq,
-                                &target,
-                                blob,
-                                0,
-                            ) {
-                                state.notify_waiters();
-                                if optype == 8 {
-                                    // keep re-firing the conf until the
-                                    // remove probe clears this key (tid-84
-                                    // race, r799k mechanism)
-                                    note_fi_era_pending(service, txn, &ans);
+                        match state.mq.queue_id_for_name(&target) {
+                            Some(q) => {
+                                state.mq.grow_msgsize(q, blob.len() as i64);
+                                if OsalQueueService::guest_post(
+                                    &mut state.mq,
+                                    &target,
+                                    blob,
+                                    0,
+                                ) {
+                                    state.notify_waiters();
+                                    if optype == 8 {
+                                        // keep re-firing the conf until the
+                                        // remove probe clears this key (tid-84
+                                        // race, r799k mechanism)
+                                        note_fi_era_pending(service, txn, &ans);
+                                    }
+                                } else {
+                                    log::warn!(
+                                        "[LIBOSAL-MBX] EMU_FAKE_CONNECTCONF: conf/data echo for txn {txn} REJECTED by {target} (queue full?)",
+                                    );
                                 }
                             }
+                            None => log::warn!(
+                                "[LIBOSAL-MBX] EMU_FAKE_CONNECTCONF: conf/data echo for txn {txn} dropped, {target} not open",
+                            ),
                         }
                     }
                 }
