@@ -13205,6 +13205,7 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                 .map(|m| m.values().any(|(_, _, n)| *n < 8))
                 .unwrap_or(false);
             if vsig != 0
+                && unicorn.get_data().elf_path.contains("prochmi")
                 && (crate::libs::libosal_linux::message::fi_era_has_pending(
                     0x001f,
                 ) || svcdone_open)

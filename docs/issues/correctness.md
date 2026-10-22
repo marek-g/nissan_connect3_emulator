@@ -3767,3 +3767,42 @@ floor=0 streaks equally BAD; root cause still unknown).  Verify in a GOOD run
 with the floor that tid-42's svc-0x6 answer is consumed, tid-65 walks past
 the svc-0x6 completion, and watch whether op 0x1e9 then reports work done
 (kind-1 wave 489->493, popup 0x5da stays closed).
+
+## r799n33x: the GOOD-tail death wave and the era lottery have ONE root cause - prochmi guest-calls fabricated in FOREIGN process VMs
+
+n264_11 (GOOD + MQ floor) proved the queue fix works (zero send-blocks,
+tid-65 walked five CCA requests further: consumed svc-0x6's DAPI answer,
+svc-0x18 conf-store at 44.5 s, requests up to R=61 all echoed) and then
+revealed the NEXT wall: a mass death wave at t=43.4-50 s - ~930 threads
+exit(1), including tid-50 (FI router) and tid-65 (HmiNavServer FSM), after
+which nothing can ever advance the SM.  The wave's signature: 508 x
+`Execution error: FETCH_UNMAPPED` at 0x1c7d110 (bHandleResponseSVCData) and
+23 x at 0x171915c (vSignalSelf), with the dead tids attributed to DAPIAPP's
+thread list.
+
+Forensics -> our own fault, not guest logic:
+
+- `prochmi::tick()` is called from `scheduler::run_process_loop` for EVERY
+  process with THAT process' unicorn.  Its fabrication legs
+  (`guest_call_bhandle_svcdone`, the s9-wake vSignalSelf spawn,
+  `pump_push_completion`, `post_blob_to_guest_handle`) all target PROCHMI
+  VAs and heap-allocate tramp/stack/pool on the CURRENT unicorn - so when a
+  foreign process' scheduler pass happened to run the tick (or the mbx
+  intercept re-fired them), the worker thread was created inside e.g.
+  DAPIAPP: first fetch of prochmi's VA -> FETCH_UNMAPPED -> exit(1).  The
+  pump-completion POOL `OnceLock` could even pin to a foreign heap forever.
+- That also kills the completion the wave was waiting for (the svcdone
+  guest-call silently fails: `unicorn.mem_write(tramp)` can succeed in the
+  foreign VM while the fetch dies), explaining both the GOOD-tail stall
+  (tid-65 never wakes -> exits/never asked again) and the BAD eras.
+- ERA LOTTERY root cause: survival hinged on which process' thread executed
+  the tick/intercept that fired each dispatch - prochmi-thread trigger =
+  worker lives, DAPI/procmap trigger = worker dies + completion lost.
+
+Fix (fidelity-neutral - these are emulator-side fabrications, allowed to be
+fixed): process gates `elf_path.contains("prochmi")` on all four legs
+(monitor.rs `guest_call_bhandle_svcdone`, prochmi.rs s9-wake vsig spawn,
+message.rs `pump_push_completion` + `post_blob_to_guest_handle`).  Foreign
+loops return false; the pending state survives and prochmi's OWN scheduler
+loop re-fires the leg on its next tick (doorbell-rung by queue activity).
+Verification: n265 series must show zero FETCH_UNMAPPED and no death wave.

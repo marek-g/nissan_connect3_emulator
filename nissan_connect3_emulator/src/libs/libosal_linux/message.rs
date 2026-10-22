@@ -3059,6 +3059,15 @@ fn post_blob_to_guest_handle(
     handle: u32,
     blob: &[u8],
 ) -> bool {
+    // r799n33x: the recorded post_fn / handle / pool all live in PROCHMI's
+    // address space, but this leg can be reached from `prochmi::tick`, which
+    // the scheduler runs in EVERY process' loop.  Spawning it on a foreign
+    // VM produced FETCH_UNMAPPED workers in that process (n264_11: 508 dead
+    // clones at 0x1c7d110 in DAPIAPP).  Defer to prochmi's own tick, which
+    // re-fires the pending answer.
+    if !unicorn.get_data().elf_path.contains("prochmi") {
+        return false;
+    }
     let post_fn = PUMP_POST_FN.load(Ordering::Relaxed);
     if post_fn == 0 || handle == 0 || handle == 0xffff_ffff {
         return false;
@@ -3311,6 +3320,14 @@ static PUMP_POST_MSGLEN: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomi
 /// nothing until a genuine post has been observed; `EMU_FAKE_FI_READY_PUSH=0`
 /// disables at the callers.
 pub fn pump_push_completion(unicorn: &mut Unicorn<'_, Context>, mut body: Vec<u8>) -> bool {
+    // r799n33x: post_fn/handle and the POOL slots are PROCHMI-side VAs, yet
+    // callers reach this from any process' context (queue intercepts, tick).
+    // Running it on a foreign VM spawns FETCH_UNMAPPED workers there and can
+    // even pin the global POOL to a foreign heap.  Only prochmi's VM may run
+    // this leg; callers retry (the pending state survives).
+    if !unicorn.get_data().elf_path.contains("prochmi") {
+        return false;
+    }
     let post_fn = PUMP_POST_FN.load(Ordering::Relaxed);
     let handle = PUMP_POST_HANDLE.load(Ordering::Relaxed);
     if post_fn == 0 || handle == 0 {

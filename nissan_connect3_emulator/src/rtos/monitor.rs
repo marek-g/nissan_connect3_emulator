@@ -2126,6 +2126,26 @@ pub fn guest_call_bhandle_svcdone(
     if std::env::var_os("EMU_FAKE_SVCDONE").is_some_and(|v| v == "0") {
         return false;
     }
+    // r799n33x: process gate.  `prochmi::tick` runs in EVERY process'
+    // scheduler loop (scheduler.rs), and this leg fabricates a guest call
+    // into PROCHMI's address space (0x1c7d110 + heap tramp).  Triggered
+    // from a foreign process' loop it spawned the worker into that VM:
+    // n264_11 caught 508 workers FETCH_UNMAPPED at 0x1c7d110 inside
+    // DAPIAPP (their tids parked in DAPIAPP's list) - the dispatcher
+    // decapitation that ends every GOOD tail and the real root of the
+    // era lottery (survival = whether the triggering post ran on a
+    // prochmi thread).  Skip foreign loops; prochmi's own tick re-fires
+    // the pending leg.
+    if !unicorn.get_data().elf_path.contains("prochmi") {
+        static SKIP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SKIP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+            log::info!(
+                "MONITOR svcdone: deferring guest-call to the prochmi loop (called from {})",
+                unicorn.get_data().elf_path
+            );
+        }
+        return false;
+    }
     if holder == 0 || body.len() < 0x1e {
         return false;
     }
