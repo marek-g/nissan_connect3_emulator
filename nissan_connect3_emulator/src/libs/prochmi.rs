@@ -5960,7 +5960,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
     // sites, naming each site's service literal as decoded from the ROM:
     // site -> svc (0x17c63c8 takes 0x152 from the pc-pool at 0x17c7158).
     {
-        const SITES: [(u32, u16, &str); 20] = [
+        const SITES: [(u32, u16, &str); 33] = [
             (0x017c_6358, 0x01f, "cmp1f"),
             (0x017c_6368, 0x01e, "cmp1e-a"),
             (0x017c_6378, 0x01e, "cmp1e-b"),
