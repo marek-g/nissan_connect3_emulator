@@ -12583,9 +12583,19 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             Some(next) => now >= next,
         });
         if due
-            && crate::libs::libosal_linux::message::hmi_fsm_state() == 6
+            && matches!(
+                crate::libs::libosal_linux::message::hmi_fsm_state(),
+                0 | 6
+            )
             && std::env::var_os("EMU_FAKE_SENSORFI").map_or(true, |v| v != "0")
         {
+            // r799n33l: state 0 joins the re-tick.  With trio-2 answered
+            // the cascade finally stores out-byte=1 and the startup proc
+            // RE-WALKS from state 0 (n247_4: 9->0 at t=40143) - and there
+            // it starves exactly like state 6 did: no SENSORFI re-tick,
+            // no pump rx leg, nothing re-runs bRunWhenRunning.  States
+            // 1-5 keep real-event-driven transitions (4 must stay clean,
+            // n179 derailed the FSM with a state-4-era kick).
             // r799n33h: the same 1 Hz re-tick the unit provides in EVERY
             // FSM state (see the comment above) - the BAD boots (n234/
             // n240/n241) starve state 6: late member re-mints (e.g. the
