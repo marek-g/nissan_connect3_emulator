@@ -825,6 +825,17 @@ static SVCDONE_PENDING: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u32, (u32, u32, u32)>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// r799n33c: every IDFactory key minted while state 9 lives (storekey
+/// probe) -> (t_ms, answered-or-pending).  The 1 Hz tick arms a
+/// data(9)+conf(8) svcdone for any mint still unanswered after 300 ms -
+/// the store-time pairing races when mints run 6 ms apart (n215: the
+/// 0x14-store paired the stale 0x13 mint, 0x14 never got answered and the
+/// cascade stalled).  func is unknown for these - pass 0: the completer
+/// matches on the key at +0x1c, n174.
+static STATE9_MINTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, (u64, bool)>>,
+> = std::sync::LazyLock::new(Default::default);
+
 /// r799n31: runtime VA (+1, Thumb) of `enavi_tclAction::vSignalSelf`
 /// (prochmi 0x0171915c) stashed by the `navif-create` probe.  The FSM calls
 /// it (vtable slot 0x60) after EVERY successful state transition: it posts
@@ -6025,6 +6036,9 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 if let Ok(mut m) = SVCDONE_PENDING.lock() {
                     m.clear();
                 }
+                if let Ok(mut m) = STATE9_MINTS.lock() {
+                    m.clear();
+                }
                 crate::libs::libosal_linux::message::fi_era_clear_pending();
                 // r799n31: stash enavi_tclAction::vSignalSelf (0x0171915c,
                 // Thumb) as runtime VA for the state-9 wake driver below.
@@ -7219,6 +7233,14 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                                 (holder, f18b as u32, 1),
                                             );
                                         }
+                                        if let Ok(mut m) = STATE9_MINTS.lock()
+                                        {
+                                            if let Some(e) =
+                                                m.get_mut(&(ordinal as u32))
+                                            {
+                                                e.1 = true;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -7830,6 +7852,17 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         let t_ms = crate::libs::dapi::emu_t0_elapsed_ms() as u64;
                         LAST_MINTED
                             .store((t_ms << 32) | r0 as u64, Ordering::Relaxed);
+                        // r799n33c: state-9 mints are tracked for the
+                        // guaranteed-answer sweep (STATE9_MINTS).
+                        if crate::libs::libosal_linux::message::hmi_fsm_state()
+                            == 9
+                        {
+                            if let Ok(mut m) = STATE9_MINTS.lock() {
+                                if m.len() < 512 {
+                                    m.entry(r0).or_insert((t_ms, false));
+                                }
+                            }
+                        }
                     }
                     log::warn!(
                         "PROCHMI pumptrace {label} t={}ms tid=[{}] tbl={r5t:#x} key={:#x} r0={r0:#x}",
@@ -7880,6 +7913,9 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     );
                     // r799n33: same confirmation for the svcdone re-fire.
                     if let Ok(mut m) = SVCDONE_PENDING.lock() {
+                        m.remove(&(r1 & 0xffff));
+                    }
+                    if let Ok(mut m) = STATE9_MINTS.lock() {
                         m.remove(&(r1 & 0xffff));
                     }
                 } else if label == "waitret" {
@@ -11861,6 +11897,55 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                             .collect::<Vec<_>>()
                             .join(","),
                     );
+                }
+                // r799n33c: arm any state-9 mint the store-time svcdone
+                // never covered (missed pairing) after 300 ms (func 0:
+                // the completer matches on the key, n174).
+                let holder = CL_TABLE_HOLDER.load(Ordering::Relaxed);
+                if holder != 0 {
+                    let now_ms = crate::libs::dapi::emu_t0_elapsed_ms() as u64;
+                    let mut sweep: Vec<u32> = Vec::new();
+                    if let Ok(mut m) = STATE9_MINTS.lock() {
+                        for (key, (t, answered)) in m.iter_mut() {
+                            if !*answered && now_ms.saturating_sub(*t) >= 300
+                            {
+                                *answered = true;
+                                sweep.push(*key);
+                            }
+                        }
+                    }
+                    for key in sweep {
+                        if let Ok(mut m) = SVCDONE_PENDING.lock() {
+                            m.entry(key).or_insert((holder, 0, 1));
+                        }
+                        let mut bb = [0u8; 0x22];
+                        bb[0xb] = 0x45;
+                        bb[0x0e..0x10]
+                            .copy_from_slice(&0xfffeu16.to_le_bytes());
+                        bb[0x14..0x16]
+                            .copy_from_slice(&0x001fu16.to_le_bytes());
+                        bb[0x1a] = 9;
+                        bb[0x1c..0x1e]
+                            .copy_from_slice(&(key as u16).to_le_bytes());
+                        crate::rtos::monitor::guest_call_bhandle_svcdone(
+                            unicorn, holder, 0xfffe, key, 0, 9, &bb,
+                        );
+                        bb[0x1a] = 8;
+                        crate::rtos::monitor::guest_call_bhandle_svcdone(
+                            unicorn, holder, 0xfffe, key, 0, 8, &bb,
+                        );
+                    }
+                    if !sweep.is_empty() {
+                        log::warn!(
+                            "PROCHMI s9-mint-sweep: {} unanswered state-9 mint(s) answered t={}ms ({}) (pairing race fallback, EMU_FAKE_SVCDONE=0 disables)",
+                            sweep.len(),
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            sweep.iter()
+                                .map(|k| format!("{k:#x}"))
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        );
+                    }
                 }
             }
             // r799n31: wake driver.  While the property confs of the absent
