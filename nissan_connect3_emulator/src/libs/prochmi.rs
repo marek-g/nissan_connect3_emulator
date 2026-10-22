@@ -5862,12 +5862,14 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // global budget in the first half second (n194: 2500 lines
                 // by t=35.8 s, nothing left for state 9).
                 static SEENPC: std::sync::LazyLock<
-                    std::sync::Mutex<std::collections::HashMap<u32, u128>>,
+                    std::sync::Mutex<std::collections::HashMap<(u32, u32), u128>>,
                 > = std::sync::LazyLock::new(Default::default);
                 let t = crate::libs::dapi::emu_t0_elapsed_ms();
                 {
                     let mut seen = SEENPC.lock().unwrap();
-                    let e = seen.entry(hit).or_insert(u128::MAX);
+                    let e = seen
+                        .entry((hit, uc.get_data().inner.thread_id()))
+                        .or_insert(u128::MAX);
                     if *e != u128::MAX && t.saturating_sub(*e) < 2000 {
                         return;
                     }
@@ -5878,15 +5880,33 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // r0 so every episode is identifiable (0x5aa5 GPS kick vs
                 // our 0x1f property echo).
                 if hit == lo + 0x174 {
-                    let src = read_u16(uc, r0);
-                    let len = read_u32(uc, r0.wrapping_add(4));
-                    let cls = read_u8(uc, r0.wrapping_add(0xb));
-                    let svc = read_u16(uc, r0.wrapping_add(0x14));
-                    let func = read_u16(uc, r0.wrapping_add(0x18));
-                    let optype = read_u8(uc, r0.wrapping_add(0x1a));
-                    let key = read_u16(uc, r0.wrapping_add(0x1c));
+                    let w0 = read_u32(uc, r0);
+                    let w1 = read_u32(uc, r0.wrapping_add(4));
+                    let (src, len, cls, svc, func, optype, key) = if w0 == 1 && w1 != 0 {
+                        // OSAL msg struct [1, body-slot, w2, w3]: dump BODY
+                        let b = w1;
+                        (
+                            read_u16(uc, b),
+                            read_u32(uc, b.wrapping_add(4)),
+                            read_u8(uc, b.wrapping_add(0xb)),
+                            read_u16(uc, b.wrapping_add(0x14)),
+                            read_u16(uc, b.wrapping_add(0x18)),
+                            read_u8(uc, b.wrapping_add(0x1a)),
+                            read_u16(uc, b.wrapping_add(0x1c)),
+                        )
+                    } else {
+                        (
+                            read_u16(uc, r0),
+                            read_u32(uc, r0.wrapping_add(4)),
+                            read_u8(uc, r0.wrapping_add(0xb)),
+                            read_u16(uc, r0.wrapping_add(0x14)),
+                            read_u16(uc, r0.wrapping_add(0x18)),
+                            read_u8(uc, r0.wrapping_add(0x1a)),
+                            read_u16(uc, r0.wrapping_add(0x1c)),
+                        )
+                    };
                     log::warn!(
-                        "PROCHMI rx45body t={t}ms tid=[{}] body={r0:#x} src={src:#x} len={len:#x} class={cls:#x} svc={svc:#x} func={func:#x} optype={optype:#x} key={key:#x}",
+                        "PROCHMI rx45body t={t}ms tid=[{}] r0={r0:#x} w=[{w0:#x},{w1:#x}] src={src:#x} len={len:#x} class={cls:#x} svc={svc:#x} func={func:#x} optype={optype:#x} key={key:#x}",
                         uc.get_data().inner.thread_id(),
                     );
                 }

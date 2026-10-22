@@ -3038,8 +3038,22 @@ pub fn refire_fi_era_pending(unicorn: &mut Unicorn<'_, Context>) -> usize {
         // reach tid 65's rx pump in state 9) is the delivery lane; fall back
         // to the plain mbx_289 push for the state-5/6 member-era entries
         // whose proven delivery lane is the queue.
+        // r799n31: the rx leg filters the frame ENVELOPE (n196 rx45body:
+        // our svc-0x1f/func-0xd62 bodies never once reached 0x17cb574, the
+        // kick-shaped ones do every second).  Re-build the pump copy from
+        // the PROVEN kick envelope (gps_data_status_answer_body: msgid
+        // 0x81008114, svc 0x000a, func 0x0f02, optype 9) carrying only the
+        // transaction key at +0x1c - the completer matches loosely on
+        // func/optype (n174: a stamp with the WRONG func still REMOVEd the
+        // gate entry), so push it twice: optype 9 (data/HIT) + optype 8
+        // (conf/REMOVE), mirroring DAPI's genuine completion pair.
         let posted = if svc == 0x001f {
-            pump_push_completion(unicorn, body.clone())
+            let mut data = gps_data_status_answer_body(key);
+            data[0x1a] = 9;
+            let mut conf = data.clone();
+            conf[0x1a] = 8;
+            (pump_push_completion(unicorn, data)
+                && pump_push_completion(unicorn, conf))
                 || push_blob_to_mbx_289(unicorn, body)
         } else {
             push_blob_to_mbx_289(unicorn, body)
