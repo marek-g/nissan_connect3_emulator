@@ -3421,3 +3421,27 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
   4. 0xfffe stand-in.
   0 and 0xfffe are treated as unknown.  New `nosub` probe at 0x1c7c8b4
   dumps the dispatcher + live subscriber ids at every future warn.
+
+## r799n33e: the availability chain ALREADY runs; the subs exist (n221)
+
+- n221 probes (`svcchg-in/svcchg-med/propinit/addsub`): the FI status
+  answers (class 0x44, state byte +0x18=0 -> flag 0x1, 0x1=state->flag 0x2)
+  for EVERY connector service (0x0a,0x2c,0x1f,0x1e,0x18,0x0d,0x300,...)
+  are consumed by tid-81's receiver 0x3b24478 and reach
+  `IFMediator::vOnServiceChange` (med 0x3920b00) natively.  No fabrication
+  is needed on that plane.
+- `addsub`: exactly TWO live subscribers exist - {disp 0x392e6b0, sub
+  0x394cef8, id 0x1} and {disp 0x39394a8, sub 0x392c338, id 0x2} (added
+  tid-65, states 7-8).  `pGetDispatcher` is a 2-slot direct array
+  ([mediator+0x14], svc<=1 - the CL entries' dispatcher key entry+0xc is
+  a SLOT index, not a service id); nosub showed the Route legs dispatch
+  through slot 0 (disp 0x392e6b0) with the cookie still 0xfffe.
+- The earlier `subs=[]` readings were MY walker bug: fw_List (vAdd
+  0x1c7ce28) is list {head@+4, tail@+8, size@+0xc}, node {prev@0,next@4,
+  ITEM@8}; the item pointer is at node+8, and the walk starts at the
+  node list-head points to.  Fixed in `sub_walk` -> the resolver now
+  hands svcdone the real cookie id 1/2, so the optype-9 VALUE leg
+  reaches subscriber::vfn+0x1c instead of dying with 'no subscriber'.
+- Also fixed: the `found` probe bound MINT_INFO/MINT_COOKIES on
+  `[sp+0x14]` - which inside bHandleResponseSVCData is the STORED FUNC
+  (`str r3,[sp,#0x14]`), not the request id; the key is r7.
