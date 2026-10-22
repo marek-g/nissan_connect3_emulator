@@ -962,8 +962,18 @@ fn resolve_done_cookie(
     // (element+0xc) - trio-2 style requests registered against the OTHER
     // dispatcher would be answered into the wrong subscriber when blindly
     // defaulting to slot 0.
+    // r799n33j: the live pending entry is authoritative for the
+    // dispatcher slot (element+0xc, bHandleResponseSVCData routes via
+    // pGetDispatcher(entry+0xc)).  MINT_INFO stores the FI SERVICE id,
+    // which must not be confused with the slot index (n245_1: guidance
+    // key 0x1a, service 0x1f, slot 0 - the old `svc<=1` gate saw 0x1f,
+    // skipped the walk and the leg carried cookie 0xfffe, which removed
+    // the entry without flipping the action).
     let mut svc = svc;
-    if !(svc <= 1) {
+    let e = cl_retrieve(unicorn, holder, key);
+    if e > 0x1000 && e < 0xf000_0000 {
+        svc = read_u16(unicorn, e.wrapping_add(0xc));
+    } else if svc > 1 {
         svc = match MINT_INFO
             .lock()
             .ok()
@@ -971,14 +981,7 @@ fn resolve_done_cookie(
             .map(|(s, _)| s)
         {
             Some(s) if s <= 1 => s,
-            _ => {
-                let e = cl_retrieve(unicorn, holder, key);
-                if e > 0x1000 && e < 0xf000_0000 {
-                    read_u16(unicorn, e.wrapping_add(0xc))
-                } else {
-                    0
-                }
-            }
+            _ => 0,
         };
     }
     if svc <= 1 && holder > 0x1000 && holder < 0xf000_0000 {
@@ -8487,6 +8490,17 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         }
                         if let Ok(mut m) = MINT_INFO.lock() {
                             m.insert(r1k, (svc, func));
+                        }
+                        // r799n33j: the subscriber that owns this command
+                        // IS the cookie pFindSubscriber matches (u16 at
+                        // sub+4) - bind it so no leg ever fires with the
+                        // 0xfffe stand-in (which removes the entry without
+                        // flipping the action, n245_1 key 0x1a).
+                        let cid = read_u16(uc, r5s.wrapping_add(4)) as u32;
+                        if cid != 0 {
+                            if let Ok(mut m) = MINT_COOKIES.lock() {
+                                m.insert(r1k, cid);
+                            }
                         }
                     }
                 } else if label == "rqc" {
