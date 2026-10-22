@@ -3029,3 +3029,30 @@ order luck.  (The queue introduced two host panics - see n19.)
 - NEXT: (1) grep the full trace corpus for the navsrv/datapool producers
   around the F6 page open (t=34s); (2) chase the UNAVAILABLE 0x0109 server;
   (3) FID->request mapping for the 0x215/0x218 errors.
+
+## r799n27: navsrv dispatch-table decoded end-to-end - the svc-6 round trip is HEALTHY
+
+- `bHandleResponseSVCData`(0x1c7d110) -> `pRetrieveRequest`(0x1c7ddac) keyed by
+  the u16 the rx-pump reads from the answer; sender `enExecuteCommand`
+  (0x1c7d248) stores pending entries via `enStoreRequest`(0x1c7de88), which
+  mints an IDFactory id (bCreateID 0x1c813ac) whenever the message's type byte
+  (+0x1a) is not 5, and maps it to {key, svc, func, t4, ord=msg+0x18, type,
+  t5=svc}.  Completion removes the entry (0x1c7d1d8, lr 0x1c7d1e4).
+- n171/n172 probe series (execcmd/store/storekey/remove/lookup+answer-blob):
+  every FIRST answer to a stored request HITS and completes (removes for keys
+  1,2,3 follow their storekey ms later); the 9 misses of 12 lookups are all
+  DUPLICATE deliveries of already-completed keys (2nd-5th copy of the same
+  answer).  'bHandleResp: Request not found in Table -> message lost!' is
+  therefore benign duplicate noise, NOT the popup blocker.  The whole
+  property-registration plane (svc 6/0xa/0x1f, func 1) completes.
+- AAPCS note re-confirmed: stack args start at entry_sp+0 (BL keeps the link
+  in a register) - earlier probes that read [sp] as a stack arg were right.
+- The pumptbl write-watch on 0x3920b00 watched the WRONG object (mediator was
+  0x392e148/0x3941690 across runs, the table follows the mediator); the probe
+  stays but its early-n16x interpretation was void.
+- NEXT (popup chase, unchanged goal): domain-0x12 pool instantiation for
+  element 0x12649081.  The CL completer being healthy removes one candidate;
+  look for what leg is supposed to MOUNT domain 0x12 (cldp_Mngr mount vector
+  watch 0x38eee88+0x20 is already live - check for late mounts) and whether
+  any answer-completion handler reaches the data adapter 0x13cb5a8/0x13cb80c
+  with a 0x12-domain element after t=34 s.

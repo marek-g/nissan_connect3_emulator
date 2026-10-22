@@ -5467,9 +5467,15 @@ fn trace_dev_write(unicorn: &mut Unicorn<'_, Context>) -> u32 {
                     }
                 };
                 if *c <= 3 {
-                    log::info!("[{tid}] [TRACE] tag {tag:#x}: {text} (#{c})");
+                    log::info!(
+                        "[{tid}] [TRACE] t={}ms tag {tag:#x}: {text} (#{c})",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                    );
                 } else if *c % 2000 == 0 {
-                    log::info!("[{tid}] [TRACE] tag {tag:#x}: {text} (repeat #{c})");
+                    log::info!(
+                        "[{tid}] [TRACE] t={}ms tag {tag:#x}: {text} (repeat #{c})",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                    );
                 }
             }
             break;

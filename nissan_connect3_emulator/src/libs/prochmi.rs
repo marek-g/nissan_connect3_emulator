@@ -2681,6 +2681,43 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
             "PROCHMI enavi-scratch write-watch installed: {}",
             watch_res_enavi.is_ok()
         );
+        // r799n27: the pump-event completer's pending-request table (the
+        // `lookup` probe reads it as tbl=0x3920b00) is EMPTY all run: every
+        // DAPI answer that reaches the HMINavServerLib queue dies on
+        // 'bHandleResp: Request not found in Table -> message lost!'
+        // (n164/n165 t=34.4s, cls 0x45 svc 0x6 txn 1).  Requests do go out
+        // (NAV_IFM resolves svc 6 -> app 7 right before), so the request leg
+        // should insert pending entries (state 3) here.  Watch the whole
+        // 4 KiB page - if no writer ever names itself, the insertion leg is
+        // the missing precondition; if writers exist, compare their key
+        // triple with the failing lookup's (svc 1 key 1 func 3).
+        let watch_res_pumptbl = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            0x0392_0b00u64,
+            0x0392_0c7fu64,
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                // The ctor at t~3 s byte-memsets the whole object (240+
+                // writes); that phase is known and would starve the budget.
+                let t_ms = crate::libs::dapi::emu_t0_elapsed_ms();
+                if t_ms < 32_000 {
+                    return true;
+                }
+                if HITS.fetch_add(1, Ordering::Relaxed) < 400 {
+                    log::warn!(
+                        "PROCHMI pumptbl WRITE t={}ms thread=[{}] addr={address:#x} size={size} value={value:#x} pc={:#x}",
+                        t_ms,
+                        uc.get_data().inner.thread_id(),
+                        uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32,
+                    );
+                }
+                true
+            },
+        );
+        log::info!(
+            "PROCHMI pumptbl write-watch installed: {}",
+            watch_res_pumptbl.is_ok()
+        );
         // r788b: cldp_Mngr singleton (0x38eee88, heap-deterministic like the
         // other 0x38e/0x39x singletons) keeps its mounted datapool domains in
         // the vector [+0x20 begin, +0x24 end); get_podp() resolves an element
@@ -6689,6 +6726,18 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // so the golden completions' func/optype can be compared with
             // our fabricated answers' (func 0, optype 9).
             (0x01c7_d110u32, "lookup", 300),
+            // r799n27: dispatch-table insertion/removal legs.  DAPI's svc-6
+            // answers reach bHandleResponseSVCData but pRetrieveRequest misses
+            // (message lost) - log which keys enStoreRequest ever registers
+            // and whether enRemoveRequest deletes them before the answer.
+            (0x01c7_de88u32, "store", 400),
+            (0x01c7_df54u32, "storekey", 400),
+            (0x01c7_e32cu32, "remove", 400),
+            // enExecuteCommand(mediator, r1, &key, r3, [sp+0x3c]=keyref,
+            // [sp+0x40]=msgdata pp, [sp+0x44]=await-flag byte): only the
+            // flag==1 leg reaches enStoreRequest; everything else posts
+            // fire-and-forget and its answer is guaranteed 'message lost'.
+            (0x01c7_d248u32, "execcmd", 300),
             // r799d: right after `bl #0x1c7ddac` (the service->entry map
             // find inside the lookup): r0 = entry (0 = the misses we keep
             // getting), else dump its fields: +0x00 u16, +0x02 u16,
@@ -7114,6 +7163,21 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 } else if label == "found" {
                     let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
                     let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32 & 0xffff;
+                    // r799n27: pRetrieveRequest null-guards [table+0x18] and
+                    // [table+8] before iterating the request map; dump the
+                    // dispatch-table internals (r6 = mediator @ entry, table
+                    // = [mediator+8]) to see which leg kills the lookup.
+                    let r6m = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                    let tbl = read_u32(uc, r6m.wrapping_add(8));
+                    let (t18, t8, t20) = if tbl != 0 && tbl < 0xf000_0000 {
+                        (
+                            read_u32(uc, tbl.wrapping_add(0x18)),
+                            read_u32(uc, tbl.wrapping_add(8)),
+                            read_u32(uc, tbl.wrapping_add(0x20)),
+                        )
+                    } else {
+                        (0, 0, 0)
+                    };
                     let ordinal = read_u32(uc, sp + 0x14) & 0xffff;
                     let (w0, w2, w6, w8, wa, wc) = if r0 != 0 && r0 < 0xf000_0000 {
                         (
@@ -7128,7 +7192,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         (0xffff, 0xffff, 0xffff, 0xffff, 0xff, 0xffff)
                     };
                     log::warn!(
-                        "PROCHMI pumptrace {label} t={}ms tid=[{}] entry={r0:#x} service={r7:#x} want_ord={ordinal:#x} w0={w0:#x} w2={w2:#x} w6={w6:#x} w8={w8:#x} state={wa:#x} w12={wc:#x}",
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] entry={r0:#x} service={r7:#x} want_ord={ordinal:#x} w0={w0:#x} w2={w2:#x} w6={w6:#x} w8={w8:#x} state={wa:#x} w12={wc:#x} med={r6m:#x} tbl={tbl:#x} tbl+18={t18:#x} tbl+8={t8:#x} tbl+20={t20:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                     );
@@ -7136,13 +7200,95 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
                     let optype = read_u32(uc, sp) & 0xff;
                     let msgobj = read_u32(uc, sp.wrapping_add(4));
+                    // r799n27: dump the answer's content header so misses can
+                    // be paired with their originating request (msgid/uniq).
+                    let md = read_u32(uc, msgobj.wrapping_add(4));
+                    let mut blob = [0u8; 32];
+                    let hdr = if msgobj > 0x1000 && msgobj < 0xf000_0000 {
+                        if uc.mem_read(md as u64, &mut blob).is_ok() {
+                            blob.chunks_exact(4)
+                                .map(|w| format!("{:#010x}", u32::from_le_bytes(w.try_into().unwrap())))
+                                .collect::<Vec<String>>()
+                                .join(" ")
+                        } else {
+                            "?".into()
+                        }
+                    } else {
+                        "-".into()
+                    };
                     log::warn!(
-                        "PROCHMI pumptrace {label} t={}ms tid=[{}] tbl={r0:#x} svc={:#x} key={:#x} func={:#x} optype={optype:#x} msgobj={msgobj:#x} lr={lr:#x}",
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] tbl={r0:#x} svc={:#x} key={:#x} func={:#x} optype={optype:#x} msgobj={msgobj:#x} md={md:#x} [{hdr}] lr={lr:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                         r1 & 0xffff,
                         r2 & 0xffff,
                         r3 & 0xffff,
+                    );
+                } else if label == "execcmd" {
+                    // ARM AAPCS: stack args live at entry_sp+0 (BL keeps the
+                    // link in a register).  Dump the await-flag, the &key
+                    // slot and the message double-pointer.
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let keyref = read_u32(uc, sp);
+                    let keyval = if keyref > 0x1000 && keyref < 0xf000_0000 {
+                        read_u32(uc, keyref) & 0xffff
+                    } else {
+                        0xffff
+                    };
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] med={r0:#x} r2={:#x} r3={:#x} keyref={keyref:#x} key={keyval:#x} msgpp={:#x} flag={:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        r2 & 0xffff,
+                        r3 & 0xffff,
+                        read_u32(uc, sp.wrapping_add(4)),
+                        read_u32(uc, sp.wrapping_add(8)) & 0xff,
+                    );
+                } else if label == "storekey" {
+                    // 0x1c7df54: just before the unlock/return; r4 holds the
+                    // u16 map key (fresh IDFactory id on the create leg).
+                    let r5t = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] tbl={r5t:#x} key={:#x} r0={r0:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32 & 0xffff,
+                    );
+                } else if label == "store" {
+                    // enStoreRequest(table, u16& key, t2, t3, [sp]=t4,
+                    // [sp+4]=t5, [sp+8]=msgdata pp).  Log the key slot and
+                    // the ord/type bytes of the stamped message (+0x18/+0x1a).
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    let key = if r1 > 0x1000 && r1 < 0xf000_0000 {
+                        read_u32(uc, r1) & 0xffff
+                    } else {
+                        0xffff
+                    };
+                    let msgpp = read_u32(uc, sp.wrapping_add(8));
+                    let md = read_u32(uc, msgpp.wrapping_add(4));
+                    let (ord, typ) = if md != 0 && md < 0xf000_0000 {
+                        (
+                            read_u32(uc, md.wrapping_add(0x18)) & 0xffff,
+                            (read_u32(uc, md.wrapping_add(0x18)) >> 16) & 0xff,
+                        )
+                    } else {
+                        (0xffff, 0xff)
+                    };
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] tbl={r0:#x} key={key:#x} t2={:#x} t3={:#x} t4={:#x} t5={:#x} md={md:#x} ord={ord:#x} typ={typ:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        r2 & 0xffff,
+                        r3 & 0xffff,
+                        read_u32(uc, sp) & 0xffff,
+                        read_u32(uc, sp.wrapping_add(4)) & 0xffff,
+                    );
+                } else if label == "remove" {
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] tbl={r0:#x} key={:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        r1 & 0xffff,
                     );
                 } else if label == "waitret" {
                     // r0 = message-ref pointer (0 on timeout).  Dump the ref
