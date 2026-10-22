@@ -3367,3 +3367,21 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
   misses).  With those completing now, expect the walk to reach cmp152 /
   cmp56 / cmp300 / cmp37 / cmp32 / cmp18 / cmp0d / cmp1f-c / cmp2c-b /
   cmp06 / cmp7d and finally the out-byte store (`s9cascade final`).
+
+## r799n33: svcdone becomes a re-firing data(9)+conf(8) pair (n213/n214)
+
+- n212 regression taught: the walk may issue THREE actions at once (the
+  30 ms mint-store pairing races the serialized workers) -> added
+  SVCDONE_PENDING + re-fire on the 1 Hz state-9 tick until the `remove`
+  probe confirms the key (a duplicate against a completed key is a
+  harmless miss).  Also hooked enRemovePropertyRegUpReg (0x1c7e284,
+  type-4 removals, `upreg` probe).
+- n213/n214: pairing+svcdone gates extended to every property connector
+  service (Presentation stores with svc 0x1e, Route with 0x2c, ...),
+  gated to hmi_fsm_state()==9 so the boot-plane member stores (states
+  5-7) and the gate (0x000a) stay untouched.  Removes climbed 11 -> 33 ->
+  136, walks reached cmp1e-a/b/c and cmp2c-a.
+- n214 stalled at cmp2c-a with all Route keys removed: those actions poll
+  the property VALUE (subscriber data leg), not just removal.  Fix: every
+  svcdone now fires optype-9 (value push through vfn+0x1c) + optype-8
+  (conf/remove) - the same pair DAPI's genuine completions form.
