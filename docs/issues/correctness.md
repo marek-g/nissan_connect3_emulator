@@ -3056,3 +3056,46 @@ order luck.  (The queue introduced two host panics - see n19.)
   watch 0x38eee88+0x20 is already live - check for late mounts) and whether
   any answer-completion handler reaches the data adapter 0x13cb5a8/0x13cb80c
   with a 0x12-domain element after t=34 s.
+
+## r799n28: popup-close chain fully traced - blocker = nobody instantiates domain-0x12
+
+New probes (prochmi.rs): `obsreg` (GUI_ObserverList::vRegister 0x13668a4,
+dumps raw content-id words), `dpobserver` (clDPElemObserver::bInit 0x13cb5a8,
+elem+proxy+mngr), storekey (post-IDFactory key), lookup answer-blob dump.
+
+Decoded ROM family (prochmi .rodata 0x25b0080.., stride 0x14):
+`{flags/period, state, content, elem(0x12-domain), waitQID}` - state 0x484
+(the 'Starting navigation.' popup) = {0x10000096, 0x484, 0x40003630,
+0x12649081, 0x900006b7}; sibling 0x485 = {0, 0x488, 0x400035fa, 0x12449060,
+0} (wait 0 = timer variant, period from the flags word).
+
+GUI_StatePseudoMediatorSync semantics (0x1375028 ctor, 0x1375150 vInitialize):
+ROM byte+0 low nibble -> flags {0->1, 1->2, 2->5, 3->7}; vInitialize creates a
+GUI timer iff bit0, and registers an ObserverList data-event receiver iff
+bit1 - i.e. exactly the kind=1 (wait-driven) rows.  The callback is
+vOnDataUpdate(int contentId) (0x13755d4, vtable-internal callers only).
+
+n173 facts:
+- obsreg: 268 registrations, NONE with content 0x900006b7; dpobserver: 422
+  bridges, all from one caller lr=0x138dd04, ZERO domain-0x12 elements.
+  => the popup's data-exists wait was never armed and nothing ever bridges
+  0x12649081 - in ANY era (n17 also had zero 0x12-domain element writes; its
+  med ticks came from the 0x2950 re-post storm, flags only cycled
+  0x1a/0x2a/0x3a = timer/fire-attempt, data never became present).
+- SM never enters state 0x484: n173 SM-DEC to-paths are [483,485]; the n17
+  era re-decisions that DID include 0x484 rode trigger events r9=0xb0001c39/
+  0xb000241d (174 each) generated ONLY by the msg-0x2950 re-post storm
+  (trace-write bug era) - legitimate successor needed, but even n17's
+  activations never satisfied the wait (see above), so the activation leg is
+  NOT the blocker either.
+- Real blocker unchanged: domain-0x12 CL pool instantiation.  The dp
+  configure table (clHMIMngr::bConfigure, sHMIConfig->[0], 52 rows) does NOT
+  contain domain 0x12; 0x12 ids exist ONLY in the dynstack ROM rows above.
+  => domain 0x12 must be mounted at RUNTIME by the navsrv SERVER side.  The
+  HMI opens its queues as app 0x121 (navsrv identity), and PROCNAV - the real
+  unit's navsrv server - is stalled: tid 16 spins in monitor-yield(svc
+  0x5c022a/...) and tid 19 exited(1), every park report since early boot.
+
+NEXT: make PROCNAV's navsrv-server leg live (audit its monitor-yield service
+requests - what svc is 0x5c022a, is the monitor's answer wrong/absent?), then
+watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.

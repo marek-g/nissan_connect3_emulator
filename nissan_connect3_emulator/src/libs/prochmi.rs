@@ -4900,6 +4900,62 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
     // deep (20 word) code-word scan to name the subsystem that instantiates
     // the 0x1-domain pools - the same leg the "Starting navigation." popup's
     // pool 0x126490xx is waiting for.
+    // r799n28: GUI_ObserverList::vRegister(receiver, contentId&, type, ord)
+    // - list every data-event registration with the raw content-id words; the
+    // 'Starting navigation.' data-exists wait must appear here as content
+    // 0x900006b7 (mediator vInitialize leg), and its producer must notify
+    // the same id.
+    {
+        let address = base_address + 0x0136_68a4u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:obsreg", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            let r2v = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let w0 = read_u32(uc, r2v);
+            let w1 = read_u32(uc, r2v.wrapping_add(4));
+            // Only popup-era ids plus a capped general sample.
+            let hot = w0 == 0x9000_06b7 || (w0 >> 28) == 0x9 && (w0 & 0xffff_ffff) == 0x9000_06b7;
+            if HITS.fetch_add(1, Ordering::Relaxed) < 400 || hot {
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCHMI obsreg t={}ms tid=[{}] list={r0:#x} recv={r1:#x} cid={w0:#x}/{w1:#x} type={r3:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                );
+            }
+            0
+        });
+    }
+
+    // r799n28: clDPElemObserver::bInit(elem, storage proxy, mngr) - the
+    // element->GUI bridge registration the data-exists mediators (kind 1,
+    // e.g. the 'Starting navigation.' popup element 0x12649081) need as the
+    // producer side of GUI_StatePseudoMediatorSync::vOnDataUpdate.  Log every
+    // bridged element with its caller; if the 0x12649xxx family is never
+    // bridged, no datapool update could ever close the popup even with the
+    // pool mounted.
+    {
+        let address = base_address + 0x013c_b5a8u32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:dpobserver", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 800 {
+                return 0;
+            }
+            let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+            let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+            let r3 = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
+            let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+            log::warn!(
+                "PROCHMI dpobserver t={}ms tid=[{}] elem={r1:#x} proxy={r2:#x} mngr={r3:#x} lr={lr:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+    }
+
     {
         let address = base_address + 0x013c_b80cu32 - ORIGINAL_BASE;
         crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:dp-initwatch", move |uc: &mut Unicorn<'_, Context>| {
