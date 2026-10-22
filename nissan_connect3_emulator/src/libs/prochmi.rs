@@ -836,7 +836,7 @@ static STATE9_MINTS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u32, (u64, bool)>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// r799n33d: `(t_ms << 16) | cookie` of the last awaiting
+/// r799n33d: `(t_ms << 32) | (svc << 16) | cookie` of the last awaiting
 /// `enExecuteCommand` (state-9), see the execcmd probe capture.
 static LAST_EXEC_COOKIE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -846,6 +846,89 @@ static LAST_EXEC_COOKIE: std::sync::atomic::AtomicU64 =
 static MINT_COOKIES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<u32, u32>>,
 > = std::sync::LazyLock::new(Default::default);
+
+/// r799n33d: mint key -> (service, func) - the svcdone resolver needs the
+/// service to pick the dispatcher whose subscriber list carries the cookie.
+static MINT_INFO: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, (u32, u32)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// r799n33d: walk the live subscriber list of one ControlDispatch
+/// (navif_tclSubscriberList at [disp+0xc]: head +4, nodes {item,next},
+/// id = u16 at [subscriber+4], matched by _pFindSubscriber 0x1c7c070).
+fn sub_walk(
+    unicorn: &Unicorn<'_, Context>,
+    disp: u32,
+) -> Vec<(u32 /*sub*/, u32 /*id*/)> {
+    let mut out = Vec::new();
+    let subs = read_u32(unicorn, disp.wrapping_add(0xc));
+    if subs <= 0x1000 || subs >= 0xf000_0000 {
+        return out;
+    }
+    let mut node = read_u32(unicorn, subs.wrapping_add(4));
+    for _ in 0..8 {
+        if node <= 0x1000 || node >= 0xf000_0000 {
+            break;
+        }
+        let item = read_u32(unicorn, node);
+        if item > 0x1000 && item < 0xf000_0000 {
+            out.push((item, read_u16(unicorn, item.wrapping_add(4))));
+        }
+        node = read_u32(unicorn, node.wrapping_add(4));
+    }
+    out
+}
+
+/// r799n33d: resolve the cookie (subscriber ID, see pFindSubscriber) for
+/// one svcdone leg.  Order: bound mint cookie (execcmd capture) -> the
+/// service dispatcher's first live subscriber (cached) -> 0xfffe stand-in.
+fn resolve_done_cookie(
+    unicorn: &Unicorn<'_, Context>,
+    holder: u32,
+    svc: u32,
+    key: u32,
+) -> u32 {
+    if let Some(c) = MINT_COOKIES.lock().ok().and_then(|m| m.get(&key).copied())
+    {
+        if c != 0xfffe && c != 0 {
+            return c;
+        }
+    }
+    let svc = if svc != 0 && svc != 0xffff {
+        svc
+    } else {
+        MINT_INFO
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&key).copied())
+            .map(|(s, _)| s)
+            .unwrap_or(0)
+    };
+    if svc != 0 && holder > 0x1000 && holder < 0xf000_0000 {
+        let arr = read_u32(unicorn, holder.wrapping_add(0x14));
+        if arr > 0x1000 && arr < 0xf000_0000 {
+            let disp = read_u32(unicorn, arr.wrapping_add(svc << 2));
+            if disp > 0x1000 && disp < 0xf000_0000 {
+                if let Some((sub, id)) =
+                    sub_walk(unicorn, disp).into_iter().find(|(_, i)| *i != 0)
+                {
+                    log::warn!(
+                        "PROCHMI svcdone: key={:#x} cookie -> live sub {:#x} id={:#x} of svc {:#x} (dispatcher walk, EMU_FAKE_SVCDONE=0 disables)",
+                        key,
+                        sub,
+                        id,
+                        svc,
+                    );
+                    if let Ok(mut m) = MINT_COOKIES.lock() {
+                        m.insert(key, id);
+                    }
+                    return id;
+                }
+            }
+        }
+    }
+    0xfffe
+}
 
 /// r799n31: runtime VA (+1, Thumb) of `enavi_tclAction::vSignalSelf`
 /// (prochmi 0x0171915c) stashed by the `navif-create` probe.  The FSM calls
@@ -6053,6 +6136,9 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 if let Ok(mut m) = MINT_COOKIES.lock() {
                     m.clear();
                 }
+                if let Ok(mut m) = MINT_INFO.lock() {
+                    m.clear();
+                }
                 crate::libs::libosal_linux::message::fi_era_clear_pending();
                 // r799n31: stash enavi_tclAction::vSignalSelf (0x0171915c,
                 // Thumb) as runtime VA for the state-9 wake driver below.
@@ -7211,13 +7297,9 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                     bb[0x1a] = 9;
                                     bb[0x1c..0x1e]
                                         .copy_from_slice(&(ordinal as u16).to_le_bytes());
-                                    let cookie = MINT_COOKIES
-                                        .lock()
-                                        .ok()
-                                        .and_then(|m| {
-                                            m.get(&(ordinal as u32)).copied()
-                                        })
-                                        .unwrap_or(0xfffe);
+                                    let cookie = resolve_done_cookie(
+                                        uc, holder, svc, ordinal as u32,
+                                    );
                                     bb[0x0e..0x10]
                                         .copy_from_slice(&(cookie as u16).to_le_bytes());
                                     // r799n33b: Route/EDM actions poll the
@@ -7423,6 +7505,12 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             (0x0167_0398u32, "st0a", 150),
             (0x0167_03a8u32, "st0b", 150),
             (0x0171_9cf0u32, "st1", 150),
+            // r799n33d: the 'HResSVCD: no subscriber found' branch inside
+            // navif_tclControlDispatch::bHandleResponseSVCData (0x1c7c6d4):
+            // r0 = dispatcher, r2 = cookie.  Dump the dispatcher's live
+            // subscriber list (svc at +0x8, ids at node->item+4) - the
+            // ground truth the svcdone cookie must match.
+            (0x01c7_c8b4u32, "nosub", 40),
         ] {
             let address = base_address + off - ORIGINAL_BASE;
             crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:pumptrace", move |uc: &mut Unicorn<'_, Context>| {
@@ -7790,6 +7878,31 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     } else {
                         (0xffff, 0xffff, 0xffff, 0xffff, 0xff, 0xffff)
                     };
+                    // r799n33d: on the state-9 legs bind what the pending
+                    // entry itself carries: svc = entry+0xc, wire body
+                    // cookie = entry+0x12 (body+0x0e, entry = body+4).
+                    if r0 != 0
+                        && r0 < 0xf000_0000
+                        && ordinal != 0
+                        && ordinal <= 0x100
+                        && crate::libs::libosal_linux::message::hmi_fsm_state(
+                            ) == 9
+                    {
+                        if let Ok(mut m) = MINT_INFO.lock() {
+                            if m.len() < 512 {
+                                m.insert(ordinal, (wc, 0));
+                            }
+                        }
+                        let e12 =
+                            read_u32(uc, r0.wrapping_add(0x10)) >> 16;
+                        if e12 != 0 && e12 != 0xffff {
+                            if let Ok(mut m) = MINT_COOKIES.lock() {
+                                if m.len() < 512 {
+                                    m.insert(ordinal, e12);
+                                }
+                            }
+                        }
+                    }
                     log::warn!(
                         "PROCHMI pumptrace {label} t={}ms tid=[{}] entry={r0:#x} service={r7:#x} want_ord={ordinal:#x} w0={w0:#x} w2={w2:#x} w6={w6:#x} w8={w8:#x} state={wa:#x} w12={wc:#x} med={r6m:#x} tbl={tbl:#x} tbl+18={t18:#x} tbl+8={t8:#x} tbl+20={t20:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
@@ -7877,8 +7990,35 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                 let t_ms = crate::libs::dapi::emu_t0_elapsed_ms(
                                 ) as u64;
                                 LAST_EXEC_COOKIE.store(
-                                    (t_ms << 16) | (cookie as u64 & 0xffff),
+                                    (t_ms << 32)
+                                        | (((r2 & 0xffff) as u64) << 16)
+                                        | (cookie as u64 & 0xffff),
                                     Ordering::Relaxed,
+                                );
+                                // ground truth: dump the request frame so the
+                                // cookie offset can be verified when the
+                                // capture proves wrong again.
+                                let mut blob = [0u8; 32];
+                                let _ = uc.mem_read(msgptr as u64, &mut blob);
+                                let hex = blob
+                                    .chunks_exact(4)
+                                    .map(|w| {
+                                        format!(
+                                            "{:#010x}",
+                                            u32::from_le_bytes(
+                                                w.try_into().unwrap()
+                                            )
+                                        )
+                                    })
+                                    .collect::<Vec<String>>()
+                                    .join(" ");
+                                log::warn!(
+                                    "PROCHMI execcmd-capture t={}ms tid=[{}] svc={:#x} cookie={:#x} msgptr={:#x} [{hex}]",
+                                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                                    uc.get_data().inner.thread_id(),
+                                    r2 & 0xffff,
+                                    cookie,
+                                    msgptr,
                                 );
                             }
                         }
@@ -7913,10 +8053,11 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                 }
                             }
                             // r799n33d: bind the awaiting enExecuteCommand
-                            // cookie to this mint (see MINT_COOKIES).
+                            // cookie + svc to this mint (see MINT_COOKIES).
                             let ec =
                                 LAST_EXEC_COOKIE.load(Ordering::Relaxed);
-                            let ec_t = ec >> 16;
+                            let ec_t = ec >> 32;
+                            let ec_svc = (ec >> 16) & 0xffff;
                             let cookie = if t_ms >= ec_t
                                 && t_ms - ec_t <= 60
                             {
@@ -7927,6 +8068,16 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             if let Ok(mut m) = MINT_COOKIES.lock() {
                                 if m.len() < 512 {
                                     m.insert(r0, cookie);
+                                }
+                            }
+                            if cookie != 0xfffe && ec_svc != 0 {
+                                if let Ok(mut m) = MINT_INFO.lock() {
+                                    if m.len() < 512 {
+                                        m.insert(
+                                            r0,
+                                            (ec_svc as u32, 0),
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -7985,6 +8136,21 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     if let Ok(mut m) = STATE9_MINTS.lock() {
                         m.remove(&(r1 & 0xffff));
                     }
+                } else if label == "nosub" {
+                    let subs = sub_walk(uc, r0);
+                    let ids = subs
+                        .iter()
+                        .map(|(s, i)| format!("{s:#x}:{i:#x}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] disp={r0:#x} svc={:#x} cookie={:#x} r3={:#x} subs=[{ids}]",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        read_u16(uc, r0.wrapping_add(0x8)),
+                        r2 & 0xffff,
+                        r3 & 0xffff,
+                    );
                 } else if label == "waitret" {
                     // r0 = message-ref pointer (0 on timeout).  Dump the ref
                     // and the 8-byte queue frame the Wait wrote at its
@@ -11936,11 +12102,7 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                     m.retain(|_, (_, _, n)| *n < 1000);
                 }
                 for (key, holder, func) in again.iter().copied() {
-                    let cookie = MINT_COOKIES
-                        .lock()
-                        .ok()
-                        .and_then(|m| m.get(&key).copied())
-                        .unwrap_or(0xfffe);
+                    let cookie = resolve_done_cookie(unicorn, holder, 0, key);
                     let mut bb = [0u8; 0x22];
                     bb[0xb] = 0x45;
                     bb[0x0e..0x10]
@@ -11990,11 +12152,7 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                         if let Ok(mut m) = SVCDONE_PENDING.lock() {
                             m.entry(key).or_insert((holder, 0, 1));
                         }
-                        let cookie = MINT_COOKIES
-                            .lock()
-                            .ok()
-                            .and_then(|m| m.get(&key).copied())
-                            .unwrap_or(0xfffe);
+                        let cookie = resolve_done_cookie(unicorn, holder, 0, key);
                         let mut bb = [0u8; 0x22];
                         bb[0xb] = 0x45;
                         bb[0x0e..0x10]
