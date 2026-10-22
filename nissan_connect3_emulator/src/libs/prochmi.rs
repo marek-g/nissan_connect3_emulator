@@ -6043,6 +6043,52 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     );
                 }
                 if name.starts_with("sp2") || name.starts_with("sp1") {
+                    // r799n33f: catch WHO writes the state word that
+                    // bIsComplete polls ([obj+4] == 2).  trio-1's action
+                    // flips 1->2 within 40 ms (n232/n233), trio-2's stays
+                    // RUNNING forever - the writer PC of the trio-1 flip
+                    // names the completion function whose preconditions
+                    // trio-2 fails.
+                    static SPY1: AtomicU32 = AtomicU32::new(0);
+                    static SPY2: AtomicU32 = AtomicU32::new(0);
+                    let seen = if name == "sp1s1" {
+                        SPY1.swap(r0, Ordering::Relaxed)
+                    } else {
+                        SPY2.swap(r0, Ordering::Relaxed)
+                    };
+                    if seen == 0 && r0 > 0x1000 && r0 < 0xf000_0000 {
+                        let lbl: &'static str =
+                            if name == "sp1s1" { "sp1" } else { "sp2" };
+                        use unicorn_engine::unicorn_const::HookType;
+                        let res = uc.add_mem_hook(
+                            HookType::MEM_WRITE,
+                            r0 as u64,
+                            (r0 + 8) as u64,
+                            move |uc2, _t, address, size, value| {
+                                static N: AtomicU32 = AtomicU32::new(0);
+                                if N.fetch_add(1, Ordering::Relaxed) < 30 {
+                                    let pc = uc2
+                                        .reg_read(RegisterARM::PC)
+                                        .unwrap_or(0)
+                                        as u32;
+                                    log::warn!(
+                                        "PROCHMI stspy {lbl} t={}ms tid=[{}] addr={address:#x} size={size} value={value:#x} pc={:#x}",
+                                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                                        uc2.get_data().inner.thread_id(),
+                                        pc.wrapping_sub(base_address)
+                                            .wrapping_add(ORIGINAL_BASE),
+                                    );
+                                }
+                                true
+                            },
+                        );
+                        log::warn!(
+                            "PROCHMI stspy {lbl} hook on {r0:#x} ok={}",
+                            res.is_ok(),
+                        );
+                    }
+                }
+                if name.starts_with("sp2") || name.starts_with("sp1") {
                     let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
                     let st = if matches!(name, "sp2s1" | "sp1s1") {
                         let vt = read_u32(uc, r0);

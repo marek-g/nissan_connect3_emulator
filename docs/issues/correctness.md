@@ -3476,3 +3476,23 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
   quirk; all trio-2 walk probes moved into the s9cascade PAGE hook
   (SITES += sp2o/g1/i1/g2/i2/g3/res/p1/a/p2/b/p3/c) - n231 decides
   whether the owner [IEnavi+0x14] is live and where tid 65 departs.
+- n231/n232/n233: trio-2 is NOT dead-guarded - iface/IEnavi(+0x14) owner
+  0x...9828/0x...80f0 are live, all three vfn+0x24 bRun issues return 1,
+  the FIRST poll (0x17c67c8 `cmp r0,#0`) is what exits the block.  The
+  state probes show WHY: trio-1 actions (ActionReqSpeechLanguage, vt
+  0x291b250+8, svc 0x0002 func 0x0d62) flip [action+4] 1->2 within 40 ms
+  of our svcdone pair; the trio-2 owner object (runtime vt 0x2912158 =
+  _ZTV enavi_tclProcGuidanceProperties +8 - proc-object pattern, req
+  type @+0x28) stays state=1 forever although its keys are svcdone'd and
+  removed.  The runtime vtable slot values differ from the file bytes
+  (this binary relocates its vtables), so static slot reading is
+  useless - stspy MEM_WRITE hooks on [obj,r0+8) capture the PC that
+  writes trio-1's state=2; that function's preconditions are what
+  trio-2 fails.
+- n234: flaky-boot regression (NOT the probes): the state-4 sleep ended
+  at v14.7 s instead of v36 s, and state 6 never advanced (dataset
+  event missed).  The tid-60 IOWrite garbage-len spin (len=stack ptr,
+  h=0x40034dcc, ~800k lines/run, chronic since n2xx, started v15.0 s in
+  n233 too) is unrelated to the stall - n233 passed 6->7 while spinning.
+  Re-run (n235) to confirm flakiness; if it reproduces, bisect the
+  wake-up that carries 4->5 early and starves the 6->7 event.
