@@ -8137,19 +8137,25 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         m.remove(&(r1 & 0xffff));
                     }
                 } else if label == "nosub" {
-                    let subs = sub_walk(uc, r0);
+                    // ControlDispatch frame regs (0x1c7c6d4 prologue):
+                    // r5 = dispatcher, r8 = cookie, r10 = reqid.
+                    let disp = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    let r8 = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+                    let r10 = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
+                    let subs = sub_walk(uc, disp);
                     let ids = subs
                         .iter()
                         .map(|(s, i)| format!("{s:#x}:{i:#x}"))
                         .collect::<Vec<_>>()
                         .join(",");
                     log::warn!(
-                        "PROCHMI pumptrace {label} t={}ms tid=[{}] disp={r0:#x} svc={:#x} cookie={:#x} r3={:#x} subs=[{ids}]",
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] disp={:#x} svc={:#x} cookie={:#x} reqid={:#x} subs=[{ids}]",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
-                        read_u16(uc, r0.wrapping_add(0x8)),
-                        r2 & 0xffff,
-                        r3 & 0xffff,
+                        disp,
+                        read_u16(uc, disp.wrapping_add(0x8)),
+                        r8 & 0xffff,
+                        r10 & 0xffff,
                     );
                 } else if label == "waitret" {
                     // r0 = message-ref pointer (0 on timeout).  Dump the ref
