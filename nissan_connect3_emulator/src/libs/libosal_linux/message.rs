@@ -2880,6 +2880,17 @@ static FI_ERA_PENDING: std::sync::OnceLock<
     >,
 > = std::sync::OnceLock::new();
 
+/// r799n31: true while fabricated answers of `svc` are still unaccepted
+/// (pending re-fire map non-empty for that service).  Used by the state-9
+/// wake driver to only re-signal the enavi thread while the property confs
+/// of the absent provider are outstanding.
+pub fn fi_era_has_pending(svc: u16) -> bool {
+    FI_ERA_PENDING
+        .get()
+        .and_then(|m| m.lock().ok().map(|m| m.keys().any(|(s, _)| *s == svc)))
+        .unwrap_or(false)
+}
+
 /// Record a fabricated member-era answer as pending re-fire (called by
 /// `fabricate_fi_ready_push` right after its initial post).
 fn note_fi_era_pending(svc: u16, key: u16, body: &[u8]) {
@@ -4461,11 +4472,13 @@ fn bridge_mbx_queue(
                         ans[8..10].copy_from_slice(&2u16.to_le_bytes());
                         ans[0xb] = 0x45;
                         ans[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
-                        static MSG_ID45: std::sync::atomic::AtomicU16 =
-                            std::sync::atomic::AtomicU16::new(0x9000);
-                        let msg_id =
-                            MSG_ID45.fetch_add(1, Ordering::Relaxed) as u32;
-                        ans[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
+                        // r799n31: the pump's rx pass routes class-0x45 frames by
+                        // the msgid as FI event id (HSI-NAV forwards it verbatim);
+                        // synthetic 0x9000-family ids are dropped there (n188: 271
+                        // pump re-fires, zero completer lookups).  The navsrv
+                        // consumer demonstrably delivers 0x81008114-shaped frames
+                        // to the completer (0x5aa5 GPS-status kicks), so reuse it.
+                        ans[0x10..0x14].copy_from_slice(&0x8100_8114u32.to_le_bytes());
                         ans[0x14..0x16].copy_from_slice(&service.to_le_bytes());
                         ans[0x16..0x18].copy_from_slice(&reg_id.to_le_bytes());
                         ans[0x18..0x1a].copy_from_slice(&function.to_le_bytes());

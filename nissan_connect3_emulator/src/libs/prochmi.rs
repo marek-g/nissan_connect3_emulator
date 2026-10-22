@@ -790,6 +790,20 @@ static FI_READY_ANSWERED: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<(u16, u16, u32)>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// r799n31: runtime VA (+1, Thumb) of `enavi_tclAction::vSignalSelf`
+/// (prochmi 0x0171915c) stashed by the `navif-create` probe.  The FSM calls
+/// it (vtable slot 0x60) after EVERY successful state transition: it posts
+/// OSAL event bit 4 on `poGetIEnaviServer()->[+0x4c] + 0x1c`, which is what
+/// wakes the enavi startup thread to run `bRunWhenRunning` again.  State 9's
+/// failing cascade path does NOT signal (silent return, `bRunWhenRunning`
+/// case 9), so with no third caller (bwrun-caller probe, n190: single lr
+/// 0x17195d4, zero hits after 37 s) it deadlocks.  While property confs of
+/// the absent CSMA provider are still unaccepted, the emulator re-runs this
+/// exact guest function on the 1 Hz tick - the wake side of the missing TE
+/// partner; the answers themselves must (and do) come from the genuine
+/// completer path.  `EMU_FAKE_SENSORFI=0` disables.
+static VSIGNALSELF_FN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     PROCHMI_BASE.store(base_address, Ordering::Relaxed);
     // r789d one-shot diagnostic (EMU_PROCHMI_XREF_SCAN=1).  prochmi is
@@ -5839,17 +5853,17 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     return;
                 }
                 static SEEN: std::sync::LazyLock<
-                    std::sync::Mutex<std::collections::HashMap<u32, u32>>,
+                    std::sync::Mutex<std::collections::HashMap<u32, u128>>,
                 > = std::sync::LazyLock::new(Default::default);
                 let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
                 let t = crate::libs::dapi::emu_t0_elapsed_ms();
                 let mut seen = SEEN.lock().unwrap();
-                let total: u32 = seen.values().sum();
-                if total >= 4000 {
+                let total: usize = seen.len();
+                if total >= 64 {
                     return;
                 }
-                let e = seen.entry(lr).or_insert(u32::MAX);
-                if *e != u32::MAX && t.saturating_sub(*e) < 1500 {
+                let e = seen.entry(lr).or_insert(u128::MAX);
+                if *e != u128::MAX && t.saturating_sub(*e) < 1500 {
                     return;
                 }
                 *e = t;
@@ -5889,6 +5903,12 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     s.clear();
                 }
                 crate::libs::libosal_linux::message::fi_era_clear_pending();
+                // r799n31: stash enavi_tclAction::vSignalSelf (0x0171915c,
+                // Thumb) as runtime VA for the state-9 wake driver below.
+                VSIGNALSELF_FN.store(
+                    base_address + 0x0171_915cu32 - ORIGINAL_BASE + 1,
+                    Ordering::Relaxed,
+                );
             }
             log::warn!(
                 "PROCHMI navif-chain {label} t={}ms tid=[{}] r0={r0:#x} lr={lr:#x}",
@@ -6984,6 +7004,13 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // so the golden completions' func/optype can be compared with
             // our fabricated answers' (func 0, optype 9).
             (0x01c7_d110u32, "lookup", 300),
+            // r799n31: the pump-event completer leg itself (0x1c7ed50:
+            // r3 = message ref, func = u16[content+0x18], optype =
+            // byte[content+0x1a], then 0x1c7d110 on the RECEIVER table
+            // [r0+0x38]).  Zero lookups for the property keys means this
+            // leg never ran for them - log its callers (lr) so a legitimate
+            // state-9 dispatcher can be identified and replicated.
+            (0x01c7_ed50u32, "cllookup", 400),
             // r799n27: dispatch-table insertion/removal legs.  DAPI's svc-6
             // answers reach bHandleResponseSVCData but pRetrieveRequest misses
             // (message lost) - log which keys enStoreRequest ever registers
@@ -7451,6 +7478,12 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     };
                     log::warn!(
                         "PROCHMI pumptrace {label} t={}ms tid=[{}] entry={r0:#x} service={r7:#x} want_ord={ordinal:#x} w0={w0:#x} w2={w2:#x} w6={w6:#x} w8={w8:#x} state={wa:#x} w12={wc:#x} med={r6m:#x} tbl={tbl:#x} tbl+18={t18:#x} tbl+8={t8:#x} tbl+20={t20:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "cllookup" {
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] tbl={r0:#x} msg={r1:#x} msgref={r3:#x} lr={lr:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                     );
@@ -11489,6 +11522,34 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             // it on this 1 Hz tick (bounded inside, cleared by the remove
             // probe once a copy lands).
             crate::libs::libosal_linux::message::refire_fi_era_pending(unicorn);
+            // r799n31: wake driver.  While the property confs of the absent
+            // CSMA provider are still unaccepted, run the guest's own
+            // `enavi_tclAction::vSignalSelf` (the OSAL-event post the FSM
+            // performs after every transition) so the enavi startup thread
+            // gets the third `bRunWhenRunning` tick state 9 never arms for
+            // itself; the cascade then re-walks and its leg succeeds as
+            // soon as the completer consumes the echoed conf.
+            let vsig = VSIGNALSELF_FN.load(Ordering::Relaxed);
+            if vsig != 0
+                && crate::libs::libosal_linux::message::fi_era_has_pending(0x001f)
+            {
+                static SIGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = SIGS.fetch_add(1, Ordering::Relaxed);
+                if n < 30 {
+                    crate::rtos::monitor::spawn_guest_call(
+                        unicorn,
+                        vsig,
+                        [0, 0, 0, 0],
+                        0x4000,
+                    );
+                    if n < 3 || n % 10 == 0 {
+                        log::warn!(
+                            "PROCHMI s9-wake: guest-call vSignalSelf #{n} fn={vsig:#x} t={}ms (fabricated wake for the absent CSMA completion, EMU_FAKE_SENSORFI=0 disables)",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                        );
+                    }
+                }
+            }
             static KICKN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = KICKN.fetch_add(1, Ordering::Relaxed);
             if n < 3 || n % 10 == 0 {
