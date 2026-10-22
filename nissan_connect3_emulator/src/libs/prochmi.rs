@@ -5836,6 +5836,43 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             },
         );
     }
+    // r799n31: pump rx class-0x45 leg forensics.  The narrow `f-accept`
+    // probe (0x17cb5ec) reported zero pops - but narrow mid-TB hooks are
+    // the known dead-probe quirk (AGENTS.md), so watch the WHOLE page
+    // 0x017cb000 and log every distinct fetch in the rx-leg window while
+    // state 9 is live.  Comparing the fetch walk for a delivered 0x5aa5
+    // GPS-status pump frame vs our property conf echoes pinpoints where
+    // our frames are filtered out.
+    {
+        let page = (base_address + 0x017c_b000u32 - ORIGINAL_BASE) & !0xfff;
+        let lo = base_address + 0x017c_b400u32 - ORIGINAL_BASE;
+        let hi = base_address + 0x017c_b700u32 - ORIGINAL_BASE;
+        let _ = unicorn.add_code_hook(
+            page as u64,
+            page as u64 + 0x1000,
+            move |uc: &mut Unicorn<'_, Context>, addr, _| {
+                let hit = addr as u32;
+                if hit < lo || hit >= hi {
+                    return;
+                }
+                if crate::libs::dapi::emu_t0_elapsed_ms() < 35_000 {
+                    return;
+                }
+                static WALKED: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if WALKED.fetch_add(1, Ordering::Relaxed) >= 2500 {
+                    return;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::warn!(
+                    "PROCHMI rx45walk t={}ms tid=[{}] pc={hit:#x} r0={r0:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                );
+            },
+        );
+    }
     // r799n31: who drives `bRunWhenRunning` (0x17c73c0, vtable slot 17 of
     // the startup FSM object, vtable 0x0291c358)?  No code xrefs exist in
     // Ghidra (pure vtable dispatch), so capture the return address at the

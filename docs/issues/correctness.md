@@ -3238,3 +3238,56 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
   deep path (requestCommand CCA round trips - what conf/status the Speech
   property registrations need, EMU_FAKE_CONNECTCONF coverage for the property
   plane) and the remaining keys 6/8 removals.
+
+## r799n31: the state-9 deadlock is real - `bRunWhenRunning` decoded end to end
+
+- Ghidra decompile of `enavi_tclProcEnaviStartup::bRunWhenRunning`
+  (0x17c73c0) resolves every earlier guess:
+  - the FSM state lives at `[this+0x30]`; every SUCCESSFUL transition ends
+    with `vtable+0x60` = `enavi_tclAction::vSignalSelf` (0x171915c): posts
+    OSAL event bit 4 to the event object at `[poGetIEnaviServer()+0x4c]+0x1c`
+    - that post is the re-tick of the enavi driver thread.
+  - **case 9 failure path (`out-byte != 1`) returns SILENTLY - no signal, no
+    timer, no state change**: a hard deadlock unless a property completion
+    itself re-signals.  case 9 success sets state back to 0 (full re-walk
+    incl. DAPI SetDefaultDevice).
+  - case 4 shows the 30 s sleep is `OSAL_s32ThreadWait(registry wait)`;
+    case 1 arms the 2000-tick sleep; case 8 completes only when
+    `bIsNavigationDataAvailable` (device-name string at [this+0x4c]).
+- `bwrun-caller` entry probe (page 0x017c7000, fetch == 0x17c73c0): the ONLY
+  caller in a whole run is lr=0x17195d4 (the `enavi_tclAction::bRun` runner:
+  vfn+0x38 -> state set -> `bl 0xfb701c` (ThreadWait) -> vfn+0x48
+  (bRunWhenRunning) -> vfn+0x18 gate) and it stops calling after the state-6
+  era (n191: hits only at t=4.4 s and 34.2 s).  tid 65 parks as
+  `blocked(sleep)` from then on.
+- `cllookup` probe (pump-event completer leg 0x1c7ed50 -> 0x1c7d110 on the
+  RECEIVER table [r0+0x38]): fires 44x during states 5-7 (all tid 65, all
+  lr=0x17c1cac, pump table 0x3b24408, msgobj 0x907acd20, msgref 0x11c) and
+  then NOTHING in state 9 - the mbx_289 consumer loop that drives that
+  dispatcher is exactly what dies with tid 65's sleep.
+- mbx_36 property-echo attempts (all logged, `EMU_FAKE_CONNECTCONF`):
+  - n185/186: minimal 0x20-byte data+conf pair, msgid 0x9000-family, onto
+    mbx_289 - posted OK (no rejects) but never consumed in state 9.
+  - n188: conf re-fires routed through `pump_push_completion` (271 posts,
+    src stamped 0x0007) - zero completer lookups.
+  - n190: msgid switched to the proven 0x81008114 FI family - still zero.
+  - n193: body padded to the working GPS-status frame size 0x98 - still zero
+    lookups for keys 0xb/0xc/0xd, cascade stays at 2 iterations.
+  - the 0x5aa5 GpsDataStatus pump kicks DO get looked up in state 9 (n188
+    36065 ms) - so the pump lane reaches tid 65; the filter that drops OUR
+    frames lives in the rx leg around 0x17cb574.  The old narrow `f-accept`
+    hook (0x17cb5ec) has zero hits - known dead-probe quirk, so n194 adds
+    the `rx45walk` page probe (page 0x017cb000, window 0x17cb400-0x17cb700,
+    t>=35 s) to compare the live fetch walk of a delivered 0x5aa5 frame vs
+    our echoes and pinpoint the bail-out address.
+- Wake driver (state-9 ticker -> guest-call `vSignalSelf` 0x0171915d,
+  30 signals while 0x1f confs pending, logged, EMU_FAKE_SENSORFI=0
+  disables): fired 30x, no `OSAL_s32EventPost` trap hit - vSignalSelf
+  bailed on its `poGetIEnaviServer()==0 || [server+0x4c]==0` guard (the
+  enavi server object stores its event at a different slot than the
+  decompile's [server+0x4c], or poGetIEnaviServer() really is NULL in our
+  era).  The ENAVI_EVENT waits in the log (mask 0x6e mode 1, 72 hits, last
+  at t=40.3 s) belong to `enavi_tclEnaviThread::vEntry` - a DIFFERENT
+  consumer than the FSM runner.  Next iteration of the wake driver should
+  post the runner's own wake object once the rx45walk identifies the real
+  completer delivery; do NOT fabricate the completion dispatch itself.

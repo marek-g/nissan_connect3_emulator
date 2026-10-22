@@ -4465,10 +4465,16 @@ fn bridge_mbx_queue(
                         "[LIBOSAL-MBX] EMU_FAKE_CONNECTCONF: standing in for mbx_36's absent CSMA provider (app 0x0024), answering ServiceData(svc {service:#06x} regid {reg_id:#04x} func {function:#06x} txn {txn}) from client {client:#06x} with a data+conf echo onto mbx_{client} (EMU_FAKE_CONNECTCONF=0 disables)"
                     );
                     for optype in [9u8, 8] {
-                        let mut ans = vec![0u8; 0x20];
+                        // r799n31: pad to the working GpsDataStatus pump
+                        // frame's size (0x98, n188 lookup blob w1) - the
+                        // pump's rx pass accepts that shape into the
+                        // completer; the 0x20-byte minimal frames died
+                        // before the keyed lookup (n188/190: zero lookups
+                        // for these keys).
+                        let mut ans = vec![0u8; 0x98];
                         ans[0..2].copy_from_slice(&0x0024u16.to_le_bytes());
                         ans[2..4].copy_from_slice(&client.to_le_bytes());
-                        ans[4..8].copy_from_slice(&(0x20u32).to_le_bytes());
+                        ans[4..8].copy_from_slice(&(0x98u32).to_le_bytes());
                         ans[8..10].copy_from_slice(&2u16.to_le_bytes());
                         ans[0xb] = 0x45;
                         ans[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
