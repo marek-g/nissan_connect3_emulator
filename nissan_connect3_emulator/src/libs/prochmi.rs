@@ -7677,8 +7677,19 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     let optype = read_u32(uc, sp) & 0xff;
                     let msgobj = read_u32(uc, sp.wrapping_add(4));
                     // r799n32: capture the connector-plane holder for the
-                    // svcdone guest-call (see CL_TABLE_HOLDER).
-                    if r2 & 0xffff <= 0x100 && r1 & 0xffff != 0x000a && r0 != 0 {
+                    // svcdone guest-call (see CL_TABLE_HOLDER).  n211: the
+                    // pump lane's legs print the SAME r2/r1/r3 shape but
+                    // pass r0=#1 (bHandleSVCData's null-content early leg,
+                    // msgobj = raw svcdone body) - identifying on the
+                    // message-object pointer keeps that garbage out of the
+                    // stash (0x11/0x12 then answered against holder 0x1,
+                    // missed, and the cascade stalled at the EDM polls).
+                    if r2 & 0xffff <= 0x100 && r1 & 0xffff != 0x000a
+                        && r0 > 0x1000
+                        && r0 < 0xf000_0000
+                        && msgobj > 0x1000
+                        && msgobj < 0xf000_0000
+                    {
                         CL_TABLE_HOLDER.store(r0, Ordering::Relaxed);
                     }
                     // r799n27: dump the answer's content header so misses can
