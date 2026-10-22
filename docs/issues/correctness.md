@@ -3175,3 +3175,66 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
   echo path proves out.  Expect the gate entry to reach state 2, the g7
   aggregate rdy=1, state-9 byte=1 -> state 0 -> 1 (DAPI SetDefaultDevice) and
   the golden popup-close cascade to start on its own.
+
+## r799n30: state 9 REACHED (n176); the eraser was our own responder; the state-9 cascade decoded
+
+- Milestone: n176 was the first run to walk 7->8->9 (34.5/34.5/34.5 s).  The
+  gate key-3 REMOVAL at 34025 ms was the genuine completion this time.
+- THE ERASER DECODED: it was never g-m18.  `cca_server_answer_sensorfi_data_
+  request` stamped the answer's +0x18 as "result 0", so its answer to the
+  gate's OWN fabricated f02 request was a func-0 optype-9 frame; the CL
+  completer (lr 0x1c7eda4) matches the key only and REMOVES on optype-9 hits,
+  so the responder deleted the pending gate entry ~13 ms before the real
+  func-f02 data answer arrived (n175 33612 key=3 func=0 msgid 0x5000 REMOVE
+  @33623, f02 MISS @33639).  Fixed: the responder now echoes the request's
+  function at +0x18.  The 0x5aa5 "stale stamps" of n174 were the deliberate
+  dummy ordinals of the gate-kick leg (prochmi.rs, KICK<3).
+- g-m18 restore: removing its member-era re-flood (n29) stalled n175 at
+  state 6 - member completions lose the mbx_289 two-consumer race and
+  nothing else completes them.  Restored, era-safe: SVC6_TXN/FI_READY_ANSWERED/
+  FI_ERA_PENDING are cleared at `navif-create` (the request table's IDFactory
+  re-mints keys from 1 on rebuild) and implausible r1 captures (>0x100) are
+  neither recorded nor answered.
+- mbx_289 is a genuine two-consumer race (tid-84 enConnect pops+drops class-
+  0x45 messages that are not its own transactions; the navsrv consumer pops
+  the rest).  `f-accept` (0x17cb5ec) had ZERO pops in n175-n181 - the tid-65
+  bCmdWait round-trips during the state legs are what actually pop answers
+  (n176 removed keys 1-5,7,9,a; DAPI's GENUINE optype-8 confs answered the
+  mbx_7-plane members 4,5,a themselves - fidelity holds).
+- Completion shapes pinned (n176/n178): optype-9 func-0 pushes HIT entries
+  (found leg + callback) but do NOT remove them; only optype-8 CONF answers
+  remove (fabricated `fabricate_fi_conf_complete` now mirrors DAPI's genuine
+  conf shape, echoes the entry +0x18 func word, gated to the navsrv era
+  t>=32 s: first-era conf pushes poisoned the pre-navsrv registration era -
+  n179 state-9 legs went silent, n180 state-9 never ran its cascade).
+  The svc-0x000a gate is excluded - it completes through its func-f02 DATA
+  answer.  n178 then removed keys 7 and 9 with the conf shape.
+- State-9 cascade fully decoded (`bRegisterPropertiesAfterDatasetIsAvailable`
+  0x17c6330): 19 `bIsCCAServiceRequired(svc)` checks in order {0x1f,0x1e,
+  0x1e,0x1e,0x2c,0x1f,0x0a,0x152(pc-pool @0x17c7158),0x56,0x300,0x37,0x32,
+  0x32,0x18,0x0d,0x1f,0x2c,0x06,0x7d}; a required (==1) service enters a leg
+  that checks `poGetIEnaviServer()` connector slots (+0x08..+0x40) and runs
+  the ActionReq property registrations (SpeechLanguage/MetricSystem/Feature,
+  PosPosition... via requestCommand 0x17b94b8 -> CCA round trip); any NULL
+  slot or failed vfn+0x18 returns through 0x17c64bc WITHOUT storing the out
+  byte (r5 != 1 path 0x17c6494/0x17c64b4).  Probe: page hook 0x17c6000 on all
+  19 cmp sites + the final (`s9cascade`, prochmi.rs).
+- n178/n181: the cascade enters the FIRST leg (svc 0x1f, r0=1, r5=1) and never
+  comes back - only 2 iterations per run.  tid 64/65 is NOT blocked, just
+  `blocked(sleep)`: the state-9 loop is EVENT-DRIVEN (the gate-kick budget of
+  3 provided the only 2 ticks; n178 went silent 24 s after 35946 ms).  n181:
+  the 1 Hz GpsDataStatus ticker (prochmi-process thread, FSM-9 gated, mbx_289
+  push, 6 fires) did NOT re-tick - the event only re-ticks when the NAVSRV
+  PUMP pops it (msgid -> FI-event conversion lives in the pump's rx leg), and
+  tid-84's enConnect ate the ticker pushes again.
+- NEXT: make the ticker's pushes reach the pump consumer despite tid 84.
+  Options (all host-side, libosal layer, allowed): (a) deliver class-0x45
+  answers whose (svc,txn) matches NO live table entry only when the navsrv
+  consumer is a parked waiter (selective hand-off in finish_guest_wait,
+  the host already arbitrates); (b) reuse `push_gps_answer`'s route
+  ("pump queue first" variant) from a prochmi guest-context probe that runs
+  every second instead of a host thread; (c) have the era-refire leg re-push
+  through the pump-event route for the ticker keys.  Then watch the 0x1f leg
+  deep path (requestCommand CCA round trips - what conf/status the Speech
+  property registrations need, EMU_FAKE_CONNECTCONF coverage for the property
+  plane) and the remaining keys 6/8 removals.
