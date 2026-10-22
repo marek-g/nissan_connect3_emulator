@@ -2887,6 +2887,13 @@ fn note_fi_era_pending(svc: u16, key: u16, body: &[u8]) {
     // navsrv consumer's `f-accept` leg (g3 pops: svc 0x0006/0x000a only);
     // other fabricated member answers (0x1f, 0x1e, ...) are legitimately
     // eaten by tid-84's enConnect resolution and would never clear.
+    // Only the startup-connector route's services complete through the
+    // navsrv consumer's `f-accept` leg (g3 pops: svc 0x0006/0x000a only);
+    // other fabricated member answers (0x1f, 0x1e, ...) are legitimately
+    // eaten by tid-84's enConnect resolution and would never clear.
+    // r799n30 note: broadening this list floods the pre-navsrv era with
+    // re-pushes (n184: the run timeline collapsed into the 10 s sleep era
+    // and state 6 died) - keep it at the proven pair.
     if !matches!(svc, 0x0006 | 0x000a) {
         return;
     }
@@ -3298,6 +3305,28 @@ pub fn push_gps_answer(unicorn: &mut Unicorn<'_, Context>, key: u16) -> &'static
     }
     if pump_push_completion(unicorn, body) {
         return "pump";
+    }
+    "none"
+}
+
+/// r799n30: the state-9 FSM re-tick kick, pump-first.  n181 proved the
+/// mbx_289 route cannot serve as the 1 Hz GpsDataStatus stand-in: tid-84's
+/// enConnect pops the push and drops it, and the msgid -> FI-event
+/// conversion that re-ticks the enavi startup handler lives in the navsrv
+/// pump's own rx leg.  The pump queue (`HMINavServerLib_1`, hosted since
+/// r799d) has a single consumer, so the event form of the message survives;
+/// the dummy ordinal 0x5aa5 keeps it out of every completer.  Falls back to
+/// the mbx route (the old behavior) when the pump queue is not available.
+pub fn push_gps_kick_pump_first(unicorn: &mut Unicorn<'_, Context>, key: u16) -> &'static str {
+    if std::env::var_os("EMU_FAKE_SENSORFI").is_some_and(|v| v == "0") {
+        return "none";
+    }
+    let body = gps_data_status_answer_body(key);
+    if pump_push_completion(unicorn, body.clone()) {
+        return "pump";
+    }
+    if push_blob_to_mbx_289(unicorn, body) {
+        return "mbx";
     }
     "none"
 }
@@ -4369,6 +4398,88 @@ fn bridge_mbx_queue(
                         "[LIBOSAL-MBX] EMU_FAKE_CONNECTCONF: standing in for {name}'s absent provider (app {server_app:#06x}), answering enConnect ServiceRegister(client {client:#06x}, svc {service:#06x}) with RegisterConf+ServiceStatus onto mbx_{client} (EMU_FAKE_CONNECTCONF=0 disables)"
                     );
                     cca_server_answer_register(unicorn, server_app, client, service);
+                }
+            }
+            // r799n30: property-level ServiceData requests on the unhosted
+            // provider queue mbx_36 (DIM/CSMA app 0x0024).  At state-9 entry
+            // the CL posts the Speech property registrations as GENUINE
+            // 32-byte client requests (n183 35458-35460ms: NAVIF -> TGT=0x24
+            // MTY=0x45 FID=0xd62/0xd65/0xd70 OP=3, txn = the enStoreRequest
+            // key at +0x1c) - and nothing answers: the `requestCommand` leg
+            // never completes, the action's vfn+0x18 stays 0 and the
+            // state-9 cascade returns early (2 iterations, timer never
+            // armed).  The provider app 0x0024 is not an emulated process
+            // (the real unit routes this to the CSMA/TE side), so answer
+            // here: echo the frame with a server optype 9 (data) + 8 (conf)
+            // pair - the conf is what REMOVEs the pending entry (n176/n178
+            // completion-shape evidence), the data feeds the AIL reference
+            // match.  One pair per (svc, regid, func, txn) request;
+            // `EMU_FAKE_CONNECTCONF=0` disables.
+            if name == "mbx_36"
+                && body.len() >= 0x1e
+                && body[0xb] == 0x45
+                && (1..=5).contains(&body[0x1a])
+                && std::env::var_os("EMU_FAKE_CONNECTCONF").is_none_or(|v| v != "0")
+            {
+                let client = u16::from_le_bytes([body[0], body[1]]);
+                let service = u16::from_le_bytes([body[0x14], body[0x15]]);
+                let reg_id = u16::from_le_bytes([body[0x16], body[0x17]]);
+                let function = u16::from_le_bytes([body[0x18], body[0x19]]);
+                let txn = u16::from_le_bytes([body[0x1c], body[0x1d]]);
+                static ANSWERED45: std::sync::LazyLock<
+                    std::sync::Mutex<std::collections::HashSet<(u16, u16, u16, u16)>>,
+                > = std::sync::LazyLock::new(Default::default);
+                let fresh = ANSWERED45
+                    .lock()
+                    .unwrap()
+                    .insert((service, reg_id, function, txn));
+                if fresh {
+                    log::warn!(
+                        "[LIBOSAL-MBX] EMU_FAKE_CONNECTCONF: standing in for mbx_36's absent CSMA provider (app 0x0024), answering ServiceData(svc {service:#06x} regid {reg_id:#04x} func {function:#06x} txn {txn}) from client {client:#06x} with a data+conf echo onto mbx_{client} (EMU_FAKE_CONNECTCONF=0 disables)"
+                    );
+                    for optype in [9u8, 8] {
+                        let mut ans = vec![0u8; 0x20];
+                        ans[0..2].copy_from_slice(&0x0024u16.to_le_bytes());
+                        ans[2..4].copy_from_slice(&client.to_le_bytes());
+                        ans[4..8].copy_from_slice(&(0x20u32).to_le_bytes());
+                        ans[8..10].copy_from_slice(&2u16.to_le_bytes());
+                        ans[0xb] = 0x45;
+                        ans[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
+                        static MSG_ID45: std::sync::atomic::AtomicU16 =
+                            std::sync::atomic::AtomicU16::new(0x9000);
+                        let msg_id =
+                            MSG_ID45.fetch_add(1, Ordering::Relaxed) as u32;
+                        ans[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
+                        ans[0x14..0x16].copy_from_slice(&service.to_le_bytes());
+                        ans[0x16..0x18].copy_from_slice(&reg_id.to_le_bytes());
+                        ans[0x18..0x1a].copy_from_slice(&function.to_le_bytes());
+                        ans[0x1a] = optype;
+                        ans[0x1b] = 1;
+                        ans[0x1c..0x1e].copy_from_slice(&txn.to_le_bytes());
+                        let mut blob = Vec::with_capacity(8 + ans.len());
+                        blob.extend_from_slice(&1u32.to_le_bytes());
+                        blob.extend_from_slice(&(ans.len() as u32).to_le_bytes());
+                        blob.extend_from_slice(&ans);
+                        let mut state = unicorn.get_data().namespace.lock().unwrap();
+                        let target = format!("mbx_{client}");
+                        if let Some(q) = state.mq.queue_id_for_name(&target) {
+                            state.mq.grow_msgsize(q, blob.len() as i64);
+                            if OsalQueueService::guest_post(
+                                &mut state.mq,
+                                &target,
+                                blob,
+                                0,
+                            ) {
+                                state.notify_waiters();
+                                if optype == 8 {
+                                    // keep re-firing the conf until the
+                                    // remove probe clears this key (tid-84
+                                    // race, r799k mechanism)
+                                    note_fi_era_pending(service, txn, &ans);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             trace_dapi_map_service_data(name, &body);

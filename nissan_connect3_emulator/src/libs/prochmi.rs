@@ -790,87 +790,8 @@ static FI_READY_ANSWERED: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<(u16, u16, u32)>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// r799n30: the HMI-side GpsDataStatus ticker.  On the unit the SENSORFI
-/// server broadcasts GpsDataStatus at ~1 Hz for its whole lifetime, and the
-/// enavi startup FSM is event-driven: every such message reaching the navsrv
-/// pump (mbx_289, class 0x45, msgid 0x81008114 -> FI event) re-ticks the
-/// enavi-status handler - the very re-tick the one-shot gate-kick (budget 3)
-/// stood in for (r798b).  With the budget spent the state-9 loop went idle
-/// after 2 cascade iterations (n178: cascade legs at 35863/35946 ms then
-/// silence for 24 s although tid 64 was merely sleeping).  Stand in for the
-/// absent SENSORFI stream: one GpsDataStatus-shaped answer per second into
-/// mbx_289, carrying the never-matching dummy ordinal 0x5aa5 so it can only
-/// act as the event kick (unmatched keys are inert in the completer, f232).
-/// Runs INSIDE the prochmi process (HMI_FSM_STATE is process-local: the
-/// same thread hosted in procnav never saw the FSM advance - n180); fires
-/// only while the startup FSM sits in state 9 (an ungated kick during the
-/// state-4 era derailed the FSM into the 4->1 retry loop - n179).
-/// `EMU_FAKE_SENSORFI=0` disables.
-fn spawn_hmi_gps_ticker(unicorn: &mut Unicorn<'_, Context>) {
-    if std::env::var_os("EMU_FAKE_SENSORFI").is_some_and(|v| v == "0") {
-        return;
-    }
-    static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if ARMED.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    let namespace = unicorn.get_data().namespace.clone();
-    let result = std::thread::Builder::new()
-        .name("hmi-gps-ticker".into())
-        .spawn(move || {
-            let mut n: u32 = 0;
-            loop {
-                if crate::libs::libosal_linux::message::hmi_fsm_state() != 9 {
-                    crate::emulator::vtime::sleep_virtual(
-                        std::time::Duration::from_millis(250),
-                    );
-                    continue;
-                }
-                n += 1;
-                let body =
-                    crate::libs::libosal_linux::message::gps_data_status_answer_body(0x5aa5);
-                let mut blob = Vec::with_capacity(8 + body.len());
-                blob.extend_from_slice(&1u32.to_le_bytes());
-                blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
-                blob.extend_from_slice(&body);
-                let posted = {
-                    let mut guard = namespace.lock().unwrap();
-                    let q = crate::common::osal_queues::OsalQueueService::ensure_queue(
-                        &mut guard.mq,
-                        "mbx_289",
-                    );
-                    guard.mq.grow_msgsize(q, blob.len() as i64);
-                    let posted = crate::common::osal_queues::OsalQueueService::guest_post(
-                        &mut guard.mq,
-                        "mbx_289",
-                        blob,
-                        2,
-                    );
-                    if posted {
-                        guard.notify_waiters();
-                    }
-                    posted
-                };
-                if n <= 3 || n % 10 == 0 {
-                    log::info!(
-                        "PROCHMI GPS ticker: GpsDataStatus-shaped event kick #{n} posted to mbx_289 ({}; re-ticks the state-9 cascade, EMU_FAKE_SENSORFI=0 disables)",
-                        if posted { "ok" } else { "queue full" }
-                    );
-                }
-                crate::emulator::vtime::sleep_virtual(std::time::Duration::from_secs(1));
-            }
-        });
-    match result {
-        Ok(_) => log::info!(
-            "PROCHMI: HMI GpsDataStatus FSM-tick ticker armed (state-9 gated, 1 Hz, EMU_FAKE_SENSORFI=0 disables)"
-        ),
-        Err(error) => log::warn!("PROCHMI: cannot start HMI GPS ticker: {error}"),
-    }
-}
-
 pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     PROCHMI_BASE.store(base_address, Ordering::Relaxed);
-    spawn_hmi_gps_ticker(unicorn);
     // r789d one-shot diagnostic (EMU_PROCHMI_XREF_SCAN=1).  prochmi is
     // prelinked: callers of the exported navif/enavi glue (enActivate,
     // IFMediator::enActivate, bInitialise, bNavIFCreate) bind through
@@ -5805,6 +5726,35 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             );
             0
         });
+    }
+    // r799n30: the state-9 loop stopped re-running after 2 iterations and
+    // tid 65 slept; find WHO waits and how long - log every long
+    // OSAL_s32ThreadWait (>300 ticks) with its caller after t=32 s.
+    // PLT-stub entry (safe narrow trap).
+    {
+        let address = base_address + 0x00fb_7040u32 - ORIGINAL_BASE;
+        let _ = unicorn.add_code_hook(
+            address as u64,
+            (address + 4) as u64,
+            move |uc: &mut Unicorn<'_, Context>, _, _| {
+                let t = crate::libs::dapi::emu_t0_elapsed_ms();
+                if t < 32_000 {
+                    return;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                if r0 <= 300 {
+                    return;
+                }
+                static H: AtomicU32 = AtomicU32::new(0);
+                if H.fetch_add(1, Ordering::Relaxed) < 40 {
+                    let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI long-wait t={t}ms tid=[{}] ticks={r0} lr={lr:#x}",
+                        uc.get_data().inner.thread_id(),
+                    );
+                }
+            },
+        );
     }
     // r799n30: state-9 cascade forensics.  `bRegisterPropertiesAfterDataset
     // IsAvailable` (0x17c6330) walks 19 `bIsCCAServiceRequired(svc)` checks
@@ -11467,6 +11417,43 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
         return;
     }
     PROCHMI_TICK_NEXT.with(|cell| cell.set(Some(now + Duration::from_millis(100))));
+
+    // r799n30: 1 Hz GpsDataStatus stand-in AS THE STATE-9 EVENT TICK.  On
+    // the unit the SENSORFI server's 1 Hz broadcast re-ticks the enavi
+    // startup FSM for its whole life; the state-9 loop stopped re-running
+    // after the gate-kick budget (3) was spent (n178: cascade legs at
+    // 35863/35946 ms, then tid 64 just slept for 24 s).  Pump-first (see
+    // message.rs): only the pump's rx leg converts the msgid to the FI
+    // event, and tid-84 eats the mbx_289 copies.  Fires only in FSM state 9
+    // (an ungated kick during the state-4 era derailed the FSM into the
+    // 4->1 retry loop, n179).  `EMU_FAKE_SENSORFI=0` disables.
+    {
+        thread_local! {
+            static TICKER_NEXT: std::cell::RefCell<Option<Instant>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let due = TICKER_NEXT.with(|cell| match *cell.borrow() {
+            None => true,
+            Some(next) => now >= next,
+        });
+        if due
+            && crate::libs::libosal_linux::message::hmi_fsm_state() == 9
+            && std::env::var_os("EMU_FAKE_SENSORFI").map_or(true, |v| v != "0")
+        {
+            let route = crate::libs::libosal_linux::message::push_gps_kick_pump_first(
+                unicorn, 0x5aa5,
+            );
+            static KICKN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = KICKN.fetch_add(1, Ordering::Relaxed);
+            if n < 3 || n % 10 == 0 {
+                log::info!(
+                    "PROCHMI gps-ticker: pump-first GpsDataStatus re-tick kick #{n} route {route} t={}ms (state-9 cascade tick source, EMU_FAKE_SENSORFI=0 disables)",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                );
+            }
+            TICKER_NEXT.with(|cell| *cell.borrow_mut() = Some(now + Duration::from_secs(1)));
+        }
+    }
 
     let event = HMI_EVENT_OBJECT.load(Ordering::Relaxed);
     if event == 0 {
