@@ -3084,3 +3084,33 @@ watchdog tick, and park waiters behave exactly like on the device: asleep
 until a peer really posts.  (Choosing per-word whitelists of addresses was
 rejected - slot ids depend on creation order; the word value itself is the
 robust signal.)
+
+## Endgame: hook-free emulation (post-golden-run refactor)
+
+Goal: the emulator speaks ONLY the wire protocol (OSAL mailboxes + CCA/FI
+frames); no execution inside guest processes. Feasible in 4 steps:
+
+1. Start the real infrastructure processes we already have on disk:
+   procmwlx (hosts ccademo_tclApp - likely the CCA directory/supplier)
+   and procsds (carries the full ail CCA client library). The CCA
+   registration fabrications (regid directory, RegisterConf/ServiceStatus
+   answers) then come from REAL code answering real class-0x41 requests -
+   the highest-value fidelity win and the biggest fabrication removed.
+2. Keep the remaining fabrications (SENSORFI/GPS, LPM, camera) as
+   wire-level frame injectors (fabricate_fi_* already build real frames;
+   only their *timing* lives in prochmi.rs now - move it to a provider
+   "device" thread next to pwr_proxy.rs).
+3. Replace the in-process svcdone guest-call of bHandleResponseSVCData
+   (0x1c7d110) with genuine delivery: post the stamped class-0x45 frame
+   into the client's mailbox + a pump wake event (the pump-first route
+   already exists) and fix the remaining drain preconditions (the
+   tid-84/theft/queue-owner issues from r799n30 are the blockers).
+   Symbol-name binding (mangled names ARE exported in prochmi's .dynsym)
+   is the interim fix for the hardcoded VA either way.
+4. Demote all behavioral-address probes (rqadd/stspy/s9cascade/evtqm/
+   s9gate...) to an opt-in build (they are read-only loggers, safe to
+   keep behind EMU_PROCHMI_NAV_TRACE).
+
+What likely stays hooked regardless: nothing functional, unless a drain
+precondition turns out genuinely unfixable at wire level - each such
+case must be logged as a fidelity deviation in correctness.md.
