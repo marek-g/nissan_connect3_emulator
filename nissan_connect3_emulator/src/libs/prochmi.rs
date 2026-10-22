@@ -8427,14 +8427,29 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     );
                 } else if label == "subpre" {
                     // before subscriber vfn+0x1c: r1 = subscriber object.
+                    // r799n33g: dump the runtime vtable slots (this
+                    // binary builds its .data.rel.ro vtables at load, the
+                    // file bytes there are a DIFFERENT class's table) and
+                    // the subscriber's head words - the vfn+0x1c target
+                    // names the real onRequestDone to decompile.
                     let r1s = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                     let vt = read_u32(uc, r1s);
+                    let slots: Vec<String> = (0..9u32)
+                        .map(|i| {
+                            format!(
+                                "{:#x}",
+                                read_u32(uc, vt.wrapping_add(i * 4)) & !1
+                            )
+                        })
+                        .collect();
                     log::warn!(
-                        "PROCHMI pumptrace {label} t={}ms tid=[{}] sub={r1s:#x} id={:#x} vt={vt:#x} vfn1c={:#x} lr={lr:#x}",
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] sub={r1s:#x} id={:#x} vt={vt:#x} w8={:#x} w10={:#x} slots=[{}] lr={lr:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                         read_u16(uc, r1s.wrapping_add(4)),
-                        read_u32(uc, vt.wrapping_add(0x1c)) & !1,
+                        read_u32(uc, r1s.wrapping_add(8)),
+                        read_u32(uc, r1s.wrapping_add(0x10)),
+                        slots.join(","),
                     );
                 } else if label == "subhand" {
                     // after subscriber vfn+0x1c: r4 = handler result
