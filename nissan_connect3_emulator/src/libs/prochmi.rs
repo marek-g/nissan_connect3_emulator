@@ -5894,7 +5894,6 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 if hit == lo + 0x174 {
                     // 0x17cb574(r0=queue obj, r1/r2=out u16s, r3=msgobj):
                     // content = [r3+4], class = content[0xb] (n202 disasm).
-                    let msgobj = read_u32(uc, uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32);
                     let r3v = uc.reg_read(RegisterARM::R3).unwrap_or(0) as u32;
                     let content = read_u32(uc, r3v.wrapping_add(4));
                     let b = content;
@@ -5912,9 +5911,8 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         (0, 0, 0, 0, 0, 0, 0)
                     };
                     log::warn!(
-                        "PROCHMI rx45body t={t}ms tid=[{}] q={r0:#x} msgobj={r3v:#x} content={content:#x} src={src:#x} len={len:#x} class={cls:#x} svc={svc:#x} func={func:#x} optype={optype:#x} key={key:#x}",
+                        "PROCHMI rx45body t={t}ms tid=[{}] q={r0:#x} msgref={r3v:#x} content={content:#x} src={src:#x} len={len:#x} class={cls:#x} svc={svc:#x} func={func:#x} optype={optype:#x} key={key:#x}",
                         uc.get_data().inner.thread_id(),
-                        msgobj,
                     );
                 }
                 let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
