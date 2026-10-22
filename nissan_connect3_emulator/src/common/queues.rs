@@ -169,6 +169,44 @@ impl MqState {
         }
 
         let id = self.alloc_id();
+        // r799n33w: burst-capacity floor for the mbx_* AIL service lanes.
+        // The n262 GOOD tail deadlocked because our zero-latency conf
+        // answers arrive in bursts the real CSMA peer physically paces out
+        // over seconds; the guest's 120-slot mbx_289 then fills, its
+        // forwarder (tid-81) parks inside a blocking mq_send, and the
+        // HmiNavServer thread that owns the only dispatcher clones hangs
+        // behind it (tid-65 <-> tid-81 circular wait).  The real unit's
+        // vendor kernel sets fs.mqueue limits to absorb exactly this; the
+        // emulator mimics that kernel tunable.  Disable with
+        // EMU_MQ_MAXMSG_FLOOR=0 to restore the guest-requested geometry.
+        let maxmsg = if name.starts_with("mbx_")
+            && std::env::var_os("EMU_MQ_MAXMSG_FLOOR").is_none_or(|v| v != "0")
+        {
+            let floor: i64 = std::env::var("EMU_MQ_MAXMSG_FLOOR")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024);
+            if maxmsg < floor {
+                log::info!(
+                    "MQ create: name={name} raised maxmsg {maxmsg} -> {floor} (EMU_MQ_MAXMSG_FLOOR kernel-tunable emulation)"
+                );
+                floor
+            } else {
+                maxmsg
+            }
+        } else {
+            maxmsg
+        };
+        if name.starts_with("mbx_") {
+            // r799n33w: mbx_* service lanes deadlocked at t~22 s in n262
+            // because a burst of fabricated confs filled the queue before
+            // the per-message consumer clones could drain it.  Log the
+            // effective geometry so the clog can be attributed to the
+            // size the guest asked for vs the emulator defaults.
+            log::info!(
+                "MQ create: name={name} id={id:#x} maxmsg={maxmsg} msgsize={msgsize} nonblock={nonblock} (guest)"
+            );
+        }
         self.queues.insert(
             id,
             MqQueue::new(name.clone(), maxmsg, msgsize, nonblock, QueueCreator::Guest),

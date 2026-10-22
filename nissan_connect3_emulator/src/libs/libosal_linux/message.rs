@@ -4576,6 +4576,20 @@ fn bridge_mbx_queue(
                     .lock()
                     .unwrap()
                     .insert((service, reg_id, function, txn));
+                if !fresh {
+                    // r799n33v: the client re-asking the SAME
+                    // (svc, regid, func, txn) means our earlier data+conf
+                    // echo did NOT satisfy the request leg - census these:
+                    // they name the exact frames whose payload shape the
+                    // AIL/completer rejects (media-state chain, case-9
+                    // re-walk deadlock feed).
+                    static RA: AtomicU32 = AtomicU32::new(0);
+                    if RA.fetch_add(1, Ordering::Relaxed) < 120 {
+                        log::warn!(
+                            "[LIBOSAL-MBX] mbx_36 class-0x45 RE-ASK from client {client:#06x}: svc {service:#06x} regid {reg_id:#04x} func {function:#06x} txn {txn} (earlier echo not accepted)"
+                        );
+                    }
+                }
                 if fresh {
                     log::warn!(
                         "[LIBOSAL-MBX] EMU_FAKE_CONNECTCONF: standing in for mbx_36's absent CSMA provider (app 0x0024), answering ServiceData(svc {service:#06x} regid {reg_id:#04x} func {function:#06x} txn {txn}) from client {client:#06x} with a data+conf echo onto mbx_{client} (EMU_FAKE_CONNECTCONF=0 disables)"

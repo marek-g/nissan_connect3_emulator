@@ -2967,20 +2967,32 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
             0x0392_0c7fu64,
             move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
                 static HITS: AtomicU32 = AtomicU32::new(0);
-                // The ctor at t~3 s byte-memsets the whole object (240+
-                // writes); that phase is known and would starve the budget.
+                // r799n33v: the old t<32s filter hid the whole startup era -
+                // exactly where the request-leg inserts must happen.  Now:
+                // per-(pc,slot) dedup so the t~3 s ctor memset cannot
+                // starve the budget.
                 let t_ms = crate::libs::dapi::emu_t0_elapsed_ms();
-                if t_ms < 32_000 {
+                let pc = uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32;
+                static KEYS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<(u32, u32), u32>>> =
+                    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                let key = (pc, (address as u32) >> 2);
+                let mut allow = false;
+                if value != 0 || t_ms >= 34_000 {
+                    if let Ok(mut m) = KEYS.lock() {
+                        let c = m.entry(key).or_insert(0);
+                        *c += 1;
+                        allow = *c <= 3;
+                    }
+                }
+                if !allow || HITS.fetch_add(1, Ordering::Relaxed) >= 1000 {
                     return true;
                 }
-                if HITS.fetch_add(1, Ordering::Relaxed) < 400 {
-                    log::warn!(
-                        "PROCHMI pumptbl WRITE t={}ms thread=[{}] addr={address:#x} size={size} value={value:#x} pc={:#x}",
-                        t_ms,
-                        uc.get_data().inner.thread_id(),
-                        uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32,
-                    );
-                }
+                log::warn!(
+                    "PROCHMI pumptbl WRITE t={}ms thread=[{}] addr={address:#x} size={size} value={value:#x} pc={:#x}",
+                    t_ms,
+                    uc.get_data().inner.thread_id(),
+                    pc,
+                );
                 true
             },
         );
@@ -3179,6 +3191,163 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
                 Ok(_) => log::info!("PROCHMI: addwrap page watch installed"),
                 Err(e) => log::warn!("PROCHMI: addwrap page watch failed: {e}"),
             }
+        }
+        // r799n33v: bHandleResponseSVCData (0x1c7d110) key resolution -
+        // 0x1c7d14c bl 0x1c7ddac(r6+8, r1=msg) builds/finds the pending
+        // key object; NULL -> 'Request not found in Table -> message
+        // lost' (0x1c7d1e8 leg).  0x1c7d154 witnesses the answer with
+        // r5 = key obj (NULL? svc/u16@+0xc? byte@+0xa?).  Dump the msg
+        // tuple [msg+0x82,+0xa2] too (the wire svc/key/func fields the
+        // 0x1c7c6d4 dispatch consumes).
+        {
+            let page = 0x01c7_d000u64;
+            let s_find = page + 0x14cu64;
+            let s_res = page + 0x154u64;
+            let s_lost = page + 0x1e8u64;
+            let result = unicorn.add_code_hook(page, page + 0x1000, move |uc: &mut Unicorn<'_, Context>, addr, _| {
+                if addr == s_find {
+                    static H: AtomicU32 = AtomicU32::new(0);
+                    if H.fetch_add(1, Ordering::Relaxed) >= 120 {
+                        return;
+                    }
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let r11 = uc.reg_read(RegisterARM::R11).unwrap_or(0) as u32;
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI bhrfind find t={}ms tid=[{}] tbl={r0:#x} kind={r1} msg={r11:#x} m[80]={:#x} m[84]={:#x} m[88]={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        read_u32(uc, r11.wrapping_add(0x80)),
+                        read_u32(uc, r11.wrapping_add(0x84)),
+                        read_u32(uc, r11.wrapping_add(0x88)),
+                    );
+                } else if addr == s_lost {
+                    // the traced 'Request not found in Table' leg: r6=this,
+                    // r4==0; dump candidate msg/kind regs + r6 fields.
+                    static H: AtomicU32 = AtomicU32::new(0);
+                    if H.fetch_add(1, Ordering::Relaxed) >= 40 {
+                        return;
+                    }
+                    let r6 = uc.reg_read(RegisterARM::R6).unwrap_or(0) as u32;
+                    let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
+                    let r10 = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
+                    let sp = uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI bhrfind lost t={}ms tid=[{}] this={r6:#x} r7={r7:#x} r10={r10:#x} r6[10]={:#x} r6[14]={:#x} sp0={:#x} s1c={:#x} s24={:#x} s48={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        read_u32(uc, r6.wrapping_add(0x10)),
+                        read_u32(uc, r6.wrapping_add(0x14)),
+                        read_u32(uc, sp),
+                        read_u32(uc, sp.wrapping_add(0x1c)),
+                        read_u32(uc, sp.wrapping_add(0x24)),
+                        read_u32(uc, sp.wrapping_add(0x48)),
+                    );
+                } else if addr == s_res {
+                    static H: AtomicU32 = AtomicU32::new(0);
+                    if H.fetch_add(1, Ordering::Relaxed) >= 120 {
+                        return;
+                    }
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI bhrfind res t={}ms tid=[{}] key={r5:#x} k[2]={:#x} k[6]={:#x} k[8]={:#x} k[a]={} k[c]={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        read_u16(uc, r5.wrapping_add(2)),
+                        read_u16(uc, r5.wrapping_add(6)),
+                        read_u16(uc, r5.wrapping_add(8)),
+                        read_u32(uc, r5.wrapping_add(0xa)) & 0xff,
+                        read_u16(uc, r5.wrapping_add(0xc)),
+                    );
+                }
+            });
+            match result {
+                Ok(_) => log::info!("PROCHMI: bhrfind page watch installed"),
+                Err(e) => log::warn!("PROCHMI: bhrfind page watch failed: {e}"),
+            }
+        }
+        // r799n33v: enavi_tclActionReqDAPIMediaStateOfDevice::enCheckDataMedium
+        // (0x171fd7c, ARM): returns 3 only when this+0x88==3 (state),
+        // this+0x80 in {0,2}, and the 24-byte-entry media vector
+        // [this+0x98,this+0x9c) has an entry with +4!=0 && +0xc==2.  Our
+        // EMU_FAKE_CONNECTCONF echoes answer the wire request but carry a
+        // ZERO payload, so the state never reaches 3 and
+        // bIsNavigationDataAvailable stays false (popup / re-walk chain).
+        // 1) witness the checker's action object + fields; 2) on first sight
+        // dynamically write-watch [a+0x7c, a+0xa4] so the response PARSER
+        // names itself via pc - that code is where the fabricated payload
+        // layout must be read from.
+        {
+            let a_base = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let a_watch_armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ab = a_base.clone();
+            let aw = a_watch_armed.clone();
+            crate::os::code_stub::trap_site(
+                unicorn,
+                0x0171_fd7cu32,
+                crate::os::code_stub::TrapMode::Arm,
+                "libs/prochmi.rs:mdm-check",
+                move |uc: &mut Unicorn<'_, Context>| {
+                    static H: AtomicU32 = AtomicU32::new(0);
+                    let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                    if r0 == 0 {
+                        return 0;
+                    }
+                    let st = read_u32(uc, r0.wrapping_add(0x88));
+                    let v0 = read_u32(uc, r0.wrapping_add(0x80));
+                    let b = read_u32(uc, r0.wrapping_add(0x98));
+                    let e = read_u32(uc, r0.wrapping_add(0x9c));
+                    let n = (e.wrapping_sub(b) >> 3).wrapping_mul(0xaaaa_aaab);
+                    // device name: the action holds its device as a
+                    // char*/fi_tclString near the head - dump the first
+                    // plausible pointer slot +0x10..+0x1c as ascii.
+                    let mut nm = String::new();
+                    for so in [0x10u32, 0x14, 0x18, 0x1c] {
+                        let p = read_u32(uc, r0.wrapping_add(so));
+                        if (0x00fb_7080..0x0380_0000).contains(&p) {
+                            let s = read_cstr(uc, p, 24);
+                            if s.len() > 2 {
+                                nm = format!("@{so:#x}\"{s}\"");
+                                break;
+                            }
+                        }
+                    }
+                    if H.fetch_add(1, Ordering::Relaxed) < 40 {
+                        log::warn!(
+                            "PROCHMI mdm check t={}ms tid=[{}] act={r0:#x} dev={v0:#x} state={st} list={b:#x}..{e:#x} n={n} {nm}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            uc.get_data().inner.thread_id(),
+                        );
+                    }
+                    if !aw.swap(true, Ordering::Relaxed) {
+                        ab.store(r0, Ordering::Relaxed);
+                        let lo = r0.wrapping_add(0x7c) as u64;
+                        let hi = r0.wrapping_add(0xa4) as u64;
+                        let res = uc.add_mem_hook(
+                            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                            lo,
+                            hi,
+                            move |ucx: &mut Unicorn<'_, Context>, _t, address, size, value| {
+                                static WH: AtomicU32 = AtomicU32::new(0);
+                                if WH.fetch_add(1, Ordering::Relaxed) < 200 {
+                                    log::warn!(
+                                        "PROCHMI mdm WRITE t={}ms tid=[{}] addr={address:#x} size={size} value={value:#x} pc={:#x}",
+                                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                                        ucx.get_data().inner.thread_id(),
+                                        ucx.reg_read(RegisterARM::R15).unwrap_or(0) as u32,
+                                    );
+                                }
+                                true
+                            },
+                        );
+                        log::info!(
+                            "PROCHMI mdm write-watch on act={r0:#x}+0x7c..0xa4 installed: {}",
+                            res.is_ok()
+                        );
+                    }
+                    0
+                },
+            );
         }
         // r757: watch the clHMIMngr framework state byte (+0x670) and its
         // pending flag (+0x671) from t=0.  The object sits at 0x38eee60

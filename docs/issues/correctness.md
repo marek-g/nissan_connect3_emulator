@@ -3688,3 +3688,82 @@ INIT bt on tmset 0x1375150, elem-read MEM_READ watches (6 table pages),
 cmleaf (page 0x182c000 code hook: leaf/set-call/set-ret of the CMNAVI
 0x2950 write leg), addwrap (page 0x1381000: wrapper entry + singleton-null
 / arg5-zero / add-OK legs).
+
+## r799n33v/w: the GOOD tail is a QUEUE deadlock, not data - mbx_289 saturates and eats its own dispatcher
+
+Two long-held hypotheses DIED this round, one new root cause was caught red-handed:
+
+- media-state payload hypothesis DEAD: `enavi_tclActionReqDAPIMediaStateOfDevice::
+  enCheckDataMedium` (thunk 0x1614d8c tail-calls the method 0x171fd7c, ARM) was
+  probed with a `mdm` trap_site + dynamic MEM_WRITE watch.  The HMI-side action
+  0x907bf020 already holds dev=2, state=3, list n=1 from t=8.0 s -> the checker
+  returns 3 and `bIsNavigationDataAvailable` is TRUE.  In GOOD, tid-65 itself
+  evaluates it TRUE at t=40.2 s (mdm check t=40200/40205 tid=[65]).  The zero
+  payload of the mbx_36 optype-9 echo never blocked anything.  The second
+  object 0x3a31fe0 (state=0, zero writes all run) is never re-checked by
+  anybody - inert.
+- "u32dp_set(0x8076000) FAILS" hypothesis DEAD: `cldp_Mngr::u32dp_set`
+  (0x1382cf0, vtable 0x28f0e18 slot +0x1c confirmed by Ghidra read_memory -
+  VA != file offset for the vtable segment!) returns the WRITTEN LENGTH, not
+  an error code.  cmleaf set-ret res=0x1 == one byte stored == SUCCESS.  Also
+  `get_u8dID` clamps out-of-range domains to 0 (not reject), so the mounted
+  52-domain vector does not exclude domain-0x80 elements the way r788b feared.
+  The CL write leg is healthy; the popup is NOT gated behind it.
+
+The REAL GOOD-tail deadlock (n262_3 + caught with new logs in n264z_7):
+
+1. t~22 s: our zero-latency fabricated conf bursts (EMU_FAKE_CONNECTCONF data+
+   conf echoes + svcdone lanes) start filling mbx_289.  The queue is
+   guest-created with attr maxmsg=120, msgsize=8, blocking (new `MQ create:`
+   info-log).  The guest-side libosal trace screams `MQ-FULL : Actual count
+   reaches Max msgs` x127 with err 0xd02/0x1800 (its own nonblock posters
+   drop).  On the real unit the CSMA peer physically paces the same confs over
+   seconds, so 120 slots never fill - our burst timing is the artifact.
+2. t~45.5-46.5 s: tid-81 (prochmi enConnect/mbx_36 consumer, cloned 35.6 s)
+   posts its 122nd frame and the QUEUE IS FULL.  DAPI's worker tid-42 posts
+   the svc-0x6 answer onto mbx_289 and parks inside blocking mq_send - new
+   log caught it: `MQ send-block: [42] name=mbx_289 id=0x44c fill=120/120`.
+3. tid-65 (HmiNavServer FSM) had just issued svc 0x6 func 0xb as a CCA request
+   (`[CCASERVER]: TGT=0x7, msg=[MTY=0x45, FID=0xb, OP=0x3, C=1, R=56]`) and
+   waits for its completion.  DAPI DID process it (tid-31 waits on mbx_7 =
+   queue id 0x40d, the tid-42 answer post is the one that parks) - but the
+   answer sits behind 120 stale frames.
+4. mbx_289's consumers are per-message dispatcher clones spawned BY tid-65's
+   pump (clone census + pumptbl list-add lr=0x17b9338).  tid-65 waits -> no
+   new clones -> queue never drains -> tid-81/tid-42 stay parked -> the answer
+   never reaches the completer -> tid-65 never wakes.  Circular wait
+   tid-65 <-> {tid-81, DAPI tid-42} over one full queue.  Nothing else runs
+   after 46.5 s; SM idles with popup 0x5da re-pushed at 14.7 s; the 489->493
+   completion (ROM row 438, kind 1, evt 0 - unconditional once the work done
+   signal arrives) is simply never signalled because op 0x1e9's work chain
+   ends in this deadlock.
+
+Fix (environment class, not an answer fabrication): `EMU_MQ_MAXMSG_FLOOR` in
+`MqState::guest_open_or_create` floors guest-created `mbx_*` queues to 1024
+slots (default; settable; `=0` restores guest-requested geometry) - the
+emulator's stand-in for the vendor kernel `fs.mqueue.*` tunables.  Rationale +
+kill-switch documented at the site.  New diagnostics: `MQ create:` (geometry
+per mbx_* queue), `MQ send-block:` once per (tid,queue) whenever a poster
+parks on a full mbx lane.
+
+Static facts banked this round:
+- Transition ROM 0x25b0408 row layout CONFIRMED by ground-truth calibration
+  (evt 0x9000052a row 423: from=w2>>16=306, to=w3&0xffff=307, kind=w3>>16=7):
+  kind-1 completion rows exist for 307->312, 494->502, 502->508, 510->799,
+  278->279, 280->295, 290->306, 311->313 and 489->493 - the GOOD tail path
+  [...,489,494,500,502,510,800,278,280,290,307] waits on exactly these.
+- GUI_ContentId::NToInteger (0x1374e4c): domain-1 ids are plain 5-bit
+  integers; their QRES=0 answers are semantics, not blockers.  Only domains
+  5/9/b have real handler objects (0x5972a30 runtime handler table).
+- SM ROM tables (0x25b0408/0x25ad4a0/0x25a13cc) have NO static xrefs
+  (no pointer, no delta, no RELATIVE reloc with that addend) - only reachable
+  via the runtime-scanned SM template fields; stop hunting for the consumer.
+- mbx_289 = queue id 0x44c (decimal 1100!), mbx_7 = 0x40d (1037),
+  NOIOSC_CB_HDR_LI_1 = 0x3ef (1007).  BlockReason queue_id prints DECIMAL in
+  SCHED park lines - always convert before mapping.
+
+Open: GOOD-era lottery went ~1/10 through n263/n264 (floor is innocent -
+floor=0 streaks equally BAD; root cause still unknown).  Verify in a GOOD run
+with the floor that tid-42's svc-0x6 answer is consumed, tid-65 walks past
+the svc-0x6 completion, and watch whether op 0x1e9 then reports work done
+(kind-1 wave 489->493, popup 0x5da stays closed).

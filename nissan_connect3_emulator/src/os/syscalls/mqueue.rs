@@ -313,6 +313,26 @@ pub fn mq_timedsend(
         }
         if queue.messages.len() >= queue.maxmsg as usize {
             // queue is full
+            if queue.name.starts_with("mbx_") {
+                // r799n33w: name every thread that parks on a full service
+                // lane - the n262 tail deadlock (mbx_289) had three such
+                // posters (prochmi pump tid-81, DAPI tid-42, tid-65).
+                static FULL_ONCE: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(u32, u32)>>> =
+                    std::sync::LazyLock::new(Default::default);
+                let tid = unicorn.get_data().thread_id();
+                let fresh = FULL_ONCE.lock().map(|mut s| s.insert((tid, mqdes))).unwrap_or(false);
+                if fresh {
+                    log::warn!(
+                        "MQ send-block: [{}] name={} id={:#x} fill={}/{} msgsize={:#x} - poster parks until a receiver drains",
+                        tid,
+                        queue.name,
+                        mqdes,
+                        queue.messages.len(),
+                        queue.maxmsg,
+                        queue.msgsize,
+                    );
+                }
+            }
             if queue.nonblock {
                 return EAGAIN;
             }
