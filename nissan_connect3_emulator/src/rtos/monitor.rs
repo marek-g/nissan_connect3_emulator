@@ -2166,13 +2166,16 @@ pub fn guest_call_bhandle_svcdone(
         }
     }
     const LEG: u32 = 0x01c7_d110; // bHandleResponseSVCData (ARM mode)
+    // NOTE: literal-pool loads encode Rn=15 (0xE59F_xxxx).  The first take
+    // used E59D (Rn=SP) so every load read [sp+24] garbage and `bx lr`
+    // jumped into the child stack (n207: PC = child+0x10, READ_UNMAPPED).
     let code: [u32; 14] = [
-        0xe59d_d018, // ldr  sp, [pc, #24]   -> [8] child sp
-        0xe59d_0018, // ldr  r0, [pc, #24]   -> [9] holder (mediator+0x38)
-        0xe59d_1018, // ldr  r1, [pc, #24]   -> [10] cookie
-        0xe59d_2018, // ldr  r2, [pc, #24]   -> [11] request key
-        0xe59d_3018, // ldr  r3, [pc, #24]   -> [12] func
-        0xe59d_e018, // ldr  lr, [pc, #24]   -> [13] leg address
+        0xe59f_d018, // ldr  sp, [pc, #24]   -> [8] child sp
+        0xe59f_0018, // ldr  r0, [pc, #24]   -> [9] holder (mediator+0x38)
+        0xe59f_1018, // ldr  r1, [pc, #24]   -> [10] cookie
+        0xe59f_2018, // ldr  r2, [pc, #24]   -> [11] request key
+        0xe59f_3018, // ldr  r3, [pc, #24]   -> [12] func
+        0xe59f_e018, // ldr  lr, [pc, #24]   -> [13] leg address
         0xe12f_ff1e, // bx   lr
         0xe320_f000, // nop
         sp, holder, cookie, key, func, LEG,
@@ -2180,6 +2183,22 @@ pub fn guest_call_bhandle_svcdone(
     let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
     if unicorn.mem_write(tramp as u64, &bytes).is_err() {
         return false;
+    }
+    // r799n32 diag (n207: guest-call PC landed at tramp+4 = word[1], i.e.
+    // only word0 ran): read the region back once to verify the bytes and
+    // addresses are what we think they are.
+    static DIAG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if DIAG.fetch_add(1, Ordering::Relaxed) < 2 {
+        let mut rb = [0u8; 56];
+        let _ = unicorn.mem_read(tramp as u64, &mut rb);
+        let words: Vec<String> = rb
+            .chunks_exact(4)
+            .map(|w| format!("{:#010x}", u32::from_le_bytes(w.try_into().unwrap())))
+            .collect();
+        log::warn!(
+            "MONITOR svcdone-diag body={body_mem:#x} child={child:#x} tramp={tramp:#x} sp={sp:#x} back={}",
+            words.join(" "),
+        );
     }
     let tid = spawn_guest_call(unicorn, tramp & !1, [0; 4], 0x1000);
     log::warn!(

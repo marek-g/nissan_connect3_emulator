@@ -7110,10 +7110,10 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                     bb[0x14..0x16]
                                         .copy_from_slice(&(svc as u16).to_le_bytes());
                                     bb[0x18..0x1a]
-                                        .copy_from_slice(&f18b.to_le_bytes());
+                                        .copy_from_slice(&(f18b as u16).to_le_bytes());
                                     bb[0x1a] = 8;
                                     bb[0x1c..0x1e]
-                                        .copy_from_slice(&ordinal.to_le_bytes());
+                                        .copy_from_slice(&(ordinal as u16).to_le_bytes());
                                     crate::rtos::monitor::guest_call_bhandle_svcdone(
                                         uc,
                                         holder,
