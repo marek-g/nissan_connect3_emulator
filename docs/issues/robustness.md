@@ -152,3 +152,29 @@ so future hook cleanups classify by callback side effects, not naming.
   ticker is merged into the window block.
 - Pump envelopes stay (inert but harmless wake-candidates); the FI-era
   pending map is still cleared by the `remove` probe.
+
+## r799n33r/s: state-6 wake + fan-out tuning - GOOD survives, lottery remains
+
+- r799n33r: vSignalSelf wake gate now also covers open member-era svcdone
+  re-arms (was 0x1f-only).  event.rs parks infinite OSAL event waits and
+  re-arms them on wake - an event sleeper is woken ONLY by a real
+  EventPost, pump-queue posts never reach it (why the 1 Hz pump kicks are
+  inert for the parked enavi thread).  n257_4 shows s9-wake firing but
+  tid 65 was already dead before the first wake in BAD eras, so this is
+  mitigation, not cure.
+- r799n33s: blind cookies {1,2,3} restricted to non-state-9 windows
+  (n257_4: thrown during the cascade they flipped foreign slots, key
+  0x18 removed x4 by our own legs, cascade stalled at sp2a).
+- Status on the new binary: n258_1 = FULL GOOD on run 1 (state 4->9,
+  cascade final, 52 keys removed, 9->0 re-walk at 47630 on worker
+  tid).  n258_2/3 still BAD (state-6 death, removed=2/3) and n256 at
+  EMU_REALTIME_FACTOR=0.5 is BAD 2/2 with identical signature - the
+  era lottery is NOT host-clock-sensitive, it is decided inside the
+  first registration rounds.  GOOD-rate now ~1/3.
+- Post-cascade truth (n258_1): state-0 re-walk starts (1 key removed),
+  then tid 65 idle again; the CMNAVI cl-entry for 0x8076000 is STILL
+  obj+4=0 at 38 s and the popup SM never triggers (no SM-DEC after
+  boot).  Confirms the r799n7 root: popup-hide + city list + CMNAVI
+  readiness all wait on the CL provisioning pass (vfn+0x18 add_element
+  loop, executed exactly once per run) + the ReqPrepareDestEnv write
+  chain.  That is the next big chase, independent of the boot lottery.
