@@ -12574,6 +12574,7 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
     // (an ungated kick during the state-4 era derailed the FSM into the
     // 4->1 retry loop, n179).  `EMU_FAKE_SENSORFI=0` disables.
     {
+        static S9_DONE: AtomicBool = AtomicBool::new(false);
         thread_local! {
             static TICKER_NEXT: std::cell::RefCell<Option<Instant>> =
                 const { std::cell::RefCell::new(None) };
@@ -12583,10 +12584,14 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             Some(next) => now >= next,
         });
         if due
-            && matches!(
-                crate::libs::libosal_linux::message::hmi_fsm_state(),
-                0 | 6
-            )
+            && (crate::libs::libosal_linux::message::hmi_fsm_state() == 6
+                || (crate::libs::libosal_linux::message::hmi_fsm_state() == 0
+                    // r799n33m: state 0 is ALSO the pre-FSM boot value -
+                    // kicking from t=0 replays the early-registration BAD
+                    // boot (n249: 5x BAD).  Re-tick state 0 only after the
+                    // FSM has been through state 9 once (the genuine
+                    // post-cascade re-walk of n247_4).
+                    && S9_DONE.load(Ordering::Relaxed)))
             && std::env::var_os("EMU_FAKE_SENSORFI").map_or(true, |v| v != "0")
         {
             // r799n33l: state 0 joins the re-tick.  With trio-2 answered
@@ -12619,6 +12624,7 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             && crate::libs::libosal_linux::message::hmi_fsm_state() == 9
             && std::env::var_os("EMU_FAKE_SENSORFI").map_or(true, |v| v != "0")
         {
+            S9_DONE.store(true, Ordering::Relaxed);
             let route = crate::libs::libosal_linux::message::push_gps_kick_pump_first(
                 unicorn, 0x5aa5,
             );
