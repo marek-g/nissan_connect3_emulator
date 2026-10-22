@@ -12517,6 +12517,29 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             Some(next) => now >= next,
         });
         if due
+            && crate::libs::libosal_linux::message::hmi_fsm_state() == 6
+            && std::env::var_os("EMU_FAKE_SENSORFI").map_or(true, |v| v != "0")
+        {
+            // r799n33h: the same 1 Hz re-tick the unit provides in EVERY
+            // FSM state (see the comment above) - the BAD boots (n234/
+            // n240/n241) starve state 6: late member re-mints (e.g. the
+            // func-0x1 timeout after an early READY edge) queue their
+            // answer pushes on mbx_289 but no pump rx leg ever drains the
+            // queue again (60 unconsumed re-fires for one txn in n241),
+            // the member never flips DONE and the gate never opens.  A
+            // pump-first kick makes tid-81's rx leg consume the backlog;
+            // a duplicate GpsDataStatus in state 6 is inert for the FSM
+            // (only state 4-era kicks derailed it, n179).
+            let route = crate::libs::libosal_linux::message::push_gps_kick_pump_first(
+                unicorn, 0x5aa5,
+            );
+            crate::libs::libosal_linux::message::refire_fi_era_pending(unicorn);
+            let _ = route;
+            TICKER_NEXT.with(|cell| {
+                *cell.borrow_mut() = Some(now + Duration::from_secs(1));
+            });
+        }
+        if due
             && crate::libs::libosal_linux::message::hmi_fsm_state() == 9
             && std::env::var_os("EMU_FAKE_SENSORFI").map_or(true, |v| v != "0")
         {
