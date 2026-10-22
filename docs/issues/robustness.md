@@ -99,3 +99,26 @@ so future hook cleanups classify by callback side effects, not naming.
   navsrv-svcready/vSvcReady guards (identical GOOD vs BAD); gate action
   itself (reaches DONE=2 in n241 while s7 still missing - the blockers
   are the svc-0x6 members + their parent procs 0x..11670/0x..11498).
+
+## r799n33n: BAD-rate spiked to ~90% - environmental shift + pump-first re-fire
+
+- Bisect result: the binary that produced GOOD boots at ~17:45 (commit
+  626a0b4) now boots BAD 3/3 - the regression is NOT any of the code
+  changes since; the host timing distribution shifted (exact cause
+  unidentified; zombies and load checked clean).
+- Every BAD since shares ONE signature: state-6 member re-mints (e.g.
+  func 0x1, key 4) get their ServiceData answers pushed to mbx_289 but
+  nothing ever consumes them (n241 txn11 x60, n242 txn4/5, n250 txn4
+  x17, uniq_removed=3). GOOD boots consume those frames during the
+  navif registration round-trip's client-side Wait - when the re-mint
+  lands after that era, the queue lane is dead.
+- Decoded root (r799n31 note re-read): host `guest_post` pushes never
+  enter the GUEST-side message list walked by the HMINavServerLib pump
+  dispatcher (0x17c1c50), and tid-81's OSAL receive (enConnect router)
+  drops them. The pump lane (pump_push_completion, used by the 1 Hz
+  GPS kicks) is the only drain-visible + thread-waking lane.
+- Fix: refire_fi_era_pending now fires ALL pending era entries (not
+  just svc 0x1f) as pump-lane data(9)+conf(8) envelopes, falling back
+  to the plain mbx push. Pump completer matches the key loosely
+  (n174) and the key space is single-per-era, so member keys resolve
+  unambiguously. EMU_FI_ERA_REFIRE=0 disables.
