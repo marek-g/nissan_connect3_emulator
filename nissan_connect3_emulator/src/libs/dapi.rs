@@ -999,13 +999,29 @@ crate::os::code_stub::trap_site(unicorn, create_error, crate::os::code_stub::Tra
                 Ok(()) => u32::from_le_bytes(buf) & 0xffff,
                 Err(_) => 0xffff,
             };
+            // r799n22: dump the request job header (first 0x20 bytes) so the
+            // originating client/message can be identified - these error
+            // requests (svc 0x3, type 0xe) have no mbx census twin, so they
+            // are internal DAPI request jobs; the header words may carry the
+            // source message pointer.
+            let mut hdr = [0u8; 32];
+            let _ = uc.mem_read(request as u64, &mut hdr);
+            let w = |o: usize| u32::from_le_bytes(hdr[o..o + 4].try_into().unwrap());
             log::warn!(
-                "DAPI poCreateErrorResult request={:#x} request_type={:#x} request_svc={:#x} code={:#x} lr={:#x}",
+                "DAPI poCreateErrorResult request={:#x} request_type={:#x} request_svc={:#x} code={:#x} lr={:#x} hdr={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
                 request,
                 request_type,
                 request_svc,
                 read(RegisterARM::R1) & 0xffff,
                 read(RegisterARM::LR) & !1,
+                w(0),
+                w(4),
+                w(8),
+                w(0xc),
+                w(0x10),
+                w(0x14),
+                w(0x18),
+                w(0x1c),
             );
         
             0

@@ -135,6 +135,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
             },
             is_read_only: false,
         },
+        // r799n22: procbaselx probes the volume root "/CRYPTNAV/" (3x per boot
+        // in n158) - the unit mounts the navigation card's CRYPTNAV partition
+        // at the filesystem root; serve the same tree read-only.
+        MountPoint {
+            mount_point: "/CRYPTNAV".to_string(),
+            file_system: Box::new(OsFileSystem::new(PathBuf::from(format!(
+                "{map_card_path}/CRYPTNAV"
+            )))),
+            is_read_only: true,
+        },
         MountPoint {
             mount_point: "/shared/cryptnav".to_string(),
             file_system: Box::new(OsFileSystem::new(PathBuf::from(map_card_path))),

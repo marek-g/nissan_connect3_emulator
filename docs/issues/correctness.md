@@ -2887,3 +2887,45 @@ order luck.  (The queue introduced two host panics - see n19.)
   engine's fastmap channel loads complete - i.e. what must answer the
   engine's GetBlockIDs/LoadBlocks so promotion 1->2 runs; then popup 0x5da
   close + city list WITHOUT EMU_FAKE_DESTENTRY.
+
+## r799n22: n158/n159 census - claims MATCH end-to-end, popup's datapool element identified, DAPI internal errors open
+
+- n158/n159 (60 s): panics 0, OnUpdate state=1 @12.6 s (golden marker),
+  channels 4/5 open with shm, STAT 25 svc-1e requests, 12/12 comparator
+  MATCH, engine class-42 acks with status byte 0 AND 3 reach mbx_22, ack to
+  the 300-family seen, STAT pops 15.  svc-300 self-post drip: 15575 (n158)
+  / 6510 (n159) per run - run-variance 260/s..2.6k/s, was 35k/s.
+- DAPI answers svc-26 after all: the class-0x45 `07 00 00 04 ... FM_T_4/5/6`
+  events on mbx_1024 are its fastmap-channel notifications (earlier
+  ack26toEngine=0 was a census-filter artifact).
+- `DAPI ServiceDataError 0x215/0x218` (x5/run) belong to DAPI-internal
+  request jobs (type 0xe / svc 3): the `request_svc` word is DAPI's internal
+  service number (no AIL svc-3 messages exist); request-hdr now dumped by
+  poCreateErrorResult.  DAPIAPP.OUT on the SD (`CRYPTNAV/DNL/BIN/NAV/COMMON`)
+  is a cryptcard container, static disasm needs the container reader ->
+  Ghidra-side follow-up.  Present in n134..n159 identically.
+- `procbaselx` opens `/CRYPTNAV/` (volume root) 3x/boot: mounted read-only
+  (main.rs), n159: no more failed.
+- App 0x24 (registry THREADINFO: `AB_24,DIM,CSMA`) has queue mbx_36 with NO
+  consumer (Wait(mbx_36)=0); PROCNAV (0x121) sends it class-41/45 svc-0x1f
+  requests (22 msgs).  Same for prochmi's svc-0x27 posts.  Not yet known to
+  matter for the popup, but it is an unhosted partner (candidates: run
+  procbaselx as host of AB_24, or answer like the CCA directory).
+- Popup 0x5da wait binding DECODED from ROM (prochmi file-VA = file-off +
+  0x8000, .rodata): the 20-byte dynstack row for content 0x40003630 is
+  {0x484, 0x40003630, elem=0x12649081, wait=0x900006b7, 0}; sibling rows use
+  elems 0x12449051/0x12449060/0x12649091/0x127090a1 - all domain-1 pools.
+  Word 0x12649081 exists ONLY in that ROM row (no PROCNAV/registry ref):
+  element ids are computed, not literal.  Boot initializes nine 0x1-domain
+  pools (0x1001000..0x101d000, writer bt 0x13cb834 = datapool wait-table
+  ctor 0x13cb82c -> 0x13a5040/0x13a5060); the 0x12649x pool is NEVER
+  instantiated -> the push-based satisfaction can't fire.  Pool
+  instantiation = the LI/IOSC session bootstrap (r799n4 NEXT-2 holds).
+- envigate `f-accept` does consume our class-45 svc-0x000a FI messages
+  (rdy=1 holder=0x2a12818) but the per-message target object arrives
+  vt=0/v18=0/v1c=0 (holder fields hmi+0xc/+0x24 = 0) and srvsetter stays
+  state=0 twice - FI-NAVI never reaches READY on the HMI side.
+- NEXT: (1) find the LI/IOSC session leg that instantiates CL pools and why
+  the NAVI pool is absent (compare boot pool writer's caller table);
+  (2) identify the writer that must fill the envigate holder for svc 0xa;
+  (3) DAPI svc-3/type-E errors via Ghidra (needs cryptcard container load).
