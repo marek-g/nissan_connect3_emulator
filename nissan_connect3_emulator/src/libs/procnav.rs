@@ -1673,10 +1673,11 @@ fn spawn_gps_provider(unicorn: &mut Unicorn<'_, Context>) {
             }
         });
     match result {
-        Ok(_) => log::info!("PROCNAV: GPS sensorfi provider started (EMU_SENSORFI=0 disables)"),
+        Ok(_) => log::info!("PROCNAV: GPS provider thread started (EMU_SENSORFI=0 disables)"),
         Err(error) => log::warn!("PROCNAV: cannot start GPS provider: {error}"),
     }
 }
+
 
 /// One `GpsDataStatus` snapshot blob: envelope + amt header, zero payload.
 /// `msg_class` selects the amt class byte (`0x45` ServiceData for the AE pump's

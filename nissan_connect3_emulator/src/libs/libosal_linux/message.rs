@@ -2928,6 +2928,72 @@ pub fn fi_era_clear_pending() {
     }
 }
 
+/// r799n30: the CONF shape of a member completion.  n176 proved the member
+/// entries (keys 4,5,a) are REMOVEd only by optype-8 (conf) answers - the
+/// optype-9 func-0 pushes HIT the entries (found leg, callback) but leave
+/// them registered (lookup key=7 @34426 HIT, no remove).  DAPI's genuine
+/// confs do this for the mbx_7-plane members only when their requests
+/// arrive; the fabricated-register members (the state-9 cascade's type-0x3
+/// legs) never get one.  Same minimal frame as `fabricate_fi_ready_push`
+/// with OPTYPE 8 and the entry's function echoed at +0x18.  Goes through
+/// `note_fi_era_pending`, replacing any data-shape entry, so the re-fire
+/// loop keeps trying the conf shape until the remove probe clears the key.
+/// `EMU_FAKE_FI_READY_PUSH=0` disables.
+pub fn fabricate_fi_conf_complete(
+    unicorn: &mut Unicorn<'_, Context>,
+    service: u16,
+    key: u16,
+    func: u16,
+) {
+    if std::env::var_os("EMU_FAKE_FI_READY_PUSH").is_some_and(|v| v == "0") {
+        return;
+    }
+    static MSG_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x7a00);
+    let mut body = vec![0u8; 0x22];
+    body[0..2].copy_from_slice(&0x0015u16.to_le_bytes()); // src SENSORFI
+    body[2..4].copy_from_slice(&0x0121u16.to_le_bytes()); // dst navi srv
+    body[4..8].copy_from_slice(&(0x22u32).to_le_bytes());
+    body[8..10].copy_from_slice(&2u16.to_le_bytes());
+    body[0xb] = 0x45;
+    body[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
+    let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    body[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
+    body[0x14..0x16].copy_from_slice(&service.to_le_bytes());
+    body[0x16..0x18].copy_from_slice(&0xffffu16.to_le_bytes());
+    stamp_registration_id("mbx_289", &mut body);
+    body[0x18..0x1a].copy_from_slice(&func.to_le_bytes());
+    body[0x1a] = 8; // OPTYPE: server conf (removes the pending entry)
+    body[0x1b] = 1;
+    body[0x1c..0x1e].copy_from_slice(&key.to_le_bytes());
+    let mut blob = Vec::with_capacity(8 + body.len());
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&body);
+    let mut state = unicorn.get_data().namespace.lock().unwrap();
+    if let Some(q) = state.mq.queue_id_for_name("mbx_289") {
+        state.mq.grow_msgsize(q, blob.len() as i64);
+        if OsalQueueService::guest_post(&mut state.mq, "mbx_289", blob, 0) {
+            log::warn!(
+                "[LIBOSAL-MBX] fabricated FI ConfComplete(svc {service:#06x} func {func:#06x} txn {key}) push to mbx_289 - the optype-8 leg that REMOVES the registered entry (EMU_FAKE_FI_READY_PUSH=0 disables)"
+            );
+            state.notify_waiters();
+            note_fi_era_pending(service, key, &body);
+        }
+    }
+}
+
+/// r799n30: the request-table entry with this key was REMOVEd (completer
+/// leg) - stop re-firing its pending answer.  IDFactory keys are not reused
+/// inside an era; a re-registration re-enters the pending map itself.
+pub fn fi_era_clear_key(key: u16) {
+    let map = FI_ERA_PENDING.get_or_init(Default::default);
+    if let Ok(mut m) = map.lock() {
+        let before = m.len();
+        m.retain(|(_, k), _| *k != key);
+        let _ = before;
+    }
+}
+
 /// Re-push every still-pending member-era answer once (the g7 gate leg
 /// observed r0==0 while the startup FSM is starved at state 5/6).  Bounded
 /// to 40 re-fires per (svc, txn).  Returns the number re-pushed.
@@ -2939,7 +3005,7 @@ pub fn refire_fi_era_pending(unicorn: &mut Unicorn<'_, Context>) -> usize {
     let due: Vec<((u16, u16), Vec<u8>)> = {
         let Ok(mut m) = map.lock() else { return 0 };
         m.values_mut().for_each(|(_, n)| *n += 1);
-        m.retain(|_, (_, n)| *n <= 40);
+        m.retain(|_, (_, n)| *n <= 120);
         m.iter().map(|(k, (b, _))| (*k, b.clone())).collect()
     };
     let mut fired = 0usize;

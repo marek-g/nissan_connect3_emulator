@@ -790,8 +790,87 @@ static FI_READY_ANSWERED: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<(u16, u16, u32)>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// r799n30: the HMI-side GpsDataStatus ticker.  On the unit the SENSORFI
+/// server broadcasts GpsDataStatus at ~1 Hz for its whole lifetime, and the
+/// enavi startup FSM is event-driven: every such message reaching the navsrv
+/// pump (mbx_289, class 0x45, msgid 0x81008114 -> FI event) re-ticks the
+/// enavi-status handler - the very re-tick the one-shot gate-kick (budget 3)
+/// stood in for (r798b).  With the budget spent the state-9 loop went idle
+/// after 2 cascade iterations (n178: cascade legs at 35863/35946 ms then
+/// silence for 24 s although tid 64 was merely sleeping).  Stand in for the
+/// absent SENSORFI stream: one GpsDataStatus-shaped answer per second into
+/// mbx_289, carrying the never-matching dummy ordinal 0x5aa5 so it can only
+/// act as the event kick (unmatched keys are inert in the completer, f232).
+/// Runs INSIDE the prochmi process (HMI_FSM_STATE is process-local: the
+/// same thread hosted in procnav never saw the FSM advance - n180); fires
+/// only while the startup FSM sits in state 9 (an ungated kick during the
+/// state-4 era derailed the FSM into the 4->1 retry loop - n179).
+/// `EMU_FAKE_SENSORFI=0` disables.
+fn spawn_hmi_gps_ticker(unicorn: &mut Unicorn<'_, Context>) {
+    if std::env::var_os("EMU_FAKE_SENSORFI").is_some_and(|v| v == "0") {
+        return;
+    }
+    static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ARMED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let namespace = unicorn.get_data().namespace.clone();
+    let result = std::thread::Builder::new()
+        .name("hmi-gps-ticker".into())
+        .spawn(move || {
+            let mut n: u32 = 0;
+            loop {
+                if crate::libs::libosal_linux::message::hmi_fsm_state() != 9 {
+                    crate::emulator::vtime::sleep_virtual(
+                        std::time::Duration::from_millis(250),
+                    );
+                    continue;
+                }
+                n += 1;
+                let body =
+                    crate::libs::libosal_linux::message::gps_data_status_answer_body(0x5aa5);
+                let mut blob = Vec::with_capacity(8 + body.len());
+                blob.extend_from_slice(&1u32.to_le_bytes());
+                blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                blob.extend_from_slice(&body);
+                let posted = {
+                    let mut guard = namespace.lock().unwrap();
+                    let q = crate::common::osal_queues::OsalQueueService::ensure_queue(
+                        &mut guard.mq,
+                        "mbx_289",
+                    );
+                    guard.mq.grow_msgsize(q, blob.len() as i64);
+                    let posted = crate::common::osal_queues::OsalQueueService::guest_post(
+                        &mut guard.mq,
+                        "mbx_289",
+                        blob,
+                        2,
+                    );
+                    if posted {
+                        guard.notify_waiters();
+                    }
+                    posted
+                };
+                if n <= 3 || n % 10 == 0 {
+                    log::info!(
+                        "PROCHMI GPS ticker: GpsDataStatus-shaped event kick #{n} posted to mbx_289 ({}; re-ticks the state-9 cascade, EMU_FAKE_SENSORFI=0 disables)",
+                        if posted { "ok" } else { "queue full" }
+                    );
+                }
+                crate::emulator::vtime::sleep_virtual(std::time::Duration::from_secs(1));
+            }
+        });
+    match result {
+        Ok(_) => log::info!(
+            "PROCHMI: HMI GpsDataStatus FSM-tick ticker armed (state-9 gated, 1 Hz, EMU_FAKE_SENSORFI=0 disables)"
+        ),
+        Err(error) => log::warn!("PROCHMI: cannot start HMI GPS ticker: {error}"),
+    }
+}
+
 pub fn prochmi_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: u32) {
     PROCHMI_BASE.store(base_address, Ordering::Relaxed);
+    spawn_hmi_gps_ticker(unicorn);
     // r789d one-shot diagnostic (EMU_PROCHMI_XREF_SCAN=1).  prochmi is
     // prelinked: callers of the exported navif/enavi glue (enActivate,
     // IFMediator::enActivate, bInitialise, bNavIFCreate) bind through
@@ -5727,6 +5806,72 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             0
         });
     }
+    // r799n30: state-9 cascade forensics.  `bRegisterPropertiesAfterDataset
+    // IsAvailable` (0x17c6330) walks 19 `bIsCCAServiceRequired(svc)` checks
+    // and only stores the out-byte at 0x17c64b4 when r5 stayed 1 - a taken
+    // leg (result == 1, `beq`) that fails its registration clears it, which
+    // keeps the state-9 loop spinning forever.  Page-range hook (narrow
+    // mid-TB probes are unreliable, AGENTS.md): dispatch on the exact `cmp`
+    // sites, naming each site's service literal as decoded from the ROM:
+    // site -> svc (0x17c63c8 takes 0x152 from the pc-pool at 0x17c7158).
+    {
+        const SITES: [(u32, u16, &str); 20] = [
+            (0x017c_6358, 0x01f, "cmp1f"),
+            (0x017c_6368, 0x01e, "cmp1e-a"),
+            (0x017c_6378, 0x01e, "cmp1e-b"),
+            (0x017c_6388, 0x01e, "cmp1e-c"),
+            (0x017c_6398, 0x02c, "cmp2c-a"),
+            (0x017c_63a8, 0x01f, "cmp1f-b"),
+            (0x017c_63b8, 0x00a, "cmp0a"),
+            (0x017c_63c8, 0x152, "cmp152"),
+            (0x017c_63d8, 0x056, "cmp56"),
+            (0x017c_63e8, 0x300, "cmp300"),
+            (0x017c_63f8, 0x037, "cmp37"),
+            (0x017c_6408, 0x032, "cmp32-a"),
+            (0x017c_641c, 0x032, "cmp32-b"),
+            (0x017c_6430, 0x018, "cmp18"),
+            (0x017c_6444, 0x00d, "cmp0d"),
+            (0x017c_6454, 0x01f, "cmp1f-c"),
+            (0x017c_6464, 0x02c, "cmp2c-b"),
+            (0x017c_6474, 0x006, "cmp06"),
+            (0x017c_6488, 0x07d, "cmp7d"),
+            (0x017c_6494, 0, "final"),
+        ];
+        let page = (base_address + 0x017c_6000u32 - ORIGINAL_BASE) & !0xfff;
+        let _ = unicorn.add_code_hook(
+            page as u64,
+            page as u64 + 0x1000,
+            move |uc: &mut Unicorn<'_, Context>, addr, _| {
+                let hit = addr as u32;
+                let idx = match SITES.iter().position(|(o, _, _)| {
+                    *o + base_address - ORIGINAL_BASE == hit
+                }) {
+                    Some(i) => i,
+                    None => return,
+                };
+                static HITS: AtomicU32 = AtomicU32::new(0);
+                if crate::libs::dapi::emu_t0_elapsed_ms() < 32_000
+                    || HITS.fetch_add(1, Ordering::Relaxed) >= 2500
+                {
+                    return;
+                }
+                let (_, svc, name) = SITES[idx];
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                let r9 = uc.reg_read(RegisterARM::R9).unwrap_or(0) as u32;
+                // The taken-leg branches matter (they are the ones allowed
+                // to clear r5); the final site shows whether the out-byte
+                // store fired.  Log everything else sparsely.
+                if name == "final" || r0 == 1 || HITS.load(Ordering::Relaxed) < 40 {
+                    log::warn!(
+                        "PROCHMI s9cascade {name} t={}ms tid=[{}] svc={svc:#06x} r0={r0} r5={r5:#x} outp={r9:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                }
+            },
+        );
+    }
     for (offset, label) in [
         (0x017c_75a8u32, "startup-navif-result"),
         (0x017c_1e80u32, "navif-create"),
@@ -6785,6 +6930,24 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                     uc, svc as u16, ordinal,
                                 );
                             }
+                            // r799n30: members are REMOVEd from the request
+                            // table only by optype-8 conf answers (n176:
+                            // keys 4,5,a removed by DAPI's genuine confs,
+                            // key 7 HIT by our optype-9 push stayed
+                            // registered; n178: conf pushes removed 7/9).
+                            // The state-9 cascade's property legs need the
+                            // same conf to fill their IEnaviServer connector
+                            // slots.  Exception: the svc-0x000a gate is
+                            // completed by its func-f02 DATA answer (n176
+                            // key 3), a conf there would only pre-empt it.
+                            if svc != 0x000a
+                                && crate::libs::dapi::emu_t0_elapsed_ms() >= 32_000
+                            {
+                                let f18 = read_u32(uc, entry.wrapping_add(0x18)) & 0xffff;
+                                crate::libs::libosal_linux::message::fabricate_fi_conf_complete(
+                                    uc, svc as u16, ordinal, f18 as u16,
+                                );
+                            }
                         }
                     }
                 }
@@ -7395,6 +7558,11 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                         r1 & 0xffff,
+                    );
+                    // r799n30: the completer removed this key - its answer
+                    // landed, stop the era re-fire for it.
+                    crate::libs::libosal_linux::message::fi_era_clear_key(
+                        (r1 & 0xffff) as u16
                     );
                 } else if label == "waitret" {
                     // r0 = message-ref pointer (0 on timeout).  Dump the ref
