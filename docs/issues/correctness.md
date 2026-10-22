@@ -3326,3 +3326,23 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
   handed to prochmi's own handler verbatim instead of being traced 20 more
   times.  Replaces the earlier note "do NOT fabricate the completion
   dispatch itself" - that held while the real lane was assumed reachable.
+
+## r799n32: svcdone guest-call VERIFIED (n210) - the property plane completes
+
+- n207/n208 first takes died instantly: the ARM trampoline encoded the
+  literal pools with `Rn=SP` (0xE59D_xxxx) instead of `Rn=PC`
+  (0xE59F_xxxx), so `bx lr` jumped to a stack pointer (PC=child+0x10,
+  READ_UNMAPPED).  Also two `copy_from_slice` panics (prochmi's `read_u16`
+  returns u32).  Fixed in n210.
+- n210 (full 75 s, no panics): every `svcdone` guest-call for a live key
+  runs the genuine leg end-to-end - `pumptrace remove` fires on the
+  GUEST-CALL thread: key 0xb (tid 86), 0xd (tid 88), 0xf (tid 100) with
+  the same lr 0x1c7d1e4 / table as the genuine in-era completions.  Each
+  completion makes the cascade re-register: fresh mints 0xe/0xf/0x10
+  appear 1-6 ms after each remove; s9cascade probe count 2 -> 5.
+- Remaining gap (fixed this commit): the `lr=0x47dc4ec0` store leg arrives
+  with r1=0, so the mint pairing did not apply (condition was o1>0x100
+  only) and those stores answered ordinal 0 (miss).  Now o1==0 pairs too,
+  gated to >=500 ms after navif-create so an era-1 mint can never pre-empt
+  a member completion.  Expect 0xc/0xe/0x10 removes and the cascade to
+  walk the remaining checks {0x1e,0x2c,0x152,0x56,0x300,...}.
