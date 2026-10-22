@@ -8240,6 +8240,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     // after subscriber vfn+0x1c: r4 = handler result,
                     // r5 = subscriber, r8 = cookie, r10 = reqid, r7 = func.
                     let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
                     let r8 = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
                     let r10 = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
                     log::warn!(
