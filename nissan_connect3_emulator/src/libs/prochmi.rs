@@ -6128,18 +6128,21 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 if name.starts_with("sp2") || name.starts_with("sp1") {
                     let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
                     let st = if matches!(name, "sp2s1" | "sp1s1") {
+                        // r799n33g: sp2s1's r0 is the PROC object; the
+                        // polled sub-action lives at proc+0x30 (state
+                        // +0x34, svc +0x38, func +0x52, req +0x58).
                         let vt = read_u32(uc, r0);
-                        // r799n33f: sp2s1's r0 is the PROC object; the
-                        // state the walk polls belongs to sub-action
-                        // proc+0x30 (state at +0x34).
-                        let soff = if name == "sp2s1" { 0x34 } else { 4 };
+                        let (soff, aoff) =
+                            if name == "sp2s1" { (0x34u32, 0x30u32) } else { (4, 0) };
+                        let act = r0.wrapping_add(aoff);
                         format!(
-                            " action={r0:#x} state={} vt={vt:#x} vfn24={:#x} svc={:#x} func={:#x} req={:#x}",
+                            " action={act:#x} state={} vt={:#x} vfn24={:#x} svc={:#x} func={:#x} req={:#x}",
                             read_u32(uc, r0.wrapping_add(soff)),
-                            read_u32(uc, vt.wrapping_add(0x24)) & !1,
-                            read_u16(uc, r0.wrapping_add(8)),
-                            read_u16(uc, r0.wrapping_add(0x22)),
-                            read_u32(uc, r0.wrapping_add(0x28)),
+                            read_u32(uc, act),
+                            read_u32(uc, read_u32(uc, act).wrapping_add(0x24)) & !1,
+                            read_u16(uc, act.wrapping_add(8)),
+                            read_u16(uc, act.wrapping_add(0x22)),
+                            read_u32(uc, act.wrapping_add(0x28)),
                         )
                     } else {
                         String::new()
@@ -12458,6 +12461,42 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
         return;
     }
     PROCHMI_TICK_NEXT.with(|cell| cell.set(Some(now + Duration::from_millis(100))));
+
+    // r799n33h: NaviServer READY re-publish while the FSM sits in state 6
+    // (flaky-boot fix, n234/n240).  The state-6 gate waits for the
+    // svc-0xa ServiceStatus edge (vSvcReady 0x15e1954 -> sink broadcast
+    // -> gate word == 2); when the navif gate CL entry registers EARLY
+    // (v14.8 s in the bad runs) the one-shot deferred publish is consumed
+    // while the FSM still sleeps in state 4 and the freshly built state-6
+    // proc never sees a broadcast.  The real TE-side provider repeats
+    // ServiceStatus asynchronously (the good runs show 12 identical
+    // flag=1/2 publishes), so repeat the deferred publish at 1 Hz while
+    // state 6 (bounded at 15; the injected frame itself is the
+    // EMU_LATE_NAVI_STATUS-gated cca_post_deferred_status).
+    {
+        static RP_N: AtomicU32 = AtomicU32::new(0);
+        thread_local! {
+            static RP_NEXT: std::cell::RefCell<Option<Instant>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let due = RP_NEXT.with(|cell| match *cell.borrow() {
+            None => true,
+            Some(next) => now >= next,
+        });
+        if due && crate::libs::libosal_linux::message::hmi_fsm_state() == 6 {
+            RP_NEXT.with(|cell| {
+                *cell.borrow_mut() = Some(now + Duration::from_millis(1000));
+            });
+            if RP_N.fetch_add(1, Ordering::Relaxed) < 15 {
+                log::warn!(
+                    "PROCHMI gate: re-publishing navi-server ServiceStatus for the state-6 gate (late-registration edge race, EMU_LATE_NAVI_STATUS=0 disables)"
+                );
+                crate::libs::libosal_linux::message::cca_post_deferred_status(
+                    unicorn, 0x0015, 0x0121, 0x000a,
+                );
+            }
+        }
+    }
 
     // r799n30: 1 Hz GpsDataStatus stand-in AS THE STATE-9 EVENT TICK.  On
     // the unit the SENSORFI server's 1 Hz broadcast re-ticks the enavi
