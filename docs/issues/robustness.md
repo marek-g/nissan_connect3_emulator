@@ -122,3 +122,33 @@ so future hook cleanups classify by callback side effects, not naming.
   to the plain mbx push. Pump completer matches the key loosely
   (n174) and the key space is single-per-era, so member keys resolve
   unambiguously. EMU_FI_ERA_REFIRE=0 disables.
+
+## r799n33p: BAD anatomy FINAL - state 6 needs the svcdone guest-call lane
+
+- r799n33n (pump-first re-fire for all svcs) did NOT fix the BAD rate:
+  the pumped gps envelopes DO reach tid 65's dispatcher while it is
+  awake, but the CL lookup misses them - the dispatcher derives the
+  service from the frame (msgid/mapping), our envelope asks for
+  `want_ord=0xf02/service 1-2` against a table holding (svc 0xa func
+  0xf02 key 3) - `found entry=0x0` (n253_1 36185/36312).  The historic
+  r799n30/n31 "pump lane delivered state-9 confs" reading was WRONG:
+  those removals (lr=0x1c7d1e4, all 111 of them in n252_2) came from
+  the DIRECT bHandleResponseSVCData guest-calls, not from pumped
+  frames.  Pumped frames are walk-visible but completer-inert.
+- Why GOOD survives and BAD does not (same code, same era): GOOD keeps
+  tid-81's mbx_289 relay alive with live wire traffic; every relay
+  post (`post8 lr=0x17cb6dc`, 32 in 1.9 s at n252_2 37.7 s) posts into
+  the pump queue and WAKES tid 65 to drain another frame.  In BAD the
+  wire is quiet after 36.3 s: tid 81 sleeps, tid 65 sleeps
+  (SleepUntil, never re-woken - zero tid-65 events after 36313 in
+  n253_1), and the pending member key (e.g. svc 0xa func 0xf02 key 3)
+  rots in the CL table while its answers pile up unread.
+- Fix: `svcdone_window()` now = {9, 6, 0-after-S9}.  In state 6 rqadd
+  binds SVCDONE_PENDING and the 1 Hz window block fires the legs via
+  `guest_call_bhandle_svcdone` (the ONLY delivery independent of the
+  tid-65/tid-81 wake choreography; already proven for the trio keys in
+  state 9).  S9_DONE latches only on a state-9 tick (a state-6 tick
+  must not arm the state-0 clause - n249).  The old state-6-only
+  ticker is merged into the window block.
+- Pump envelopes stay (inert but harmless wake-candidates); the FI-era
+  pending map is still cleared by the `remove` probe.
