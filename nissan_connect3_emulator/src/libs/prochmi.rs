@@ -7511,6 +7511,15 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // subscriber list (svc at +0x8, ids at node->item+4) - the
             // ground truth the svcdone cookie must match.
             (0x01c7_c8b4u32, "nosub", 40),
+            // r799n33e: the service-availability chain that POPULATES the
+            // subscriber lists on the real unit (FI class 0x44 ->
+            // 0x1c7edac -> IFMediator::vOnServiceChange -> ControlBase ->
+            // vInitiatePropertyRegistration -> vfn+0x24 -> bAddSubscriber).
+            // Which leg is dead for the connector services?
+            (0x01c7_edacu32, "svcchg-in", 120),
+            (0x01c7_d068u32, "svcchg-med", 120),
+            (0x01c7_c3b0u32, "propinit", 120),
+            (0x01c7_c358u32, "addsub", 120),
         ] {
             let address = base_address + off - ORIGINAL_BASE;
             crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:pumptrace", move |uc: &mut Unicorn<'_, Context>| {
@@ -8136,6 +8145,65 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     if let Ok(mut m) = STATE9_MINTS.lock() {
                         m.remove(&(r1 & 0xffff));
                     }
+                } else if label == "svcchg-in" {
+                    // (receiver, msg): r12 = [r1+4] body; svc +0x14,
+                    // regid +0x16, state +0x18, class +0x0b.
+                    let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let body = read_u32(uc, r1.wrapping_add(4));
+                    let (cls, svc, regid, st) = if body > 0x1000
+                        && body < 0xf000_0000
+                    {
+                        (
+                            read_u8(uc, body.wrapping_add(0x0b)),
+                            read_u16(uc, body.wrapping_add(0x14)),
+                            read_u16(uc, body.wrapping_add(0x16)),
+                            read_u8(uc, body.wrapping_add(0x18)),
+                        )
+                    } else {
+                        (0xff, 0xffff, 0xffff, 0xff)
+                    };
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] recv={r0:#x} msg={r1:#x} body={body:#x} class={cls:#x} svc={svc:#x} regid={regid:#x} state={st:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                    );
+                } else if label == "svcchg-med" {
+                    // IFMediator::vOnServiceChange(svc, flag, u32, u8):
+                    let sp = uc.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] med={r0:#x} svc={:#x} flag={:#x} a4={r3:#x} a5={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        r1 & 0xffff,
+                        r2 & 0xff,
+                        read_u8(uc, sp),
+                    );
+                } else if label == "propinit" {
+                    // ControlDispatch::vInitiatePropertyRegistration:
+                    // [disp+0x14] = control, subs list at [disp+0xc].
+                    let subs = sub_walk(uc, r0);
+                    let ids = subs
+                        .iter()
+                        .map(|(_, i)| format!("{i:#x}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] disp={r0:#x} ctrl={:#x} subs=[{ids}]",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        read_u32(uc, r0.wrapping_add(0x14)),
+                    );
+                } else if label == "addsub" {
+                    // ControlDispatch::bAddSubscriber(disp, subscriber):
+                    // id = [sub+4], dispatcher's svc-ish word at +0x8.
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] disp={r0:#x} sub={r1:#x} id={:#x} disp+8={:#x} disp+0x14={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        read_u16(uc, r1.wrapping_add(4)),
+                        read_u16(uc, r0.wrapping_add(0x8)),
+                        read_u32(uc, r0.wrapping_add(0x14)),
+                    );
                 } else if label == "nosub" {
                     // ControlDispatch frame regs (0x1c7c6d4 prologue):
                     // r5 = dispatcher, r8 = cookie, r10 = reqid.
