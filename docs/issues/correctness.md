@@ -3469,3 +3469,10 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
   pending element (`cl_retrieve`, host clone of pRetrieveRequest:
   node{key@+8, element@+0xc}) instead of defaulting to slot 0, so trio-2
   style requests hitting dispatcher slot 1 get the id-2 subscriber.
+- n229/n230: the trap_site-based sp2 probes fired ONLY on svcdone worker
+  threads (our guest-call re-enters bRegisterPropertiesAfterDataset
+  IsAvailable through the notify chain!) - the tid-65 walk reaches
+  cmp1f-b's `beq` but no sp2 trap logged, the classic dead-narrow-probe
+  quirk; all trio-2 walk probes moved into the s9cascade PAGE hook
+  (SITES += sp2o/g1/i1/g2/i2/g3/res/p1/a/p2/b/p3/c) - n231 decides
+  whether the owner [IEnavi+0x14] is live and where tid 65 departs.
