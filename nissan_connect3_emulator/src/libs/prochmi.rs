@@ -6916,8 +6916,22 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // payloads), the rest get a minimal ServiceData push.
                 // All of it is logged; EMU_FAKE_SENSORFI=0 / 
                 // EMU_FAKE_FI_READY_PUSH=0 disable the legs.
-                let ordinal =
-                    (uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff) as u16;
+                let ordinal = {
+                    let o1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
+                    // r799n31: the state-9 property stores (svc 0x1f,
+                    // lr 0x17b95c4/0x47dc4ec0 burst) carry the ENTRY
+                    // pointer-ish value in r1 (0x7703...), not the minted
+                    // key (n199: their conf-store rows at 35554-35557 ms
+                    // were silently skipped - the OOB budget was spent on
+                    // the earlier svc-6 noise).  The IDFactory key is
+                    // stored IN the entry at +0x0c (r799d `found` probe:
+                    // `+0x0c u16 transaction id`); read it there.
+                    if o1 > 0x100 {
+                        read_u16(uc, entry.wrapping_add(0x0c)) as u32 & 0xffff
+                    } else {
+                        o1
+                    }
+                } as u16;
                 // r799n29: sanity.  The request table's IDFactory mints
                 // small monotonically increasing keys per era; a captured
                 // r1 far out of that range (n174: 0x5aa5) is a different

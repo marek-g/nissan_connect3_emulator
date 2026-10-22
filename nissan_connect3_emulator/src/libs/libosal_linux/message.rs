@@ -3012,6 +3012,72 @@ pub fn fi_era_clear_key(key: u16) {
         m.retain(|(_, k), _| *k != key);
         let _ = before;
     }
+    if let Ok(mut m) = PROPERTY_ANSWERS.lock() {
+        m.retain(|(_, k), _| *k != key);
+    }
+}
+
+/// r799n31: outstanding conf answers for the state-9 property legs, keyed
+/// (svc, txn), each carrying the REQUEST's own reply-queue handle (body
+/// word 3 @ +0x0c - the enConnect relay queue the real provider answers
+/// into, NOT the client's mbx_289 whose only consumer is tid 81 and it
+/// drops frames with no parked `enReceiveWait`: n199 - 166 mbx_289 copies
+/// woken-and-eaten by tid 81, zero completions).  Re-pushed through the
+/// guest's native `OSAL_s32MessageQueuePost` (the recorded pump post_fn)
+/// until the remove probe clears the entry key.
+static PROPERTY_ANSWERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(u16, u16), (Vec<u8>, u32, u32)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Native-post `blob` to the guest queue object at `handle` from guest
+/// context (mirrors `pump_push_completion`'s lane: copy to a pool slot,
+/// spawn a guest call of the live `OSAL_s32MessageQueuePost`).
+fn post_blob_to_guest_handle(
+    unicorn: &mut Unicorn<'_, Context>,
+    handle: u32,
+    blob: &[u8],
+) -> bool {
+    let post_fn = PUMP_POST_FN.load(Ordering::Relaxed);
+    if post_fn == 0 || handle == 0 || handle == 0xffff_ffff {
+        return false;
+    }
+    static POOL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if POOL.get().is_none() {
+        let mmu_arc = unicorn.get_data().mmu.clone();
+        let pool = mmu_arc.lock().unwrap().heap_alloc(
+            unicorn,
+            0x2000,
+            Prot::READ | Prot::WRITE,
+            "[property-answer-pool]",
+        );
+        let _ = POOL.set(pool);
+    }
+    let pool = POOL.get().copied().unwrap_or(0);
+    if pool == 0 {
+        return false;
+    }
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let idx = NEXT.fetch_add(1, Ordering::Relaxed) % 32;
+    let slot = pool + (idx as u32) * 0x100;
+    if blob.len() > 0xf8 || unicorn.mem_write(slot as u64, blob).is_err() {
+        return false;
+    }
+    let tid = crate::rtos::monitor::spawn_guest_call(
+        unicorn,
+        post_fn,
+        [handle, slot, blob.len() as u32, 0],
+        0x2000,
+    );
+    if tid == 0xffff_ffff {
+        static S: AtomicU32 = AtomicU32::new(0);
+        if S.fetch_add(1, Ordering::Relaxed) < 3 {
+            log::warn!(
+                "[LIBOSAL-MBX] property answer: guest post spawn failed (post_fn={post_fn:#x} handle={handle:#x})"
+            );
+        }
+        return false;
+    }
+    true
 }
 
 /// Re-push every still-pending member-era answer once (the g7 gate leg
@@ -3038,26 +3104,16 @@ pub fn refire_fi_era_pending(unicorn: &mut Unicorn<'_, Context>) -> usize {
         // reach tid 65's rx pump in state 9) is the delivery lane; fall back
         // to the plain mbx_289 push for the state-5/6 member-era entries
         // whose proven delivery lane is the queue.
-        // r799n31: the rx leg filters the frame ENVELOPE (n196 rx45body:
-        // our svc-0x1f/func-0xd62 bodies never once reached 0x17cb574, the
-        // kick-shaped ones do every second).  Re-build the pump copy from
-        // the PROVEN kick envelope (gps_data_status_answer_body: msgid
-        // 0x81008114, svc 0x000a, func 0x0f02, optype 9) carrying only the
-        // transaction key at +0x1c - the completer matches loosely on
-        // func/optype (n174: a stamp with the WRONG func still REMOVEd the
-        // gate entry), so push it twice: optype 9 (data/HIT) + optype 8
-        // (conf/REMOVE), mirroring DAPI's genuine completion pair.
-        let posted = if svc == 0x001f {
-            let mut data = gps_data_status_answer_body(key);
-            data[0x1a] = 9;
-            let mut conf = data.clone();
-            conf[0x1a] = 8;
-            (pump_push_completion(unicorn, data)
-                && pump_push_completion(unicorn, conf))
-                || push_blob_to_mbx_289(unicorn, body)
-        } else {
-            push_blob_to_mbx_289(unicorn, body)
-        };
+        // r799n31: the pump lane is the WRONG connector for these entries
+        // (its table 0x3b24430 only knows the SENSORFI connector's own
+        // keys like 0x5aa5 - n198: tid 65 wakes and runs cllookup on the
+        // pump table for every kick, the property keys 0xb/0xc/0xd live in
+        // the CL connector table).  The legitimate completer of the
+        // enConnect-routed property legs is tid-81's enReceiveWait on
+        // mbx_289, which matches the answer by its msgid (= the request's
+        // R ordinal = the entry key, fixed in the mbx_36 hook above).
+        // Plain queue re-pushes it until a copy lands.
+        let posted = push_blob_to_mbx_289(unicorn, body);
         if posted {
             fired += 1;
             log::warn!(
@@ -4492,13 +4548,16 @@ fn bridge_mbx_queue(
                         ans[8..10].copy_from_slice(&2u16.to_le_bytes());
                         ans[0xb] = 0x45;
                         ans[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
-                        // r799n31: the pump's rx pass routes class-0x45 frames by
-                        // the msgid as FI event id (HSI-NAV forwards it verbatim);
-                        // synthetic 0x9000-family ids are dropped there (n188: 271
-                        // pump re-fires, zero completer lookups).  The navsrv
-                        // consumer demonstrably delivers 0x81008114-shaped frames
-                        // to the completer (0x5aa5 GPS-status kicks), so reuse it.
-                        ans[0x10..0x14].copy_from_slice(&0x8100_8114u32.to_le_bytes());
+                        // r799n31: the enConnect router (tid-81 enReceiveWait
+                        // on mbx_289) completes async client requests by
+                        // matching the ANSWER's msgid to the request's - and
+                        // the request's msgid IS the R=11/12/13 ordinal the
+                        // enPostMsg wire shows (n183 35458ms, msgid at
+                        // body+0x10), the same ordinal enStoreRequest minted
+                        // as the entry key (+0x1c).  Carrying any other id
+                        // (0x9000++ n185, 0x81008114 n190+) meant "message
+                        // lost".  Echo the request's own msgid.
+                        ans[0x10..0x14].copy_from_slice(&((txn as u32).to_le_bytes()));
                         ans[0x14..0x16].copy_from_slice(&service.to_le_bytes());
                         ans[0x16..0x18].copy_from_slice(&reg_id.to_le_bytes());
                         ans[0x18..0x1a].copy_from_slice(&function.to_le_bytes());
