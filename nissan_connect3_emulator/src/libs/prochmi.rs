@@ -810,6 +810,10 @@ static LAST_MINTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// argument of the svcdone guest-call (state 9 has no live dispatcher).
 static CL_TABLE_HOLDER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// r799n32: emu-t0 ms of the last `navif-create` (request-table rebuild);
+/// gates the 0x1f mint pairing to the era that runs state 9.
+static PROPERTY_ERA_T: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// r799n31: runtime VA (+1, Thumb) of `enavi_tclAction::vSignalSelf`
 /// (prochmi 0x0171915c) stashed by the `navif-create` probe.  The FSM calls
 /// it (vtable slot 0x60) after EVERY successful state transition: it posts
@@ -5997,6 +6001,16 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 if let Ok(mut s) = FI_READY_ANSWERED.lock() {
                     s.clear();
                 }
+                // r799n32: the LAST_MINTED ordinal pairing for the 0x1f
+                // plane is only valid well after this rebuild - before the
+                // walk reaches state 9 a fresh mint belongs to the member
+                // registrations and pairing could pre-empt a genuine
+                // completion (r799n29 rule).  State 9 is entered ~1.5 s
+                // after create, era-1 property stores (if any) right away.
+                PROPERTY_ERA_T.store(
+                    crate::libs::dapi::emu_t0_elapsed_ms() as u64,
+                    Ordering::Relaxed,
+                );
                 crate::libs::libosal_linux::message::fi_era_clear_pending();
                 // r799n31: stash enavi_tclAction::vSignalSelf (0x0171915c,
                 // Thumb) as runtime VA for the state-9 wake driver below.
@@ -6937,8 +6951,9 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     // r1 - not the minted key.  Take the freshest IDFactory
                     // mint (storekey probe, <= 30 ms old, same era) for
                     // this plane only; leave every other service on the
-                    // r799n29 reject rule.
-                    if o1 > 0x100 && svc == 0x001f {
+                    // r799n29 reject rule.  n210: the 0x47dc4ec0 leg
+                    // arrives with r1=0 - pair that too.
+                    if (o1 > 0x100 || o1 == 0) && svc == 0x001f {
                         let lm = LAST_MINTED.load(Ordering::Relaxed);
                         let mint_t = (lm >> 32) as u64;
                         let mint_key = (lm & 0xffff) as u32;
@@ -6947,6 +6962,8 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         if mint_key != 0
                             && mint_key <= 0x100
                             && now_ms.saturating_sub(mint_t) <= 30
+                            && now_ms
+                                >= PROPERTY_ERA_T.load(Ordering::Relaxed) + 500
                         {
                             mint_key as u16
                         } else {
