@@ -3555,3 +3555,24 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
   (b) `rqadd` binds MINT_COOKIES[key] = subscriber id (u16 at sub+4)
   the moment the map binding is made, so the very first leg carries the
   owning cookie.
+
+## r799n33l: the cascade CLOSES (9 -> 0 re-walk) - final-site semantics fixed
+
+- n247_4 (GOOD boot): with the trio-2 command keys answered under the
+  owning cookie+holder (r799n33j/k), every property block passes
+  (sp1a-c, cmp1e, cmp2c, sp2* all r0=1) and the startup proc moves
+  9 -> 0 at t=40143ms - the FIRST full completion of
+  bRegisterPropertiesAfterDatasetIsAvailable ever observed.
+- CAVEAT decoded: the `final` probe sits on `cmp r5,#1` at 0x17c6494,
+  BEFORE the store sequence 0x17c649c..0x17c64b4:
+  `r3=(r5==1); if(r9==0) r3=0; if(r3) strb 1,[r9]; r0=r5`.
+  So the logged `r0` is the LAST bIsCCAServiceRequired result (0 for
+  svc 0x7d, the tail check), NOT the stored byte.  r5==1 && outp!=0 in
+  the log means the out-byte WAS stored as 1 - do not read r0=0 there
+  as a failure.
+- Next problem (r799n33l fix): the re-walk parked in state 0 - the FSM
+  is only re-ticked by our 1 Hz pump-first SENSORFI kick in states 6/9,
+  but on the unit that broadcast runs for the FSM's whole life.  The
+  kick + era re-fire now run in states {0, 6, 9} (state 4 stays clean,
+  n179).  States 1-5 keep their real-event transitions; add them to the
+  ticker only if the re-walk demonstrably starves there.
