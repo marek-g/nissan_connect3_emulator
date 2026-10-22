@@ -7532,6 +7532,9 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // does the handler ACCEPT our optype-9 payload (flip the
             // action to done) or silently drop it?
             (0x01c7_c878u32, "subhand", 120),
+            // r799n33f: BEFORE the handler call - r1 = the subscriber
+            // object, so its vtable and the [vt+0x1c] target can be named.
+            (0x01c7_c850u32, "subpre", 120),
         ] {
             let address = base_address + off - ORIGINAL_BASE;
             crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:pumptrace", move |uc: &mut Unicorn<'_, Context>| {
@@ -8236,21 +8239,32 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         read_u16(uc, r0.wrapping_add(0x8)),
                         read_u32(uc, r0.wrapping_add(0x14)),
                     );
+                } else if label == "subpre" {
+                    // before subscriber vfn+0x1c: r1 = subscriber object.
+                    let r1s = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    let vt = read_u32(uc, r1s);
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] sub={r1s:#x} id={:#x} vt={vt:#x} vfn1c={:#x} lr={lr:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        read_u16(uc, r1s.wrapping_add(4)),
+                        read_u32(uc, vt.wrapping_add(0x1c)) & !1,
+                    );
                 } else if label == "subhand" {
-                    // after subscriber vfn+0x1c: r4 = handler result,
-                    // r5 = subscriber, r8 = cookie, r10 = reqid, r7 = func.
-                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    // after subscriber vfn+0x1c: r4 = handler result
+                    // (ControlDispatch prologue regs: r8 = cookie,
+                    // r10 = reqid, r7 = func).
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
                     let r7 = uc.reg_read(RegisterARM::R7).unwrap_or(0) as u32;
                     let r8 = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
                     let r10 = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
                     log::warn!(
-                        "PROCHMI pumptrace {label} t={}ms tid=[{}] res={r0:#x} sub={r5:#x} cookie={:#x} reqid={:#x} func={:#x} vt={:#x}",
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] res={r4:#x} cookie={:#x} reqid={:#x} func={:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                         r8 & 0xffff,
                         r10 & 0xffff,
-                        r7,
-                        read_u32(uc, r5),
+                        r7 & 0xffff,
                     );
                 } else if label == "nosub" {
                     // ControlDispatch frame regs (0x1c7c6d4 prologue):
