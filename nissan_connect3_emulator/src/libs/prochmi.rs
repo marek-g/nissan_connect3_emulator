@@ -7718,6 +7718,13 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // r799n33f: BEFORE the handler call - r1 = the subscriber
             // object, so its vtable and the [vt+0x1c] target can be named.
             (0x01c7_c850u32, "subpre", 120),
+            // r799n33g: onRequestCommand (the vfn+0x10 post-leg, runtime
+            // slot [vt+0x10]=0x17b93fc): pops the action for the key from
+            // map1 (sub+0x14) / map2 (sub+0x28) and only then notifies.
+            // Log both maps around it to see whether the key is even
+            // registered (it is NOT for trio-1 in n237 -> no flip).
+            (0x017b_93fcu32, "orca", 400),
+            (0x017b_944cu32, "orca1", 400),
             // r799n33f: the trio-2/sp2 probes moved to the s9cascade PAGE
             // hook - 0x17c6xxx is THUMB code and the trap_site(TrapMode::
             // Arm) breakpoint of the pumptrace table never fires there.
@@ -8424,6 +8431,25 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         read_u16(uc, r1.wrapping_add(4)),
                         read_u16(uc, r0.wrapping_add(0x8)),
                         read_u32(uc, r0.wrapping_add(0x14)),
+                    );
+                } else if label == "orca" {
+                    // entry: r0=subscriber, r1=event, r2=key.
+                    let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] sub={r0:#x} id={:#x} ev={r1:#x} key={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        read_u16(uc, r0.wrapping_add(4)),
+                        r2 & 0xffff,
+                    );
+                } else if label == "orca1" {
+                    // after pPop(map1,key): r0 = action (0 -> try map2).
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] hit={r0:#x} key={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        r5 & 0xffff,
                     );
                 } else if label == "subpre" {
                     // before subscriber vfn+0x1c: r1 = subscriber object.
