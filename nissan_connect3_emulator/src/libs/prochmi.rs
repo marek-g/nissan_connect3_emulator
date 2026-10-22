@@ -11914,7 +11914,7 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                             }
                         }
                     }
-                    for key in sweep {
+                    for key in sweep.iter().copied() {
                         if let Ok(mut m) = SVCDONE_PENDING.lock() {
                             m.entry(key).or_insert((holder, 0, 1));
                         }
