@@ -850,8 +850,18 @@ static LAST_EXEC_COOKIE: std::sync::atomic::AtomicU64 =
 /// `hmi_fsm_state() == 9` gates.
 static S9_DONE: AtomicBool = AtomicBool::new(false);
 fn svcdone_window() -> bool {
+    // r799n33p: state 6 joins.  The BAD boots (n241/n242/n250/n253) all
+    // starve state 6's queue lane: late member re-mints (e.g. svc 0xa
+    // func 0xf02 key 3 in n253_1) get their answers pushed while tid 65
+    // is parked in its round-trip Wait and NOBODY relays/wakes it again
+    // (GOOD only survives because tid-81's relay keeps posting into the
+    // pump queue, n252_2 37.7s burst).  The svcdone guest-call lane is
+    // the only delivery that does not depend on tid 65/tid 81 wake
+    // choreography, so bind and re-fire member keys through it here.
+    // The pump-first kick state 6 needs (r799n33h) runs in this same
+    // block, making the old state-6-only ticker redundant.
     let st = crate::libs::libosal_linux::message::hmi_fsm_state();
-    st == 9 || (st == 0 && S9_DONE.load(Ordering::Relaxed))
+    st == 9 || st == 6 || (st == 0 && S9_DONE.load(Ordering::Relaxed))
 }
 
 static MINT_COOKIES: std::sync::LazyLock<
@@ -12588,41 +12598,20 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             None => true,
             Some(next) => now >= next,
         });
-        if due
-            && crate::libs::libosal_linux::message::hmi_fsm_state() == 6
-            && std::env::var_os("EMU_FAKE_SENSORFI").map_or(true, |v| v != "0")
-        {
-            // r799n33l: state 0 joins the re-tick.  With trio-2 answered
-            // the cascade finally stores out-byte=1 and the startup proc
-            // RE-WALKS from state 0 (n247_4: 9->0 at t=40143) - and there
-            // it starves exactly like state 6 did: no SENSORFI re-tick,
-            // no pump rx leg, nothing re-runs bRunWhenRunning.  States
-            // 1-5 keep real-event-driven transitions (4 must stay clean,
-            // n179 derailed the FSM with a state-4-era kick).
-            // r799n33h: the same 1 Hz re-tick the unit provides in EVERY
-            // FSM state (see the comment above) - the BAD boots (n234/
-            // n240/n241) starve state 6: late member re-mints (e.g. the
-            // func-0x1 timeout after an early READY edge) queue their
-            // answer pushes on mbx_289 but no pump rx leg ever drains the
-            // queue again (60 unconsumed re-fires for one txn in n241),
-            // the member never flips DONE and the gate never opens.  A
-            // pump-first kick makes tid-81's rx leg consume the backlog;
-            // a duplicate GpsDataStatus in state 6 is inert for the FSM
-            // (only state 4-era kicks derailed it, n179).
-            let route = crate::libs::libosal_linux::message::push_gps_kick_pump_first(
-                unicorn, 0x5aa5,
-            );
-            crate::libs::libosal_linux::message::refire_fi_era_pending(unicorn);
-            let _ = route;
-            TICKER_NEXT.with(|cell| {
-                *cell.borrow_mut() = Some(now + Duration::from_secs(1));
-            });
-        }
+        // r799n33p: the old state-6-only ticker (r799n33h kick + era
+        // re-fire) is merged into the svcdone_window() block below - that
+        // window now includes state 6 and adds the reliable svcdone
+        // guest-call lane for the starved member re-mints there.
         if due
             && svcdone_window()
             && std::env::var_os("EMU_FAKE_SENSORFI").map_or(true, |v| v != "0")
         {
-            S9_DONE.store(true, Ordering::Relaxed);
+            // r799n33p: S9_DONE marks "the FSM has been through state 9",
+            // it must not latch on a state-6 window tick (that would arm
+            // the state-0 clause prematurely - the n249 BAD-boot trap).
+            if crate::libs::libosal_linux::message::hmi_fsm_state() == 9 {
+                S9_DONE.store(true, Ordering::Relaxed);
+            }
             let route = crate::libs::libosal_linux::message::push_gps_kick_pump_first(
                 unicorn, 0x5aa5,
             );
