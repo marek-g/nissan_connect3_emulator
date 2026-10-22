@@ -3099,3 +3099,27 @@ n173 facts:
 NEXT: make PROCNAV's navsrv-server leg live (audit its monitor-yield service
 requests - what svc is 0x5c022a, is the monitor's answer wrong/absent?), then
 watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
+
+## r799n28b: wait table is static ROM; nobody evaluates or mounts for the popup
+
+- Wait-table (tmwt probe, 0x13a5040) base WTBASE=0x28f1718, stride 8,
+  lim 0x14d2: entry[0x6b7] = {0x9000000f, 0x10000002, 2} is STATIC ROM (the
+  dynstack family rows) - 'data exists' is evaluated against live pools at
+  query time.  n174: ZERO queries for id 0x6b7 all run; the sweep only walks
+  ids of ACTIVE waits (t=12010 sweep walked 0x1a2..), so nothing ever even
+  asks whether 0x12649081 exists - because state 0x484 was never entered.
+- cldp_Mngr mounts (dpmount watch now prints pc): ONLY ever written from
+  0x1382fc4 (inside cldp_Mngr::bConfigure - the 52-domain loop) and
+  0x1383938 (vector insert aux) at t~2.8s.  There is NO runtime mount leg in
+  this binary at all => domain 0x12 can never be mounted via cldp_Mngr; the
+  0x12-domain ids must live in a DIFFERENT pool instance (not the 52-domain
+  HMI one).  cldp_Mngr::get_podp THROWS for unmounted domains (0x1382b00
+  __cxa_allocate_exception leg) - and no caller ever passes a 0x12 id.
+- 'Starting navigation.' sysdlg popup id = 0xc00005da (tmwrap probe notes);
+  its startup-era REMOVE ran without a 0x49 close.  The golden close must
+  come from the dynsm decision cascade, entered via a posted SM event
+  (n17 rode trigger r9=0xb0001c39, storm-artifact).  Transition ids like
+  0x1ab3 are runtime indices, not ROM literals.
+- NEXT: instrument the dynsm event-post leg feeding SM-DEC (find what posts
+  r9 triggers and which trigger ID transition-to-0x484 listens for); the
+  SM-PAGE doTransition probe already names trans IDs per event.

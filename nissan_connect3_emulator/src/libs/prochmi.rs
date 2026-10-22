@@ -2730,12 +2730,14 @@ crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode
             unicorn_engine::unicorn_const::HookType::MEM_WRITE,
             0x0038_eee88u64 + 0x20,
             0x0038_eee88u64 + 0x27,
-            move |_uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
+            move |uc: &mut Unicorn<'_, Context>, _t, address, size, value| {
                 static HITS: AtomicU32 = AtomicU32::new(0);
                 if HITS.fetch_add(1, Ordering::Relaxed) < 120 {
                     log::warn!(
-                        "PROCHMI dpmount WRITE t={}ms addr={address:#x} size={size} value={value:#x}",
+                        "PROCHMI dpmount WRITE t={}ms addr={address:#x} size={size} value={value:#x} pc={:#x} tid=[{}]",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.reg_read(RegisterARM::R15).unwrap_or(0) as u32,
+                        uc.get_data().inner.thread_id(),
                     );
                 }
                 true
