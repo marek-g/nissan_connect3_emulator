@@ -6045,9 +6045,14 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 if name.starts_with("sp2") || name.starts_with("sp1") {
                     let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
                     let st = if matches!(name, "sp2s1" | "sp1s1") {
+                        let vt = read_u32(uc, r0);
                         format!(
-                            " action={r0:#x} state={}",
-                            read_u32(uc, r0.wrapping_add(4))
+                            " action={r0:#x} state={} vt={vt:#x} vfn24={:#x} svc={:#x} func={:#x} req={:#x}",
+                            read_u32(uc, r0.wrapping_add(4)),
+                            read_u32(uc, vt.wrapping_add(0x24)) & !1,
+                            read_u16(uc, r0.wrapping_add(8)),
+                            read_u16(uc, r0.wrapping_add(0x22)),
+                            read_u32(uc, r0.wrapping_add(0x28)),
                         )
                     } else {
                         String::new()
