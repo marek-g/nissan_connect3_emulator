@@ -854,8 +854,10 @@ static MINT_INFO: std::sync::LazyLock<
 > = std::sync::LazyLock::new(Default::default);
 
 /// r799n33d: walk the live subscriber list of one ControlDispatch
-/// (navif_tclSubscriberList at [disp+0xc]: head +4, nodes {item,next},
-/// id = u16 at [subscriber+4], matched by _pFindSubscriber 0x1c7c070).
+/// (subs list at [disp+0xc]).  Exact fw_List layout from vAdd (0x1c7ce28):
+/// list {.., head@+4, tail@+8, size@+0xc}; node {prev@0, next@4, item@8};
+/// the item is the subscriber, its id is the u16 at [subscriber+4]
+/// (_pFindSubscriber 0x1c7c070 matches exactly that).
 fn sub_walk(
     unicorn: &Unicorn<'_, Context>,
     disp: u32,
@@ -870,7 +872,7 @@ fn sub_walk(
         if node <= 0x1000 || node >= 0xf000_0000 {
             break;
         }
-        let item = read_u32(unicorn, node);
+        let item = read_u32(unicorn, node.wrapping_add(8));
         if item > 0x1000 && item < 0xf000_0000 {
             out.push((item, read_u16(unicorn, item.wrapping_add(4))));
         }
@@ -894,7 +896,7 @@ fn resolve_done_cookie(
             return c;
         }
     }
-    let svc = if svc != 0 && svc != 0xffff {
+    let svc = if svc != 0 && svc != 0xffff && svc <= 1 {
         svc
     } else {
         MINT_INFO
@@ -902,9 +904,9 @@ fn resolve_done_cookie(
             .ok()
             .and_then(|m| m.get(&key).copied())
             .map(|(s, _)| s)
-            .unwrap_or(0)
+            .unwrap_or(0xffff)
     };
-    if svc != 0 && holder > 0x1000 && holder < 0xf000_0000 {
+    if svc <= 1 && holder > 0x1000 && holder < 0xf000_0000 {
         let arr = read_u32(unicorn, holder.wrapping_add(0x14));
         if arr > 0x1000 && arr < 0xf000_0000 {
             let disp = read_u32(unicorn, arr.wrapping_add(svc << 2));
@@ -7298,7 +7300,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                     bb[0x1c..0x1e]
                                         .copy_from_slice(&(ordinal as u16).to_le_bytes());
                                     let cookie = resolve_done_cookie(
-                                        uc, holder, svc, ordinal as u32,
+                                        uc, holder, 0xffff, ordinal as u32,
                                     );
                                     bb[0x0e..0x10]
                                         .copy_from_slice(&(cookie as u16).to_le_bytes());
@@ -7890,16 +7892,18 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     // r799n33d: on the state-9 legs bind what the pending
                     // entry itself carries: svc = entry+0xc, wire body
                     // cookie = entry+0x12 (body+0x0e, entry = body+4).
+                    // The REQUEST id is r7 ([reqid]@0x1c7d130); [sp+0x14]
+                    // is the stored FUNC, not the key.
+                    let reqkey = r7 & 0xffff;
                     if r0 != 0
                         && r0 < 0xf000_0000
-                        && ordinal != 0
-                        && ordinal <= 0x100
+                        && reqkey != 0
                         && crate::libs::libosal_linux::message::hmi_fsm_state(
                             ) == 9
                     {
                         if let Ok(mut m) = MINT_INFO.lock() {
                             if m.len() < 512 {
-                                m.insert(ordinal, (wc, 0));
+                                m.insert(reqkey, (wc, 0));
                             }
                         }
                         let e12 =
@@ -7907,7 +7911,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         if e12 != 0 && e12 != 0xffff {
                             if let Ok(mut m) = MINT_COOKIES.lock() {
                                 if m.len() < 512 {
-                                    m.insert(ordinal, e12);
+                                    m.insert(reqkey, e12);
                                 }
                             }
                         }
