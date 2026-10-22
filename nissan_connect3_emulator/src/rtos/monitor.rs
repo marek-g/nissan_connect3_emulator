@@ -2188,7 +2188,7 @@ pub fn guest_call_bhandle_svcdone(
     // only word0 ran): read the region back once to verify the bytes and
     // addresses are what we think they are.
     static DIAG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if DIAG.fetch_add(1, Ordering::Relaxed) < 2 {
+    if DIAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2 {
         let mut rb = [0u8; 56];
         let _ = unicorn.mem_read(tramp as u64, &mut rb);
         let words: Vec<String> = rb
