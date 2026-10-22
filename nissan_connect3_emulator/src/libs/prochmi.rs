@@ -5981,6 +5981,24 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             (0x017c_6474, 0x006, "cmp06"),
             (0x017c_6488, 0x07d, "cmp7d"),
             (0x017c_6494, 0, "final"),
+            // r799n33f: trio-2 (cmp1f-b block 0x17c6748) walk: guard
+            // points + the three poll comparators.  n229: the block RUNS
+            // (iface 0x...41c8, issues execute) but sp2a (first poll cmp)
+            // never fires -> the vfn+0x24 issue chain exits the block;
+            // these sites pinpoint the departure.
+            (0x017c_6758, 0x1f, "sp2o"),
+            (0x017c_6774, 0x1f, "sp2g1"),
+            (0x017c_6788, 0x1f, "sp2i1"),
+            (0x017c_678c, 0x1f, "sp2g2"),
+            (0x017c_679c, 0x1f, "sp2i2"),
+            (0x017c_67a0, 0x1f, "sp2g3"),
+            (0x017c_67b0, 0x1f, "sp2res"),
+            (0x017c_67b4, 0x1f, "sp2p1"),
+            (0x017c_67c8, 0x1f, "sp2a"),
+            (0x017c_67d0, 0x1f, "sp2p2"),
+            (0x017c_67e4, 0x1f, "sp2b"),
+            (0x017c_67ec, 0x1f, "sp2p3"),
+            (0x017c_6800, 0x1f, "sp2c"),
         ];
         let page = (base_address + 0x017c_6000u32 - ORIGINAL_BASE) & !0xfff;
         let _ = unicorn.add_code_hook(
@@ -6014,10 +6032,10 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         uc.get_data().inner.thread_id(),
                     );
                 }
-                if matches!(name, "sp2i" | "sp2o") {
+                if name.starts_with("sp2") {
                     let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
                     log::warn!(
-                        "PROCHMI s9cascade {name} t={}ms tid=[{}] r0(iface)={r0:#x} r4(owner)={r4:#x}",
+                        "PROCHMI s9cascade {name} t={}ms tid=[{}] r0={r0:#x} r4(owner/last)={r4:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                     );
@@ -7577,21 +7595,9 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // r799n33f: BEFORE the handler call - r1 = the subscriber
             // object, so its vtable and the [vt+0x1c] target can be named.
             (0x01c7_c850u32, "subpre", 120),
-            // r799n33f: the cmp1f-b block (0x17c6748) is the SECOND ISpeech
-            // trio (server [+0x14] getters 0x1620a14/0x1620a04/0x1620a34);
-            // it issues vfn+0x24 x3 then polls vfn+0x18 x3 - which poll
-            // returns 0 and exits the cascade?  Probe the three
-            // post-poll `cmp` points (r0 = poll result, r4 = server).
-            (0x017c_67c8u32, "sp2a", 150),
-            (0x017c_67e4u32, "sp2b", 150),
-            (0x017c_6800u32, "sp2c", 150),
-            // r799n33f: the guards BEFORE trio-2 issues: r0 = interface
-            // from poGetIEnaviServer-ish 0x161f754, r4 = [interface+0x14]
-            // (the trio-2 owner object).  n228: cmp1f-b fires but no sp2
-            // poll does -> one of these is NULL (r5 gets cleared at
-            // 0x17c680c without a single issue).
-            (0x017c_674cu32, "sp2i", 150),
-            (0x017c_6758u32, "sp2o", 150),
+            // r799n33f: the trio-2/sp2 probes moved to the s9cascade PAGE
+            // hook - 0x17c6xxx is THUMB code and the trap_site(TrapMode::
+            // Arm) breakpoint of the pumptrace table never fires there.
         ] {
             let address = base_address + off - ORIGINAL_BASE;
             crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:pumptrace", move |uc: &mut Unicorn<'_, Context>| {
