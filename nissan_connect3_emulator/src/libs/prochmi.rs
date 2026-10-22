@@ -7738,6 +7738,13 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // sub-action EVER register (and does the navif leg succeed
             // so the vAdd into map1 runs)?
             (0x017b_94b8u32, "rqc", 400),
+            // r799n33i: vAdd(map1, key, action) inside requestCommand -
+            // the CCA COMMAND-plane binding.  The CL-side found-probe
+            // only sees optype-5 stores, so command keys (guidance
+            // funcs, e.g. 0x0106) were never svcdone-answered (n243_2:
+            // rqc registers func 0x106, bonr never reaches it).
+            (0x017b_9550u32, "rqadd", 400),
+            (0x017b_95c0u32, "rqadd2", 400),
             // r799n33f: the trio-2/sp2 probes moved to the s9cascade PAGE
             // hook - 0x17c6xxx is THUMB code and the trap_site(TrapMode::
             // Arm) breakpoint of the pumptrace table never fires there.
@@ -8445,6 +8452,43 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         read_u16(uc, r0.wrapping_add(0x8)),
                         read_u32(uc, r0.wrapping_add(0x14)),
                     );
+                } else if matches!(label, "rqadd" | "rqadd2") {
+                    // vAdd(mapX, key, action): r1 = key (u16), r2 = action,
+                    // r5 = subscriber, [sub+8] = navif IFMediator (the same
+                    // holder the CL legs use).  Bind CCA COMMAND-plane keys
+                    // (the found-probe only sees the optype-5 stores) so
+                    // the 1 Hz svcdone re-fire answers them too.
+                    let r1k = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32
+                        & 0xffff;
+                    let r2a = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                    let r5s = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    let svc = read_u16(uc, r2a.wrapping_add(0x20));
+                    let func = read_u16(uc, r2a.wrapping_add(0x22));
+                    let holder = read_u32(uc, r5s.wrapping_add(8));
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] key={:#x} act={r2a:#x} st={} svc={:#x} func={:#x} holder={:#x}",
+                        crate::libs::libosal_linux::message::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        r1k,
+                        read_u32(uc, r2a.wrapping_add(4)),
+                        svc,
+                        func,
+                        holder,
+                    );
+                    if label == "rqadd"
+                        && crate::libs::libosal_linux::message::hmi_fsm_state()
+                            == 9
+                        && r1k != 0
+                        && holder > 0x1000
+                        && holder < 0xf000_0000
+                    {
+                        if let Ok(mut m) = SVCDONE_PENDING.lock() {
+                            m.entry(r1k).or_insert((holder, func, 0));
+                        }
+                        if let Ok(mut m) = MINT_INFO.lock() {
+                            m.insert(r1k, (svc, func));
+                        }
+                    }
                 } else if label == "rqc" {
                     // requestCommand entry: r0=sub, r1=action, r2=svc,
                     // r3=func.
