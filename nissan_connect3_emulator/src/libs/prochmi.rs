@@ -12671,11 +12671,18 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                     // owns no entry is a harmless pRetrieveRequest miss.
                     let mut cookies = vec![cookie];
                     cookies.extend(alt_done_cookies(unicorn, holder, cookie));
-                    let extra = [1u32, 2, 3]
-                        .into_iter()
-                        .filter(|c| !cookies.contains(c))
-                        .collect::<Vec<_>>();
-                    cookies.extend(extra);
+                    // r799n33s: the blind trio is for the state-6 member
+                    // era ONLY.  Thrown during the state-9 cascade it hits
+                    // foreign live slots (cookie space is per-dispatcher),
+                    // flips them spuriously and the client re-mints -
+                    // n257_4 key 0x18 removed x4, cascade stalled at sp2a.
+                    if crate::libs::libosal_linux::message::hmi_fsm_state() != 9 {
+                        let extra = [1u32, 2, 3]
+                            .into_iter()
+                            .filter(|c| !cookies.contains(c))
+                            .collect::<Vec<_>>();
+                        cookies.extend(extra);
+                    }
                     for c in cookies.iter().copied() {
                         bb[0x0e..0x10]
                             .copy_from_slice(&(c as u16).to_le_bytes());
