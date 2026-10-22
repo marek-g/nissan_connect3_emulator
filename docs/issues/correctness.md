@@ -3496,3 +3496,34 @@ watch dpmount/dpobserver for a domain-0x12 mount and the 0x12649081 write.
   n233 too) is unrelated to the stall - n233 passed 6->7 while spinning.
   Re-run (n235) to confirm flakiness; if it reproduces, bisect the
   wake-up that carries 4->5 early and starves the 6->7 event.
+
+## r799n33g: the leg plane is decoded - delivery dies at the action maps (n235-n237)
+
+- stspy (MEM_WRITE on the polled state words): trio-1's flip writer is
+  pc=0x171aa54 = enavi_tclActionCCAReqProperty::bNotifyWhenRunning
+  LAB_0171aa50 (vSetErrorState-then-state=2, the ERROR-complete path -
+  poll bIsComplete passes on it too).  trio-2's sub-action state word
+  (proc+0x34) receives ZERO writes in the whole run: nothing ever calls
+  its notify.  The state-2 flip is NOT err-value dependent (any stored
+  *piVar4 not e/f -> error-complete), so the stamp-0x0f idea was dead
+  on arrival: vExtractCookieRequestID (0x1c80304) proves REQUEST-ID =
+  body+0x1c and optype byte = body+0x1b (NOT +0x1a!), cookie = body+0x0e.
+- The subscriber the legs reach (sub id 1, runtime vt 0x291be08) is
+  enavi_tclCCACommandSubscriber: runtime slots [vfn+0x1c]=0x17b95cc
+  onRequestServiceRegister (registration plane, ignores the key) and
+  [vfn+0x10]=0x17b93fc onRequestCommand = the REQUEST-DONE leg: pops
+  action = pPop(map1=sub+0x14, key) else pFind(map2=sub+0x28, key),
+  then bOnRequest/action-vfn+0x70 -> that is what eventually runs
+  bNotifyWhenRunning.  No map entry for the key = silent no-op while
+  the table-wide enRemoveRequest still removes the CL entry (explains
+  removed-keys-with-no-flip across n224-n236).
+- Fan-out (r799n33g) to every live subscriber changed nothing -> the
+  key is simply absent from BOTH maps of BOTH subscribers.  orca/orca1
+  probes (0x17b93fc entry, 0x17b944c post-pPop) in n238 show whether
+  onRequestCommand even runs per leg and which side (subscriber map vs
+  our key) loses the registration.  Suspect: the enavi action registers
+  its mint into the map via requestCommand on the ENAVI thread only
+  when its bRun vfn+0x48 vIssue runs - trio-1 got in (flip), trio-2's
+  re-issue loop (bNotifyWhenRunning 0x8000000e re-arm path mints new
+  ids every pass) re-registers under the NEW key while our legs answer
+  the CL-table key from the found-probe - key pairs diverge.
