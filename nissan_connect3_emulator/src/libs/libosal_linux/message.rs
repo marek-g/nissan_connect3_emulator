@@ -2992,7 +2992,21 @@ pub fn fabricate_fi_conf_complete(
     body[0x18..0x1a].copy_from_slice(&func.to_le_bytes());
     body[0x1a] = 8; // OPTYPE: server conf (removes the pending entry)
     body[0x1b] = 1;
-    body[0x1c..0x1e].copy_from_slice(&key.to_le_bytes());
+    // r799n33g: the request-id/error field.  ActionCCAReq::bOnRequest
+    // (0x1719b74) only notifies when `*event == 0` OR the service is
+    // available OR svc==0x3c - a non-zero event on an unavailable service
+    // RESETS the action for retry (the never-ending re-issue loop, n238:
+    // ev=0x800002a1 for every property key).  Stamp 0: the completer
+    // still matches the key via the extracted request-id (register r1 at
+    // the remove leg - pPop hits came from there, n238 orca1), so the
+    // removal semantics are unchanged.  EMU_FI_ERR_KEY=1 restores the
+    // old key-stamped frames for comparison runs.
+    let err_field: u16 = if std::env::var_os("EMU_FI_ERR_KEY").is_some_and(|v| v == "1") {
+        key
+    } else {
+        0
+    };
+    body[0x1c..0x1e].copy_from_slice(&err_field.to_le_bytes());
     let mut blob = Vec::with_capacity(8 + body.len());
     blob.extend_from_slice(&1u32.to_le_bytes());
     blob.extend_from_slice(&(body.len() as u32).to_le_bytes());

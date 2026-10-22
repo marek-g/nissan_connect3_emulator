@@ -7725,6 +7725,11 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // registered (it is NOT for trio-1 in n237 -> no flip).
             (0x017b_93fcu32, "orca", 400),
             (0x017b_944cu32, "orca1", 400),
+            // r799n33g: bOnRequest entry (0x1719b74): r0 = the action the
+            // map yielded, r1 = event ptr.  Compare with the polled trio-2
+            // sub-action (proc+0x30 = 0x...348 region) - a mismatch means
+            // the polled sub-action is NOT the registered one.
+            (0x0171_9b74u32, "bonr", 400),
             // r799n33f: the trio-2/sp2 probes moved to the s9cascade PAGE
             // hook - 0x17c6xxx is THUMB code and the trap_site(TrapMode::
             // Arm) breakpoint of the pumptrace table never fires there.
@@ -8432,6 +8437,24 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         read_u16(uc, r0.wrapping_add(0x8)),
                         read_u32(uc, r0.wrapping_add(0x14)),
                     );
+                } else if label == "bonr" {
+                    // bOnRequest(action, event*, optype, typebase):
+                    // r0=action, r1=event ptr.  Log the action identity so
+                    // it can be matched against the polled sub-action.
+                    let r1b = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] action={r0:#x} state={} ev={:#x} svc={:#x} func={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        read_u32(uc, r0.wrapping_add(4)),
+                        if r1b > 0x1000 && r1b < 0xf000_0000 {
+                            read_u32(uc, r1b)
+                        } else {
+                            0xffff_ffff
+                        },
+                        read_u16(uc, r0.wrapping_add(0x20)),
+                        read_u16(uc, r0.wrapping_add(0x22)),
+                    );
                 } else if label == "orca" {
                     // entry: r0=subscriber, r1=event, r2=key.
                     let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
@@ -8460,7 +8483,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     // names the real onRequestDone to decompile.
                     let r1s = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
                     let vt = read_u32(uc, r1s);
-                    let slots: Vec<String> = (0..9u32)
+                    let slots: Vec<String> = (0..17u32)
                         .map(|i| {
                             format!(
                                 "{:#x}",
@@ -12454,28 +12477,40 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             // confirmed yet (see SVCDONE_PENDING); a duplicate against an
             // already-completed key is a harmless pRetrieveRequest miss.
             {
-                let mut again: Vec<(u32, u32, u32)> = Vec::new();
+                let mut again: Vec<(u32, u32, u32, u32)> = Vec::new();
                 if let Ok(mut m) = SVCDONE_PENDING.lock() {
                     for (key, (holder, func, n)) in m.iter_mut() {
                         if *n < 8 {
                             *n += 1;
-                            again.push((*key, *holder, *func));
+                            // r799n33g: carry the mint's service so the
+                            // leg stamps the dispatcher slot of the LIVE
+                            // entry (bHandleResponseSVCData routes via
+                            // pGetDispatcher(entry+0xc), n238 the trio-2
+                            // keys sit in map1 yet never flip because
+                            // ev=0x800002a1 != 0 makes bOnRequest RESET
+                            // the action instead of bNotify - the wire
+                            // error was an era leftover).
+                            let svc = MINT_INFO
+                                .lock()
+                                .ok()
+                                .and_then(|m| m.get(key).map(|(s, _)| *s))
+                                .unwrap_or(0);
+                            again.push((*key, *holder, *func, svc));
                         }
                     }
                     m.retain(|_, (_, _, n)| *n < 1000);
                 }
-                for (key, holder, func) in again.iter().copied() {
+                for (key, holder, func, svc) in again.iter().copied() {
                     let cookie = resolve_done_cookie(unicorn, holder, 0, key);
                     let mut bb = [0u8; 0x22];
                     bb[0xb] = 0x45;
                     bb[0x0e..0x10]
                         .copy_from_slice(&(cookie as u16).to_le_bytes());
-                    bb[0x14..0x16].copy_from_slice(&0x001fu16.to_le_bytes());
+                    bb[0x14..0x16].copy_from_slice(&(svc as u16).to_le_bytes());
                     bb[0x18..0x1a]
                         .copy_from_slice(&(func as u16).to_le_bytes());
                     bb[0x1a] = 9;
-                    bb[0x1c..0x1e]
-                        .copy_from_slice(&(key as u16).to_le_bytes());
+                    bb[0x1c..0x1e].copy_from_slice(&(key as u16).to_le_bytes());
                     // r799n33f: fan the pair out to every live subscriber
                     // (see alt_done_cookies - only the owner flips).
                     let mut cookies = vec![cookie];
@@ -12499,7 +12534,7 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                         again.len(),
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         again.iter()
-                            .map(|(k, _, _)| format!("{k:#x}"))
+                            .map(|(k, _, _, _)| format!("{k:#x}"))
                             .collect::<Vec<_>>()
                             .join(","),
                     );
