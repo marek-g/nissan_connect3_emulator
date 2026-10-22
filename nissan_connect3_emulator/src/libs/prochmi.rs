@@ -7527,6 +7527,11 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             (0x01c7_d068u32, "svcchg-med", 120),
             (0x01c7_c3b0u32, "propinit", 120),
             (0x01c7_c358u32, "addsub", 120),
+            // r799n33f: right after the subscriber value-handler return
+            // (0x1c7c874 `ldr pc,[r12,#0x1c]`, r5=subscriber, r4=result):
+            // does the handler ACCEPT our optype-9 payload (flip the
+            // action to done) or silently drop it?
+            (0x01c7_c878u32, "subhand", 120),
         ] {
             let address = base_address + off - ORIGINAL_BASE;
             crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:pumptrace", move |uc: &mut Unicorn<'_, Context>| {
@@ -8198,13 +8203,53 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 } else if label == "addsub" {
                     // ControlDispatch::bAddSubscriber(disp, subscriber):
                     // id = [sub+4], dispatcher's svc-ish word at +0x8.
+                    // r799n33f: dump the subscriber object head incl. the
+                    // vtable - ControlDispatch vfn+0x1c dispatches through
+                    // [sub+0x1c] and we must decode that handler.
+                    let mut head = [0u8; 32];
+                    let _ = uc.mem_read(r1 as u64, &mut head);
+                    let hex = head
+                        .chunks_exact(4)
+                        .map(|w| {
+                            format!(
+                                "{:#010x}",
+                                u32::from_le_bytes(w.try_into().unwrap())
+                            )
+                        })
+                        .collect::<Vec<String>>()
+                        .join(" ");
+                    let vt = read_u32(uc, r1);
+                    let mut slots = [0u8; 32];
+                    let _ = uc
+                        .mem_read(vt.wrapping_add(0x18) as u64, &mut slots);
+                    let s18 = u32::from_le_bytes(
+                        slots[0..4].try_into().unwrap(),
+                    ) & !1;
+                    let s1c = u32::from_le_bytes(
+                        slots[4..8].try_into().unwrap(),
+                    ) & !1;
                     log::warn!(
-                        "PROCHMI pumptrace {label} t={}ms tid=[{}] disp={r0:#x} sub={r1:#x} id={:#x} disp+8={:#x} disp+0x14={:#x}",
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] disp={r0:#x} sub={r1:#x} id={:#x} disp+8={:#x} disp+0x14={:#x} vt={vt:#x} vfn18={s18:#x} vfn1c={s1c:#x} [{hex}]",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
                         read_u16(uc, r1.wrapping_add(4)),
                         read_u16(uc, r0.wrapping_add(0x8)),
                         read_u32(uc, r0.wrapping_add(0x14)),
+                    );
+                } else if label == "subhand" {
+                    // after subscriber vfn+0x1c: r4 = handler result,
+                    // r5 = subscriber, r8 = cookie, r10 = reqid, r7 = func.
+                    let r5 = uc.reg_read(RegisterARM::R5).unwrap_or(0) as u32;
+                    let r8 = uc.reg_read(RegisterARM::R8).unwrap_or(0) as u32;
+                    let r10 = uc.reg_read(RegisterARM::R10).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI pumptrace {label} t={}ms tid=[{}] res={r0:#x} sub={r5:#x} cookie={:#x} reqid={:#x} func={:#x} vt={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        r8 & 0xffff,
+                        r10 & 0xffff,
+                        r7,
+                        read_u32(uc, r5),
                     );
                 } else if label == "nosub" {
                     // ControlDispatch frame regs (0x1c7c6d4 prologue):
