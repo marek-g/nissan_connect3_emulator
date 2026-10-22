@@ -814,6 +814,17 @@ static CL_TABLE_HOLDER: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 /// gates the 0x1f mint pairing to the era that runs state 9.
 static PROPERTY_ERA_T: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// r799n33: property keys answered once by `svcdone` at store time but not
+/// yet confirmed REMOVEd by the `remove` probe -> re-fired on the 1 Hz
+/// state-9 pump-kick tick.  A single store-time call races the issuing
+/// enStoreRequest/walk (n211 missed 0x11/0x12 on a poisoned holder, n212
+/// missed 0xc/0xd/0xe when the walk issued three actions at once), while a
+/// duplicate call against an already-completed key is a harmless
+/// pRetrieveRequest miss.  value = (holder, func, attempts).
+static SVCDONE_PENDING: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, (u32, u32, u32)>>,
+> = std::sync::LazyLock::new(Default::default);
+
 /// r799n31: runtime VA (+1, Thumb) of `enavi_tclAction::vSignalSelf`
 /// (prochmi 0x0171915c) stashed by the `navif-create` probe.  The FSM calls
 /// it (vtable slot 0x60) after EVERY successful state transition: it posts
@@ -6011,6 +6022,9 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     crate::libs::dapi::emu_t0_elapsed_ms() as u64,
                     Ordering::Relaxed,
                 );
+                if let Ok(mut m) = SVCDONE_PENDING.lock() {
+                    m.clear();
+                }
                 crate::libs::libosal_linux::message::fi_era_clear_pending();
                 // r799n31: stash enavi_tclAction::vSignalSelf (0x0171915c,
                 // Thumb) as runtime VA for the state-9 wake driver below.
@@ -6945,15 +6959,35 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 // EMU_FAKE_FI_READY_PUSH=0 disable the legs.
                 let ordinal = {
                     let o1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32 & 0xffff;
-                    // r799n31: the state-9 property stores (svc 0x1f,
-                    // lr 0x17b95c4/0x47dc4ec0 burst) carry the owner
-                    // back-pointer ([entry+0x0c], n200 f0c=0x3a33738) in
-                    // r1 - not the minted key.  Take the freshest IDFactory
-                    // mint (storekey probe, <= 30 ms old, same era) for
-                    // this plane only; leave every other service on the
-                    // r799n29 reject rule.  n210: the 0x47dc4ec0 leg
-                    // arrives with r1=0 - pair that too.
-                    if (o1 > 0x100 || o1 == 0) && svc == 0x001f {
+                    // r799n31/n33: the state-9 property stores carry the
+                    // owner back-pointer (or 0) in r1 - not the minted key
+                    // (n200 f0c, n210 0x47dc4ec0 leg).  Take the freshest
+                    // IDFactory mint (<= 30 ms old) for the property
+                    // CONNECTOR plane.  n213: the Presentation/Route/EDM
+                    // groups store with their own connector svc (0x1e...),
+                    // so gate on the service set minus the boot plane
+                    // (0x0006 members, r799n29 reject rule) and the gate
+                    // (0x000a, completed by its own data answer, r799n30),
+                    // and only while the walk is live in state 9 (member
+                    // registrations run in states 5-7).
+                    if (o1 > 0x100 || o1 == 0)
+                        && matches!(
+                            svc,
+                            0x001f
+                                | 0x001e
+                                | 0x002c
+                                | 0x0152
+                                | 0x0056
+                                | 0x0300
+                                | 0x0037
+                                | 0x0032
+                                | 0x0018
+                                | 0x000d
+                                | 0x007d
+                        )
+                        && crate::libs::libosal_linux::message::hmi_fsm_state()
+                            == 9
+                    {
                         let lm = LAST_MINTED.load(Ordering::Relaxed);
                         let mint_t = (lm >> 32) as u64;
                         let mint_key = (lm & 0xffff) as u32;
@@ -7109,13 +7143,31 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                 crate::libs::libosal_linux::message::fabricate_fi_conf_complete(
                                     uc, svc as u16, ordinal, f18 as u16,
                                 );
-                                // r799n32: the property plane has no live
-                                // dispatcher in state 9 (tid 65 sleeps,
-                                // tid 81's drain only posts content-less
-                                // wake events) - invoke the completion leg
-                                // the genuine CCASERVER answer would drive,
-                                // directly.  See monitor::guest_call_bhandle_svcdone.
-                                if svc == 0x001f {
+                                // r799n32/n33: the property plane has no
+                                // live dispatcher in state 9 (tid 65
+                                // sleeps, tid 81's drain only posts
+                                // content-less wake events) - invoke the
+                                // completion leg the genuine CCASERVER
+                                // answer would drive, directly.  All
+                                // property connector services except the
+                                // gate; only in state 9 (see pairing gate).
+                                if matches!(
+                                    svc,
+                                    0x001f
+                                        | 0x001e
+                                        | 0x002c
+                                        | 0x0152
+                                        | 0x0056
+                                        | 0x0300
+                                        | 0x0037
+                                        | 0x0032
+                                        | 0x0018
+                                        | 0x000d
+                                        | 0x007d
+                                ) && crate::libs::libosal_linux::message::hmi_fsm_state(
+                                        )
+                                        == 9
+                                {
                                     let holder =
                                         CL_TABLE_HOLDER.load(Ordering::Relaxed);
                                     let f18b =
@@ -7140,6 +7192,18 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                         8,
                                         &bb,
                                     );
+                                    // r799n33: re-fire until the remove
+                                    // probe confirms (see SVCDONE_PENDING).
+                                    if holder != 0 {
+                                        if let Ok(mut m) =
+                                            SVCDONE_PENDING.lock()
+                                        {
+                                            m.insert(
+                                                ordinal as u32,
+                                                (holder, f18b as u32, 1),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -7203,6 +7267,10 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             (0x01c7_de88u32, "store", 400),
             (0x01c7_df54u32, "storekey", 400),
             (0x01c7_e32cu32, "remove", 400),
+            // r799n33: the type-4 (property-update registration) twin of
+            // enRemoveRequest (keys svc/func/slot, not the request key) -
+            // also confirms an entry is gone for the svcdone re-fire.
+            (0x01c7_e284u32, "upreg", 400),
             // enExecuteCommand(mediator, r1, &key, r3, [sp+0x3c]=keyref,
             // [sp+0x40]=msgdata pp, [sp+0x44]=await-flag byte): only the
             // flag==1 leg reaches enStoreRequest; everything else posts
@@ -7794,6 +7862,10 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     crate::libs::libosal_linux::message::fi_era_clear_key(
                         (r1 & 0xffff) as u16
                     );
+                    // r799n33: same confirmation for the svcdone re-fire.
+                    if let Ok(mut m) = SVCDONE_PENDING.lock() {
+                        m.remove(&(r1 & 0xffff));
+                    }
                 } else if label == "waitret" {
                     // r0 = message-ref pointer (0 on timeout).  Dump the ref
                     // and the 8-byte queue frame the Wait wrote at its
@@ -11730,6 +11802,47 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             // it on this 1 Hz tick (bounded inside, cleared by the remove
             // probe once a copy lands).
             crate::libs::libosal_linux::message::refire_fi_era_pending(unicorn);
+            // r799n33: re-fire the svcdone completions that no `remove`
+            // confirmed yet (see SVCDONE_PENDING); a duplicate against an
+            // already-completed key is a harmless pRetrieveRequest miss.
+            {
+                let mut again: Vec<(u32, u32, u32)> = Vec::new();
+                if let Ok(mut m) = SVCDONE_PENDING.lock() {
+                    for (key, (holder, func, n)) in m.iter_mut() {
+                        if *n < 8 {
+                            *n += 1;
+                            again.push((*key, *holder, *func));
+                        }
+                    }
+                    m.retain(|_, (_, _, n)| *n < 1000);
+                }
+                for (key, holder, func) in again.iter().copied() {
+                    let mut bb = [0u8; 0x22];
+                    bb[0xb] = 0x45;
+                    bb[0x0e..0x10]
+                        .copy_from_slice(&0xfffeu16.to_le_bytes());
+                    bb[0x14..0x16].copy_from_slice(&0x001fu16.to_le_bytes());
+                    bb[0x18..0x1a]
+                        .copy_from_slice(&(func as u16).to_le_bytes());
+                    bb[0x1a] = 8;
+                    bb[0x1c..0x1e]
+                        .copy_from_slice(&(key as u16).to_le_bytes());
+                    crate::rtos::monitor::guest_call_bhandle_svcdone(
+                        unicorn, holder, 0xfffe, key, func, 8, &bb,
+                    );
+                }
+                if !again.is_empty() {
+                    log::warn!(
+                        "PROCHMI s9-svcdone-refire: {} pending key(s) re-armed t={}ms ({})",
+                        again.len(),
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        again.iter()
+                            .map(|(k, _, _)| format!("{k:#x}"))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    );
+                }
+            }
             // r799n31: wake driver.  While the property confs of the absent
             // CSMA provider are still unaccepted, run the guest's own
             // `enavi_tclAction::vSignalSelf` (the OSAL-event post the FSM
