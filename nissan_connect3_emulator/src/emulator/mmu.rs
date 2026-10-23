@@ -63,6 +63,8 @@ pub struct Mmu {
     /// (`phys_section_add` assert) at ~42 s that way.
     arena_next: u32,
     arena_end: u32,
+    /// r799n33zr: first byte of the current arena (ring-wrap target).
+    arena_base: u32,
     /// r799n33zż: see [`Mmu::defragment`] - counts down map calls after an
     /// unproductive merge pass (QEMU section leak protection).
     defrag_backoff: u32,
@@ -76,6 +78,7 @@ impl Mmu {
             heap_mem_end: 0u32,
             arena_next: 0,
             arena_end: 0,
+            arena_base: 0,
             defrag_backoff: 0,
         }
     }
@@ -100,12 +103,32 @@ impl Mmu {
             return self.heap_alloc(unicorn, size, Prot::READ | Prot::WRITE, desc);
         }
         if self.arena_next == 0 || self.arena_end - self.arena_next < size {
-            let base = self.heap_alloc(unicorn, ARENA_SIZE, Prot::READ | Prot::WRITE, desc);
-            if base == 0 {
-                return 0;
+            if self.arena_base != 0 {
+                // r799n33zr: RING-WRAP instead of mapping a second arena.
+                // Guest calls are milliseconds-long, never block, and the
+                // ring is 1024 slots deep, so the oldest slice is long dead
+                // when the cursor comes back around - while EVERY extra
+                // arena permanently raises unicorn's `sections_nb` (never
+                // freed), and the s9 echo rounds (budget 200, n33zq) burn
+                // ~1 arena per 20 s of rounds (n278_2 asserted again).
+                static WRAPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let w = WRAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if w < 3 || w % 512 == 0 {
+                    log::warn!(
+                        "mmu arena ring-wrap #{w} at {:#x} (reusing {ARENA_SIZE:#x} stack pool, {desc})",
+                        self.arena_base
+                    );
+                }
+                self.arena_next = self.arena_base;
+            } else {
+                let base = self.heap_alloc(unicorn, ARENA_SIZE, Prot::READ | Prot::WRITE, desc);
+                if base == 0 {
+                    return 0;
+                }
+                self.arena_base = base;
+                self.arena_next = base;
+                self.arena_end = base + ARENA_SIZE;
             }
-            self.arena_next = base;
-            self.arena_end = base + ARENA_SIZE;
         }
         let at = self.arena_next;
         self.arena_next += size;
@@ -129,6 +152,27 @@ impl Mmu {
         self.remove_internal(unicorn, address, size);
 
         // fresh anonymous memory is zero-filled by the emulator (like a real kernel)
+        // r799n33zr: leak-budget watchdog.  unicorn's QEMU never frees a
+        // MemoryRegion: EVERY mem_map/mem_map_ptr ever performed raises
+        // `map->sections_nb`, and `phys_section_add` aborts the whole
+        // emulator at TARGET_PAGE_SIZE (4096).  Count every map so runs can
+        // see WHERE the budget went instead of dying mid-cascade.
+        {
+            static MAPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = MAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 3000 || n == 3600 || n == 3900 {
+                log::warn!(
+                    "mmu MAP-BUDGET {n}/4096 vm={} regions={} desc={}",
+                    unicorn.get_data().elf_path.rsplit('/').next().unwrap_or("?"),
+                    self.regions.len(),
+                    description,
+                );
+            }
+            if n > 3900 && n % 50 == 0 {
+                log::warn!("mmu MAP-BUDGET {n}/4096 vm={} desc={}",
+                    unicorn.get_data().elf_path.rsplit('/').next().unwrap_or("?"), description);
+            }
+        }
         unicorn.mem_map(address as u64, size as u64, perms).unwrap();
 
         let desc = match description.len() {
@@ -173,6 +217,21 @@ impl Mmu {
     ) {
         self.defragment(unicorn);
         self.remove_internal(unicorn, address, size);
+
+        // r799n33zr: same leak budget as `Mmu::map` (mem_map_ptr registers
+        // a MemoryRegion too and unicorn never frees it).
+        {
+            static MAPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = MAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 3000 || n == 3600 || n == 3900 || (n > 3900 && n % 50 == 0) {
+                log::warn!(
+                    "mmu SHARED-MAP-BUDGET {n} vm={} regions={} desc={}",
+                    unicorn.get_data().elf_path.rsplit('/').next().unwrap_or("?"),
+                    self.regions.len(),
+                    description,
+                );
+            }
+        }
 
         unsafe {
             unicorn

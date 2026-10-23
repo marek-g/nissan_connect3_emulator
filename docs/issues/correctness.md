@@ -4026,3 +4026,27 @@ wake budget 30 -> 120.  While completions are pending the wake-lane
 guest-calls keep threads runnable, so the loop stays awake by
 construction - the park now only happens when the guest is legitimately
 idle.
+
+## r799n33zr: key-0 echo was the post-state-9 abort; arena ring-wrap + map-budget watchdog
+
+n279_1 narrowed the post-s9 death to a clean signature: tid-65 consumes
+`svc=0x000a txn=0` -> completer miss (`lookup key=0x0 func=0xf02`, no
+key-0 svc-0a entry EXISTS - GOOD printed zero key-0 f02 lookups) ->
+`handler_res=0` -> `open /dev/tty` -> `exit_group(127)`.  GOOD never
+opened /dev/tty (0 opens): that open is the abort path, and it fires only
+for a MISS on a key the FSM treats as an expected answer.  Source: the
+conf-store gate leg records ordinal 0 for one svc-0x0a store; the echo
+becomes a permanent-miss frame that the refire lane re-posts forever
+(key 0 never appears in the `remove` probe, so `fi_era_clear_key` never
+fires for it).  Fix: `rqkey_owned_by_want` now rejects key 0 for every
+lane except the (hosted-off) svc-6 plane - applied at the single choke
+point, so the conf-complete leg (also unguarded until now) and the refire
+loop (which had `key != 0 &&`) are covered too.
+
+n278_2 also re-crashed `phys_section_add`: with the 200-round budget the
+guest-call stacks exhaust the 16 MiB arena every ~20 s and EVERY extra
+arena is a permanent unicorn section (they are never freed).  Arenas now
+RING-WRAP (1024-slot stack pool reused; guest calls never block and die
+in ms, so old slices are long dead), and `map`/`map_shared` carry a
+MAP-BUDGET watchdog log so a future leak names itself instead of dying
+mid-cascade.

@@ -2968,6 +2968,11 @@ pub fn fabricate_fi_conf_complete(
     if std::env::var_os("EMU_FAKE_FI_READY_PUSH").is_some_and(|v| v == "0") {
         return;
     }
+    // r799n33zr: the conf echo stamps `key` into the same key-only
+    // completer - same live-owner rule as the data lanes.
+    if !rqkey_owned_by_want(key, service) {
+        return;
+    }
     static MSG_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x7a00);
     let mut body = vec![0u8; 0x22];
     body[0..2].copy_from_slice(&0x0015u16.to_le_bytes()); // src SENSORFI
@@ -3154,8 +3159,9 @@ pub fn refire_fi_era_pending(unicorn: &mut Unicorn<'_, Context>) -> usize {
         // r799n33zc: re-check the live key owner EVERY re-fire - between
         // notes the key may have been freed and re-minted to a foreign
         // plane, and this lane pushes optype-9 frames into the same
-        // key-only completer.
-        if key != 0 && !rqkey_owned_by_want(key, 0x000a) {
+        // key-only completer.  r799n33zr: key 0 goes through the guard
+        // too (a re-posted key-0 body was n279_1's murder frame).
+        if !rqkey_owned_by_want(key, 0x000a) {
             continue;
         }
         let mut data = gps_data_status_answer_body(key);
@@ -3488,7 +3494,16 @@ fn rqkey_owned_by_want(key: u16, want_svc: u16) -> bool {
             }
             false
         }
-        None => true,
+        // r799n33zr: a key-0 push is poison for every lane but the svc-6
+        // members (f240 - and that plane is DAPI-hosted now, n33zb).  n279_1
+        // died 1 s into state 9 after consuming our gate-leg echo stamped
+        // ordinal 0: the completer holds NO key-0 svc-0a entry, the frame
+        // missed, and unlike the inert 0x5aa5 kicks the handler reported
+        // the miss to the FSM - `open /dev/tty` + `exit_group(127)`, an
+        // abort GOOD never printed (0 tty opens).  The refire lane keeps
+        // re-posting key-0 bodies from earlier notes, so filter them at
+        // the choke point too.
+        None => key != 0 || want_svc == 0x0006,
     }
 }
 
