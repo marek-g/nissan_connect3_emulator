@@ -7974,9 +7974,19 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             // slots.  Exception: the svc-0x000a gate is
                             // completed by its func-f02 DATA answer (n176
                             // key 3), a conf there would only pre-empt it.
-                            if svc != 0x000a
-                                && crate::libs::dapi::emu_t0_elapsed_ms() >= 32_000
-                            {
+                            // r799n51: the t>=32 s era gate is RETIRED.
+                            // Fast-ctor boots (n322+) mint the whole
+                            // property batch at t~19-25 s and finished it
+                            // BEFORE the gate opened - n325_2 carried 44
+                            // fi-ready pushes but ZERO ConfCompletes (GOOD
+                            // ran 62), and the optype-8 conf leg is the
+                            // ONLY lane that REMOVES the registered entry
+                            // (n176/n178) - without it the batch could
+                            // never convert and the cascade stalled.  The
+                            // era gate's foreign-owner protection is
+                            // already provided per-key by
+                            // `rqkey_owned_by_want` inside the fabricator.
+                            if svc != 0x000a {
                                 // r799n42b: STAMP stays the legacy +0x18 read
                                 // on LEG bodies.  With the REAL func the
                                 // bHandle legs run deeper and their orphan
