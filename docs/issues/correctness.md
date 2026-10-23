@@ -4798,3 +4798,33 @@ n310_1 state of the art (all fixes on):
   sp2* sweep starting; eventually 's9cascade final'.  If wakes churn
   again (word value rejected), the parked-val probe is the fallback
   (record val at WAIT registration, wake with the observed GOOD value).
+
+## r799n52 RESULT (n328): event-delivery kick CONVERTS - new wall = svc-2c step
+
+- n328 3/3 boots: ANSWER-EVENT store1+woke 125-263/boot, removes cover all
+  26 registered keys (max 0x1a, uniq 26 = everything BAD registers), bonr 25,
+  vfn10 120-144, and for the FIRST TIME cmp1e-b (n=11), cmp1e-c (n=10) and
+  cmp2c-a (n=7) fire.  Cascade timeline 37.9-42.5 s (GOOD 39-44 s).  The
+  `slotWord=1; FUTEX_WAKE` protocol was the missing delivery half all along:
+  signal-only wakes could never close a cmp1e pass (n321-n327 confirmed).
+- New wall: the cascade enters the svc-2c STEP (cmp2c-a's beq target
+  0x17c6670) 7 times and leaves SILENTLY - cmp1f-b/cmp0a/cmp300/cmp18/cmp0d/
+  cmp06/final and every sp2* stay at 0, and the FSM spins state-9 until t=90.
+- Disasm of the step (0x17c6670): singleton accessor 0x161f754 (lazy ctor
+  0x161dd24), trio = [singleton+0x10] must be != 0 (with the walk flag r5==1),
+  then THREE getters (0x164dafc / 0x164db04 / 0x164db2c) each executed as
+  vfn+0x24 (issue) on the first pass and vfn+0x18 (bIsComplete, must return
+  !=0) on re-entry; ANY failed poll leaves via the silent tail 0x17c64bc.
+  All-pass -> b 0x17c63a0 -> cmp1f-b check -> 1f==1 -> the trio-2 ISSUER
+  block (0x17c6748, getters 0x1620a14/a04/a34 on [singleton+0x14], same
+  issue-then-poll shape) - that is the step-2 traffic sweep GOOD completes in
+  the t=42 burst (252 removes).  BAD never enters trio-2 either (sp2acc
+  unknown, sp2o=0).
+- r799n53: 11 new s9cascade sites (same live page hook): st2c-acc (singleton
+  ptr), st2c-trio (r4 dump), st2c-act1/2/3 (action object dumps like
+  sp2act*), st2c-p1/p2/p3 (the three poll results), st2c-fb + st2c-fb1f
+  (fallback path + its 1f-state check), sp2acc (trio-2 singleton null-check).
+  n329 will say whether BAD dies on a null trio or on a poll, and what the
+  trio-1 actions are (svc/func/req) - the answer decides whether the fix is
+  a traffic-era answer lane (svc-0x000a / 0x002c data) or a missing
+  registration precondition.
