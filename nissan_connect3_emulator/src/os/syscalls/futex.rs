@@ -321,7 +321,7 @@ fn wait_preferred(unicorn: &Unicorn<'_, Context>, tid: u32) -> bool {
 /// through the emulator's spawn-herd wait queues.  Returns the waiter count
 /// (0 when the word is not shared memory in this VM).
 pub fn wake_all_shared_waiters(unicorn: &Unicorn<'_, Context>, uaddr: u32) -> usize {
-    wake_all_shared_waiters_owned(unicorn, uaddr, None)
+    wake_all_shared_waiters_owned(unicorn, uaddr, None, usize::MAX)
 }
 
 /// r799n49: `Some(owner_pid)` restricts the wake to waiters registered by
