@@ -201,7 +201,7 @@ pub fn futex(
                 // multi-line {:#?} key blob) and serializes on the VM
                 // lock.  Keep every productive wake and one line per
                 // word per 5 s of the spam, with a dup count.
-                let now = crate::libs::dapi::emu_t0_elapsed_ms();
+                let now = crate::libs::dapi::emu_t0_elapsed_ms() as u64;
                 static WAKE0: std::sync::LazyLock<
                     std::sync::Mutex<
                         std::collections::HashMap<u32, (u64, u64)>,
