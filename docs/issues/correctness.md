@@ -4470,3 +4470,15 @@ default; enabled only after golden-run comparison proves no real answer
 ever arrives for them).  GOOD's own unfinished 9 keys (0x300/0x2c/0x6 batch)
 sit BEHIND this batch - clearing the six should expose the final trio and
 `s9cascade final`.
+
+r799n38b: sharper lead - conf-store `lm` word.  GOOD's svc-0xa store shows
+the request body ALREADY materialized at store time (lm=0x946200000003 =
+guest msg-page pointer high + ordinal); BAD stores the same conf with
+lm=0x0 - an EMPTY slot: the BAD client never materialized the request body,
+so there is nothing for the wire and DAPI can never answer.  Same store
+probe, same first ordinal (ord=3) both runs - the divergence is INSIDE the
+store path (msgobj allocation/fill before the store).  Next step: Ghidra the
+CCS conf-store (0x17b95xx legs around lr=0x17b9554/0x17b95c4) and the msgobj
+allocation it calls; find which precondition (service metadata? pool state?)
+is missing in BAD - this is a genuine client-side gap, NOT (yet) a reason to
+fabricate traffic answers.
