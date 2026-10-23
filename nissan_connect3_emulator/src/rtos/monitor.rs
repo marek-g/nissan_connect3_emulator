@@ -2092,7 +2092,8 @@ pub fn spawn_guest_call_lr(
             .inner
             .next_thread_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        data.threads.lock().unwrap().push(GuestThread {
+        let mut list = data.threads.lock().unwrap();
+        list.push(GuestThread {
             id: tid,
             rtos_task: true,
             status: ThreadStatus::Runnable,
@@ -2101,6 +2102,25 @@ pub fn spawn_guest_call_lr(
             pending_result: None,
             clear_child_tid: None,
         });
+        // r799n36 probe: tail svcdone workers (n297 tids 546+) were logged as
+        // spawned but produced ZERO guest-side output.  Name the VM list they
+        // actually land in and how many runnables sit there.  n298 verdict:
+        // they DO land in prochmi and DO run - they park on the IOSC id-word
+        // of the conf they must complete (SHM-WAIT) and wait for the peer
+        // that writes it.  Gated now: EMU_GUEST_CALL_AUDIT=1.
+        if std::env::var_os("EMU_GUEST_CALL_AUDIT").is_some() {
+            static SPAWNED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SPAWNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 300 {
+                let runnables = list
+                    .iter()
+                    .filter(|t| t.status == ThreadStatus::Runnable)
+                    .count();
+                log::info!(
+                    "guest-call spawn audit: tid {tid} -> {} pc={start:#x} runnable_now={runnables}",
+                    data.elf_path,
+                );
+            }
+        }
         tid
     };
     tid

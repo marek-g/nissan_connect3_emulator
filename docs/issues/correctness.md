@@ -4260,3 +4260,28 @@ through the OLD host-slot pump ring; since r799n35 the ring is guest-malloc
 fed - check whether pump_push_completion still reaches `bHandleResp` FOUND
 (entry != 0x0) for the tail keys, and compare the completer's key-matching
 word-for-word between a GOOD tail round and a BAD one.
+
+n298_1 (spawn audit, EMU_GUEST_CALL_AUDIT=1): the "workers never run"
+theory is FALSIFIED - they land in prochmi's list and DO execute
+(pumptrace `found` + `bhrfind res` for their key), then park in
+`SHM-WAIT id-word` on the IOSC id word of the object that carries their
+conf answer (worker 460: uaddr 0x40110e6c, key /dev/shm#file:0x32+1117804).
+The wake machinery works (word 0x40110e6c was woken 7x - tids 193..198
+purged key 0x3 at t=35.5s), but NOBODY ever writes/creates the object the
+TAIL workers wait on.  GOOD contrast: worker 373 parked 39.9 s on word
+0x4010c56c and at 42.1 s a peer thread finished processing the ECHO frame
+(`post8`->consumer-> guest `enChkErrInf: Decoded error msg [FID=0x9b1a]
+code=0x2a1 -> 0x800002a1` on the HMINavServerLib_1 consumer leg, TRACE tag
+0x2700) - the id-word write + futex_wake came out of that processing and
+the woken worker then ran subhand -> compres -> remove (key 0x1a purged).
+So the missing tail link is NOT the worker lane but the echo CONSUMER:
+BAD posts the echoes (`pumptrace post8/notify` into HMINavServerLib_1,
+svc 0x20 payloads) and the consumer polls (`Wait timeout=0` cadence alive
+at the kill), but the frame never completes through
+`enChkErrInf`/deliver - BAD `envigate f-accept` = 24 vs GOOD 130, and BAD
+`cca server` census lacks GOOD's `server 0x0020: answered
+ServiceRegister(svc 0x0180) from 0x0109 with RegisterConf+ServiceStatus`.
+Next step (fresh session): trace one GOOD f-accept frame end-to-end from
+its poster to the consumer's enChkErrInf leg and find the equivalent
+poster BAD lacks (CCS 0x0180 RegisterConf for the nav-server services vs
+`hosted` suppression of the CCS answer lane by the new provider procs).
