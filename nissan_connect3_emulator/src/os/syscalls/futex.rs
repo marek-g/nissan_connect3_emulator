@@ -406,7 +406,7 @@ pub fn wake_all_shared_waiters_owned(
 /// workers.  EMU_WAKE_PRIORITY=0 disables (same umbrella: it is the wake
 /// machinery's delivery half).
 pub fn wake_answered_events(
-    unicorn: &Unicorn<'_, Context>,
+    unicorn: &mut Unicorn<'_, Context>,
     uaddr: u32,
     owner: Option<u32>,
     limit: usize,
