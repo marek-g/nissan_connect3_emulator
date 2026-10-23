@@ -4319,3 +4319,13 @@ n300_1: full 94.9 s of logging, zero asserts, regions cap 485, wakes 10 (was
 x26, subhand reached reqid 0x26).  sp2res still 0 -> the next layer of the
 tail.  ALWAYS run BAD with `> file 2>&1` at least once per session - pipes
 hide SIGABRT banners.
+
+r799n36c: PROCSDSTS spawn staggered (map-engine pattern, host thread, never
+sleep in guest context) until prochmi's own mq_open created mbx_265 - kills
+the sdsts-vs-HMI O_EXCL race for good (n300_2 lost HMI startup entirely;
+n295 lost the queue).  n301_1..3 (all redirect-run, no pipes): 3/3 q_fail=0,
+gate reports "mbx_265 already created: true", rqadd max 0x2d/0x2d/0x2e (GOOD
+0x3d), removes max 0x2b (was frozen at 0x19 for weeks, GOOD 0x34), sp2res
+x6-10 (GOOD x30), final still 0/3.  The tail is now ONE ORDER OF MAGNITUDE
+from GOOD rather than dead - the remaining gap is completion ROUNDS, not a
+wall.

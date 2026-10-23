@@ -75,6 +75,49 @@ pub fn spawn_process(app_name: &str, filename: &str, cmdline: &str) -> Result<()
             .map_err(|err| err.to_string())?;
         return Ok(());
     }
+    // r799n36: PROCSDSTS staggering.  The unit boots LINUX ORDER with real
+    // inter-process spacing (seconds apart): PROCHMI (PROC02) has created its
+    // mailbox mbx_265 long before PROCSDSTS (PROC07) starts, and sdsts' SCD
+    // bring-up - which `scd_bCreateQueue`s its partner apps' queues when they
+    // do not exist yet - therefore never touches it.  Here all eight processes
+    // exec within ~1 ms, so sdsts sometimes won the race and prochmi's own
+    // mq_open(O_CREAT|O_EXCL) met EEXIST -> "Application 0x0109: Queue could
+    // not be created" -> no HMI startup at all (n300_2; earlier n295).  Defer
+    // the sdsts spawn on a host thread (never sleep in the guest call!) until
+    // the queue exists in the shared namespace, 15 s timeout.
+    if elf_path.contains("procsds_ts") {
+        let launcher = launcher.clone();
+        let app_name = app_name.to_string();
+        std::thread::Builder::new()
+            .name("sdsts-spawn".into())
+            .spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                let mut owned = false;
+                loop {
+                    owned = launcher
+                        .factory
+                        .namespace()
+                        .lock()
+                        .unwrap()
+                        .mq
+                        .queue_id_for_name("mbx_265")
+                        .is_some();
+                    if owned || std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                log::info!(
+                    "OSAL: deferred PROCSDSTS spawn starting at t={}ms (mbx_265 already created: {owned})",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                );
+                if let Err(err) = launch(&launcher, &app_name, &elf_path, args) {
+                    log::warn!("OSAL: deferred PROCSDSTS spawn failed: {err}");
+                }
+            })
+            .map_err(|err| err.to_string())?;
+        return Ok(());
+    }
     launch(launcher, app_name, &elf_path, args)
 }
 
