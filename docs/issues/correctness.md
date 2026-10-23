@@ -4633,3 +4633,25 @@ n310_1 state of the art (all fixes on):
   while a svc-0x000a key is pending (property-era kicks churned the wake
   queues - n314 boots). Success markers: vfn10/completer hits for keys
   0x2e.., removes past 0x2d, vOnUpdate*Traffic* > 0, `s9cascade final`.
+
+## r799n46b/c regressions pinned (n316) + the GOOD func-0 fact
+
+- n316 (property-plane full bodies + real funcs on all stub legs): ALL
+  THREE boots died before sp2 (svc-0x1e era). Two poisons were mixed in:
+  * the 0x0024->0x0121 template body carries the REAL func at +0x18 and
+    makes the svc-0x1e/0x1f stub-era legs run the deep branch (n310_3
+    orphan-free shape) on the host body ring;
+  * stamping real funcs into the refire bb for property keys did the same.
+  r799n46c keeps BOTH opt-in (`EMU_SVC_FULL_BODY=1`) and svc-0x000a-scoped
+  by default: traffic legs (chunk lane, malloc'd) keep the GOOD-full body,
+  property legs keep the proven stubs.
+- New GOOD fact (n264_11 svc-0x1f census): GOOD completed its LAST property
+  keys - including func 0x8000 key 0x2d - with minimal `15 00 21 01 22 00
+  ... 1f 00 0e 01 00 00 09 01 <key>` func-0 frames (x16, src SENSORFI, len
+  0x22): the very shape our fi-ready push posts. The completer matched key
+  only, and the tid-821/841 WORKER legs consumed those frames right after a
+  wake ('compres completer_res=0x80000218' then remove lr=0x1c7d1e4).
+  => shape and lane are NOT the property gap; it is the wake/consumption
+  lottery (BAD parks 220 workers/key, GOOD ~a dozen).
+- Budget 200 on SVCDONE_PENDING re-fires stays: 8-starvation killed the
+  process tick (n277 self-starvation trap).
