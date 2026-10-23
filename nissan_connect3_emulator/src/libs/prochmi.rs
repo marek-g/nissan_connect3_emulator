@@ -846,9 +846,15 @@ fn s9_answer_kick(uc: &mut Unicorn<'_, Context>) {
         return;
     }
     let words = crate::os::syscalls::futex::shm_parked_wait_words();
+    // r799n49: slice-wake the herd parked on each id-word, bounded to this
+    // (prochmi) process and to GOOD's storm density (~46 wakes/s; one 1 Hz
+    // round = one 48-slice).  n320_on: 1248 parks vs 75 wakes over 55 s -
+    // GOOD's leg chains ran because its completer storm kept draining the
+    // park queue; BAD's parked legs never see their (already filled) chain.
+    let owner = uc.get_data().inner.process_id;
     let mut total = 0usize;
     for w in &words {
-        total += crate::os::syscalls::futex::wake_all_shared_waiters(uc, *w);
+        total += crate::os::syscalls::futex::wake_all_shared_waiters_owned(uc, *w, Some(owner), 48);
     }
     if total > 0 {
         log::warn!(
@@ -13623,17 +13629,13 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                             .collect::<Vec<_>>()
                             .join(","),
                     );
-                    // r799n45b: the previous round's spawns are parked by
-                    // now - wake them so each re-checks its slot and runs
-                    // the decode leg over whatever the lanes posted since
-                    // (store-time answers land before the herd parks; the
-                    // kick storm is what makes GOOD's winners).  r799n46:
-                    // only while a svc-0x000a (traffic) key is pending -
-                    // kicking through the PROPERTY era churned the wake
-                    // queues and degraded all three n314 boots.
-                    if again.iter().any(|(_, _, _, s)| *s == 0x000a) {
-                        s9_answer_kick(unicorn);
-                    }
+                    // r799n49: every re-fire round slice-wakes the herd
+                    // (48/word) - n320_on showed 1248 parks vs 75 wakes:
+                    // GOOD's chains ran on its completer storm, BAD's legs
+                    // sit parked.  (The n314 property-era churn that gated
+                    // this to svc-0x000a was the push_traffic_ready_pump
+                    // alias poison, removed since.)
+                    s9_answer_kick(unicorn);
                 }
                 // r799n33c: arm any state-9 mint the store-time svcdone
                 // never covered (missed pairing) after 300 ms (func 0:

@@ -321,12 +321,28 @@ fn wait_preferred(unicorn: &Unicorn<'_, Context>, tid: u32) -> bool {
 /// through the emulator's spawn-herd wait queues.  Returns the waiter count
 /// (0 when the word is not shared memory in this VM).
 pub fn wake_all_shared_waiters(unicorn: &Unicorn<'_, Context>, uaddr: u32) -> usize {
+    wake_all_shared_waiters_owned(unicorn, uaddr, None)
+}
+
+/// r799n49: `Some(owner_pid)` restricts the wake to waiters registered by
+/// that process (the svcdone herd kick targets prochmi's own VM so one
+/// answer cannot unpark every foreign waiter in the box); `limit` bounds
+/// the slice like GOOD's wake storm.
+pub fn wake_all_shared_waiters_owned(
+    unicorn: &Unicorn<'_, Context>,
+    uaddr: u32,
+    owner: Option<u32>,
+    limit: usize,
+) -> usize {
     let key = match shm_futex_key(unicorn, uaddr) {
         Some(k) => k,
         None => return 0,
     };
     let namespace = unicorn.get_data().namespace.clone();
-    let count = namespace.lock().unwrap().futex_wake_all_sh(&key);
+    let count = namespace
+        .lock()
+        .unwrap()
+        .futex_wake_slice(&key, owner, limit);
     if count > 0 {
         log::warn!(
             "futex: ANSWER-KICK word {:#x} key {:#?} woke-all {} t={} thread [{}]",

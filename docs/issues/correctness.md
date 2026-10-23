@@ -4655,3 +4655,35 @@ n310_1 state of the art (all fixes on):
   lottery (BAD parks 220 workers/key, GOOD ~a dozen).
 - Budget 200 on SVCDONE_PENDING re-fires stays: 8-starvation killed the
   process tick (n277 self-starvation trap).
+
+## r799n48b/49: the park-queue drought (n319-n320 forensics)
+
+- n320 A/B (current binary, features off vs on): OFF died at svc-1e (like
+  n318/n319 - the early-death mode PREDATES r799n47/48), ON got the deepest
+  boot of the whole n316+ series (property batch ISSUED, 48 removes, all
+  75 era-word wakes hit woke=1 - wake-priority works).
+- GOOD frame census decoded: svc-1f/1e/2c answers ride HMINavServerLib_1 in
+  CCS layout: regid per-svc (1f->0x010e, 1e->0x010f, 2c->0x010d), func @+0x18
+  (0 for the fast lane), optype @+0x1a, key @+0x1c. BAD's fabricated answers
+  were ALREADY byte-equivalent (regid echoes the client's own id - the +0x10
+  delta vs GOOD is just BAD's mint offset). The lane/shape search is CLOSED:
+  GOOD's consumer chain never popped them from a queue either (f-accept has
+  no svc-1f in GOOD; the pump consumes only svc-0003 x35k).
+- GOOD's completion chain lives entirely in the svcdone WORKER leg: wake ->
+  orca1 (orphan miss ok) -> subhand -> callbacks (IOSC IOWrite h=0x40031bec,
+  TRACE tag 0x2714) -> compres (res 0x80010002 STILL removes) -> remove
+  lr=0x1c7d1e4 -> issues the NEXT wake (the hand-off storm, woke=1 x230).
+  Post-wake READ_UNMAPPED deaths at 0x1c7d118 exist in BOTH logs (GOOD dies
+  96 of 222 woken legs too) - they are not our gap.
+- BAD's drought: 1248 SHM-WAIT parks on the era word 0x4011042c vs 75 issued
+  wakes in 55 s. Parked legs never re-run their chains; the store-time kick
+  only ever found ~10 registered waiters because most of the herd had already
+  been watchdog-reaped (zombies - fixed by r799n47 spurious-wake return).
+- r799n48b: wake-priority scoped to the LEG's id-word park (return frame
+  inside 0x1c75000-0x1c76000 of prochmi_out) - unscoped priority front-cut
+  sync-pool/AE queues too and stalled state 8 (n319).
+- r799n49: the herd slice-wake - s9_answer_kick (store-time + EVERY re-fire
+  round) wakes up to 48 prochmi-owned waiters per recorded id-word
+  (namespace::futex_wake_slice), matching GOOD's ~46 wakes/s storm density.
+  Success markers unchanged: removes past 0x21/0x2d, vfn10 for 1f keys,
+  vOnUpdate*Traffic* > 0, s9cascade final.

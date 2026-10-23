@@ -167,6 +167,44 @@ impl SystemNamespace {
         self.futex_wake_shared(key, usize::MAX)
     }
 
+    /// r799n49: wake up to `limit` waiters of `key`; `Some(owner)` restricts
+    /// to that process (the svcdone herd lives in PROCHMI's VM). GOOD's
+    /// completer storm drained ~46 parks/s - a bounded per-round slice keeps
+    /// the churn in that band instead of unparking the whole box per answer.
+    pub fn futex_wake_slice(
+        &mut self,
+        key: &(String, u32),
+        owner: Option<u32>,
+        limit: usize,
+    ) -> usize {
+        let q = match self.futex_by_key.get_mut(key) {
+            Some(q) => q,
+            None => return 0,
+        };
+        let mut n = 0usize;
+        let mut keep = std::collections::VecDeque::new();
+        while let Some(id) = q.pop_front() {
+            let mine = owner
+                .map(|o| {
+                    self.futex_slab
+                        .get(&id)
+                        .map(|w| w.owner_pid == o)
+                        .unwrap_or(true)
+                })
+                .unwrap_or(true);
+            if mine && n < limit {
+                if let Some(w) = self.futex_slab.get_mut(&id) {
+                    w.signaled = true;
+                }
+                n += 1;
+            } else {
+                keep.push_back(id);
+            }
+        }
+        *q = keep;
+        n
+    }
+
     /// Signal up to `val` pending waiters of a shared futex word. Returns how
     /// many were marked; the caller rings the process doorbells (via
     /// `notify_waiters`) so the owners reap them.
