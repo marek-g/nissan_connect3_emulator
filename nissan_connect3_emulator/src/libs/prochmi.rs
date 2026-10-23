@@ -8151,9 +8151,14 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                             // carry the REAL func (MINT_INFO
                                             // from rqadd); the store-time
                                             // f18b is a counter tail.
-                                            let pend_func = real_f
-                                                .map(|f| f as u32)
-                                                .unwrap_or(f18b as u32);
+                                            let pend_func =
+                                                if svc as u16 == 0x000a {
+                                                    real_f
+                                                        .map(|f| f as u32)
+                                                        .unwrap_or(f18b as u32)
+                                                } else {
+                                                    f18b as u32
+                                                };
                                             m.insert(
                                                 ordinal as u32,
                                                 (holder, pend_func, 1),
@@ -13480,7 +13485,17 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                             mi.get(&(key as u32)).map(|(_, f)| *f as u16)
                         })
                         .filter(|f| *f != 0);
-                    let func = real_f.unwrap_or(func as u16) as u32;
+                    // r799n46c: the real-func stamp is FOR svc-0x000a only
+                    // (its traffic_status_answer_body + completer pairing
+                    // need it).  Stamping real funcs on the property-plane
+                    // STUB legs makes those legs run deeper into the orphan
+                    // free() on the host body ring (n310_3 poison shape) -
+                    // all three n316 boots died before sp2.
+                    let func = if svc == 0x000a {
+                        real_f.unwrap_or(func as u16) as u32
+                    } else {
+                        func
+                    };
                     let mut bb = [0u8; 0x22];
                     bb[0xb] = 0x45;
                     bb[0x0e..0x10]
@@ -13505,9 +13520,13 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                         if svc == 0x0006 || svc == 0x0007 {
                             return None;
                         }
-                        if std::env::var_os("EMU_SVC_FULL_BODY")
-                            .is_some_and(|v| v == "0")
-                            && svc != 0x000a
+                        // r799n46c: default OFF outside svc-0x000a - the
+                        // property-plane template bodies broke ALL THREE
+                        // n316 boots (nav stack never reached sp2).  Opt-in
+                        // with EMU_SVC_FULL_BODY=1 for experiments.
+                        if svc != 0x000a
+                            && !std::env::var_os("EMU_SVC_FULL_BODY")
+                                .is_some_and(|v| v == "1")
                         {
                             return None;
                         }
