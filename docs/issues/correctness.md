@@ -3868,3 +3868,29 @@ not-found gnf leg that stores gate +4 = 2 (r799g).
 Same round: 0/8 n265 + 0/8 n266 confirmed the tick-gate alone does not
 shift the lottery (it removes foreign-VM garbage, keep it), and the era
 fork was proven to sit entirely in the state-6 reply ordering.
+
+## r799n33za: the true poisoner - `fabricate_fi_ready_push` kick REFIRE rate (f74 fix was innocent)
+
+n267 (0/6) falsified the f74-duplicate theory: the f74 responder never even
+ran in the dying runs (no `f74 REQUEST raw`), yet the len-0x22 class-0x45
+svc-0x0006 poison frames kept murdering live pending keys.  The normalized
+tid-65 probe diff (GOOD n264_11 vs BAD n267_1 from t=30 s) pinned the fork
+to the microsecond of the murder and the message log named the poster:
+`fabricated FI ServiceData(svc 0x0006 txn K)` - `fabricate_fi_ready_push`,
+the gate-kick completion push (body len 0x22, ordinal at +0x1c = the mint's
+key).  Its r799n30 re-fire loop retries EVERY scheduler pass (budget 300),
+so pushes sat in mbx_289 spaced 40-90 ms apart; the completer "matches key
+only and REMOVES on any optype hit", and svc 0x0006/0x000a requests are
+ALSO answered genuinely by DAPI (~100 ms, len 0x98 src app 0x0007).  A
+re-fire landing between tid-65's `rqadd key=K` and DAPI's answer consumed
+the entry, DAPI's real answer died `bhrfind lost`, and the enavi FSM
+called exit_group(127) - 100% of BAD eras (n265: frames at 37.746/37.812 s;
+n267: 37.226/37.474/37.560 s).  GOOD = tid-81's clone lane happened to eat
+the duplicates before tid-65 registered the colliding key.
+
+Fix: rate-limit `fabricate_fi_ready_push` per transaction key (250 ms
+default, `EMU_FI_PUSH_RATELIMIT_MS`, 0 = old burst).  The kick loop
+re-tries within milliseconds, so a throttled push still fires whenever the
+entry getter is genuinely still 0 - the n175 "one push loses the race"
+stall cannot return - while DAPI (~100 ms) now always wins every live key.
+The f74 pacing from n33z stays (harmless, more TE-realistic).

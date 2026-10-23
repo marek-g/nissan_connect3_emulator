@@ -3530,6 +3530,43 @@ pub fn fabricate_fi_ready_push(unicorn: &mut Unicorn<'_, Context>, service: u16,
     if std::env::var_os("EMU_FAKE_FI_READY_PUSH").is_some_and(|v| v == "0") {
         return;
     }
+    // r799n33za: rate-limit per transaction key (default 250 ms).  This
+    // push carries svc + the mint's ordinal into the SHARED completer key
+    // space; DAPI (app 0x0007, emulated, fidelity rule 1) answers svc-0x06
+    // and svc-0x0a requests genuinely within ~100 ms.  At the kick loop's
+    // native rate (retry every scheduler pass, budget 300) the re-fires
+    // posted duplicates that landed WHILE the next request's key was live
+    // and REMOVED it (the completer matches key only, r799n30 note), so
+    // DAPI's genuine answer arrived orphaned (`bhrfind lost`) and the
+    // enavi FSM killed prochmi with exit_group(127) - the whole BAD era
+    // (n265/n267 forensics: poison `fabricated FI ServiceData(svc 0x0006)`
+    // posts at 37.226/37.474/37.560 s murder key 2 between the request and
+    // DAPI's answer).  250 ms spacing makes DAPI win every live key; the
+    // kick still lands whenever the getter is genuinely still 0 (the loop
+    // re-tries within milliseconds), so the n175 "one push loses the race"
+    // stall cannot return.  EMU_FI_PUSH_RATELIMIT_MS=0 restores the burst.
+    {
+            let rate_ms: u128 = std::env::var("EMU_FI_PUSH_RATELIMIT_MS")
+                .ok()
+                .and_then(|v| v.parse::<u128>().ok())
+                .unwrap_or(250);
+            if rate_ms > 0 {
+                static LAST: std::sync::LazyLock<
+                    std::sync::Mutex<std::collections::HashMap<u16, u128>>,
+                > = std::sync::LazyLock::new(Default::default);
+            let now = crate::libs::dapi::emu_t0_elapsed_ms();
+            let mut m = LAST.lock().unwrap();
+            if let Some(t) = m.get(&key) {
+                if now.saturating_sub(*t) < rate_ms {
+                    return;
+                }
+            }
+            if m.len() > 512 {
+                m.clear();
+            }
+            m.insert(key, now);
+        }
+    }
     static MSG_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x7800);
     let mut body = vec![0u8; 0x22];
     body[0..2].copy_from_slice(&0x0015u16.to_le_bytes()); // src SENSORFI
