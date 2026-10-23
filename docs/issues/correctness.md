@@ -3841,3 +3841,30 @@ ServiceStatus shape vs the pumppage accept filter w14=0x00030006);
 (b) DAPI-side: make its state-6 reply timing match its own request (it
 already does - the problem is OUR stale frames, not DAPI); (c) the tick-gate
 (n33x) removes foreign-VM writes into DAPI's heap that perturb the ordering.
+
+## r799n33z: the state-6 poison frame is OUR OWN f74 duplicate - mbx-leg now paced + single-shot
+
+Follow-up to n33y nailed the culprit frame: len 0x22 class-0x45 svc=0x0006
+(the `f-accept svc=0x0006 txn=2`) is our `cca_server_answer_sensorfi_data_
+request` standing in for app 0x0015 on the f74 readiness lane - and its
++0x1c ordinal follows the ADVANCING `F74_REG_ORD`.  The very same request
+(R=1, TGT=0x7 svc-6 regid-3) is ALSO answered genuinely by DAPI (the len
+0x98 src-app-0x0007 frame).  At zero latency our duplicate (or its re-fire
+at the next ordinal) lands in the window between tid-65 registering the
+NEXT request's pending key (R=2 -> key=2) and DAPI's real answer arriving:
+the completer "matches key only and REMOVES on any optype hit", so our
+frame consumes the foreign entry and DAPI's genuine answer dies as
+`bhrfind lost` -> the leg never completes -> FSM suicide (exit_group 127).
+GOOD vs BAD was purely whether DAPI's answer won that millisecond race.
+
+Fidelity (rule 1): DAPI is emulated and DOES answer these - our stand-in
+must not outrun it.  Fix: the f74 (mbx_7) app-receiver leg is now (a)
+single-shot per registration ordinal and (b) scheduled +250 ms later
+(`EMU_F74_MBX_DELAY_MS`, namespace-level `ANSWER_SCHED` lane drained from
+the scheduler pass; 0 restores the old burst).  The pump-route leg
+(`pump_push_completion`) stays immediate; the late frame still feeds the
+not-found gnf leg that stores gate +4 = 2 (r799g).
+
+Same round: 0/8 n265 + 0/8 n266 confirmed the tick-gate alone does not
+shift the lottery (it removes foreign-VM garbage, keep it), and the era
+fork was proven to sit entirely in the state-6 reply ordering.

@@ -351,6 +351,9 @@ pub fn run_process_loop(
         }
         crate::gpu::tick(unicorn);
         crate::libs::prochmi::tick(unicorn);
+        // r799n33z: flush paced fabricated answers whose simulated latency
+        // elapsed (namespace-level posts; safe from any process loop).
+        crate::libs::libosal_linux::message::drain_due_answers(unicorn);
 
         // memory-leak watchdog: guest heap/brk growth per process
         {

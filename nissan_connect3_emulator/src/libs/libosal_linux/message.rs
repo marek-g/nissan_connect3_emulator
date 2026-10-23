@@ -3985,6 +3985,41 @@ fn cca_server_answer_sensorfi_data_request(
     blob.extend_from_slice(&(body.len() as u32).to_le_bytes());
     blob.extend_from_slice(&body);
     let target = format!("mbx_{client}");
+    // r799n33z: the mbx_7 f74 duplicate is POISON at zero latency - tid-65's
+    // state-6 NAVIF entries register pending keys in the same completer
+    // table, and our frame (whose +0x1c ordinal advances with F74_REG_ORD)
+    // eats the live key before DAPI's genuine answer (src app 0x0007, len
+    // 0x98) reaches it: `bhrfind lost` -> the leg never completes -> the
+    // FSM exits prochmi at 37.8 s (the BAD era; n265 forensics).  DAPI IS
+    // emulated and answers these requests genuinely (fidelity rule 1), so
+    // our leg may only arrive as a late app-receiver touch (the not-found
+    // gnf leg is what stores gate +4 = 2, r799g) - give it real-TE-like
+    // latency and post each registration ordinal at most once.
+    if name == "mbx_7" {
+        if std::env::var_os("EMU_F74_MBX").is_some_and(|v| v == "0") {
+            return;
+        }
+        if service == 0x0006 && reg_id == 3 {
+            let ord = u16::from_le_bytes([body[0x18], body[0x19]]);
+            static SENT: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+                std::sync::LazyLock::new(Default::default);
+            if !SENT.lock().unwrap().insert(ord) {
+                log::info!(
+                    "[LIBOSAL-MBX] sensorfi f74 mbx-leg duplicate for ord {ord} suppressed (single-shot)"
+                );
+                return;
+            }
+        }
+        schedule_named_answer(unicorn, &target, blob);
+        log::info!(
+            "[LIBOSAL-MBX] sensorfi fake server {server_app:#06x}: answered ServiceData(svc {service:#06x} regid {reg_id:#04x} func {function:#06x}) from {client:#06x} on {name} with {what} (mbx leg PACED +{}ms behind DAPI's genuine answer, EMU_F74_MBX_DELAY_MS)",
+            std::env::var("EMU_F74_MBX_DELAY_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(250),
+        );
+        return;
+    }
     let mut delivered = false;
     {
         let mut state = unicorn.get_data().namespace.lock().unwrap();
@@ -4013,6 +4048,65 @@ fn cca_server_answer_sensorfi_data_request(
     log::info!(
         "[LIBOSAL-MBX] sensorfi fake server {server_app:#06x}: answered ServiceData(svc {service:#06x} regid {reg_id:#04x} func {function:#06x}) from {client:#06x} on {name} with {what} (delivered {delivered} -> {target})"
     );
+}
+
+/// r799n33z: paced fabricate-answer lane.  The f74 mbx-leg duplicate must
+/// NOT arrive before DAPI's genuine answer to the same request (its
+/// advancing registration ordinal otherwise eats the NAVIF entry's pending
+/// key - the state-6 `bhrfind lost` death = the BAD era).  Real CSMA/TE
+/// latency is hundreds of ms; our zero-latency posts lost that ordering.
+/// Deferred frames post from `drain_due_answers` (scheduler pass).
+static ANSWER_SCHED: std::sync::LazyLock<
+    std::sync::Mutex<Vec<(std::time::Instant, String, Vec<u8>)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+pub fn schedule_named_answer(unicorn: &mut Unicorn<'_, Context>, name: &str, blob: Vec<u8>) {
+    let ms = std::env::var("EMU_F74_MBX_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(250);
+    if ms == 0 {
+        let mut state = unicorn.get_data().namespace.lock().unwrap();
+        if let Some(q) = state.mq.queue_id_for_name(name) {
+            state.mq.grow_msgsize(q, blob.len() as i64);
+            if OsalQueueService::guest_post(&mut state.mq, name, blob, 0) {
+                state.notify_waiters();
+            }
+        }
+        return;
+    }
+    ANSWER_SCHED
+        .lock()
+        .unwrap()
+        .push((std::time::Instant::now() + std::time::Duration::from_millis(ms), name.to_string(), blob));
+}
+
+/// Post every answer whose simulated latency elapsed.  Called from the
+/// scheduler pass (every process loop; namespace-level posts only).
+pub fn drain_due_answers(unicorn: &mut Unicorn<'_, Context>) {
+    let now = std::time::Instant::now();
+    let due: Vec<(String, Vec<u8>)> = {
+        let mut s = ANSWER_SCHED.lock().unwrap();
+        let due: Vec<_> = s
+            .iter()
+            .filter(|(at, _, _)| *at <= now)
+            .map(|(_, n, b)| (n.clone(), b.clone()))
+            .collect();
+        s.retain(|(at, _, _)| *at > now);
+        due
+    };
+    if due.is_empty() {
+        return;
+    }
+    let mut state = unicorn.get_data().namespace.lock().unwrap();
+    for (name, blob) in due {
+        if let Some(q) = state.mq.queue_id_for_name(&name) {
+            state.mq.grow_msgsize(q, blob.len() as i64);
+            if OsalQueueService::guest_post(&mut state.mq, &name, blob, 0) {
+                state.notify_waiters();
+            }
+        }
+    }
 }
 
 fn bridge_guest_osal_queue(
