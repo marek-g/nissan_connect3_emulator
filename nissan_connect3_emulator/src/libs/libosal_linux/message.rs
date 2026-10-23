@@ -3657,6 +3657,44 @@ pub fn push_gps_answer(unicorn: &mut Unicorn<'_, Context>, key: u16) -> &'static
     "none"
 }
 
+/// r799n41: pump-first ServiceData answer for the svc-0x000a TRAFFIC-status
+/// funcs (0x0101/0x0102/0x0107/0x0125/0x8000/0x8001 - GOOD completed them
+/// with same-func answers: worker msgobj wake + 4 vOnUpdate callbacks,
+/// n264_11 tid-1012 trace).  The body is the proven GpsDataStatus answer
+/// shape with the func field set to the requested one (the completer keys
+/// on the transaction ordinal at +0x1c; GOOD's own answer frames carried
+/// the request's func, never f02).  Pump route FIRST: the mbx_289 copies
+/// of the traffic answers demonstrably die in tid-84's enConnect Wait
+/// (n305: 60 pushes for key 0x31, zero `f-accept` pops), while the hosted
+/// pump queue has the single consumer that feeds the decode/completer leg
+/// (r799n30 lesson).  `EMU_FAKE_TMC_STATUS=0` disables; always logged.
+pub fn push_traffic_status_answer(
+    unicorn: &mut Unicorn<'_, Context>,
+    func: u16,
+    key: u16,
+) -> &'static str {
+    if std::env::var_os("EMU_FAKE_SENSORFI").is_some_and(|v| v == "0") {
+        return "none";
+    }
+    if std::env::var_os("EMU_FAKE_TMC_STATUS").is_some_and(|v| v == "0") {
+        return "none";
+    }
+    if !rqkey_owned_by_want(key, 0x000a) {
+        return "none";
+    }
+    let mut body = gps_data_status_answer_body(key);
+    body[0x18..0x1a].copy_from_slice(&func.to_le_bytes());
+    if pump_push_completion(unicorn, body.clone()) {
+        note_fi_era_pending(0x000a, key, &body);
+        return "pump";
+    }
+    if push_blob_to_mbx_289(unicorn, body.clone()) {
+        note_fi_era_pending(0x000a, key, &body);
+        return "mbx";
+    }
+    "none"
+}
+
 /// r799n30: the state-9 FSM re-tick kick, pump-first.  n181 proved the
 /// mbx_289 route cannot serve as the 1 Hz GpsDataStatus stand-in: tid-84's
 /// enConnect pops the push and drops it, and the msgid -> FI-event

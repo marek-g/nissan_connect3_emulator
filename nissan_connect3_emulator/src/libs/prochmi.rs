@@ -7718,7 +7718,8 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     if (o1 > 0x100 || o1 == 0)
                         && matches!(
                             svc,
-                            0x001f
+                            0x000a
+                                | 0x001f
                                 | 0x001e
                                 | 0x002c
                                 | 0x0152
@@ -7732,20 +7733,40 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         )
                         && svcdone_window()
                     {
-                        let lm = LAST_MINTED.load(Ordering::Relaxed);
-                        let mint_t = (lm >> 32) as u64;
-                        let mint_key = (lm & 0xffff) as u32;
-                        let now_ms =
-                            crate::libs::dapi::emu_t0_elapsed_ms() as u64;
-                        if mint_key != 0
-                            && mint_key <= 0x100
-                            && now_ms.saturating_sub(mint_t) <= 30
-                            && now_ms
-                                >= PROPERTY_ERA_T.load(Ordering::Relaxed) + 500
-                        {
-                            mint_key as u16
-                        } else {
-                            o1 as u16
+                        // r799n40: prefer the DETERMINISTIC reverse lookup -
+                        // the rqadd probes bind key -> (svc, func) at issue
+                        // time, 1 ms before this store, on the same tid -
+                        // over the freshest-mint pairing, which races when
+                        // requests are issued 6 ms apart (n211/n212/n215
+                        // missed pairings; n306 key 0x2c got no answer at
+                        // all).  Trust it only while the found key is live
+                        // and still owned by THIS (svc, func) - the very
+                        // anti-pre-empt rule r799n33zc imposed on mint
+                        // pairing, now enforced per-transaction.
+                        let f18s =
+                            (read_u32(uc, entry.wrapping_add(0x18)) & 0xffff) as u16;
+                        match rqkey_find(svc as u16, f18s).filter(|k| {
+                            matches!(rqkey_owner(*k), Some((s, f)) if s == svc as u16 && f == f18s)
+                        }) {
+                            Some(k) => k,
+                            None => {
+                                let lm = LAST_MINTED.load(Ordering::Relaxed);
+                                let mint_t = (lm >> 32) as u64;
+                                let mint_key = (lm & 0xffff) as u32;
+                                let now_ms =
+                                    crate::libs::dapi::emu_t0_elapsed_ms() as u64;
+                                if mint_key != 0
+                                    && mint_key <= 0x100
+                                    && now_ms.saturating_sub(mint_t) <= 30
+                                    && now_ms
+                                        >= PROPERTY_ERA_T.load(Ordering::Relaxed)
+                                            + 500
+                                {
+                                    mint_key as u16
+                                } else {
+                                    o1 as u16
+                                }
+                            }
                         }
                     } else {
                         o1 as u16
@@ -7832,7 +7853,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             .unwrap_or(true);
                         if fresh {
                             log::warn!(
-                                "[LIBOSAL-MBX] gate svc 0x000a txn {ordinal}: GpsDataStatus answer for entry {entry:#x} (one per registration, echoes this store's ordinal)"
+                                "[LIBOSAL-MBX] gate svc 0x000a txn {ordinal} func {f18g:#x}: GpsDataStatus answer for entry {entry:#x} (one per registration, echoes this store's ordinal)"
                             );
                             crate::libs::libosal_linux::message::fabricate_fi_data_request(
                                 uc, 0x000a, ordinal,
@@ -7843,13 +7864,21 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             // message.rs) so the gate completion (and the
                             // FI-event kick it doubles as) does not depend
                             // on it (f235: request never consumed, state 6
-                            // forever).
-                            let route =
+                            // forever).  r799n41: the state-9 traffic-era
+                            // stores (func != 0x0f02) get a same-func
+                            // answer on the pump-first lane - GOOD answered
+                            // them with the request's own func.
+                            let route = if f18g == 0x0f02 {
                                 crate::libs::libosal_linux::message::push_gps_answer(
                                     uc, ordinal,
-                                );
+                                )
+                            } else {
+                                crate::libs::libosal_linux::message::push_traffic_status_answer(
+                                    uc, f18g, ordinal,
+                                )
+                            };
                             log::info!(
-                                "[LIBOSAL-MBX] gate svc 0x000a txn {ordinal}: direct GpsDataStatus answer route {route}"
+                                "[LIBOSAL-MBX] gate svc 0x000a txn {ordinal} func {f18g:#x}: direct answer route {route}"
                             );
                         }
                     } else if matches!(svc, 0x0006 | 0x001e | 0x0018 | 0x001f | 0x002c | 0x000d | 0x0300) {
