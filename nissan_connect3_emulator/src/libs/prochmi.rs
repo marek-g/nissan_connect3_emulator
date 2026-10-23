@@ -816,6 +816,20 @@ pub fn rqkey_owner(key: u16) -> Option<(u16, u16)> {
     RQKEY_LIVE.lock().ok().and_then(|m| m.get(&key).copied())
 }
 
+/// r799n40: the live key currently owning the (svc, func) transaction
+/// (reverse of RQKEY_LIVE).  The state-9 svc-0x000a traffic stores pass an
+/// owner back-pointer (0) in r1 at the conf-store site - n305: three of six
+/// traffic stores answered txn 0 ("route none") while GOOD carried the true
+/// ordinals 46/48/50 there - so the answer ordinal is recovered from the
+/// binding the `rqadd` probe recorded at issue time.
+pub fn rqkey_find(svc: u16, func: u16) -> Option<u16> {
+    RQKEY_LIVE.lock().ok().and_then(|m| {
+        m.iter()
+            .find(|(_, (s, f))| *s == svc && *f == func)
+            .map(|(k, _)| *k)
+    })
+}
+
 /// r799n33zf: set when a fresh member key entered `SVCDONE_PENDING`; the
 /// completion ticker (normally 1 Hz, the SENSORFI broadcast cadence) runs
 /// an extra round immediately so the answer + wake reach the parked enavi
@@ -7787,6 +7801,18 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     // can complete them; a wrong-key match is a no-op in the
                     // completer (f232: keys 0x11..0x1e all inert).
                     if svc == 0x000a {
+                        // r799n40: recover the transaction key this store
+                        // issued from the rqadd-recorded live binding when
+                        // r1 does not carry it (traffic-era stores pass the
+                        // owner back-pointer; n305 keys 46/48/50 got txn 0
+                        // and thus NO answer at all).  Trust the recovery
+                        // only while the key is live and still owned by
+                        // this very service (r799n33zc anti-pre-empt rule).
+                        let f18g =
+                            (read_u32(uc, entry.wrapping_add(0x18)) & 0xffff) as u16;
+                        let ordinal = rqkey_find(0x000a, f18g)
+                            .filter(|k| matches!(rqkey_owner(*k), Some((0x000a, _))))
+                            .unwrap_or(ordinal as u16) as u16;
                         static DEFERRED: AtomicU32 = AtomicU32::new(0);
                         if DEFERRED.fetch_add(1, Ordering::Relaxed) == 0 {
                             log::warn!(
