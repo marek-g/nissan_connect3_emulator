@@ -4329,3 +4329,37 @@ gate reports "mbx_265 already created: true", rqadd max 0x2d/0x2d/0x2e (GOOD
 x6-10 (GOOD x30), final still 0/3.  The tail is now ONE ORDER OF MAGNITUDE
 from GOOD rather than dead - the remaining gap is completion ROUNDS, not a
 wall.
+
+## r799n36d: tail falsifications after the section-diet (n300-n302 forensics)
+
+With the coma gone the tail became measurable; a full census diff (GOOD
+n264_11 vs BAD n301_1/n302_1) falsified the remaining "broken lane" hopes:
+
+- FI fabrication coverage EQUAL (txn 0-45 covered in both; GOOD just keeps
+  issuing to 61 because its machine never stops).
+- consumer decode count EQUAL (127 vs 128) - the enChkErrInf leg is fine.
+- svcdone trio-holder spawns complete (keys 0x1..0x2d, same as GOOD).
+- procmwlx alive to kill; post8/notify/notify legs ~equal (173 vs 217).
+- GOOD itself ends its log with 9 UN-removed keys (0x35-0x3d): GOOD was
+  killed MID-cascade at 45 s - "GOOD" only means the machine kept RUNNING.
+- BAD freeze shape (n301_1, t=38.9 s wall): decodes->0, hot-mutex wakes->0
+  (769 waits / 242 wakes total), while DAPI keeps posting to
+  HMINavServerLib_1 until kill (213 guest posts, overflow x18).  The trio
+  round pops ONE frame per pass (cllookup x34 total) and the pops miss the
+  handler table (handler_res 2/173 vs GOOD 12/65).
+
+n302_1 (EMU_REALTIME_FACTOR=0.25, 360 s run): conf timeouts dilate 4x but
+the machine still freezes at wall t=46 s (right after state-9 entry),
+removes 0x2c, stuck keys 0x27/0x2b/0x2d, last round exits EARLIER (sp2a
+r0=0).  Wakes were NOT the limitation (~131 fired).  Dilation does not fix
+the tail - the trio pass simply does not reach the consumer poll leg.
+
+=> Remaining suspect set (narrowed): (a) the trio's own poll/consume leg
+lives in native flow the synthesized vtick does not traverse (GOOD's tid-65
+vtick'd NATIVELY 13x, driven by real answers); (b) handler-table entries
+for the trio confs are gone (unregistered/timed out) by the time any frame
+with their msgref is popped.  Next experiment = design.md step 3: deliver
+stamped class-0x45 frames into the client-side path for the PENDING trio
+keys instead of the parked worker guest-calls (user-approved), and watch
+whether the trio's next pass consumes them (probe: cllookup hit-rate +
+stepprobe ev-entry on pending keys).
