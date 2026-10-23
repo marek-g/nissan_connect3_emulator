@@ -1510,30 +1510,70 @@ crate::os::code_stub::trap_site(unicorn, lua_prepare_call, crate::os::code_stub:
             };
 
             if !forced {
-            let gui = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
-            // r799n60: DIAGNOSTIC GUARD.  From t~38.3 s on (in GOOD too,
-            // n264_11 vs n340_2 identically) bGUIMainloop is entered with
-            // this=0xe - the static widget-engine object at singleton slot
-            // 0x2a18da4 (vtable clGUIWidgetEngine 0x401d34) has been
-            // overwritten with 0xe and its [r7,#0x3d] display_mode read
-            // then READ_UNMAPPED-kills the caller.  Until the writer is
-            // found: fingerprint the callers, skip OUR passes on the dead
-            // object (guest call into 0xe+... would fault the same way)
-            // and let the guest follow its own fate.
+            let mut gui = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            // r799n60: dead-this repair.  From t~27-38 s on (GOOD too,
+            // n264_11 vs n340_2) bGUIMainloop is entered with this=0xe:
+            // a guest-call return re-fires this site once AFTER
+            // TOUCH_RETURN_PENDING was already consumed, r0 then holds the
+            // callee's result (fix267 pattern), and the entry replay
+            // faults on [this,#0x3d] READ_UNMAPPED - killing the GUI
+            // thread in a crash/respawn cycle (the real reason the loop's
+            // total iterations ever stop at a few hundred, and why
+            // post-final input/taps are dead).  The singleton slot
+            // 0x2a18da4 itself is NEVER overwritten (MEM_WRITE watch: one
+            // write only, the live pointer at t=1.45 s) - only the re-fire
+            // register state is stale.  Restore the saved entry state and
+            // carry on.
             if gui < 0x1000 {
                 let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
-                static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
-                    log::warn!(
-                        "PROCHMI bGUIMainloop DEAD-THIS t={}ms tid=[{}] this={:#x} lr={:#x} sp={:#x}",
-                        crate::libs::dapi::emu_t0_elapsed_ms(),
-                        uc.get_data().inner.thread_id(),
-                        gui,
-                        lr,
-                        uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32,
-                    );
+                let saved0 = TOUCH_RETURN_REGS[0].load(Ordering::Relaxed);
+                if saved0 > 0x1000 {
+                    for (index, register) in [
+                        RegisterARM::R0,
+                        RegisterARM::R1,
+                        RegisterARM::R2,
+                        RegisterARM::R3,
+                        RegisterARM::R12,
+                        RegisterARM::R13,
+                        RegisterARM::R14,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let saved = TOUCH_RETURN_REGS[index].load(Ordering::Relaxed);
+                        if saved != 0 {
+                            let _ = uc.reg_write(register, saved as u64);
+                        }
+                    }
+                    static REPAIRED: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let r = REPAIRED.fetch_add(1, Ordering::Relaxed);
+                    if r < 8 || r % 512 == 0 {
+                        log::warn!(
+                            "PROCHMI bGUIMainloop DEAD-THIS repaired #{r} t={}ms tid=[{}] this={gui:#x} -> {saved0:#x} lr={lr:#x} pend={}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            uc.get_data().inner.thread_id(),
+                            TOUCH_RETURN_PENDING.load(Ordering::Relaxed),
+                        );
+                    }
+                    gui = saved0;
+                } else {
+                    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
+                        log::warn!(
+                            "PROCHMI bGUIMainloop DEAD-THIS t={}ms tid=[{}] this={:#x} lr={:#x} sp={:#x} smhide={} pend={} slot={:#x}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            uc.get_data().inner.thread_id(),
+                            gui,
+                            lr,
+                            uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32,
+                            SM_HIDE_STATE.load(Ordering::Relaxed),
+                            TOUCH_RETURN_PENDING.load(Ordering::Relaxed),
+                            read_u32(uc, base_address - ORIGINAL_BASE + 0x2a18_da4),
+                        );
+                    }
+                    return 0;
                 }
-                return 0;
             }
             if gui != 0 {
                 GUI_ENGINE_ADDRESS.store(gui, Ordering::Relaxed);
