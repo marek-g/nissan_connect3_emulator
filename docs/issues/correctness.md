@@ -4929,3 +4929,28 @@ n310_1 state of the art (all fixes on):
   wire answer still rides the mbx push lane.  Markers n333: suite keys
   get orca1 HIT + bonr + remove; st2c-p*/st0a-p* all r0=1; cmp152/cmp56/
   cmp300 first firings; possibly cmp1f-c/cmp2c-b/cmp06/final.
+
+## r799n57 RESULT (n333): s9cascade FINAL fires - the state-9 cascade completes
+
+- n333 2/2 boots: ALL six svc-0a suite keys complete (bonr 6/6, removes,
+  st0a p1-p6 all r0=1), the walk runs the whole GOOD label set plus the
+  tail (cmp1f-b, cmp0a, cmp18, cmp0d, cmp1f-c, cmp2c-b, cmp06) and the
+  out-byte STORE fires: `s9cascade final` t=48.8/49.3 s (GOOD golden
+  n264_11: 44.1 s - the ~5 s gap is the BAD fast-ctor era starting the
+  cascade later... GOOD cascade 39->44, BAD 38->49, the traffic suite
+  re-mints once extra).  After final: no more s9cascade evaluations, the
+  ENAVI nudge ticker STOPS (last post 47.7 s < final) - the state-9 loop
+  exited for real.
+- health.py scoreboard n333_1 vs golden n264_11: max-remove 0x4c vs 0x34,
+  sp2res 38 vs 30, decodes 222 vs 128, final 2 vs 1, removed>=0x2c: 29
+  keys vs 9.  BAD now MINTS AND COMPLETES PAST the golden boot's
+  frontier; unremoved leftovers: BAD 4 svc-2c late-era keys (0x48-0x4b,
+  funcs 0x8/0xe/0x11/0x12) vs GOOD's own 8 (incl. svc-300 funcs 0x56/
+  0x63/0x80/0x86 and svc-18 0x402 - GOOD leaves those unremoved too).
+- IMPORTANT golden-set correction: n264_11 (the only successful GOOD
+  cascade boot) is TRUNCATED at t=44.6 s; the other ten n264_*.log run
+  full 94 s but are EARLY-DIED GOOD boots (max-remove 0x2).  GOOD's
+  popup-close behaviour after final is therefore NOT on record - the
+  dynstack/popup silence after final in BAD matches GOOD's (no dynstack
+  ops after 44.1 s in n264_11 either).  Next: EMU_MAP_DUMP_DIR window
+  dumps (PPM) of the post-final GUI to see the actual HMI state.
