@@ -4246,3 +4246,17 @@ re-post precondition (r799n14 livelock: unanswered regid-0xfffe STAT answers
 must find NO client handler to be re-posted; BAD now has 3 STAT admin
 registrations vs GOOD 2, may be claiming them) and the svc-6 fi-ready push
 deficit (secondary list in r799n35 notes).
+
+n297_1 follow-up (EMU_FI_PUSH_SVC6=1): no effect (wakes=2, sp2res=0) -
+r799n33zb's svc-6 suppression stands, DAPI answers svc-6 genuinely.  The
+wake-gate dry-out is now precisely located: the tail conf key (0x26,
+func 0x970e, cookies 1/2, optype 8/9 pairs) is re-driven by the svcdone
+guest-call lane dozens of times (tids 546..584, retries -> 200) but
+`bHandleResponseSVCData` never consumes it, so SVCDONE_PENDING closes the
+gate and the 0x1f era gets no new requests.  GOOD's tail instead completed
+every key (remove 0x1a..0x34, f-accept svc-6 x48 riding pump-completion
+slots r3=0x909xxxx).  Next hypothesis to test: GOOD's completion stream ran
+through the OLD host-slot pump ring; since r799n35 the ring is guest-malloc
+fed - check whether pump_push_completion still reaches `bHandleResp` FOUND
+(entry != 0x0) for the tail keys, and compare the completer's key-matching
+word-for-word between a GOOD tail round and a BAD one.
