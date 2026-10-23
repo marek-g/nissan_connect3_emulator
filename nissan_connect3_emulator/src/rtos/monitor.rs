@@ -2284,6 +2284,8 @@ pub fn guest_call_bhandle_svcdone(
         );
     }
     let tid = spawn_guest_call(unicorn, tramp & !1, [0; 4], 0x1000);
+    // r799n48: wake-priority hint (worker tid -> transaction key).
+    crate::os::syscalls::futex::note_svcdone_tid_key(tid, key as u16);
     log::warn!(
         "MONITOR svcdone: bHandleResponseSVCData(holder={holder:#x}, cookie={cookie:#x}, key={key:#x}, func={func:#x}, optype={optype}) guest-call tid {tid} (EMU_FAKE_SVCDONE=0 disables)"
     );

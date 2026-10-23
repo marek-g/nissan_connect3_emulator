@@ -573,7 +573,25 @@ fn advance_blocked(unicorn: &mut Unicorn<'_, Context>) {
                                 None
                             }
                         }
-                        crate::os::syscalls::namespace::SharedFutexPoll::Gone => None,
+                        crate::os::syscalls::namespace::SharedFutexPoll::Gone => {
+                            // r799n47: the waiter was already removed from
+                            // the registry (watchdog steal, dead-owner
+                            // repair).  Keeping the thread blocked here made
+                            // it a PERMANENT zombie: parked in the host
+                            // scheduler, invisible to every future wake, and
+                            // counted in no queue - the wake-lottery queues
+                            // then read empty (n307 `woke 0` x95 with
+                            // hundreds of "parked" workers) while the herd
+                            // physically grew.  Return a spurious success
+                            // like Linux does for a futex wait on a futex
+                            // that was torn down: the guest re-checks its
+                            // word, consumes any token there, and re-parks
+                            // with a FRESH registration a peer wake can find.
+                            log::debug!(
+                                "[{tid}] shared-futex waiter {id} gone - spurious-wake return (r799n47)"
+                            );
+                            Some(Ok(0u32))
+                        }
                     }
                 };
                 match outcome {

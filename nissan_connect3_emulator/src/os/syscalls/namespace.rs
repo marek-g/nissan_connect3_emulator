@@ -84,6 +84,7 @@ impl SystemNamespace {
         key: (String, u32),
         uaddr: u32,
         owner_pid: u32,
+        front: bool,
     ) -> usize {
         let id = self.next_futex_waiter;
         self.next_futex_waiter += 1;
@@ -96,7 +97,12 @@ impl SystemNamespace {
                 signaled: false,
             },
         );
-        self.futex_by_key.entry(key).or_default().push_back(id);
+        let q = self.futex_by_key.entry(key).or_default();
+        if front {
+            q.push_front(id);
+        } else {
+            q.push_back(id);
+        }
         id
     }
 

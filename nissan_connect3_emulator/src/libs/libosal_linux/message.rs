@@ -3033,6 +3033,8 @@ pub fn fabricate_fi_conf_complete(
             );
             state.notify_waiters();
             note_fi_era_pending(service, key, &body);
+            crate::os::syscalls::futex::note_key_answered(key);
+            crate::os::syscalls::futex::note_key_answered(key);
         }
     }
 }
@@ -3050,6 +3052,8 @@ pub fn fi_era_clear_key(key: u16) {
     if let Ok(mut m) = PROPERTY_ANSWERS.lock() {
         m.retain(|(_, k), _| *k != key);
     }
+    // r799n48: the wake-priority hint retires with the entry.
+    crate::os::syscalls::futex::note_key_resolved(key);
 }
 
 /// r799n31: outstanding conf answers for the state-9 property legs, keyed
@@ -3733,6 +3737,9 @@ pub fn push_gps_answer(unicorn: &mut Unicorn<'_, Context>, key: u16) -> &'static
         // runs tid-84's enConnect Wait ate the first copy (h7/h8: the step
         // loop stalled at iteration 3, members 3..0xa never registered).
         note_fi_era_pending(0x000a, key, &body);
+        if key != 0x5aa5 {
+            crate::os::syscalls::futex::note_key_answered(key);
+        }
         return "mbx";
     }
     if pump_push_completion(unicorn, body) {
@@ -3803,10 +3810,12 @@ pub fn push_traffic_status_answer(
     let body = traffic_status_answer_body(func, key);
     if pump_push_completion(unicorn, body.clone()) {
         note_fi_era_pending(0x000a, key, &body);
+        crate::os::syscalls::futex::note_key_answered(key);
         return "pump";
     }
     if push_blob_to_mbx_289(unicorn, body.clone()) {
         note_fi_era_pending(0x000a, key, &body);
+        crate::os::syscalls::futex::note_key_answered(key);
         return "mbx";
     }
     "none"
@@ -3972,6 +3981,7 @@ pub fn fabricate_fi_ready_push(unicorn: &mut Unicorn<'_, Context>, service: u16,
             );
             state.notify_waiters();
             note_fi_era_pending(service, key, &body);
+            crate::os::syscalls::futex::note_key_answered(key);
         }
     }
 }

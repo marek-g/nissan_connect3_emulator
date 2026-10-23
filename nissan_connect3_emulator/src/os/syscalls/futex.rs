@@ -112,7 +112,11 @@ pub fn futex(
                         .or_else(|| Some(crate::emulator::vtime::deadline(Duration::from_secs(20))));
                     let namespace = data.namespace.clone();
                     let owner_pid = unicorn.get_data().inner.process_id;
-                    let id = namespace.lock().unwrap().futex_wait_shared(key, uaddr, owner_pid);
+                    let preferred = wait_preferred(thread_id);
+                    let id = namespace
+                        .lock()
+                        .unwrap()
+                        .futex_wait_shared(key, uaddr, owner_pid, preferred);
                     unicorn.get_data().set_action(ThreadAction::Block(
                         BlockReason::FutexWaitShared {
                             id,
@@ -209,6 +213,72 @@ static PARK_WORDS: std::sync::LazyLock<std::sync::Mutex<Vec<u32>>> =
 /// Snapshot of the id-words with known parked waiters.
 pub fn shm_parked_wait_words() -> Vec<u32> {
     PARK_WORDS.lock().map(|w| w.clone()).unwrap_or_default()
+}
+
+/// r799n48: wake-priority hint.  GOOD spawned ~4 svcdone legs per key, BAD
+/// 28-220 (re-fire rounds until removal), so the completer's wake(val=1) -
+/// which pops ONE waiter FIFO - hits the answered key's owner with GOOD's
+/// ~25% probability but BAD's ~1-4%: the wake lottery IS the era lottery.
+/// The host knows both sides of the association: the spawn site knows
+/// worker-tid -> transaction key (note_svcdone_tid_key), and the answer
+/// lanes know which keys already have an answer frame posted
+/// (note_key_answered).  A worker parking for an ANSWERED key registers at
+/// the FRONT of the wake queue, so the very next completer wake pops it -
+/// legal (futex makes no FIFO promise) and it restores GOOD's hit rate.
+/// EMU_WAKE_PRIORITY=0 disables.
+static TIDKEY: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, u16>>> =
+    std::sync::LazyLock::new(Default::default);
+static ANSWERED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn wake_priority_enabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*OFF.get_or_init(|| {
+        std::env::var_os("EMU_WAKE_PRIORITY").is_some_and(|v| v == "0")
+    })
+}
+
+/// monitor.rs: a freshly spawned svcdone worker handles this transaction key.
+pub fn note_svcdone_tid_key(tid: u32, key: u16) {
+    if !wake_priority_enabled() {
+        return;
+    }
+    if let Ok(mut m) = TIDKEY.lock() {
+        if m.len() < 8192 {
+            m.insert(tid, key);
+        }
+    }
+}
+
+/// message/prochmi lanes: an answer frame for this key is now posted
+/// (matches the completer's key-only matching).
+pub fn note_key_answered(key: u16) {
+    if !wake_priority_enabled() {
+        return;
+    }
+    if let Ok(mut s) = ANSWERED.lock() {
+        s.insert(key);
+    }
+}
+
+/// Drop keys whose request-table entry was REMOVEd (remove probe), so old
+/// answers cannot bias the queue forever.
+pub fn note_key_resolved(key: u16) {
+    if let Ok(mut s) = ANSWERED.lock() {
+        s.remove(&key);
+    }
+}
+
+/// True when this thread's svcdone key already has a posted answer.
+fn wait_preferred(tid: u32) -> bool {
+    if !wake_priority_enabled() {
+        return false;
+    }
+    TIDKEY
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&tid).copied())
+        .is_some_and(|k| ANSWERED.lock().map(|s| s.contains(&k)).unwrap_or(false))
 }
 
 /// r799n44: host-side kick used by the state-9 answer lanes - wakes every
