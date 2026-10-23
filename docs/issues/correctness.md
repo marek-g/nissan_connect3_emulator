@@ -4734,3 +4734,30 @@ n310_1 state of the art (all fixes on):
   self-complete without needing any rx consumer to fill their slot. If
   that converts the svc-1f batch, the slot-fill gap is retired for the
   property era and the traffic era can reuse the same body lane.
+
+## r799n51: the ConfComplete starvation (the removal lane never opened)
+
+- GOOD-vs-BAD chain forensics on the SAME fabricated lane (svcdone spawn):
+  GOOD seed legs (tid-372/373/374, t=42.1s) run found -> vecwalk -> IOSC
+  event IOWrite (vOnUpdate* fan-out) -> subhand res=0x0 -> compres ->
+  wake(1) hand-off -> next leg vfn10(key) -> completer(msgobj=host page)
+  -> orca1 HIT -> bonr -> remove.  BAD legs park at the same spot but no
+  wake ever CARRIES the fill: our kick flips only the futex word.
+- The fill in GOOD comes from the OPTYPE-8 CONF leg (the conf-store
+  stepprobe entry == the woken leg's orca1 hit - same action object).
+  GOOD fabricated 62 FI ConfCompletes; n325_2 fabricated ZERO while
+  pushing 44 fi-ready data frames: the store-time conf lane was gated at
+  t>=32_000 ms, but fast-ctor boots mint and finish the whole property
+  batch at t~19-25 s - the gate never opened during the era.
+  The optype-8 conf is the ONLY lane that REMOVES registered entries
+  (n176/n178), so every fast boot stalled by construction.
+- Subhand res=0 census confirms: GOOD processes reqids 0x1a-0x1f
+  (property era) successfully; BAD only ever reqid<=0x1a.
+- r799n51: gate removed (svc!=0x000a kept - the gate key is completed by
+  its f02 data answer).  Foreign-owner safety stays with
+  rqkey_owned_by_want per key.  If state-6 conf poison returns, reinstate
+  a STATE-based gate (enter-state-9 marker), not a wall-clock one.
+- Spawn-holder census for the record: BAD spawns pin the c6-ctor client
+  (0x3a9f740) while the native FSM steps run on the 0x3acXXXX family -
+  watch this in n327: if confs fire but subhand still misses the 1f
+  reqids, the holder re-pin (live step client) is the follow-up.
