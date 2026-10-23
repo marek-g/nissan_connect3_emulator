@@ -7909,9 +7909,21 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                     uc, ordinal,
                                 )
                             } else {
-                                crate::libs::libosal_linux::message::push_traffic_status_answer(
+                                let r = crate::libs::libosal_linux::message::push_traffic_status_answer(
                                     uc, f18g, ordinal,
-                                )
+                                );
+                                // r799n45: ALSO the property-proven lane -
+                                // the minimal ServiceData on mbx_289 that the
+                                // state-9 winners actually decoded and
+                                // removed with (tid-522, n306: func-0 body,
+                                // completer matches key only).  The GPS-event
+                                // shape above is eaten by tid-84's enConnect
+                                // Wait (that is why the traffic copies died
+                                // on the mbx lane in n305/n307).
+                                crate::libs::libosal_linux::message::fabricate_fi_ready_push(
+                                    uc, 0x000a, ordinal,
+                                );
+                                r
                             };
                             log::info!(
                                 "[LIBOSAL-MBX] gate svc 0x000a txn {ordinal} func {f18g:#x}: direct answer route {route}"
