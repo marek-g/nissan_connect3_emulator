@@ -13382,6 +13382,19 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                     0x001f,
                 ) || svcdone_open)
             {
+                // r799n33zs: in state 9 a vSignalSelf tick drives one
+                // bRunWhenRunning pass, and that loop carries the FSM's
+                // give-up budget: GOOD spent ~3 passes over 6+ s and lived;
+                // our 100 ms pulse wakes burned 5 passes in <1 s and fired
+                // the `open /dev/tty` + `exit_group(127)` abort (n280_1,
+                // died on the innocent 0x5aa5 kick - the abort itself is
+                // round-budget, GOOD survived the very same miss).
+                // State-9 wakes therefore ride only the 1 Hz tick floor;
+                // pulse rounds still run the svcdone/echo legs, which live
+                // on the guest-call clones and do NOT consume FSM passes.
+                if crate::libs::libosal_linux::message::hmi_fsm_state() != 9
+                    || due
+                {
                 static SIGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 let n = SIGS.fetch_add(1, Ordering::Relaxed);
                 // r799n33zq: 30 -> 120 wakes to match the longer
@@ -13400,6 +13413,7 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                             crate::libs::dapi::emu_t0_elapsed_ms(),
                         );
                     }
+                }
                 }
             }
             static KICKN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

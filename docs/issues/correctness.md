@@ -4050,3 +4050,22 @@ RING-WRAP (1024-slot stack pool reused; guest calls never block and die
 in ms, so old slices are long dead), and `map`/`map_shared` carry a
 MAP-BUDGET watchdog log so a future leak names itself instead of dying
 mid-cascade.
+
+## r799n33zs: the post-s9 abort is FSM round-budget, burned by our own wake storm
+
+n280_1 died on the *innocent* `0x5aa5` kick frame (GOOD consumed 7 of
+those and lived, and GOOD printed the identical `found entry=0x0
+want_ord=0xf02` misses) - so the miss is not the trigger.  The trigger is
+the bRunWhenRunning give-up budget: GOOD's tid-65 spent n=1..3 enavi-chain
+passes across 6+ s and reached the final at 44.1 s; our 100 ms pulse-round
+`vSignalSelf` wakes drive one pass each and exhaust a ~5-pass budget in
+under a second, landing in the abort path (`open /dev/tty` +
+`exit_group(127)` - GOOD never opened the tty).  Our wake lane was
+literally ticking the FSM to death.
+
+Fix: in state 9 the fabricated wake rides only the 1 Hz tick floor
+(`due`), matching GOOD's pass cadence; pulse rounds still run the
+svcdone/echo legs (those execute on guest-call clones and do not consume
+FSM passes).  The member-era (state 6) pulse wake stays - there the
+problem was the opposite (too few wakes before tid-65's f02 patience,
+n274_1).
