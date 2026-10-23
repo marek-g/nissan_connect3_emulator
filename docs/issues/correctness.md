@@ -5051,3 +5051,20 @@ n310_1 state of the art (all fixes on):
   ~400x480 half of the 800x480 framebuffer (right half = map layer, not
   captured), and coordinates are 1:1 - the radio 'Menu' softkey sits at
   panel ~(55,333), NOT at 2x.
+
+## n345/n345K: the boot-time NAV hard-key presses + EMU_FAKE_DESTENTRY were the GUI-thread poison
+
+- Clean matrix (no EMU_KEY_TEST, no EMU_FAKE_DESTENTRY): the GUI mainloop
+  runs HEALTHY through the whole 90 s boot (1500-1900 iterations, ZERO
+  dead-this entries, zero repairs needed), and the cascade still completes:
+  n345_4 final@58.0 s, n345_5 final@52.4 s (max-remove 0x53, 35 keys >=0x2c
+  removed - far past golden 0x34).  n345 1/5 + n345K 1/2 finals = same
+  startup lottery as always, nothing new broke.
+- With the boot EMU_KEY_TEST nav presses and/or the fake-destentry KBD
+  substitute, tid-GUI runs vInitDestinationEntry(mode=6) at t~38.5 s and
+  the widget tree gets the 0xe sentinel (dead-this era + sibling-walk
+  crash).  EMU_KEY_TEST=2:nav,... stays useful for key-path debugging but
+  is now KNOWN-POISONOUS for GUI-interaction runs - GUI-goal runs must
+  omit it (and omit EMU_FAKE_DESTENTRY, which posts the same event class).
+- r799n60d/e repairs stay in as a safety net (0 hits on clean runs).
+- n346: winning-config + dumps + scripted Menu tap (60,333) at final+3 s.
