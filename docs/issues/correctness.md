@@ -4998,3 +4998,34 @@ n310_1 state of the art (all fixes on):
   s9-nudge, gated to post-final so it can never poison the member eras.
   EMU_TOUCH_ANCHOR=final semantics tightened: schedule seconds are now
   "after final" (base = S9_DONE_MS, stamped at the final site).
+
+## r799n60: the GUI thread has been crash-dying since t~27-38 s IN GOOD TOO - hidden prerequisite of all GUI interactivity
+
+- Chasing "scripted taps never fire post-final" (n339): the EMU_TOUCH_TEST
+  injector + touch drain + SDL clicks all hang off the bGUIMainloop ENTRY
+  hook, and the loop stops iterating.  Hook-entry log showed the last
+  HEALTHY iteration at t=39.5 s (GOOD n264_11) / 38.2 s (BAD n340_2), then a
+  burst of `this=0xe` entries and a crash: `ldrb r8,[r7,#0x3d]` at 0x133bf04
+  (display_mode read inside bGUIMainloop) -> READ_UNMAPPED -> `thread exited
+  with code 1`.  GOOD exhibits the IDENTICAL death (910 execution errors) -
+  the golden boots simply never needed the GUI afterwards, so this wall was
+  never visible in the GOOD-cascade chase.  It IS the precondition for the
+  user's GUI goal (Menu -> New address -> city keyboard).
+- Investigation chain: singleton slot for clGUIWidgetEngine = GOT base
+  0x2a12818 + 0x658c = 0x2a18da4 (resolved from the bCheckMsgBox GOT
+  accessor literal pool; 0x133bcf4 = bCheckMsgBox, NOT the mainloop as the
+  old comment claimed - the mainloop is 0x133be70, bExecute 0x133c134, both
+  hooked).  MEM_WRITE watch on the slot: EXACTLY ONE write, the LIVE
+  pointer 0x2d047a4 at t=1.45 s - nobody ever writes 0xe there.  So the
+  engine object is alive; only the re-FIRE register state is stale:
+  a guest-call return re-fires the mainloop trap site once after
+  TOUCH_RETURN_PENDING was consumed, r0 carries the callee result (0xe),
+  the replayed entry stores it into r7 and the [r7,#0x3d] read faults
+  (fix267 pattern, now also on the mainloop site).  The loop's whole
+  lifetime is a crash/respawn zombie - healthy iterations end at the
+  thread's last respawn.
+- r799n60d fix: at the mainloop site, `this < 0x1000` + live saved entry
+  r0 (TOUCH_RETURN_REGS[0]) -> restore the full saved entry register set
+  and run the iteration normally (log throttled #8 then every 512th).
+  Guards also added: dead-this skip (no self-faulting guest calls) and the
+  bExecute-side upstream fingerprint.
