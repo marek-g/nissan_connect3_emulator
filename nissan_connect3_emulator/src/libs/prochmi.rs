@@ -8173,10 +8173,24 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                         })
                                         .filter(|f| *f != 0);
                                     let full_body = |op: u8| -> Option<Vec<u8>> {
+                                        // r799n57: svc-0x0a legs ride the
+                                        // EMPTY stub body now.  n332_1: all
+                                        // 32 suite legs (funcs 0x102/0x107/
+                                        // 0x101/0x8001/0x8000/0x125, keys
+                                        // 0x2f-0x34) reached the completer
+                                        // with data=[msgobj+4]=0x98 (the
+                                        // chunked traffic body) and DIED -
+                                        // a payload-carrying frame routes
+                                        // to the app data receiver, not the
+                                        // entry-completion leg (r798 rule).
+                                        // GOOD's 248 completer legs were
+                                        // ALL data=0x0: the traffic answer
+                                        // data rides the WIRE lane (the
+                                        // full-body mbx push above), the
+                                        // LEG delivers the bare event.
                                         if svc == 0x0006
                                             || svc == 0x0007
-                                            || (svc == 0x000a
-                                                && real_f == Some(0x0f02))
+                                            || svc == 0x000a
                                         {
                                             return None;
                                         }
@@ -13656,7 +13670,10 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                             return None;
                         }
                         let f = real_f?;
-                        if svc == 0x000a && f == 0x0f02 {
+                        // r799n57: svc-0a refire legs carry NO payload
+                        // either (see the store-time lane: data=0x98
+                        // completer legs never take the completion route).
+                        if svc == 0x000a {
                             return None;
                         }
                         Some(if svc == 0x000a {
