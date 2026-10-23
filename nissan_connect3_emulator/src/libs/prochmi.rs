@@ -846,15 +846,21 @@ fn s9_answer_kick(uc: &mut Unicorn<'_, Context>) {
         return;
     }
     let words = crate::os::syscalls::futex::shm_parked_wait_words();
-    // r799n49: slice-wake the herd parked on each id-word, bounded to this
-    // (prochmi) process and to GOOD's storm density (~46 wakes/s; one 1 Hz
-    // round = one 48-slice).  n320_on: 1248 parks vs 75 wakes over 55 s -
-    // GOOD's leg chains ran because its completer storm kept draining the
-    // park queue; BAD's parked legs never see their (already filled) chain.
+    // r799n49c: wake the WHOLE prochmi-owned herd on every recorded id-word
+    // each round (slice 48 was below GOOD's ~230-storm coverage; n321_2
+    // proved the hand-off engine chains once coverage is there - 454
+    // woke=1/10s at t=70 - and 1-in-4 spawn proved the parked legs are the
+    // workforce, not the obstacle).  Priority keeps answered-key workers at
+    // the queue front so guest wake(val=1) lands right too.
     let owner = uc.get_data().inner.process_id;
     let mut total = 0usize;
     for w in &words {
-        total += crate::os::syscalls::futex::wake_all_shared_waiters_owned(uc, *w, Some(owner), 48);
+        total += crate::os::syscalls::futex::wake_all_shared_waiters_owned(
+            uc,
+            *w,
+            Some(owner),
+            usize::MAX,
+        );
     }
     if total > 0 {
         log::warn!(
@@ -13461,16 +13467,13 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                         // (n33zż) keeps 200 rounds affordable (~20 s).
                         if *n < 200 {
                             *n += 1;
-                            // r799n49b: spawn every 4th round only.  The
-                            // 1 Hz re-fire parked ~75 workers/s while the
-                            // wake slice drains 48/s - the park queue NEVER
-                            // emptied and wakes kept landing on stale slots.
-                            // GOOD completed with ~4 legs per key; the 4-in
-                            // cadence (plus the wake-priority + slice) puts
-                            // BAD's density in that band while keeping the
-                            // round itself (tick alive, n277 lesson) every
-                            // second.
-                            if *n % 4 == 1 {
+                            // r799n49c: spawn every round.  The parked legs
+                            // ARE the completion workforce (n322's 1-in-4
+                            // cadence starved it); the wake side (slice +
+                            // priority + per-round kick) supplies the fuel.
+                            // The condition is kept as an always-true knob
+                            // for future experiments.
+                            if *n >= 1 {
                             // r799n33g: carry the mint's service so the
                             // leg stamps the dispatcher slot of the LIVE
                             // entry (bHandleResponseSVCData routes via
