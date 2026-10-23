@@ -5101,3 +5101,27 @@ n310_1 state of the art (all fixes on):
 - n349 adds the third tap (final+18 s, 192,152) - keyboard / city entry is
   the next observable step.  Note n348 needed no TimedOut wakes (loop still
   pumped after the taps; the r799n61 arm stays as the fallback for parks).
+
+## n349: New Address tap walks the genuine chain to the LI request; wall = the refresh ANSWER (procnav)
+
+- n349_1/_3 (2/2 final boots): tap (192,152) delivered; chain: sys-event
+  0xcb -> hsanav-destentry-country -> hsi-cmd 0x81008089 (stack-originated,
+  NOT the fake) -> vInitDestinationEntry(mode=6) PASS ->
+  enavi_tclILocationInput::bRequestRefresh(0x38f9a30, 0x658E, 0) (#1) ->
+  view-destroy cid=607 (keyboard page torn down waiting for the answer).
+  GUI thread survives it all (the 38.5 s deinit death was nav-key poison,
+  gone in the clean config).
+- GOOD contrast (n264_11, t=39467): the SAME bRequestRefresh(59742768,25966,
+  0) is followed IN THE SAME MILLSECOND by the sink callback
+  vOnRequestRefresh() on the HMI's own HSI thread, driven by an evtqm WRITE
+  (addr 0x38eeef0 value 0x78, pc=0x135a3ac) + mbx_1024 post - i.e. GOOD's
+  LI client completes the refresh LOCALLY (evtqm event queue), BAD's newer
+  CL/gateway routing (svcmgr gw-lookup/gw-deliver era) sends it out to the
+  LI SERVER (procnav, which carries li_tclIMWorker/
+  s32OnServiceStatusLocationInput) and procnav stays silent - no procnav
+  log line exists past t~40 s in n349_1.
+- Next wall (the last one for the user's goal): get PROCNAV to answer the
+  location-input refresh (request 0x658E) - it gates the keyboard screen
+  where the city name gets typed.  procnav's answer depends on its nav-
+  data/service-ready state (li_tcl worker), and PROCNAV mints/registers
+  that state during its own startup era - audit there first.
