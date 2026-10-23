@@ -38,6 +38,25 @@ pub fn writev(unicorn: &mut Unicorn<'_, Context>, fd: u32, iov: u32, iovcnt: u32
                     String::from_utf8_lossy(&buf)
                 );
             }
+            // r799n35: glibc __libc_message writes its fatal text
+            // ("*** %s ***: %s terminated") with writev to /dev/tty - mirror
+            // it (the unistd::write TTY witness misses this path, so the
+            // abort reason was invisible; the message names the corruption).
+            if fd == 2
+                || crate::os::syscalls::fcntl::TTY_FDS
+                    .lock()
+                    .unwrap()
+                    .contains(&fd)
+            {
+                log::warn!(
+                    "{:#x}: [{}] [WRITEV-TTY fd {} seg {}] {:?}",
+                    unicorn.reg_read(RegisterARM::PC).unwrap(),
+                    unicorn.get_data().inner.thread_id(),
+                    fd,
+                    index,
+                    String::from_utf8_lossy(&buf)
+                );
+            }
 
             match unicorn
                 .get_data()

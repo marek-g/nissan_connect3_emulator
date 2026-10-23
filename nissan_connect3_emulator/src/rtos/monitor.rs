@@ -1451,9 +1451,6 @@ fn complete_osal_service(
                             item.extend_from_slice(&1u32.to_le_bytes());
                             item.extend_from_slice(&copy.to_le_bytes());
                             let mut guard = namespace.lock().unwrap();
-                            crate::common::osal_queues::OsalQueueService::ensure_queue(
-                                &mut guard.mq, name,
-                            );
                             posted = crate::common::osal_queues::OsalQueueService::guest_post(
                                 &mut guard.mq,
                                 name,
@@ -1499,14 +1496,9 @@ fn complete_osal_service(
                 let namespace = unicorn.get_data().namespace.clone();
                 let mut guard = namespace.lock().unwrap();
                 let queue = format!("mbx_{dst_app}");
-                crate::common::osal_queues::OsalQueueService::ensure_queue(&mut guard.mq, &queue);
                 let mut content = vec![0u8; 0x18];
                 let blob = if unicorn.mem_read(body as u64, &mut content).is_ok() {
                     let src_queue = format!("mbx_{src_app}");
-                    crate::common::osal_queues::OsalQueueService::ensure_queue(
-                        &mut guard.mq,
-                        &src_queue,
-                    );
                     let handle = osal_kernel_handle(&src_queue);
                     content[0x0c..0x10].copy_from_slice(&handle.to_le_bytes());
                     let mut b = Vec::with_capacity(8 + 0x18);
@@ -2038,6 +2030,19 @@ pub fn spawn_guest_call(
     args: [u32; 4],
     stack_size: u32,
 ) -> u32 {
+    spawn_guest_call_lr(unicorn, entry, args, stack_size, MQ_NOTIFY_EXIT_STUB)
+}
+
+/// r799n35: same as [`spawn_guest_call`] but with an explicit return address,
+/// so a caller can chain a result-capture trampoline behind the call (the
+/// pump-completion slots malloc real chunks through this).
+pub fn spawn_guest_call_lr(
+    unicorn: &mut Unicorn<'_, Context>,
+    entry: u32,
+    args: [u32; 4],
+    stack_size: u32,
+    lr: u32,
+) -> u32 {
     if entry < 0x1000 {
         return 0xffff_ffff;
     }
@@ -2066,9 +2071,10 @@ pub fn spawn_guest_call(
             .reg_write(reg as i32, value as u64)
             .unwrap();
     }
-    // return = quiet thread exit (see spawn_guest_thread's r754 comment).
+    // return = quiet thread exit (see spawn_guest_thread's r754 comment), or
+    // the caller's trampoline (r799n35 `spawn_guest_call_lr`).
     unicorn
-        .reg_write(RegisterARM::R14 as i32, MQ_NOTIFY_EXIT_STUB as u64)
+        .reg_write(RegisterARM::R14 as i32, lr as u64)
         .unwrap();
     let start = entry & !1;
     unicorn
@@ -2502,7 +2508,7 @@ fn complete_osal_mbx_create(unicorn: &mut Unicorn<'_, Context>, thread: u32, blo
     );
     let namespace = unicorn.get_data().namespace.clone();
     let mut guard = namespace.lock().unwrap();
-    let queue_id = crate::common::osal_queues::OsalQueueService::ensure_queue(&mut guard.mq, &name);
+    let queue_id = crate::common::osal_queues::OsalQueueService::force_create(&mut guard.mq, &name);
     guard.mq.grow_msgsize(queue_id, size.max(8) as i64 * count.max(1) as i64);
     drop(guard);
     log::info!("monitor: OSAL[{thread}] queue create name {name:?} size {size} count {count}");
@@ -2584,7 +2590,7 @@ fn complete_osal_mbx_create_ptr(unicorn: &mut Unicorn<'_, Context>, thread: u32,
         let namespace = unicorn.get_data().namespace.clone();
         let mut guard = namespace.lock().unwrap();
         let queue_id =
-            crate::common::osal_queues::OsalQueueService::ensure_queue(&mut guard.mq, &name);
+            crate::common::osal_queues::OsalQueueService::force_create(&mut guard.mq, &name);
         guard.mq.grow_msgsize(queue_id, size.max(8) as i64 * count.max(1) as i64);
     }
     if write_word(unicorn, out, handle).is_err() {
@@ -2759,15 +2765,19 @@ fn complete_osal_mbx_wait(
         None => {
             let namespace = unicorn.get_data().namespace.clone();
             let mut guard = namespace.lock().unwrap();
-            let queue_id = crate::common::osal_queues::OsalQueueService::ensure_queue(
-                &mut guard.mq,
-                &name,
-            );
-            let message = crate::common::osal_queues::OsalQueueService::pop_guest_message(
-                &mut guard.mq,
-                queue_id,
-                usize::MAX,
-            );
+            // r799n36: wait must not materialize the queue either (a created
+            // name blocks the guest owner's O_EXCL create); no queue yet just
+            // means no message yet.
+            let queue_id = guard.mq.queue_id_for_name(&name).unwrap_or(0);
+            let message = if queue_id != 0 {
+                crate::common::osal_queues::OsalQueueService::pop_guest_message(
+                    &mut guard.mq,
+                    queue_id,
+                    usize::MAX,
+                )
+            } else {
+                None
+            };
             if name == "mbx_22" {
                 // TEMP r799n14: the 14 class-0x42 svc-0x1e answers were
                 // accepted into mbx_22 but no delivery of them was ever

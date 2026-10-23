@@ -313,7 +313,72 @@ pub fn libosal_add_code_hooks(unicorn: &mut Unicorn<'_, Context>, base_address: 
                 0
             });
         }
-        // r790: message-pool open fix.  The real kernel-side IOSC master
+        // r799n36: fixed-size pool audit for the OSAL queue-control pool.
+        // BAD (9 booted processes) creates 19 queues and the 20th
+        // (mapengine's AppId 1024) fails inside OSAL_pvMemPoolFixSizeGetBlock
+        // OfPool -> mapengine bInitInstance fails -> no mbx_1024 -> the whole
+        // svc-0x300 map-data traffic (GOOD: 35k messages) is dead.  Log every
+        // pool Create (name, config-struct deref: block count/size) and every
+        // GetBlock (pool descriptor identity) to find where the queue pool's
+        // capacity comes from.
+        {
+            let address = base_address + (0x4850_cfcc - 0x484d_8000);
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/mod.rs:mempool-create", move |uc: &mut Unicorn<'_, Context>| {
+                static HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                use std::sync::atomic::Ordering;
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 60 {
+                    return 0;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let r2 = uc.reg_read(RegisterARM::R2).unwrap_or(0) as u32;
+                let read = |uc: &mut Unicorn<'_, Context>, a: u32| -> u32 {
+                    let mut w = [0u8; 4];
+                    uc.mem_read(a as u64, &mut w).map(|_| u32::from_le_bytes(w)).unwrap_or(0xffff_ffff)
+                };
+                let name = if r0 == 0 { "<auto>".to_string() } else {
+                    let mut b = [0u8; 8];
+                    let _ = uc.mem_read(r0 as u64, &mut b);
+                    String::from_utf8_lossy(&b).trim_matches(char::from(0)).to_string()
+                };
+                let cfg4 = read(uc, r1.wrapping_add(4));
+                let cfgc = read(uc, r1.wrapping_add(0xc));
+                let blocks = read(uc, cfgc);
+                let bsize = read(uc, cfgc.wrapping_add(4));
+                let cfg10 = read(uc, r1.wrapping_add(0x10));
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                log::warn!(
+                    "LIBOSAL pool-diag mempool-create t={}ms tid=[{}] name={name:?} desc={r2:#x} cfg={r1:#x} cfg+4={cfg4:#x} cfg+0xc={cfgc:#x} blocks={blocks} bsize={bsize} cfg+0x10={cfg10:#x} lr={lr:#x}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                );
+                0
+            });
+            let address = base_address + (0x4850_d4e8 - 0x484d_8000);
+            crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/libosal_linux/mod.rs:mempool-getblock", move |uc: &mut Unicorn<'_, Context>| {
+                static HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                use std::sync::atomic::Ordering;
+                if HITS.fetch_add(1, Ordering::Relaxed) >= 120 {
+                    return 0;
+                }
+                let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                let r1 = uc.reg_read(RegisterARM::R1).unwrap_or(0) as u32;
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                let owner = {
+                    let mmu = uc.get_data().mmu.lock().unwrap();
+                    mmu.executable_location(lr)
+                        .map(|(l, o)| format!("{l}+0x{o:x}"))
+                        .unwrap_or_else(|| format!("{lr:#x}"))
+                };
+                log::warn!(
+                    "LIBOSAL pool-diag mempool-getblock t={}ms tid=[{}] elf={} r0={r0:#x} r1={r1:#x} lr={owner}",
+                    crate::libs::dapi::emu_t0_elapsed_ms(),
+                    uc.get_data().inner.thread_id(),
+                    uc.get_data().elf_path,
+                );
+                0
+            });
+        }
         // sets the pool-init flag (+0x1ac) in the shared IOSC data block, so
         // every process' vInitMessagePool creates its local pool object before
         // OSAL_s32MessagePoolOpen runs; in the emulator only procbaselx

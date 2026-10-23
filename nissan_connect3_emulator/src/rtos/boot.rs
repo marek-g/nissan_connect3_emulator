@@ -97,6 +97,11 @@ impl Default for RtosBootConfig {
                 StartProcessCommand::start_proc("/opt/bosch/navbin/PROCNAV.OUT"),
                 StartProcessCommand::start_proc("procmapengine.out"),
                 StartProcessCommand::start_proc("procvoice_out.out"),
+                // r799n36: PROCSDSTS (PROC07 of LINUX ORDER, the TTS/text-to-
+                // speech SDS twin; PROC_REGISTRY=sdstsapp.reg already rides
+                // the ni2k_eur navi pack) joins before PROCSDS, matching the
+                // unit's order ...PROCVOICE, PROCSDSTS, PROCSDS...
+                StartProcessCommand::start_proc("procsds_ts.out"),
                 StartProcessCommand::start_proc("procsds.out"),
             ],
             start_queue: queues::OSAL_CB_HDR_LI_MAIN.to_string(),

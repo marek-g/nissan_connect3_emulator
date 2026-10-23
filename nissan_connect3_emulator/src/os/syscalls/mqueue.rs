@@ -135,13 +135,54 @@ pub fn mq_open(
             oflag & O_EXCL != 0,
             oflag & O_NONBLOCK != 0,
         ) {
-            MqGuestOpen::Opened(id) | MqGuestOpen::Created(id) => {
+            MqGuestOpen::Opened(id) => {
                 state.notify_waiters();
+                log::info!(
+                    "mq_open census: {} [{}] name={name:?} oflag={oflag:#x} -> opened id={id:#x}",
+                    unicorn.get_data().elf_path,
+                    unicorn.get_data().thread_id(),
+                );
                 id
             }
-            MqGuestOpen::AlreadyExists => EEXIST,
-            MqGuestOpen::NotFound => ENOENT,
-            MqGuestOpen::InvalidAttrs => EINVAL,
+            MqGuestOpen::Created(id) => {
+                state.notify_waiters();
+                // r799n36: census.  procmapengine dies when its
+                // mq_open("mbx_1024", O_CREAT|O_EXCL) returns -1 with the
+                // name already taken (assert osalmqueue.cpp:1181 -> err
+                // 0x72003 -> "Queue could not be created"); GOOD never hits
+                // this.  Log every guest mq_open so one run names the
+                // earlier holder of the colliding name.
+                log::info!(
+                    "mq_open census: {} [{}] name={name:?} oflag={oflag:#x} -> CREATED id={id:#x}",
+                    unicorn.get_data().elf_path,
+                    unicorn.get_data().thread_id(),
+                );
+                id
+            }
+            MqGuestOpen::AlreadyExists => {
+                log::warn!(
+                    "mq_open census: {} [{}] name={name:?} oflag={oflag:#x} -> EEXIST (name already created by another process)",
+                    unicorn.get_data().elf_path,
+                    unicorn.get_data().thread_id(),
+                );
+                EEXIST
+            }
+            MqGuestOpen::NotFound => {
+                log::warn!(
+                    "mq_open census: {} [{}] name={name:?} oflag={oflag:#x} -> ENOENT",
+                    unicorn.get_data().elf_path,
+                    unicorn.get_data().thread_id(),
+                );
+                ENOENT
+            }
+            MqGuestOpen::InvalidAttrs => {
+                log::warn!(
+                    "mq_open census: {} [{}] name={name:?} oflag={oflag:#x} -> EINVAL (attrs maxmsg={maxmsg} msgsize={msgsize})",
+                    unicorn.get_data().elf_path,
+                    unicorn.get_data().thread_id(),
+                );
+                EINVAL
+            }
         }
     };
 

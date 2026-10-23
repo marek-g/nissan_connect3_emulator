@@ -196,6 +196,43 @@ impl OsalQueueService {
             return id;
         }
 
+        // r799n36 fidelity: an application mailbox (`mbx_<app>` / `MQB_<app>`)
+        // is created by its *own* guest process - via the non-IOSC `mq_open
+        // (O_CREAT|O_EXCL)` leg of `OSAL_s32MessageQueueCreate` or the IOSC
+        // create request - and a host lane materializing it early registers the
+        // name in the shared namespace so the owner's O_EXCL create meets
+        // EEXIST: assert osalmqueue.cpp:1181 -> "Queue could not be created"
+        // killed procmapengine (mbx_1024) and prochmi (mbx_265).  Host-side
+        // ensure/pop/post against such a queue therefore must not create it;
+        // the sentinel id 0 matches no real queue (ids start at
+        // MQ_HANDLE_BASE), so waiters see "empty" and `guest_post` drops the
+        // message like a real ENOENT `mq_send` would.
+        if name.starts_with("mbx_") || name.starts_with("MQB_") {
+            if std::env::var_os("EMU_MQ_NO_AUTOCREATE").is_none() {
+                static LOST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if LOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                    log::info!(
+                        "MQ ensure refused: {name:?} is an app mailbox - not created host-side (owner must mq_open it)"
+                    );
+                }
+            }
+            return 0;
+        }
+
+        let spec =
+            spec_for_name(&name).unwrap_or_else(|| default_queue_spec(&name, OSAL_DEFAULT_MSGSIZE));
+        mq.rtos_open_or_create(&spec.name, spec.maxmsg, spec.msgsize)
+    }
+
+    /// Unconditional create-or-get.  Only for lanes that carry an explicit
+    /// guest *create* request (the RTOS monitor's OSAL queue-create request,
+    /// the IOSC leg of `OSAL_s32MessageQueueCreate`) - the guest is the
+    /// creator there, so registering the name is correct.
+    pub fn force_create(mq: &mut MqState, name: &str) -> u32 {
+        let name = canonical_mq_name(name);
+        if let Some(id) = mq.queue_id_for_name(&name) {
+            return id;
+        }
         let spec =
             spec_for_name(&name).unwrap_or_else(|| default_queue_spec(&name, OSAL_DEFAULT_MSGSIZE));
         mq.rtos_open_or_create(&spec.name, spec.maxmsg, spec.msgsize)
@@ -204,13 +241,31 @@ impl OsalQueueService {
     pub fn guest_post(mq: &mut MqState, name: &str, data: Vec<u8>, osal_priority: u32) -> bool {
         let name = canonical_mq_name(name);
         let requested_msgsize = data.len() as i64;
-        let spec = spec_for_name(&name).unwrap_or_else(|| {
-            default_queue_spec(&name, OSAL_DEFAULT_MSGSIZE.max(requested_msgsize))
-        });
 
+        // r799n36 fidelity: a host post must never CREATE the queue.  On the
+        // unit `mq_send` into a not-yet-created mailbox fails with ENOENT and
+        // the sender retries later; here the old materialize-on-post silently
+        // registered the name in the shared namespace, so procmapengine's own
+        // `mq_open("mbx_1024", O_CREAT|O_EXCL)` met EEXIST (assert
+        // osalmqueue.cpp:1181 -> "Queue could not be created" -> the whole
+        // svc-0x300 map-data channel died).  Host-side posts that arrive
+        // before the guest creator is up are dropped, exactly like the real
+        // ENOENT, and the synthesizing lanes re-post on their own cadence.
         let id = match mq.queue_id_for_name(&name) {
             Some(id) => id,
-            None => mq.rtos_open_or_create(&name, spec.maxmsg, spec.msgsize.max(requested_msgsize)),
+            None => {
+                use std::sync::{Mutex, OnceLock};
+                static DROPPED: OnceLock<Mutex<std::collections::HashSet<String>>> =
+                    OnceLock::new();
+                let set = DROPPED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+                if set.lock().unwrap().insert(name.clone()) {
+                    log::info!(
+                        "osal-queue: host post of {} bytes to {name:?} dropped - queue not (yet) created by its guest app (real mq_send would ENOENT)",
+                        data.len(),
+                    );
+                }
+                return false;
+            }
         };
 
         // The host queue table is bookkeeping, not guest-visible mq metadata

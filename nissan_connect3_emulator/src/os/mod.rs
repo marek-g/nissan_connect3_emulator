@@ -8,6 +8,7 @@ use crate::emulator::context::Context;
 pub use crate::libs::libosal_linux::libosal_add_code_hooks;
 use crate::libs::dapi::dapiapp_add_code_hooks;
 use crate::libs::gl_stub::{libegl_add_code_hooks, libgles2_add_code_hooks};
+use crate::libs::libc_trap::libc_add_code_hooks;
 use crate::libs::libsvg_resource::libsvg_resource_add_code_hooks;
 use crate::libs::libtrace::libtrace_add_code_hooks;
 use crate::libs::procmapengine::procmapengine_add_code_hooks;
@@ -140,6 +141,10 @@ pub fn add_library_hook(unicorn: &mut Unicorn<'_, Context>, library: &str, base_
 
     match library {
         "/usr/lib/libtrace.so" => libtrace_add_code_hooks(unicorn, base_address),
+        // r799n35: abort()/__assert_fail witnesses (libc_trap.rs) - the ld.so
+        // mapping path for libc is /lib/libc.so.6 (symlink), the real file is
+        // libc-2.8.so; hook under either spelling.
+        "/lib/libc.so.6" | "/lib/libc-2.8.so" => libc_add_code_hooks(unicorn, base_address),
         "/opt/bosch/processes/libosal_linux_so.so" => libosal_add_code_hooks(unicorn, base_address),
         "/usr/lib/libEGL.so" => libegl_add_code_hooks(unicorn, base_address),
         "/usr/lib/libGLESv2.so" => libgles2_add_code_hooks(unicorn, base_address),

@@ -3352,6 +3352,61 @@ static PUMP_POST_MSGLEN: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomi
 /// loop (f263-f265 buffer overflow, f275 drain starvation).  Falls back to
 /// nothing until a genuine post has been observed; `EMU_FAKE_FI_READY_PUSH=0`
 /// disables at the callers.
+/// r799n35: glibc 2.8 `malloc` (link VA == runtime VA, verified through the
+/// abort chain: `abort+0x108` appears verbatim in the guest's stack dumps).
+const LIBC_MALLOC: u32 = 0x47dc_345c;
+
+/// Build the once-per-process trampoline page feeding the pump-completion
+/// slot ring: 8 caves, each `str r0,[pc,#4]; ldr pc,[pc,#8]` storing the
+/// malloc return value into its own scratch word (cave+0xc) and then jumping
+/// to the quiet-exit stub.  RWX via heap_alloc (arena_alloc is RW-only and
+/// would FETCH_UNMAPPED).
+fn pump_malloc_trampoline(unicorn: &mut Unicorn<'_, Context>) -> u32 {
+    static TRAMP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if let Some(p) = TRAMP.get() {
+        return *p;
+    }
+    let page = {
+        let mmu_arc = unicorn.get_data().mmu.clone();
+        let mut mmu = mmu_arc.lock().unwrap();
+        mmu.heap_alloc(
+            unicorn,
+            0x1000,
+            Prot::READ | Prot::WRITE | Prot::EXEC,
+            "[pump-malloc-tramp]",
+        )
+    };
+    if page == 0 {
+        return 0;
+    }
+    for i in 0..8u32 {
+        let cave = page + i * 0x20;
+        let words: [u32; 8] = [
+            0xe58f_0004, // str r0, [pc, #4]  -> scratch word at cave+0xc
+            0xe59f_f008, // ldr pc, [pc, #8]  -> exit stub at cave+0x14
+            0,
+            0, // scratch word (malloc's r0 lands here; 0 = idle)
+            0,
+            crate::emulator::memory_map::MQ_NOTIFY_EXIT_STUB,
+            0,
+            0,
+        ];
+        let mut bytes = Vec::with_capacity(32);
+        for w in words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        if unicorn.mem_write(cave as u64, &bytes).is_err() {
+            log::warn!("[LIBOSAL-MBX] pump completion: trampoline page write failed");
+            return 0;
+        }
+    }
+    log::info!(
+        "[LIBOSAL-MBX] pump completion: malloc trampoline at {page:#x} (8 slots, malloc={LIBC_MALLOC:#x})"
+    );
+    let _ = TRAMP.set(page);
+    page
+}
+
 pub fn pump_push_completion(unicorn: &mut Unicorn<'_, Context>, mut body: Vec<u8>) -> bool {
     // r799n33x: post_fn/handle and the POOL slots are PROCHMI-side VAs, yet
     // callers reach this from any process' context (queue intercepts, tick).
@@ -3368,26 +3423,79 @@ pub fn pump_push_completion(unicorn: &mut Unicorn<'_, Context>, mut body: Vec<u8
         // the queue handle are unknown, nothing safe to call.
         return false;
     }
-    static POOL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    if POOL.get().is_none() {
-        let mmu_arc = unicorn.get_data().mmu.clone();
-        let pool = mmu_arc.lock().unwrap().heap_alloc(
-            unicorn,
-            0x2000,
-            Prot::READ | Prot::WRITE,
-            "[pump-completion-pool]",
-        );
-        let _ = POOL.set(pool);
-    }
-    let pool = POOL.get().copied().unwrap_or(0);
-    if pool == 0 {
+    // r799n35: the body slots MUST be guest-malloc'ed chunks.  The orphan
+    // cleanup leg (bHandleResp "Request not found", entry=0x0) calls free()
+    // on the message data pointer, so a host heap_alloc slot trips glibc:
+    // "*** glibc detected *** prochmi_out.out: free(): invalid pointer:
+    // 0x90909000" -> __libc_message -> abort -> exit_group(0x7f) - the true
+    // root cause behind every r799d-era state-9 death (witnessed through the
+    // new WRITEV-TTY mirror, n291_2/3/4).  The slot ring is fed ASYNC: each
+    // round harvests finished malloc results from the trampolines' scratch
+    // words; when the ring is dry the round spawns the next malloc call and
+    // skips (callers keep the pending state, rounds retry ~100ms later).
+    const SLOT_SIZE: u32 = 0x100;
+    const SLOT_COUNT: u32 = 8;
+    if body.len() >= SLOT_SIZE as usize {
+        static G: AtomicU32 = AtomicU32::new(0);
+        if G.fetch_add(1, Ordering::Relaxed) < 4 {
+            log::warn!(
+                "[LIBOSAL-MBX] pump completion: body len {:#x} exceeds slot size, dropping",
+                body.len(),
+            );
+        }
         return false;
     }
+    let tramp = pump_malloc_trampoline(unicorn);
+    if tramp == 0 {
+        return false;
+    }
+    static SLOT_BUSY: AtomicU32 = AtomicU32::new(0);
+    static SLOT_READY: std::sync::Mutex<std::collections::VecDeque<u32>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+    // Harvest finished malloc calls: the trampoline stored r0 (chunk ptr) in
+    // its scratch word at cave+0xc; 0 = still running, 1 = ours (reserved).
+    {
+        let mut mask = SLOT_BUSY.load(Ordering::Relaxed);
+        for i in 0..SLOT_COUNT {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
+            let addr = tramp + i * 0x20 + 0xc;
+            let mut w = [0u8; 4];
+            if unicorn.mem_read(addr as u64, &mut w).is_ok() {
+                let v = u32::from_le_bytes(w);
+                if v != 0 && v != 1 {
+                    let _ = unicorn.mem_write(addr as u64, &[0u8; 4]);
+                    mask &= !(1 << i);
+                    SLOT_BUSY.store(mask, Ordering::Relaxed);
+                    SLOT_READY.lock().unwrap().push_back(v);
+                }
+            }
+        }
+    }
+    let slot = match SLOT_READY.lock().unwrap().pop_front() {
+        Some(s) => s,
+        None => {
+            // No chunk ready: spend this round on feeding the ring.
+            let mask = SLOT_BUSY.load(Ordering::Relaxed);
+            if let Some(i) = (0..SLOT_COUNT).find(|i| mask & (1 << *i) == 0) {
+                SLOT_BUSY.store(mask | (1 << i), Ordering::Relaxed);
+                let cave = tramp + i * 0x20;
+                let _ = unicorn.mem_write((cave + 0xc) as u64, &1u32.to_le_bytes());
+                crate::rtos::monitor::spawn_guest_call_lr(
+                    unicorn,
+                    LIBC_MALLOC,
+                    [SLOT_SIZE, 0, 0, 0],
+                    0x1000,
+                    cave,
+                );
+            }
+            return false;
+        }
+    };
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    // 0x100-byte stride: the body (0x22 B) must not be overwritten by the
-    // next completion before the pump has parsed this one.
+    // msgbuf frames stay one per index (see r799d note by the MSGBUF pool).
     let idx = NEXT.fetch_add(1, Ordering::Relaxed) % 32;
-    let slot = pool + (idx as u32) * 0x100;
     // r799d: mirror enConnect's relay re-stamp.  The genuine answers that
     // completed DAPI's svc-6 transaction (f273: completer saw
     // svc=0x6 key=5 src=0x7 regid=0x3) reached the pump THROUGH enConnect,

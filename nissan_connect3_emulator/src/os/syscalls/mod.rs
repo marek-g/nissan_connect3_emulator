@@ -19,7 +19,7 @@ mod stat;
 mod time;
 mod timer;
 mod uio;
-mod unistd;
+pub mod unistd;
 mod utsname;
 
 trait SysCallError {

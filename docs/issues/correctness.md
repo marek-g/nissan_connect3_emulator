@@ -4164,3 +4164,85 @@ PROCPHONE, PROCDAPI, PROCMAP, PROCVOICE, PROCSDSTS, PROCSDS, ...
   UNMAPPED storms ride exit_group teardown of prochmi worker clones.  The
   only real crash left is the FSM abort at prochmi+0x86f24 (state 9, 65 ms
   in) - still the r799n34 decode target.
+
+## r799n35: the state-9 "abort" decoded - free() of a non-malloc slot
+
+The r799d-era death (`open /dev/tty` + `exit_group(0x7f)`) was NOT an FSM
+logic abort.  Three witnesses were needed: (1) a LIBC code-stub pair at
+`abort`/`__assert_fail` (src/libs/libc_trap.rs) showing the caller is
+`__libc_message` (lr=0x47db5fc0), not assert/terminate; (2) decoding glibc
+2.8 `__libc_message` (libc is plain on disk, link base 0x47d58000) showed it
+emits the fatal text with **writev** (svc 0x92) - a syscall path with no
+mirror, so the message had never surfaced; (3) a WRITEV-TTY mirror in
+uio.rs printed it:
+
+```
+*** glibc detected *** prochmi_out.out: free(): invalid pointer: 0x90909000 ***
+```
+
+`0x909xxxxx` is the `[pump-completion-pool]` - pump_push_completion posted
+fabricated completions whose data slot was a host `heap_alloc` region, and
+the pump's orphan-response leg (`bHandleResp: Request not found`, entry=0x0)
+`free()`s the message data pointer.  A non-malloc pointer passes glibc's
+chunk checks only when the bytes below it look like a valid header - that
+was the whole "era lottery".
+
+Fix: the slot ring is now fed by the GUEST's own `malloc` (0x47dc345c,
+verified ARM prologue; runtime VA == link VA) called through
+`spawn_guest_call_lr` (new, monitor.rs) into a per-slot RWX trampoline that
+stores r0 into its scratch word and exits quietly (message.rs
+`pump_malloc_trampoline`).  n292_1..3: 3/3 runs reach state 9 and SURVIVE
+(zero exit_group, zero free-aborts), slots post as real heap chunks
+(0x3939de0...), `sp2res` reappears x2.
+
+Still open (next): the cascade now stalls ~40 s into state 9 - s9-wake
+vSignalSelf fires only #0/#1 (gate `fi_era_has_pending(0x1f) || svcdone_open`
+goes quiet), sp2a legs return r0=0x0 (pRetrieveRequest misses -> no
+enRemoveRequest, removes frozen at key 0x19 vs GOOD 0x1a-0x34), no
+`s9cascade final` yet.
+
+## r799n36: host lanes were stealing app-mailbox names - queue-create poison decoded (map-engine reborn)
+
+Priority per user: boot PROCSDSTS (`procsds_ts.out`, LINUX ORDER PROC07,
+`sdstsapp.reg` already in the navi pack) and keep pushing.  sdsts boots
+(heartbeat x14, creates its own `mbx_4105` = APPID 0x1009).
+
+Then the map-engine blocker (carried from r799n35) was decoded - it was NOT
+an OSAL pool exhaustion.  Chain: `OSAL_s32MessageQueueCreate` non-IOSC leg
+runs `mq_open("/mbx_1024", O_RDWR|O_CREAT|O_EXCL)`; the emulator's shared
+`MqState` answered EEXIST -> assert osalmqueue.cpp:1181 (lr 0x4850f81c =
+bl of the assert, verified by disassembly) -> err 0x72003 -> scd_bCreateQueue
+fails -> map-engine bInitInstance dies -> no mbx_1024 consumer -> GOOD's
+35,742-message svc-0x300 STAT flood channel dead.  n295 census (new
+`mq_open census` info log in mqueue.rs + mempool-create/getblock pool-diag
+probes) named the thieves: NO guest created mbx_1024 - host lanes did:
+`guest_post`/`ensure_queue` **materialized** queues on first post/wait
+(synthesized ApplicationInfoStatus, renfi posts, ServiceStatus re-post
+pairs, CCS-stamp forwarder, and the monitor's wait lane).  The same poison
+killed prochmi's AppId 265 create in n295 (sdsts connected to HMI before
+prochmi's own create at t=2690 - a real-unit boot-spacing artifact, and it
+did not recur in 3/3 later runs).
+
+Fidelity fixes (all fabricate *less*):
+* `guest_post` never creates: a post into a not-yet-created mailbox is
+  dropped + logged once per name, exactly like a real ENOENT `mq_send`; the
+  synthesizing lanes re-post on their own cadence.
+* `ensure_queue` refuses `mbx_*`/`MQB_*` names (sentinel id 0 - matches no
+  queue, ids start at MQ_HANDLE_BASE; waiters just see "empty").  Explicit
+  guest create requests (monitor OSAL queue-create request, the IOSC leg)
+  go through the new `force_create`, which keeps the old create-or-get body.
+* monitor post lane + CCS-stamp forwarder + wait lane no longer call
+  ensure_queue at all (wait reads `queue_id_for_name`, None -> no message).
+
+n296_1..3: 3/3 `MessageQueueCreate failed`=0, `success for AppId 1024`=1,
+zero exit_group, state 9 reached; map-engine BODY THREADS ALIVE (body-pass
+dispatch, its class-0x42 svc-0x1e answers now reach mbx_22, STAT admin
+reference registered); the STAT self-flood into mbx_1024 restarted in 2/3
+runs (4830/5036 posts vs GOOD 35,742, run 1 flood=0 - era still shifts).
+`s9cascade final` still 0/3.
+
+Next: the flood is short-lived vs GOOD (GOOD floods until 44 s) - diff the
+re-post precondition (r799n14 livelock: unanswered regid-0xfffe STAT answers
+must find NO client handler to be re-posted; BAD now has 3 STAT admin
+registrations vs GOOD 2, may be claiming them) and the svc-6 fi-ready push
+deficit (secondary list in r799n35 notes).
