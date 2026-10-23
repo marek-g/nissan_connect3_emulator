@@ -3917,3 +3917,26 @@ So the final split by fidelity rule 1:
   frame - our push was the premature-completion murder weapon, n268).
 - svc 0x000a / GpsDataStatus (SENSORFI 0x0015) and svc 0x001e legs: keep
   (no emulated host; n269 proved turning them off starves state 8).
+
+## r799n33zc: live key-owner guard on every fabricated completion
+
+n270 (svc-6 push off, 0/6) moved the murder weapon to the svc-0x0a leg:
+`f-accept svc=0x000a txn=2` (our gate echo, ordinal recorded legitimately
+by its own conf-store) REMOVED tid-65's NAVIF entry key=2 - because the
+HMINavServerLib IDFactory is ONE counter across all planes and REUSES
+released keys: key 1 was removed at 37.798 s, the gate's next mint grabbed
+2, while NAVIF's just-registered `svc6 func=0xa` request was the real live
+owner of 2.  Key-only completer => indistinguishable => same
+premature-completion death 60 ms later.
+
+Fix: `RQKEY_LIVE` (prochmi.rs) tracks each live key's owning (svc, func)
+from the rqadd/rqadd2 probes, drops it on the remove probe, clears on
+navif-create.  Every fabricated completion lane (push_gps_answer,
+fabricate_fi_ready_push, the sensorfi responder echo, the refire loop) now
+calls `rqkey_owned_by_want(key, want_svc)`: a foreign live owner blocks
+the push, and the (want_svc, key) pair is FROZEN once rejected (the stolen
+key re-mints back to our plane milliseconds later and a repeated push
+would re-arm the collision - the answer for our transaction already went
+missing once, completing it later with the wrong lifetime is not worth
+the risk).  Ownerless keys pass (f240 key-0 members).  EMU_FI_PUSH_OWNER-
+GUARD=0 restores unguarded pushes for diagnostics.

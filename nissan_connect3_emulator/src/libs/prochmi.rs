@@ -776,6 +776,40 @@ thread_local! {
 static SVC6_TXN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, u16>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// r799n33zc: which (svc, func) transaction CURRENTLY owns each live key of
+/// the shared HMINavServerLib IDFactory (fed by the `rqadd`/`rqadd2` and
+/// `remove` pumptrace probes).  ONE counter issues keys to every plane
+/// (gate registrations, NAVIF member requests, clones), so a fabricated
+/// answer stamped "its registration's ordinal" is indistinguishable - to
+/// the key-only completer - from the completion of whatever DIFFERENT
+/// transaction currently lives under that same number (n268: svc-6 push
+/// ate NAVIF's live key 2; n270: the svc-0x0a gate echo, correct per its
+/// own conf-store, ate NAVIF's RE-ISSUED key 2 after key 1's removal
+/// restarted the mint at 2).  Fabrication lanes must consult this map and
+/// only complete a key whose live owner is the transaction they answer.
+static RQKEY_LIVE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u16, (u16, u16)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Note a live key's owning transaction (from the rqadd probes).
+pub(crate) fn rqkey_note(key: u16, svc: u16, func: u16) {
+    if let Ok(mut m) = RQKEY_LIVE.lock() {
+        m.insert(key, (svc, func));
+    }
+}
+
+/// Drop a key's owner (from the remove probe).
+pub(crate) fn rqkey_drop(key: u16) {
+    if let Ok(mut m) = RQKEY_LIVE.lock() {
+        m.remove(&key);
+    }
+}
+
+/// The (svc, func) currently registered under `key`, if any.
+pub fn rqkey_owner(key: u16) -> Option<(u16, u16)> {
+    RQKEY_LIVE.lock().ok().and_then(|m| m.get(&key).copied())
+}
+
 /// r799n29: the (svc, ordinal, entry) tuples the fi-ready leg already
 /// answered.  Formerly a function-local static; hoisted so the
 /// `navif-create` probe can clear it (together with `SVC6_TXN` and
@@ -6650,6 +6684,11 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 if let Ok(mut m) = SVC6_TXN.lock() {
                     m.clear();
                 }
+                // r799n33zc: keys are re-minted from 1 by the new table -
+                // the old ownership map is meaningless (and dangerous).
+                if let Ok(mut m) = RQKEY_LIVE.lock() {
+                    m.clear();
+                }
                 if let Ok(mut s) = FI_READY_ANSWERED.lock() {
                     s.clear();
                 }
@@ -8708,6 +8747,8 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         uc.get_data().inner.thread_id(),
                         r1 & 0xffff,
                     );
+                    // r799n33zc: the key is free now - no live owner.
+                    rqkey_drop((r1 & 0xffff) as u16);
                     // r799n30: the completer removed this key - its answer
                     // landed, stop the era re-fire for it.
                     crate::libs::libosal_linux::message::fi_era_clear_key(
@@ -8817,6 +8858,9 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     let svc = read_u16(uc, r2a.wrapping_add(0x20));
                     let func = read_u16(uc, r2a.wrapping_add(0x22));
                     let holder = read_u32(uc, r5s.wrapping_add(8));
+                    // r799n33zc: record the live key owner for the
+                    // fabrication lanes' collision guard.
+                    rqkey_note(r1k as u16, svc as u16, func as u16);
                     log::warn!(
                         "PROCHMI pumptrace {label} t={}ms tid=[{}] key={:#x} act={r2a:#x} st={} svc={:#x} func={:#x} holder={:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),

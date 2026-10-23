@@ -3151,6 +3151,13 @@ pub fn refire_fi_era_pending(unicorn: &mut Unicorn<'_, Context>) -> usize {
         // above: the queue lane only drains during a client Wait era, and
         // host-posted blobs are invisible to the pump dispatcher anyway).
         let _ = svc;
+        // r799n33zc: re-check the live key owner EVERY re-fire - between
+        // notes the key may have been freed and re-minted to a foreign
+        // plane, and this lane pushes optype-9 frames into the same
+        // key-only completer.
+        if key != 0 && !rqkey_owned_by_want(key, 0x000a) {
+            continue;
+        }
         let mut data = gps_data_status_answer_body(key);
         data[0x1a] = 9;
         let mut conf = data.clone();
@@ -3450,8 +3457,56 @@ pub fn pump_push_completion(unicorn: &mut Unicorn<'_, Context>, mut body: Vec<u8
 /// over the same mailbox as genuine TE answers (f274/f276: pump-first
 /// ordering hijacked member answers and state 6 never closed).  The pump
 /// route is only for the state-8 f74 answer (`fabricate_f74_ready_event`).
+/// r799n33zc: collision guard for every fabricated completion.  The shared
+/// IDFactory re-mints keys across planes, so before stamping `key` into an
+/// answer we verify the transaction CURRENTLY living under that key is one
+/// of OURS (`want_svc`); a foreign live owner (e.g. tid-65's NAVIF member
+/// request re-using the ordinal our gate recorded) means the push would
+/// remove that foreign entry - the very murder of n268/n270 BAD eras.  A key
+/// with no live owner passes: it can only miss (or complete a plane the
+/// rqadd probes never see, f240's key-0 members).  EMU_FI_PUSH_OWNERGUARD=0
+/// restores the unguarded pushes.
+fn rqkey_owned_by_want(key: u16, want_svc: u16) -> bool {
+    if std::env::var_os("EMU_FI_PUSH_OWNERGUARD").is_some_and(|v| v == "0") {
+        return true;
+    }
+    // r799n33zc: once a (want_svc, key) push has been rejected, the key
+    // will very likely be RE-ISSUED back to our own plane moments later
+    // (that is exactly how it got stolen: n270 NAVIF released key 2, the
+    // gate's next mint grabbed it, our next re-fire would poison it).
+    // The answer for the transaction that originally owned the mint has
+    // already gone missing once - keep the whole (svc, key) pair frozen
+    // for the era (EMU_FI_PUSH_REJECT_HOLD_MS, default one hour) so the
+    // loop cannot re-arm the collision.
+    static REJECTED: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashSet<(u16, u16)>>,
+    > = std::sync::LazyLock::new(Default::default);
+    if REJECTED.lock().map(|s| s.contains(&(want_svc, key))).unwrap_or(false) {
+        return false;
+    }
+    match crate::libs::prochmi::rqkey_owner(key) {
+        Some((ksvc, _)) if ksvc == want_svc => true,
+        Some((ksvc, kfunc)) => {
+            if let Ok(mut s) = REJECTED.lock() {
+                s.insert((want_svc, key));
+            }
+            static SKIP: AtomicU32 = AtomicU32::new(0);
+            if SKIP.fetch_add(1, Ordering::Relaxed) < 8 {
+                log::warn!(
+                    "[LIBOSAL-MBX] fabricated {want_svc:#06x} answer for key {key} skipped (pair frozen): key currently owned by svc {ksvc:#06x} func {kfunc:#06x} (EMU_FI_PUSH_OWNERGUARD=0 restores)"
+                );
+            }
+            false
+        }
+        None => true,
+    }
+}
+
 pub fn push_gps_answer(unicorn: &mut Unicorn<'_, Context>, key: u16) -> &'static str {
     if std::env::var_os("EMU_FAKE_SENSORFI").is_some_and(|v| v == "0") {
+        return "none";
+    }
+    if !rqkey_owned_by_want(key, 0x000a) {
         return "none";
     }
     let body = gps_data_status_answer_body(key);
@@ -3528,6 +3583,9 @@ pub fn fabricate_fi_data_request(unicorn: &mut Unicorn<'_, Context>, service: u1
 /// ev-entry -> vfn+0x4c -> READY(2).  `EMU_FAKE_FI_READY_PUSH=0` disables.
 pub fn fabricate_fi_ready_push(unicorn: &mut Unicorn<'_, Context>, service: u16, key: u16) {
     if std::env::var_os("EMU_FAKE_FI_READY_PUSH").is_some_and(|v| v == "0") {
+        return;
+    }
+    if !rqkey_owned_by_want(key, service) {
         return;
     }
     // r799n33zb: svc 0x0006 is HOSTED - DAPI (app 0x0007) answers every
@@ -3908,6 +3966,12 @@ fn cca_server_answer_sensorfi_data_request(
     // r797b: the fabricated client request carries the CL transaction
     // ordinal to complete at +0x1c (genuine requests keep 0 there).
     let txn_key = u16::from_le_bytes([body[0x1c], body[0x1d]]);
+    // r799n33zc: same collision guard as the push lanes - an answer whose
+    // echoed ordinal now aliases a foreign live entry must not be posted
+    // at all (it would remove that entry before the real host answers).
+    if txn_key != 0 && !rqkey_owned_by_want(txn_key, service) {
+        return;
+    }
     static SEQ: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(1);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     // Echo the client's reference tuple (svc/regid and the +0x0c function
