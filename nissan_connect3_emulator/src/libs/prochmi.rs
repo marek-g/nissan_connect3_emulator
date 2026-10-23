@@ -13461,6 +13461,16 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                         // (n33zż) keeps 200 rounds affordable (~20 s).
                         if *n < 200 {
                             *n += 1;
+                            // r799n49b: spawn every 4th round only.  The
+                            // 1 Hz re-fire parked ~75 workers/s while the
+                            // wake slice drains 48/s - the park queue NEVER
+                            // emptied and wakes kept landing on stale slots.
+                            // GOOD completed with ~4 legs per key; the 4-in
+                            // cadence (plus the wake-priority + slice) puts
+                            // BAD's density in that band while keeping the
+                            // round itself (tick alive, n277 lesson) every
+                            // second.
+                            if *n % 4 == 1 {
                             // r799n33g: carry the mint's service so the
                             // leg stamps the dispatcher slot of the LIVE
                             // entry (bHandleResponseSVCData routes via
@@ -13474,7 +13484,8 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                                 .ok()
                                 .and_then(|m| m.get(key).map(|(s, _)| *s))
                                 .unwrap_or(0);
-                            again.push((*key, *holder, *func, svc));
+                                again.push((*key, *holder, *func, svc));
+                            }
                         }
                     }
                     m.retain(|_, (_, _, n)| *n < 1000);
@@ -13629,12 +13640,15 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                             .collect::<Vec<_>>()
                             .join(","),
                     );
-                    // r799n49: every re-fire round slice-wakes the herd
-                    // (48/word) - n320_on showed 1248 parks vs 75 wakes:
-                    // GOOD's chains ran on its completer storm, BAD's legs
-                    // sit parked.  (The n314 property-era churn that gated
-                    // this to svc-0x000a was the push_traffic_ready_pump
-                    // alias poison, removed since.)
+                }
+                // r799n49b: the slice-wake runs EVERY round (the spawn is
+                // 1-in-4 now) while any svcdone key is pending - drain
+                // rate must exceed the reduced park inflow.
+                let has_pending = SVCDONE_PENDING
+                    .lock()
+                    .map(|m| !m.is_empty())
+                    .unwrap_or(false);
+                if has_pending {
                     s9_answer_kick(unicorn);
                 }
                 // r799n33c: arm any state-9 mint the store-time svcdone
