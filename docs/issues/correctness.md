@@ -4363,3 +4363,39 @@ stamped class-0x45 frames into the client-side path for the PENDING trio
 keys instead of the parked worker guest-calls (user-approved), and watch
 whether the trio's next pass consumes them (probe: cllookup hit-rate +
 stepprobe ev-entry on pending keys).
+
+## r799n36e: the tail blocker is ONE dead-holder shm mutex + a watchdog that never fires
+
+GOOD vs BAD sp2 census t>=39 s: GOOD ran the FULL trio walker until its kill
+(sp2o x15, sp2i1 x30, sp2res x30, sp2p1 x30, p2 x24, p3 x22, sp2c x21,
+sp2b x23, sp2a x27 - rounds execute on the ANSWER-PROCESSING threads, every
+genuine answer arrival re-runs one full round ~every 300 ms).  BAD: ZERO sp2
+steps after t=38425 ms despite 50+ synthesized wakes.  The synthesized
+vSignalSelf clone cannot drive the walker - only the answer processors can,
+and after 38.9 s EVERY answer worker parks on the hot shm mutex word
+(0x40110dac, waits 769/wakes 242 overall, wakes->0 exactly at the freeze).
+
+Mechanism: the mutex holder died mid-critical-section (the 0x1c7d118
+READ_UNMAPPED worker crash-storm kills workers inside the AIL list lock -
+GOOD had MORE crashes (366) but its lock never stayed held: real answer
+traffic kept releasing it (230 wakes)).  440+ late waiters should ALL have
+been repaired by the r654 shared-futex watchdog (BlockReason::FutexWaitShared
+{ deadline: vnow+20 s, watchdog: true } -> scheduler.rs "repaired word"):
+the repair path logged ZERO lines in n301/n302 although the prochmi VM was
+awake (wakes fired to t=355 s).  WHY the watchdog never fires is now THE bug.
+
+Next session, surgical:
+1) one-shot host probe: when waiters-on-one-key count exceeds ~64, log the
+   raw shm word value + holder candidates (mem_read via the waiting
+   unicorn) - confirm the word is non-zero (locked) and identify the holder
+   tid vs the crashed tids.
+2) instrument scheduler.rs advance_blocked FutexWaitShared arm: log the
+   first expiry check for that key - find why neither the "re-arming"
+   (word==0) nor the "repaired word" (word!=0) branch ever runs (suspect
+   the deadline never expires because vnow() is *dilated wall* while the
+   check only happens on some other path, or the waiter is registered in
+   the global shm registry but reaped per-process - audit futex_wait_shared
+   ids vs the registry the reaper scans).
+3) once the watchdog repairs the word, the parked workers wake -> run the
+   sp2 round -> decode -> wake cascade continues - that is the whole
+   residual tail in one fix.
