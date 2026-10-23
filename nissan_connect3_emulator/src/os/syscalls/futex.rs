@@ -112,7 +112,7 @@ pub fn futex(
                         .or_else(|| Some(crate::emulator::vtime::deadline(Duration::from_secs(20))));
                     let namespace = data.namespace.clone();
                     let owner_pid = unicorn.get_data().inner.process_id;
-                    let preferred = wait_preferred(thread_id);
+                    let preferred = wait_preferred(unicorn, thread_id);
                     let id = namespace
                         .lock()
                         .unwrap()
@@ -269,16 +269,50 @@ pub fn note_key_resolved(key: u16) {
     }
 }
 
-/// True when this thread's svcdone key already has a posted answer.
-fn wait_preferred(tid: u32) -> bool {
+/// True when this thread's svcdone key already has a posted answer AND the
+/// wait is the LEG's id-word park (r799n48b): a worker's OTHER parks
+/// (sync-pool semaphores, AE dispatch slots, PS mutexes) must NOT steal
+/// front-of-queue from their own domains - n319's boots stalled in state 8
+/// once priority went unscoped.  The leg park is identified by a return
+/// frame inside the prochmi LEG thunk page (0x1c75104-0x1c751cc, the
+/// vtable +0xac8/+0xad4 thunks that wrap bHandleResponseSVCData).
+fn wait_preferred(unicorn: &Unicorn<'_, Context>, tid: u32) -> bool {
     if !wake_priority_enabled() {
         return false;
     }
-    TIDKEY
+    let answered = TIDKEY
         .lock()
         .ok()
         .and_then(|m| m.get(&tid).copied())
-        .is_some_and(|k| ANSWERED.lock().map(|s| s.contains(&k)).unwrap_or(false))
+        .is_some_and(|k| ANSWERED.lock().map(|s| s.contains(&k)).unwrap_or(false));
+    if !answered {
+        return false;
+    }
+    let sp = unicorn.reg_read(RegisterARM::SP).unwrap_or(0) as u32;
+    let mmu = unicorn.get_data().mmu.clone();
+    for i in 0..48u32 {
+        let mut buf = [0u8; 4];
+        if unicorn
+            .mem_read(sp.wrapping_add(i * 4) as u64, &mut buf)
+            .is_err()
+        {
+            break;
+        }
+        let c = u32::from_le_bytes(buf);
+        if !(0x1c75_000..0x1c76_000).contains(&c) {
+            continue;
+        }
+        let prochmi = {
+            let g = mmu.lock().unwrap();
+            g.executable_location(c)
+                .map(|(l, _)| l.contains("prochmi_out"))
+                .unwrap_or(false)
+        };
+        if prochmi {
+            return true;
+        }
+    }
+    false
 }
 
 /// r799n44: host-side kick used by the state-9 answer lanes - wakes every
