@@ -3893,6 +3893,46 @@ pub fn fabricate_f74_ready_event(unicorn: &mut Unicorn<'_, Context>, key: u16) -
     pump_push_completion(unicorn, body)
 }
 
+/// r799n45b: the pump-lane [1, slot] readiness event for the state-9
+/// svc-0x000a TRAFFIC keys, shaped exactly like `fabricate_f74_ready_event`
+/// (whose pump-drain 0x45 special case parses slot @+0x1b and ordinal
+/// @+0x1c).  The mbx_289 copy of this shape (r799n45) made a consumer leg
+/// run deep into the traffic handler and free() a pointer into the live
+/// connector object (n313_1 glibc "double free: 0x03939c70") - on the pump
+/// lane the body lives in a guest-MALLOC'ed slot, so any free the leg
+/// performs lands on a legitimate chunk.  Pump slot bodies are exactly
+/// what the state-6/8 lookups consume, so the ordinal carried here must be
+/// the live traffic key.
+pub fn push_traffic_ready_pump(unicorn: &mut Unicorn<'_, Context>, key: u16) -> bool {
+    if std::env::var_os("EMU_FAKE_TMC_STATUS").is_some_and(|v| v == "0") {
+        return false;
+    }
+    if !rqkey_owned_by_want(key, 0x000a) {
+        return false;
+    }
+    static MSG_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0x7b00);
+    let mut body = vec![0u8; 0x22];
+    body[0..2].copy_from_slice(&0x0015u16.to_le_bytes()); // src SENSORFI
+    body[2..4].copy_from_slice(&0x0121u16.to_le_bytes()); // dst navi srv
+    body[4..8].copy_from_slice(&(0x22u32).to_le_bytes());
+    body[8..10].copy_from_slice(&2u16.to_le_bytes());
+    body[0xb] = 0x45;
+    body[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
+    let msg_id = MSG_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    body[0x10..0x14].copy_from_slice(&msg_id.to_le_bytes());
+    body[0x14..0x16].copy_from_slice(&0x000au16.to_le_bytes()); // svc
+    body[0x16..0x18].copy_from_slice(&0x0003u16.to_le_bytes()); // regid
+    body[0x18..0x1a].copy_from_slice(&key.to_le_bytes()); // transaction ordinal
+    body[0x1a] = 6; // golden OPTYPE (member completions read optype 6)
+    body[0x1b] = 1; // service slot
+    body[0x1c..0x1e].copy_from_slice(&key.to_le_bytes()); // ordinal (drain)
+    let ok = pump_push_completion(unicorn, body.clone());
+    if ok {
+        note_fi_era_pending(0x000a, key, &body);
+    }
+    ok
+}
+
 /// r755: answer the `ServiceData` *requests* (class 0x45, OPTYPE byte @+0x1a
 /// in the client set) the HMI sends once a service registration is
 /// confirmed - the navigation service (0x0027) queries are what the HMI

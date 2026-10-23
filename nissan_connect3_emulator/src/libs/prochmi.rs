@@ -7912,16 +7912,17 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                 let r = crate::libs::libosal_linux::message::push_traffic_status_answer(
                                     uc, f18g, ordinal,
                                 );
-                                // r799n45: ALSO the property-proven lane -
-                                // the minimal ServiceData on mbx_289 that the
-                                // state-9 winners actually decoded and
-                                // removed with (tid-522, n306: func-0 body,
-                                // completer matches key only).  The GPS-event
-                                // shape above is eaten by tid-84's enConnect
-                                // Wait (that is why the traffic copies died
-                                // on the mbx lane in n305/n307).
-                                crate::libs::libosal_linux::message::fabricate_fi_ready_push(
-                                    uc, 0x000a, ordinal,
+                                // r799n45b: the minimal ServiceData now
+                                // rides the PUMP lane (malloc'ed guest slot
+                                // bodies).  n313_1 lesson: posting this
+                                // shape to mbx_289 let a consumer leg run
+                                // deeper and free() a pointer INTO the live
+                                // connector object (glibc "double free:
+                                // 0x03939c70", heap arena) - the completer
+                                // matched key only, but the leg's payload
+                                // deref on the shape decided the branch.
+                                crate::libs::libosal_linux::message::push_traffic_ready_pump(
+                                    uc, ordinal,
                                 );
                                 r
                             };
@@ -13461,6 +13462,12 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                             .collect::<Vec<_>>()
                             .join(","),
                     );
+                    // r799n45b: the previous round's spawns are parked by
+                    // now - wake them so each re-checks its slot and runs
+                    // the decode leg over whatever the lanes posted since
+                    // (store-time answers land before the herd parks; the
+                    // kick storm is what makes GOOD's winners).
+                    s9_answer_kick(unicorn);
                 }
                 // r799n33c: arm any state-9 mint the store-time svcdone
                 // never covered (missed pairing) after 300 ms (func 0:
