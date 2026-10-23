@@ -63,6 +63,9 @@ pub struct Mmu {
     /// (`phys_section_add` assert) at ~42 s that way.
     arena_next: u32,
     arena_end: u32,
+    /// r799n33zż: see [`Mmu::defragment`] - counts down map calls after an
+    /// unproductive merge pass (QEMU section leak protection).
+    defrag_backoff: u32,
 }
 
 impl Mmu {
@@ -73,6 +76,7 @@ impl Mmu {
             heap_mem_end: 0u32,
             arena_next: 0,
             arena_end: 0,
+            defrag_backoff: 0,
         }
     }
 
@@ -440,6 +444,19 @@ impl Mmu {
         if self.regions.len() < 500 {
             return;
         }
+        // r799n33zż: unicorn's QEMU never frees a MemoryRegion - EVERY
+        // mem_map ever performed permanently raises `sections_nb`, and the
+        // flatview asserts at 4096.  With the region list stuck just over
+        // the threshold (runs severed by ~500 permanent EXEC/shared
+        // regions), EVERY map re-triggered merges of the SAME few runs,
+        // leaking one section per merge (1081 triggers in n272_4/n276_1 ->
+        // assert at ~42 s).  After an unproductive pass (saves < 20
+        // regions) back off for 300 map calls so the pass runs at most
+        // once per ~300 new regions.
+        if self.defrag_backoff > 0 {
+            self.defrag_backoff -= 1;
+            return;
+        }
         // r799n33zd: crash diagnostics - n271 runs hit the flatview cap
         // (`phys_section_add` assert) at ~42 s while the region list should
         // have been kept near 500; log WHO is at the trigger and how much of
@@ -471,6 +488,7 @@ impl Mmu {
             );
         }
         self.regions.sort_unstable_by_key(|r| r.memory_start);
+        let before_len = self.regions.len();
         let mergeable = |r: &MmuRegion| {
             (r.memory_perms & Prot::EXEC) == Prot::NONE && r.shared_key.is_none()
         };
@@ -536,6 +554,9 @@ impl Mmu {
             i = j;
         }
         self.regions = merged;
+        if before_len - self.regions.len() < 20 {
+            self.defrag_backoff = 300;
+        }
     }
 
     fn remove_internal(&mut self, unicorn: &mut Unicorn<'_, Context>, address: u32, size: u32) {        // split regions at the beginning and end point of the range

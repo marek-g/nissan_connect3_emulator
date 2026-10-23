@@ -12973,6 +12973,74 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
     if !unicorn.get_data().elf_path.contains("prochmi") {
         return;
     }
+    // r799n33zg: stall diagnostics - n271..n275 survivor runs sit in
+    // state 9 with tid-65 silent for 50+ s; its last calls (Wait(0) +
+    // u32GetFromMessageQueue) rule out the IOSC-event sleep (8-unit
+    // deadline long expired, and finish_iosc_wait honours deadlines), so
+    // dump WHERE every prochmi thread is parked, once at +5 s and once at
+    // +40 s after the first state-9 tick.
+    {
+        static S9_T0: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static S9_DUMP_5: AtomicU32 = AtomicU32::new(0);
+        static S9_DUMP_40: AtomicU32 = AtomicU32::new(0);
+        if crate::libs::libosal_linux::message::hmi_fsm_state() == 9 {
+            let now_ms = crate::libs::dapi::emu_t0_elapsed_ms() as u64;
+            if S9_T0.load(Ordering::Relaxed) == 0 {
+                S9_T0.store(now_ms.max(1), Ordering::Relaxed);
+            }
+            let t0 = S9_T0.load(Ordering::Relaxed);
+            let elapsed = now_ms.saturating_sub(t0);
+            let (flag, due) = if elapsed >= 40_000 {
+                (&S9_DUMP_40, true)
+            } else if elapsed >= 5_000 {
+                (&S9_DUMP_5, true)
+            } else {
+                (&S9_DUMP_5, false)
+            };
+            if due && flag.fetch_add(1, Ordering::Relaxed) == 0 {
+                let mut summary: std::collections::HashMap<String, u32> =
+                    std::collections::HashMap::new();
+                let mut tid65 = String::new();
+                for t in unicorn.get_data().threads.lock().unwrap().iter() {
+                    let reason = match &t.status {
+                        crate::emulator::thread::ThreadStatus::Blocked(r) => r.name(),
+                        s => match s {
+                            crate::emulator::thread::ThreadStatus::Runnable => {
+                                "runnable".to_string()
+                            }
+                            crate::emulator::thread::ThreadStatus::Running => {
+                                "running".to_string()
+                            }
+                            crate::emulator::thread::ThreadStatus::Exited(c) => {
+                                format!("exited({c})")
+                            }
+                            crate::emulator::thread::ThreadStatus::Blocked(_) => {
+                                unreachable!()
+                            }
+                        },
+                    };
+                    *summary.entry(reason.clone()).or_default() += 1;
+                    if t.id == 65 {
+                        tid65 = reason;
+                    }
+                }
+                let mut top: Vec<_> = summary.into_iter().collect();
+                top.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+                log::warn!(
+                    "PROCHMI stall-dump t={}ms s9+{}ms threads={} tid65={} top={}",
+                    now_ms,
+                    now_ms.saturating_sub(t0),
+                    unicorn.get_data().threads.lock().unwrap().len(),
+                    tid65,
+                    top.iter()
+                        .take(6)
+                        .map(|(r, n)| format!("{r}:{n}"))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
+        }
+    }
     let now = Instant::now();
     // TEMP r757 diagnostic: sample the framework state byte every scheduler
     // pass.  Runs fix79-81 proved +0x670 changes (0xff -> 3, 4 -> 3) with no
@@ -13094,7 +13162,24 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
         // guest-call lane for the starved member re-mints there.
         // r799n33zf: also run when a fresh member key pulsed (event-driven
         // first round; the 1 Hz cadence alone missed it - n274_1).
-        let pulse = RQ_PULSE.swap(false, Ordering::Relaxed);
+        // r799n33zż: throttled to one pulse round per 100 ms - the s9
+        // property flood pulses on every rqadd (one per ~30 ms) and the
+        // unthrottled rounds spawned ~64k svcdone guest-calls in 40 s
+        // (n276_1), inflating arenas and the defragment churn that leaks
+        // QEMU sections.
+        static PULSE_T: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let pulse = if RQ_PULSE.load(Ordering::Relaxed) {
+            let now_ms = crate::libs::dapi::emu_t0_elapsed_ms() as u64;
+            if now_ms.saturating_sub(PULSE_T.load(Ordering::Relaxed)) >= 100 {
+                RQ_PULSE.store(false, Ordering::Relaxed);
+                PULSE_T.store(now_ms, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         if (due || pulse)
             && svcdone_window()
             && std::env::var_os("EMU_FAKE_SENSORFI").map_or(true, |v| v != "0")

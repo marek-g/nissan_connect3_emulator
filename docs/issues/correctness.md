@@ -3980,3 +3980,27 @@ the floor).  Also guarded the last unguarded fabrication lane: the
 mbx_36 class-0x45 echo stamps `txn` too; a foreign-owner key defers the
 echo and releases the ANSWERED45 tuple so the client's RE-ASK retries
 when the transaction is its own again.
+
+## r799n33zż: defragment backoff + pulse throttle (the arena fix traded death-wave for section-leak storm)
+
+n276_1 survived the death wave, walked 4->..->9, then the emulator
+ASSERTED again at ~40 s.  Root cause found in the unicorn/QEMU core:
+`phys_section_add` counts EVERY MemoryRegion ever created - unmap does
+NOT free them - so the 4096 cap is a budget of MAPS, not of live regions.
+The r799n33zd arena removed the per-stack maps but exposed a worse
+amplifier: the s9 property flood pulses the completion round on every
+rqadd (~30 ms), each round fires ~dozens of svcdone guest-calls (64,279
+svcdone log lines in 40 s), arenas exhaust -> new 16 MiB maps -> every
+map re-triggers a defragment pass (region list hovers at ~1021 because
+~527 EXEC/shared regions sever the mergeable runs), and every merge
+LEAKS one section (1081 passes -> thousands of leaked sections -> assert).
+
+Fixes: (1) `Mmu::defrag_backoff` - after an unproductive pass (saves<20)
+skip merging for 300 map calls; (2) the RQ_PULSE completion round is
+throttled to 100 ms (the pulse stays pending, so the first round after a
+fresh key still runs promptly); (3) `stall-dump` probe in prochmi::tick
+(once at s9+5 s, once at s9+40 s): per-block-reason census of all prochmi
+threads incl. tid-65 - n271..n275 survivors sit in state 9 with tid-65
+silent and its last calls (Wait(0)+GetFromMQ, timeout=0x8, both native
+paths that honour deadlines) rule out IOSC-event sleep; the dump names
+where it really is parked.
