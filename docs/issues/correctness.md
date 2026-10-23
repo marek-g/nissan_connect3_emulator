@@ -4482,3 +4482,37 @@ CCS conf-store (0x17b95xx legs around lr=0x17b9554/0x17b95c4) and the msgobj
 allocation it calls; find which precondition (service metadata? pool state?)
 is missing in BAD - this is a genuine client-side gap, NOT (yet) a reason to
 fabricate traffic answers.
+
+## r799n39: the six traffic keys are STAMPED correctly - the wake chain is the gap
+
+Corrects r799n38/r799n38b (both wrong): byte-level frame census shows BAD
+ALREADY builds and posts the right frames:
+
+- BAD posts to mbx_21 the client request `21 01 15 00 ... svc=0x000a
+  func=0x0102 optype=3 key=0x2e` (IDENTICAL bytes to GOOD's, only msgid
+  differs) AND to HMINavServerLib_1 the fake-SENSORFI server answer
+  `15 00 21 01 98 00 ... func=0x0102 optype=9 key=0x2e` (GOOD never needed
+  this one).  The s9-svcdone-refire lane also runs with the right
+  svc/func/key (bb built from MINT_INFO/SVCDONE_PENDING).
+- Yet BAD never REMOVes keys 0x2e-0x33, and the GOOD-only markers are the
+  consumption leg: `pumptrace vfn10 r3=key` + `completer msgobj=...` +
+  `idq-fhit [key]` + the 4 vOnUpdate callbacks.  BAD's vfn10 runs only for
+  already-completed keys (1a-2d); idq-fhit for 0x2e-0x33: 0 hits (GOOD: 4
+  each on vec 0x394cf0c).
+- GOOD's completion burst at 43801-43844 was lit by tid-60 running the
+  mbx_1024 pump (35742 `Wait(mbx_1024) delivered class=0x45 svc=0x0300`
+  copies over the run; a burst right before worker 1012's vfn10).  BAD
+  delivers MORE snapshots (91209 total: 65046 svc=0x26 + 26128 svc=0x300)
+  but the traffic keys' consume leg never fires - the frames sit accepted-
+  nowhere while 1100 svcdone workers for 0x2e-0x33 spawn and never execute
+  a single guest instruction (no OSAL-wait, no futex park, no crash line).
+- r1 at conf-store differs too (GOOD carries the minted ordinal in r1 even
+  in the traffic era - gate lines txn 46/48/50; BAD's even stores pass
+  r1=0 and the svc-0x000a mint-pairing exclusion makes them answer txn 0
+  "route none").  Fix candidate: answer svc-0x000a property stores via a
+  RQKEY_LIVE reverse lookup (rqkey_note already binds key->(svc,func) at
+  rqadd) instead of r1/mint pairing.
+
+Next: instrument WHY svcdone workers never execute (spawn -> first fetch),
+and/or drive the consume leg from the mbx_1024/mbx_1 delivery lane that
+GOOD proves works.  Ghidra: LEG region 0x1c75110-0x1c7d1e4 wake site.
