@@ -3470,30 +3470,20 @@ fn rqkey_owned_by_want(key: u16, want_svc: u16) -> bool {
     if std::env::var_os("EMU_FI_PUSH_OWNERGUARD").is_some_and(|v| v == "0") {
         return true;
     }
-    // r799n33zc: once a (want_svc, key) push has been rejected, the key
-    // will very likely be RE-ISSUED back to our own plane moments later
-    // (that is exactly how it got stolen: n270 NAVIF released key 2, the
-    // gate's next mint grabbed it, our next re-fire would poison it).
-    // The answer for the transaction that originally owned the mint has
-    // already gone missing once - keep the whole (svc, key) pair frozen
-    // for the era (EMU_FI_PUSH_REJECT_HOLD_MS, default one hour) so the
-    // loop cannot re-arm the collision.
-    static REJECTED: std::sync::LazyLock<
-        std::sync::Mutex<std::collections::HashSet<(u16, u16)>>,
-    > = std::sync::LazyLock::new(Default::default);
-    if REJECTED.lock().map(|s| s.contains(&(want_svc, key))).unwrap_or(false) {
-        return false;
-    }
+    // r799n33ze: pure live-owner check on EVERY push (the n33zc reject-
+    // freeze was too blunt: state-9 re-mints of the property plane reuse
+    // (svc,key) pairs the freeze had frozen while the ORIGINAL transaction
+    // was long gone - n272_3 died ~2 s into state 9 with the 0x1f answers
+    // starved).  The guard alone is sound: a collision can only happen
+    // while a foreign transaction is LIVE under the key, and that is
+    // exactly what this check - re-run on every re-fire - rejects.
     match crate::libs::prochmi::rqkey_owner(key) {
         Some((ksvc, _)) if ksvc == want_svc => true,
         Some((ksvc, kfunc)) => {
-            if let Ok(mut s) = REJECTED.lock() {
-                s.insert((want_svc, key));
-            }
             static SKIP: AtomicU32 = AtomicU32::new(0);
             if SKIP.fetch_add(1, Ordering::Relaxed) < 8 {
                 log::warn!(
-                    "[LIBOSAL-MBX] fabricated {want_svc:#06x} answer for key {key} skipped (pair frozen): key currently owned by svc {ksvc:#06x} func {kfunc:#06x} (EMU_FI_PUSH_OWNERGUARD=0 restores)"
+                    "[LIBOSAL-MBX] fabricated {want_svc:#06x} answer for key {key} skipped: key currently owned by svc {ksvc:#06x} func {kfunc:#06x} (EMU_FI_PUSH_OWNERGUARD=0 restores)"
                 );
             }
             false
