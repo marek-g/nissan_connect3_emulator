@@ -3530,6 +3530,30 @@ pub fn fabricate_fi_ready_push(unicorn: &mut Unicorn<'_, Context>, service: u16,
     if std::env::var_os("EMU_FAKE_FI_READY_PUSH").is_some_and(|v| v == "0") {
         return;
     }
+    // r799n33zb: svc 0x0006 is HOSTED - DAPI (app 0x0007) answers every
+    // svc-6 request genuinely (n269 proved it: with the push off, DAPI's
+    // own txn-2 frame still FOUND + removed the pending key and state 6
+    // closed).  Our optype-9 push against a registration ordinal is a
+    // duplicate the real provider never sends, and because the completer
+    // matches key only, a push whose ordinal aliases a live foreign entry
+    // (IDFactory keys are shared with the NAVIF request stream - n268:
+    // conf-store recorded tid-65's own rqadd key 2 as "the gate ordinal")
+    // completes that foreign request PREMATURELY with empty data - the
+    // step then advances, fails its content check ~70 ms later, and the
+    // enavi FSM exits prochmi (exit_group 127).  Fidelity rule 1: never
+    // fabricate what an emulated process answers itself.  The unhosted
+    // legs (svc 0x000a / GpsDataStatus from SENSORFI 0x0015, svc 0x001e)
+    // stay - n269 proved turning THOSE off starves state 8's f02 readiness
+    // instead.  EMU_FI_PUSH_SVC6=1 restores the svc-6 leg for diagnostics.
+    if service == 0x0006 && std::env::var_os("EMU_FI_PUSH_SVC6").is_none_or(|v| v != "1") {
+        static SKIPPED: AtomicU32 = AtomicU32::new(0);
+        if SKIPPED.fetch_add(1, Ordering::Relaxed) < 4 {
+            log::warn!(
+                "[LIBOSAL-MBX] fi-ready push for svc 0x0006 skipped (DAPI-hosted service, fidelity rule 1; EMU_FI_PUSH_SVC6=1 restores) key {key}"
+            );
+        }
+        return;
+    }
     // r799n33za: rate-limit per transaction key (default 250 ms).  This
     // push carries svc + the mint's ordinal into the SHARED completer key
     // space; DAPI (app 0x0007, emulated, fidelity rule 1) answers svc-0x06

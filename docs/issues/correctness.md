@@ -3894,3 +3894,26 @@ re-tries within milliseconds, so a throttled push still fires whenever the
 entry getter is genuinely still 0 - the n175 "one push loses the race"
 stall cannot return - while DAPI (~100 ms) now always wins every live key.
 The f74 pacing from n33z stays (harmless, more TE-realistic).
+
+## r799n33zb: svc-6 fi-ready leg disabled by default (DAPI-hosted); f02/GpsDataStatus legs stay
+
+The per-key rate-limit (n33za) was necessary but not sufficient - n268
+(0/6) still died: the FIRST svc-6 push per key passes the limiter, and one
+such push is already enough when its ordinal aliases a live foreign entry.
+The DECISIVE experiment was n269 (`EMU_FAKE_FI_READY_PUSH=0`, 0/4 GOOD but
+a new, slower signature): state 6 CLOSED (key 2 found + removed 3.6 s later
+by DAPI's own txn-2 frame - hosted completion works), and death moved to
+41.2 s at the NEXT leg (`svc 0x000a func 0xf02` rqadd key=3 never answered
+- the same flag had also switched off the GpsDataStatus supplier, and
+SENSORFI 0x0015 is NOT emulated).  GOOD n264_11 shows our f02 lane working
+when it stamps the live ordinal (38189: `svc=0x000a txn=3` -> found ->
+removed key 3) and being harmless when it stamps the garbage 0x5aa5
+(misses).
+
+So the final split by fidelity rule 1:
+- svc 0x0006 optype-9 pushes: DAPI-hosted -> skipped by default
+  (`EMU_FI_PUSH_SVC6=1` restores for diagnostics; every real provider
+  completes a registration with conf only, never an unsolicited data
+  frame - our push was the premature-completion murder weapon, n268).
+- svc 0x000a / GpsDataStatus (SENSORFI 0x0015) and svc 0x001e legs: keep
+  (no emulated host; n269 proved turning them off starves state 8).
