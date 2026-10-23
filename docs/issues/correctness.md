@@ -5125,3 +5125,23 @@ n310_1 state of the art (all fixes on):
   where the city name gets typed.  procnav's answer depends on its nav-
   data/service-ready state (li_tcl worker), and PROCNAV mints/registers
   that state during its own startup era - audit there first.
+
+## r799n62 checkpoint: golden-chain truth - GOOD's LI refresh ALSO rode the FAKE 0x81008089, and completed LOCALLY
+
+- GOOD n264_11: EMU_FAKE_DESTENTRY posts 0x81008089 at t=39463 -> fi-recv
+  pass -> deinit-entry mode=6 -> bRequestRefresh (39467) -> evtqm WRITE
+  0x38eeef0=0x78 (event 120, pc 0x135a3ac, clEventQueueManager::bWriteQueue
+  family) -> mbx_1024 post -> sink vOnRequestRefresh() on tid-50.  The LI
+  client completes the refresh THROUGH THE LOCAL EVENT QUEUE, same millisecond.
+- BAD n349_1: the tap raises 0x81008089 ORGANICALLY (widget -> hsi-cmd from
+  the stack, no fake), deinit-entry passes, bRequestRefresh executes - and
+  NO evtqm 0x78 write follows (BAD evtqm watches cover the identical
+  address range and DO fire 734x for other events, last @72831).  BAD's
+  client skips the local-completion branch; the refine sink completes
+  synchronously in BOTH, so the guard is refresh-specific (error-state /
+  connection flag in the enavi_tclILocationInput object 0x3a24c40 or the
+  proxy 0x38f9a30).
+- Next step (new session): disassemble the bRequestRefresh body (trace tag
+  site, near the enGetRequestRefreshErrorState accessor 0x162d5e4) and find
+  the branch that decides local evtqm completion vs outbound request; dump
+  the deciding field in GOOD (n264_11 era) vs BAD at tap time.
