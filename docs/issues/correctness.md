@@ -4828,3 +4828,32 @@ n310_1 state of the art (all fixes on):
   trio-1 actions are (svc/func/req) - the answer decides whether the fix is
   a traffic-era answer lane (svc-0x000a / 0x002c data) or a missing
   registration precondition.
+
+## r799n53 RESULT (n329): the svc-2c step trio == the cmp-gate keys; nosub self-destruct
+
+- st2c-* probes (n329 3/3): the trio IS non-null (0x3a26f10); its three
+  actions are v24-gate actions (vfn24=0x1719458) that register CCA keys
+  rqadd key=0x18 func=0x1, key=0x19 func=0x2, key=0x1a func=0x8000,
+  svc=0x2c - i.e. THE keys that were the "limbo trio" since n327.  GOOD
+  registers the identical trio (0x18-0x1a, same funcs) at t=39674 and
+  completes all three via worker legs (lookup -> orca1 HIT -> compres ->
+  remove -> bonr ev=0) within ~100 ms; poll p1 then passes and the cascade
+  walks on to cmp1f-b/trio-2.
+- BAD n329_1: key 0x19 completed fully (tid-399 cookie=0x1 optype=9:
+  orca1 hit + bonr + remove; act2 -> state=2) and 0x1a likewise - but key
+  0x18 was KILLED BY OUR OWN FAN-OUT: the foreign cookie=0x2 optype-9 leg
+  took the nosub path (entry FOUND, pFindSubscriber MISS) and the completer
+  still REMOVED the entry (t=42605, 55 ms after rqadd), 1 s before the
+  owner leg could wake.  act1 stuck state=1 -> st2c poll1 = 0 -> silent
+  0x17c64bc exit every pass (7x), cascade never reaches trio-2.
+- GOOD's nosub census never touches trio keys - GOOD's holder had ONE live
+  subscriber then, so alt_done_cookies returned nothing; the fan-out only
+  fires in BAD's richer subscriber state and always into foreign slots.
+  r799n33q's assumption "a leg against a cookie that owns no entry is a
+  harmless pRetrieveRequest miss" is WRONG whenever the entry exists but
+  the subscriber doesn't: the nosub path still completes-and-removes.
+- r799n54: alt fan-out gated to state!=9 (store-time + refire lanes),
+  dropped entirely in the s9-mint-sweep.  The n254 state-6 member-era
+  lesson is untouched.  Success markers n330: no nosub on trio reqids,
+  st2c-p1 r0=1, cmp1f-b/cmp0a/cmp300 + sp2* first firings, rqadd keys
+  past 0x1a (traffic era), and eventually s9cascade final.
