@@ -5086,3 +5086,18 @@ n310_1 state of the art (all fixes on):
   returns -ETIMEDOUT, and the loop performs its authentic between-messages
   iteration (exactly what the device's timed poll does).  No message is
   fabricated; the queue stays as-is.
+
+## n348: the whole menu chain works - radio -> MAP OPTIONS -> NAVIGATION ("New Address" visible)
+
+- n348_1/_3 (2/3 boots, final fired): both scripted taps delivered
+  (vPressed/vReleased traced, view churn in the same ms):
+  tap (60,333) -> MAP OPTIONS; tap (200,152)=Enter Destination ->
+  stateview leave 0xe5 / enter view 0x126 / dynstack 0x32f+popup 0x5e2 ->
+  the NAVIGATION page: New Address | Previous Destinations | Points Of
+  Interest | Home | Cancel Route | Next Page (window_0021.png).
+- Verified panel coordinate chain (1:1 with the 800x480 dumps):
+  Menu softkey (60,333); MAP OPTIONS "Enter Destination" (200,152);
+  NAVIGATION "New Address" (192,152).
+- n349 adds the third tap (final+18 s, 192,152) - keyboard / city entry is
+  the next observable step.  Note n348 needed no TimedOut wakes (loop still
+  pumped after the taps; the r799n61 arm stays as the fallback for parks).
