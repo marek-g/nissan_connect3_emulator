@@ -129,6 +129,27 @@ pub fn futex(
                         .lock()
                         .unwrap()
                         .futex_wait_shared(key, uaddr, owner_pid, preferred);
+                    // r799n52: remember (uaddr, key) for every svcdone worker
+                    // park.  GOOD's completer does `slotWord = 1; FUTEX_WAKE`
+                    // - the woken leg PROVES delivery by re-reading the word,
+                    // which is why GOOD's wakes convert (vfn10 -> bonr ->
+                    // state 2).  Our old kick only flipped the futex signal,
+                    // the leg saw an EMPTY slot, re-parked (churn) or fell
+                    // into the table subhand leg (0x800002a1 -> action RESET
+                    // -> re-issue loop, n327_2).  wake_answered_events() now
+                    // writes 1 into the word before waking - the genuine
+                    // OsalEvent protocol, only for ANSWERED keys.
+                    if let Some(wkey) = TIDKEY
+                        .lock()
+                        .map(|m| m.get(&thread_id).copied())
+                        .unwrap_or(None)
+                    {
+                        if let Ok(mut m) = EVENT_WAITERS.lock() {
+                            if m.len() < 16384 {
+                                m.insert(id, (uaddr, wkey));
+                            }
+                        }
+                    }
                     unicorn.get_data().set_action(ThreadAction::Block(
                         BlockReason::FutexWaitShared {
                             id,
@@ -242,6 +263,12 @@ static TIDKEY: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u3
     std::sync::LazyLock::new(Default::default);
 static ANSWERED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u16>>> =
     std::sync::LazyLock::new(Default::default);
+
+/// r799n52: waiter-id -> (futex-word GVA, svcdone key) for every svcdone
+/// worker park (see the registration site in the WAIT branch).
+static EVENT_WAITERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, (u32, u16)>>,
+> = std::sync::LazyLock::new(Default::default);
 
 fn wake_priority_enabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -367,6 +394,72 @@ pub fn wake_all_shared_waiters_owned(
         namespace.lock().unwrap().notify_waiters();
     }
     count
+}
+
+/// r799n52: the genuine OsalEvent completion - for every svcdone worker
+/// parked on `uaddr` whose mint key is ANSWERED, store 1 into the futex
+/// word (guest-visible, GOOD's completer does `slotWord = 1` before
+/// FUTEX_WAKE) and wake exactly those waiters.  A woken leg re-reads the
+/// word, finds the delivery proven and runs vfn10 -> completer -> bOnRequest
+/// -> action state 2 (the cmp1e gate's precondition).  Keys still pending
+/// are NOT woken - their legs keep parking, exactly like GOOD's un-answered
+/// workers.  EMU_WAKE_PRIORITY=0 disables (same umbrella: it is the wake
+/// machinery's delivery half).
+pub fn wake_answered_events(
+    unicorn: &Unicorn<'_, Context>,
+    uaddr: u32,
+    owner: Option<u32>,
+    limit: usize,
+) -> usize {
+    if !wake_priority_enabled() {
+        return 0;
+    }
+    let Some(key) = shm_futex_key(unicorn, uaddr) else {
+        return 0;
+    };
+    let namespace = unicorn.get_data().namespace.clone();
+    let woken = {
+        let answered = ANSWERED.lock().unwrap();
+        let waiters = EVENT_WAITERS.lock().unwrap();
+        namespace.lock().unwrap().futex_wake_keyed(
+            &key,
+            &|id| {
+                waiters
+                    .get(&id)
+                    .is_some_and(|(_, k)| answered.contains(k))
+            },
+            limit,
+        )
+    };
+    let mut wrote = 0usize;
+    for (id, va) in &woken {
+        // the parked word is prochmi's GVA - the kick runs on prochmi's VM
+        // (r799n33x rule), so a direct guest write is on the right address
+        // space.  The value 1 is what the waiter's futex-WAKE loop expects.
+        if unicorn
+            .mem_write(*va as u64, &1u32.to_le_bytes())
+            .is_ok()
+        {
+            wrote += 1;
+        }
+        if let Ok(mut m) = EVENT_WAITERS.lock() {
+            m.remove(id);
+        }
+    }
+    if !woken.is_empty() {
+        log::warn!(
+            "futex: ANSWER-EVENT word {:#x} store1+woke {} ({} word-writes) t={} thread [{}]",
+            uaddr,
+            woken.len(),
+            wrote,
+            crate::libs::dapi::emu_t0_elapsed_ms(),
+            unicorn.get_data().thread_id(),
+        );
+        let _ = owner; // selection is per-ANSWERED-key already; all such
+                      // waiters are prochmi svcdone workers by registration.
+        namespace.lock().unwrap().notify_waiters();
+    }
+    woken.len()
 }
 
 /// wake at most `val` blocked waiters of the futex at `uaddr`

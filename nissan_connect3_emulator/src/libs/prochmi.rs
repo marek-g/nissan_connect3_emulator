@@ -842,25 +842,28 @@ fn s9_answer_kick(uc: &mut Unicorn<'_, Context>) {
     if std::env::var("EMU_S9_ANSWER_WAKE").map(|v| v == "0").unwrap_or(false) {
         return;
     }
-    if crate::libs::dapi::emu_t0_elapsed_ms() < 32_000 {
-        return;
-    }
+    // r799n52: the t>=32_000 era gate retires with the churn floor: the
+    // event wake is key-scoped (only ANSWERED keys are touched), so it
+    // cannot storm era-6 lanes - and fast-ctor boots spend their whole
+    // property era between t=19 s and t=25 s, which the gate shadowed.
     let words = crate::os::syscalls::futex::shm_parked_wait_words();
-    // r799n50: bounded slice again (48/word).  usize::MAX (n323/n324) proved
-    // the herd WITHOUT filled slots is not fuel-hungry workforce but a pure
-    // churn loop: n324_3 measured 41k wake/re-park churn per 10 s per era
-    // word against only ~3 genuine guest wakes - the woken legs re-read an
-    // EMPTY slot and park again, burning the VM lock.  Until a slot-writing
-    // lane exists, more coverage cannot remove more keys; the deepest boot
-    // of the series (n320_on, 0x21) used the mildest wake profile.
+    // r799n52: the kick now performs the GENUINE event delivery - for every
+    // svcdone worker whose mint key is ANSWERED it stores 1 into the parked
+    // futex word and wakes exactly those waiters (GOOD's completer protocol
+    // `slotWord = 1; FUTEX_WAKE`).  n327_2 proved the pure-signal kick can
+    // never convert: the leg re-reads an EMPTY slot, falls into the table
+    // subhand leg (0x800002a1), bOnRequest RESETS the action and the FSM
+    // re-mints forever.  Non-answered workers stay parked (GOOD behaviour),
+    // so there is no churn floor - and the t>=32 s era gate retires with
+    // it: fast-ctor boots live the whole property era at t~19-25 s.
     let owner = uc.get_data().inner.process_id;
     let mut total = 0usize;
     for w in &words {
-        total += crate::os::syscalls::futex::wake_all_shared_waiters_owned(uc, *w, Some(owner), 48);
+        total += crate::os::syscalls::futex::wake_answered_events(uc, *w, Some(owner), 256);
     }
     if total > 0 {
         log::warn!(
-            "PROCHMI s9-answer-kick: woke-all {total} waiter(s) on {} park-word(s) t={}ms tid=[{}]",
+            "PROCHMI s9-answer-kick: store1+woke {total} waiter(s) on {} park-word(s) t={}ms tid=[{}]",
             words.len(),
             crate::libs::dapi::emu_t0_elapsed_ms(),
             uc.get_data().thread_id(),

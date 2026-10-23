@@ -167,6 +167,36 @@ impl SystemNamespace {
         self.futex_wake_shared(key, usize::MAX)
     }
 
+    /// r799n52: wake waiters selected by `wanted` (front-to-back, at most
+    /// `limit` of them); returns their (waiter-id, futex-word GVA) so the
+    /// caller can perform the guest-visible event-store BEFORE the wake
+    /// becomes observable.  Non-matching waiters keep their queue places.
+    pub fn futex_wake_keyed(
+        &mut self,
+        key: &(String, u32),
+        wanted: &dyn Fn(usize) -> bool,
+        limit: usize,
+    ) -> Vec<(usize, u32)> {
+        let mut out = Vec::new();
+        let Some(q) = self.futex_by_key.get_mut(key) else {
+            return out;
+        };
+        let mut keep = std::collections::VecDeque::new();
+        while let Some(id) = q.pop_front() {
+            let uaddr = self.futex_slab.get(&id).map(|w| w.uaddr);
+            if out.len() < limit && uaddr.is_some() && wanted(id) {
+                if let Some(w) = self.futex_slab.get_mut(&id) {
+                    w.signaled = true;
+                }
+                out.push((id, uaddr.unwrap()));
+            } else {
+                keep.push_back(id);
+            }
+        }
+        *q = keep;
+        out
+    }
+
     /// r799n49: wake up to `limit` waiters of `key`; `Some(owner)` restricts
     /// to that process (the svcdone herd lives in PROCHMI's VM). GOOD's
     /// completer storm drained ~46 parks/s - a bounded per-round slice keeps

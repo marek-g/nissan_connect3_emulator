@@ -4761,3 +4761,40 @@ n310_1 state of the art (all fixes on):
   (0x3a9f740) while the native FSM steps run on the 0x3acXXXX family -
   watch this in n327: if confs fire but subhand still misses the 1f
   reqids, the holder re-pin (live step client) is the follow-up.
+
+## r799n52: the kick must DELIVER, not just signal (n327 forensics)
+
+- r799n51 (conf gate retired, 599d844) unblocked the removal plane:
+  n327_2 removed ALL registered keys (25/25 incl. svc-1f), held state=9,
+  and ran 197 cascade events - first cascade in the series to reach
+  cmp1e-a.  confs 20-26/boot (was 0), vOnUpdate fan-out 380-680.
+- The new wall: cmp1e-a fires but cmp1e-b never does.  Disassembly of the
+  v24 gate (0x1719458, ARM - prochmi text is ARM not Thumb): obj+4 is the
+  ACTION state; state==2 (data-complete) passes with v14res==0, state==1
+  (conf-only) takes the v44/v18/v14 leg and a bad-exit on v14res==1.
+  GOOD advances 1->2 via stepprobe ev-entry + bonr (bOnRequest ev=0 from
+  the woken worker's vfn10 chain).  BAD's bonr legs fire (9x svc-1e!) but
+  the v24 scan still sees state 1: the FSM re-mints (limbo 3 keys), the
+  object states flip 0/1/2, and no pass sees ALL svc-1e actions == 2 at
+  once.
+- Root cause chain: BAD wakes are signal-only.  GOOD completer protocol =
+  `slotWord = 1; FUTEX_WAKE(1)`.  A woken BAD leg re-reads an EMPTY slot,
+  takes the table subhand leg (res=0x800002a1 = no subscriber), bOnRequest
+  RESETS the action for retry (r799n33g semantics re-confirmed), the FSM
+  re-issues, and the cmp1e pass never closes.  Pure-signal kicks therefore
+  CANNOT convert at any coverage (explains n321-n325).
+- Holder theory CLOSED (n327_2: remove tbl 0x39205e0 and spawn-leg lookup
+  tbl 0x3953c40 are the same client's planes - legs do find and remove).
+- r799n52: wake_answered_events - registry EVENT_WAITERS (waiter-id ->
+  (uaddr, key), filled at park for TIDKEY workers); namespace
+  futex_wake_keyed pops the front-prefix of answered waiters (no churn:
+  un-answered workers keep their queue place); futex.rs stores 1 into each
+  woken waiter's futex word (guest-visible, prochmi VM rule honored) and
+  notifies.  s9_answer_kick now calls ONLY this (256 cap) - and its
+  t>=32 s era gate is retired (key-scoped, cannot storm era-6 lanes;
+  fast-ctor eras live at t~19-25 s).
+- Success markers for n328: ANSWER-EVENT lines store1+woke>0; vfn10 r3
+  reaching 0x1b+ (1f era keys); cmp1e-b/c + cmp2c-a + cmp1f-b appearing;
+  sp2* sweep starting; eventually 's9cascade final'.  If wakes churn
+  again (word value rejected), the parked-val probe is the fallback
+  (record val at WAIT registration, wake with the observed GOOD value).
