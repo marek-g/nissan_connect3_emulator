@@ -5029,3 +5029,25 @@ n310_1 state of the art (all fixes on):
   and run the iteration normally (log throttled #8 then every 512th).
   Guards also added: dead-this skip (no self-faulting guest calls) and the
   bExecute-side upstream fingerprint.
+
+## r799n60e RESULT (n344): GUI thread survives 38.5 s for the first time; taps fire; next wall = the sibling-chain crash at 0x137b734
+
+- n344 3/3: the dead-this repair fires (repaired-slot #0-#2 @t~38.5 s,
+  this=0xe -> live 0x2d047a4 from the singleton slot), loop iterations jump
+  300 -> 670-914, and the FINAL-anchored scripted taps FINALLY inject
+  (2/2 final boots).  n344_1 (final@56.6 s): tap #0 (352,229) at 59.7 s.
+- New death mode (n344_1 @62.2 s): crash at 0x137b734 inside the
+  GUI_Widget parent/sibling walk (r4 = [r4,#0x18] chain; r4 becomes the
+  stale 0xe and [0x26] faults) right after event2app 0x81008025 ->
+  fi-recv.  Same 0xe sentinel, now deeper in the widget tree - the FIRST
+  poisoning event is still the 38.5 s era: tid-128 runs
+  vInitDestinationEntry(mode=6, guard 'pass') at t=38524 (r788b deinit-
+  entry probe), 13 ms before the first dead-this entry.  mode 6 rides
+  FI event 0x81008089 - which EMU_FAKE_DESTENTRY posts as a keyboard-scan
+  substitute (and the boot-time EMU_KEY_TEST nav presses feed it too).
+- Matrix n345: NO EMU_KEY_TEST, NO EMU_FAKE_DESTENTRY, repair + final-
+  anchored taps - does the loop live to the cascade end without the nav-
+  key/deinit churn?  Panel map refined from the dumps: content is the LEFT
+  ~400x480 half of the 800x480 framebuffer (right half = map layer, not
+  captured), and coordinates are 1:1 - the radio 'Menu' softkey sits at
+  panel ~(55,333), NOT at 2x.
