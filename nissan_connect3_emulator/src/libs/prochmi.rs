@@ -8041,30 +8041,50 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                     cookies.extend(alt_done_cookies(
                                         uc, holder, cookie,
                                     ));
-                                    // r799n46: svc-0x000a traffic legs run
-                                    // with the FULL GOOD answer body and
-                                    // the REAL func bound at rqadd time
-                                    // (MINT_INFO; f18b is the counter tail
-                                    // there, r799n42 lesson).
+                                    // r799n46: legs run with the FULL GOOD
+                                    // answer body and the REAL func bound
+                                    // at rqadd time (MINT_INFO; f18b is the
+                                    // counter tail, r799n42 lesson).  The
+                                    // GpsDataStatus gate shape and svc-6/7
+                                    // (DAPI-hosted) keep the proven stub.
                                     let real_f = MINT_INFO
                                         .lock()
                                         .ok()
                                         .and_then(|mi| {
                                             mi.get(&(ordinal as u32))
-                                                .map(|(_, f)| *f)
+                                                .map(|(_, f)| *f as u16)
                                         })
-                                        .filter(|f| *f != 0x0f02);
-                                    let bb9_full: Option<Vec<u8>> =
-                                        if svc as u16 == 0x000a {
-                                            real_f.map(|f| {
-                                                crate::libs::libosal_linux::message::traffic_status_answer_body(
-                                                    f as u16,
-                                                    ordinal as u16,
-                                                )
-                                            })
+                                        .filter(|f| *f != 0);
+                                    let full_body = |op: u8| -> Option<Vec<u8>> {
+                                        if svc == 0x0006
+                                            || svc == 0x0007
+                                            || (svc == 0x000a
+                                                && real_f == Some(0x0f02))
+                                        {
+                                            return None;
+                                        }
+                                        if std::env::var_os("EMU_SVC_FULL_BODY")
+                                            .is_some_and(|v| v == "0")
+                                            && svc != 0x000a
+                                        {
+                                            return None;
+                                        }
+                                        let f = real_f?;
+                                        Some(if svc == 0x000a {
+                                            crate::libs::libosal_linux::message::traffic_status_answer_body(
+                                                f, ordinal as u16,
+                                            )
                                         } else {
-                                            None
-                                        };
+                                            crate::libs::libosal_linux::message::service_answer_body(
+                                                svc as u16,
+                                                f,
+                                                ordinal as u16,
+                                                op,
+                                            )
+                                        })
+                                    };
+                                    let bb9_full: Option<Vec<u8>> = full_body(9);
+                                    let bb8_full: Option<Vec<u8>> = full_body(8);
                                     for c in cookies.iter().copied() {
                                         bb[0x0e..0x10].copy_from_slice(
                                             &(c as u16).to_le_bytes(),
@@ -8076,7 +8096,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                                     holder,
                                                     c,
                                                     ordinal as u32,
-                                                    real_f.unwrap_or(f18b as u32),
+                                                    real_f.map(|f| f as u32).unwrap_or(f18b as u32),
                                                     9,
                                                     b9,
                                                 );
@@ -8094,15 +8114,30 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                             }
                                         }
                                         bb[0x1a] = 8;
-                                        crate::rtos::monitor::guest_call_bhandle_svcdone(
-                                            uc,
-                                            holder,
-                                            c,
-                                            ordinal as u32,
-                                            f18b as u32,
-                                            8,
-                                            &bb,
-                                        );
+                                        match bb8_full.as_deref() {
+                                            Some(b8) => {
+                                                crate::rtos::monitor::guest_call_bhandle_svcdone(
+                                                    uc,
+                                                    holder,
+                                                    c,
+                                                    ordinal as u32,
+                                                    real_f.map(|f| f as u32).unwrap_or(f18b as u32),
+                                                    8,
+                                                    b8,
+                                                );
+                                            }
+                                            None => {
+                                                crate::rtos::monitor::guest_call_bhandle_svcdone(
+                                                    uc,
+                                                    holder,
+                                                    c,
+                                                    ordinal as u32,
+                                                    f18b as u32,
+                                                    8,
+                                                    &bb,
+                                                );
+                                            }
+                                        }
                                         bb[0x1a] = 9;
                                     }
                                     // r799n33: re-fire until the remove
@@ -8113,16 +8148,12 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                         {
                                             // r799n46: the pending tuple's
                                             // func feeds every re-fire -
-                                            // carry the REAL func for
-                                            // svc-0x000a (MINT_INFO), the
-                                            // store-time f18b is a counter
-                                            // tail there.
-                                            let pend_func =
-                                                if svc as u16 == 0x000a {
-                                                    real_f.unwrap_or(f18b as u32)
-                                                } else {
-                                                    f18b as u32
-                                                };
+                                            // carry the REAL func (MINT_INFO
+                                            // from rqadd); the store-time
+                                            // f18b is a counter tail.
+                                            let pend_func = real_f
+                                                .map(|f| f as u32)
+                                                .unwrap_or(f18b as u32);
                                             m.insert(
                                                 ordinal as u32,
                                                 (holder, pend_func, 1),
@@ -13439,6 +13470,17 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                 }
                 for (key, holder, func, svc) in again.iter().copied() {
                     let cookie = resolve_done_cookie(unicorn, holder, 0, key);
+                    // r799n46: legs carry the REAL rqadd func (MINT_INFO) -
+                    // pending tuples stored the store-time counter tail for
+                    // the non-0x000a services (r799n42b kept +0x18 there).
+                    let real_f = MINT_INFO
+                        .lock()
+                        .ok()
+                        .and_then(|mi| {
+                            mi.get(&(key as u32)).map(|(_, f)| *f as u16)
+                        })
+                        .filter(|f| *f != 0);
+                    let func = real_f.unwrap_or(func as u16) as u32;
                     let mut bb = [0u8; 0x22];
                     bb[0xb] = 0x45;
                     bb[0x0e..0x10]
@@ -13448,24 +13490,43 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                         .copy_from_slice(&(func as u16).to_le_bytes());
                     bb[0x1a] = 9;
                     bb[0x1c..0x1e].copy_from_slice(&(key as u16).to_le_bytes());
-                    // r799n46: the svc-0x000a traffic keys re-fire with the
-                    // FULL GOOD answer body (0x98 = header + gps wire
-                    // payload, n264_11 byte-compatible).  GOOD's own
-                    // bHandleResponseSVCData legs ran on exactly this object
-                    // shape and completed; the 0x22 stub only ever reached
-                    // the miss path.  The malloc-chunk lane in monitor.rs
-                    // keeps the leg's free() legal.
-                    let bb9_full: Option<Vec<u8>> = if svc == 0x000a
-                        && (func as u16) != 0x0f02
-                    {
-                        Some(
+                    // r799n46: re-fire with the FULL GOOD answer body -
+                    // 0x98 bytes: svc-0x000a traffic rides the GpsDataStatus
+                    // wire body, every other RTOS-answered service the
+                    // generic 0x0024->0x0121 template (n264_11: all svc-0x1f
+                    // completions rode it).  GOOD's bHandleResponseSVCData
+                    // legs ran on exactly this shape and completed; the 0x22
+                    // stub only ever reached the miss path.  monitor.rs
+                    // writes >0x3c bodies to guest-MALLOC'ed chunks, so the
+                    // leg's free() stays legal.  svc-0x0006 stays stubbed
+                    // (DAPI-hosted, fidelity rule 1) and the GpsDataStatus
+                    // gate key keeps its proven stub pair.
+                    let full_body = |op: u8| -> Option<Vec<u8>> {
+                        if svc == 0x0006 || svc == 0x0007 {
+                            return None;
+                        }
+                        if std::env::var_os("EMU_SVC_FULL_BODY")
+                            .is_some_and(|v| v == "0")
+                            && svc != 0x000a
+                        {
+                            return None;
+                        }
+                        let f = real_f?;
+                        if svc == 0x000a && f == 0x0f02 {
+                            return None;
+                        }
+                        Some(if svc == 0x000a {
                             crate::libs::libosal_linux::message::traffic_status_answer_body(
-                                func as u16, key as u16,
-                            ),
-                        )
-                    } else {
-                        None
+                                f, key as u16,
+                            )
+                        } else {
+                            crate::libs::libosal_linux::message::service_answer_body(
+                                svc as u16, f, key as u16, op,
+                            )
+                        })
                     };
+                    let bb9_full: Option<Vec<u8>> = full_body(9);
+                    let bb8_full: Option<Vec<u8>> = full_body(8);
                     // r799n33f: fan the pair out to every live subscriber
                     // (see alt_done_cookies - only the owner flips).
                     // r799n33q: also throw the low cookies {1,2,3} blind.
@@ -13505,9 +13566,18 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                             }
                         }
                         bb[0x1a] = 8;
-                        crate::rtos::monitor::guest_call_bhandle_svcdone(
-                            unicorn, holder, c, key, func, 8, &bb,
-                        );
+                        match bb8_full.as_deref() {
+                            Some(b8) => {
+                                crate::rtos::monitor::guest_call_bhandle_svcdone(
+                                    unicorn, holder, c, key, func, 8, b8,
+                                );
+                            }
+                            None => {
+                                crate::rtos::monitor::guest_call_bhandle_svcdone(
+                                    unicorn, holder, c, key, func, 8, &bb,
+                                );
+                            }
+                        }
                         bb[0x1a] = 9;
                     }
                 }

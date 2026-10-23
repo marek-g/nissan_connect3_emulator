@@ -3752,6 +3752,31 @@ pub fn push_gps_answer(unicorn: &mut Unicorn<'_, Context>, key: u16) -> &'static
 /// (n305: 60 pushes for key 0x31, zero `f-accept` pops), while the hosted
 /// pump queue has the single consumer that feeds the decode/completer leg
 /// (r799n30 lesson).  `EMU_FAKE_TMC_STATUS=0` disables; always logged.
+/// r799n46: GOOD-shaped 0x98 ServiceData ANSWER template for the RTOS-core
+/// answered services (src 0x0024 -> navi client 0x0121, class 0x45, regid
+/// 0x010e, optype/result bytes `0? 01`, ordinal at +0x1c).  n264_11 shows
+/// every svc-0x1f completion riding this exact shape (funcs 0x0103..0x0d70
+/// x 0x98) - GOOD's bHandle legs ran on it and completed.  The payload
+/// behind the header is zero (status/GET answers with an empty body are
+/// legitimate - the completer reads only the header fields).
+pub fn service_answer_body(svc: u16, func: u16, key: u16, optype: u8) -> Vec<u8> {
+    let mut body = vec![0u8; 0x98];
+    body[0..2].copy_from_slice(&0x0024u16.to_le_bytes()); // src RTOS core
+    body[2..4].copy_from_slice(&0x0121u16.to_le_bytes()); // dst navi client
+    body[4..8].copy_from_slice(&0x98u32.to_le_bytes());
+    body[8..10].copy_from_slice(&2u16.to_le_bytes());
+    body[0xb] = 0x45;
+    body[0x0e..0x10].copy_from_slice(&0xfffeu16.to_le_bytes());
+    body[0x10..0x14].copy_from_slice(&(key as u32).to_le_bytes()); // msgid
+    body[0x14..0x16].copy_from_slice(&svc.to_le_bytes());
+    body[0x16..0x18].copy_from_slice(&0x010eu16.to_le_bytes()); // regid
+    body[0x18..0x1a].copy_from_slice(&func.to_le_bytes());
+    body[0x1a] = optype;
+    body[0x1b] = 1;
+    body[0x1c..0x1e].copy_from_slice(&key.to_le_bytes());
+    body
+}
+
 /// r799n46: the GOOD-shaped full traffic-status answer (GpsDataStatus wire
 /// body, func overwritten with the request's own func, len field 0x98 -
 /// n264_11's svc-0x0a optype-9 frames are byte-compatible with this shape).
