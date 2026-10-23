@@ -846,21 +846,17 @@ fn s9_answer_kick(uc: &mut Unicorn<'_, Context>) {
         return;
     }
     let words = crate::os::syscalls::futex::shm_parked_wait_words();
-    // r799n49c: wake the WHOLE prochmi-owned herd on every recorded id-word
-    // each round (slice 48 was below GOOD's ~230-storm coverage; n321_2
-    // proved the hand-off engine chains once coverage is there - 454
-    // woke=1/10s at t=70 - and 1-in-4 spawn proved the parked legs are the
-    // workforce, not the obstacle).  Priority keeps answered-key workers at
-    // the queue front so guest wake(val=1) lands right too.
+    // r799n50: bounded slice again (48/word).  usize::MAX (n323/n324) proved
+    // the herd WITHOUT filled slots is not fuel-hungry workforce but a pure
+    // churn loop: n324_3 measured 41k wake/re-park churn per 10 s per era
+    // word against only ~3 genuine guest wakes - the woken legs re-read an
+    // EMPTY slot and park again, burning the VM lock.  Until a slot-writing
+    // lane exists, more coverage cannot remove more keys; the deepest boot
+    // of the series (n320_on, 0x21) used the mildest wake profile.
     let owner = uc.get_data().inner.process_id;
     let mut total = 0usize;
     for w in &words {
-        total += crate::os::syscalls::futex::wake_all_shared_waiters_owned(
-            uc,
-            *w,
-            Some(owner),
-            usize::MAX,
-        );
+        total += crate::os::syscalls::futex::wake_all_shared_waiters_owned(uc, *w, Some(owner), 48);
     }
     if total > 0 {
         log::warn!(
