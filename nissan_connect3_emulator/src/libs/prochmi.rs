@@ -12900,6 +12900,21 @@ fn post_gui_util_startup_anim_status(unicorn: &mut Unicorn<'_, Context>, status:
 }
 
 pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
+    // r799n33x: EVERY leg of this tick fabricates state inside PROCHMI's
+    // address space (framework bytes, GUI posts, svcdone guest-calls, the
+    // HMI_MAIN event wake by tid), but the scheduler calls it from every
+    // process' run_process_loop with that process' unicorn.  On a foreign
+    // loop the legs wrote garbage into the foreign VM, spawned workers that
+    // FETCH_UNMAPPED on prochmi VAs (n264_11: 508 dead clones inside
+    // DAPIAPP - the death wave + era lottery root cause), and burned the
+    // retry counters of pending completions.  HMI work belongs to prochmi's
+    // own loop; it is doorbell-rung on queue activity, so deferral is only
+    // a scheduling delay.  Hooks that legitimately act in a foreign VM
+    // (lsync/map announcement, gui-util probe) call their functions from
+    // hook context directly, not through this tick.
+    if !unicorn.get_data().elf_path.contains("prochmi") {
+        return;
+    }
     let now = Instant::now();
     // TEMP r757 diagnostic: sample the framework state byte every scheduler
     // pass.  Runs fix79-81 proved +0x670 changes (0xff -> 3, 4 -> 3) with no

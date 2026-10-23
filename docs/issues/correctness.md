@@ -3806,3 +3806,38 @@ message.rs `pump_push_completion` + `post_blob_to_guest_handle`).  Foreign
 loops return false; the pending state survives and prochmi's OWN scheduler
 loop re-fires the leg on its next tick (doorbell-rung by queue activity).
 Verification: n265 series must show zero FETCH_UNMAPPED and no death wave.
+
+## r799n33y: BAD era fully decoded - the state-6 fork is a key-collision race over mbx_289 frame ORDER
+
+n265 (8x BAD, zero FETCH_UNMAPPED - gate verified) gave the first clean BAD
+trace.  BAD is NOT a hang: tid-65 reaches startup state 5 at 37.6 s, state 6
+at 37.75 s - IDENTICALLY to GOOD - then calls exit_group(0x7f) at ~37.83 s
+(the whole prochmi commits suicide; status 127 = init-fail path).  GOOD
+passes through the same state 6 and reaches 7/8/9.
+
+The fork, line by line (BAD n265_1 vs GOOD n264_11):
+
+- tid-65 posts the state-6 NAVIF member request (svc=0x6 func=0xa, R=2,
+  rqadd key=0x2).  Both eras identical here.
+- GOOD: DAPI's reply PAIR lands while key=2's entry is still pending: the
+  data frame (f-accept svc=0x0006, optype 9) FOUND the entry (w6=0x6), the
+  completer removed key=2 and the step advanced; the svc-0x0a follow-up
+  frame got its own live key; state=7 at 39.19 s.
+- BAD: a STALE frame pair for (svc=6, txn=2) - queued in mbx_289 BEFORE the
+  request was issued (len 0x22, posted during the registration-era noise) -
+  is drained first and consumes/removes key=2 at 37.81 s; DAPI's REAL reply
+  (svc=0x000a txn=2) arriving 20 ms later hits `bhrfind lost` (entry gone);
+  the pending leg never completes; the FSM's give-up path exits the process.
+- So GOOD vs BAD = whether the stale svc-6 optype-9 frame sits in mbx_289 at
+  the instant tid-65 registers key=2.  The stale frames come from the
+  registration-era traffic our fabrications + DAPI push onto mbx_289 in
+  bursts; their drain order is scheduler-lottery - exactly the observed
+  era-lottery.
+
+Next-step candidates (not yet done): (a) stop the registration-era optype-9
+DATA frames for svc 6/0xa from being fabricated at all (only conf, and only
+addressed to the registering client - check cca_server_answer_register's
+ServiceStatus shape vs the pumppage accept filter w14=0x00030006);
+(b) DAPI-side: make its state-6 reply timing match its own request (it
+already does - the problem is OUR stale frames, not DAPI); (c) the tick-gate
+(n33x) removes foreign-VM writes into DAPI's heap that perturb the ordering.
