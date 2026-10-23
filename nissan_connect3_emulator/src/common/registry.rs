@@ -14,6 +14,10 @@ const DEFAULT_REGISTRY_FILES: &[&str] = &[
     "procearly.reg",
     "procmw.reg",
     "procmwlx.reg",
+    // r799n34b: procvoice_out.out joined the boot set; its PROCESS\PROCVOICE
+    // hive lives only in this file (procsql's PROCSQL hive is already in
+    // base.reg, the SDS hives ride ni2k_eur/sds*.reg via the navi pack).
+    "procvoice.reg",
     "prochmi.reg",
 ];
 
@@ -100,6 +104,39 @@ impl RegistryHandle {
 /// by that guest itself - service resolution prefers them and the kernel CCA
 /// responder never fabricates replies for them (fidelity rule).
 pub const HOSTED_SERVER_APPS: [u32; 3] = [0x0001, 0x0007, 0x0109];
+
+/// r799n34: the boot set grew (procmwlx/procsds/procsql/procvoice host real
+/// CCS apps - procsds owns 0x1000..0x1009, procmwlx 0x1b/0x1c), so a static
+/// list can no longer say who serves a queue.  A process that *blocks in a
+// Wait on `mbx_N`* demonstrably consumes that queue, so the libosal wait
+/// intercept records it here and every "answer for an unhosted server" lane
+/// steps aside (fidelity rule: only partners NOT among the running processes
+/// may be fabricated).  Clients open provider queues to post; only the real
+/// server waits on them, so a Wait is the reliable hosting signal.
+pub fn note_hosted_app_queue(name: &str) {
+    if let Some(app) = name.strip_prefix("mbx_").and_then(|d| d.parse::<u32>().ok()) {
+        static RUNTIME: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+            std::sync::LazyLock::new(Default::default);
+        if let Ok(mut s) = RUNTIME.lock() {
+            if s.insert(app) {
+                log::info!(
+                    "[CCA] app {app:#x} ({name}) is hosted by a running process: unhosted-answer lanes stand down for it"
+                );
+            }
+        }
+    }
+}
+
+/// True when app id `app` is served by one of the emulated processes - the
+/// static core trio or a queue observed being waited on at runtime.
+pub fn app_is_hosted(app: u32) -> bool {
+    if HOSTED_SERVER_APPS.contains(&app) {
+        return true;
+    }
+    static RUNTIME: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u32>>> =
+        std::sync::LazyLock::new(Default::default);
+    RUNTIME.lock().map(|s| s.contains(&app)).unwrap_or(false)
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Registry {

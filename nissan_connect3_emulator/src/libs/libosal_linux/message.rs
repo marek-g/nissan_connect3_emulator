@@ -753,6 +753,14 @@ fn handle_queue_api(
                 }
             } else {
                 let stack_timeout = read_stack_timeout(unicorn, api_name);
+                if matches!(
+                    api_name,
+                    "OSAL_s32MessageQueueWait" | "OSAL_s32MessageQueuePriorityWait"
+                ) {
+                    // r799n34: blocking Wait on mbx_N == this process hosts
+                    // app N (see registry::note_hosted_app_queue).
+                    crate::common::registry::note_hosted_app_queue(&decoded.name);
+                }
                 log::info!(
                     "0x{:x} [{}] [LIBOSAL] {}(handle=0x{:x}, info=0x{:x}, type={}, name={}, buf=0x{:x}, size=0x{:x}, timeout=0x{:x}, caller={})",
                     addr - base_address + 0x484d8000,
@@ -3288,8 +3296,20 @@ static HMI_FSM_STATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 /// leftover member entry instead of the gate).
 pub static F74_REG_ORD: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
-pub fn note_hmi_fsm_state(state: u32) {
+/// r799n34: the FSM thread's id is NOT stable across era changes - booting
+/// procmwlx/procsds shifts every tid (65 became 120 in n286_2), so any
+/// diagnostic that must name the HmiNavServer thread reads it from here
+/// (recorded by the startup-step probe) instead of hard-coding 65.
+pub static HMI_FSM_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn note_hmi_fsm_state(state: u32, tid: u32) {
     HMI_FSM_STATE.store(state, Ordering::Relaxed);
+    HMI_FSM_TID.store(tid, Ordering::Relaxed);
+}
+
+/// Latest observed HMI startup FSM thread id (0 until first seen).
+pub fn hmi_fsm_thread_id() -> u32 {
+    HMI_FSM_TID.load(Ordering::Relaxed)
 }
 
 /// Latest observed HMI startup FSM state (`0xffff_ffff` until first seen).
@@ -3872,6 +3892,12 @@ fn cca_server_answer_data_request_if_unhosted(
         Some(v) if (1..=0xffff).contains(&v) => v as u16,
         _ => return,
     };
+    // r799n34: if a running process hosts that server app, it must answer
+    // its own ServiceData (fidelity rule; procsds/procmwlx now host real
+    // CCS apps whose queues used to be fabrication-only).
+    if crate::common::registry::app_is_hosted(server_app as u32) {
+        return;
+    }
     let reg_id = u16::from_le_bytes([body[0x16], body[0x17]]);
     let function = u16::from_le_bytes([body[0x18], body[0x19]]);
     cca_server_answer_data_request(unicorn, server_app, client, service, reg_id, function);
@@ -3898,6 +3924,10 @@ fn cca_server_answer_sensorfi_data_request(
         return;
     }
     if std::env::var_os("EMU_FAKE_SENSORFI").is_some_and(|v| v == "0") {
+        return;
+    }
+    // r799n34: a running process now hosting app 0x15 answers on its own.
+    if crate::common::registry::app_is_hosted(0x15) {
         return;
     }
     let server_app = match name.strip_prefix("mbx_").and_then(|d| d.parse::<u32>().ok()) {
@@ -4680,8 +4710,7 @@ fn bridge_mbx_queue(
                             // the HMI itself must be answered by that guest,
                             // never fabricated here (fidelity rule).
                             if (1..=0xffff).contains(&server)
-                                && !crate::common::registry::HOSTED_SERVER_APPS
-                                    .contains(&(server as u32))
+                                && !crate::common::registry::app_is_hosted(server)
                             {
                                 // r797: the unit's CCA directory also
                                 // broadcasts ApplicationInfoStatus(server,
@@ -4765,6 +4794,9 @@ fn bridge_mbx_queue(
             if matches!(name, "mbx_21" | "mbx_36")
                 && body.len() >= 0x18
                 && body[0xb] == 0x41
+                // r799n34: stand aside once a running process hosts the
+                // provider (Wait-based detector, registry.rs).
+                && !crate::common::registry::app_is_hosted(if name == "mbx_21" { 0x15 } else { 0x24 })
                 && std::env::var_os("EMU_FAKE_CONNECTCONF").is_none_or(|v| v != "0")
             {
                 let server_app: u16 = if name == "mbx_21" { 0x0015 } else { 0x0024 };

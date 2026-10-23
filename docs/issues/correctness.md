@@ -4092,3 +4092,46 @@ Fixes in `Mmu`:
 - `map_shared` and the fresh-map fallback path hard-unmap overlapping freed
   fragments first (`hard_purge`) so `mem_map`/`mem_map_ptr` never collide
   with stale mappings; shared (host-ptr) regions are never soft-freed.
+
+## r799n34: real provider processes join the boot (procmwlx/procsds/procsql/procvoice)
+
+Direction change per user: instead of chasing the fabrication flags one by one,
+boot the processes that on the unit ARE the fabricated partners, then retire
+the fabrications behind them.
+
+- `RtosBootConfig::default` now also starts `procmwlx_out.out`, `procsds.out`,
+  `procsql_out.out`, `procvoice_out.out` (queue-boot lane spawns their VMs
+  unchanged; n286/n287 show all eight processes spawning).  procsds and
+  procmwlx come up healthy (scheduler heartbeats, own app loops waiting on
+  mbx_27/28 (mwlx, apps 0x1b/0x1c) and mbx_4096..4105 (procsds, apps
+  0x1000..0x1009)).  procmwlx has a noisy `/dev/.udev/queue.bin` retry thread
+  but its main app loop runs.  procvoice finds its hive after `procvoice.reg`
+  joined `DEFAULT_REGISTRY_FILES` (PROCSQL hive already rides base.reg, the
+  SDS hives ride ni2k_eur/sdsapp.reg via the navi pack - no other reg work
+  was needed).
+- Wait-based hosted-app detection (registry.rs `note_hosted_app_queue` /
+  `app_is_hosted`): a process blocking in `OSAL_s32MessageQueue(Wait)` on
+  `mbx_N` demonstrably consumes app N, so every "answer for an unhosted
+  server" lane (generic RegisterConf responder, `..._data_request_if_unhosted`,
+  SENSORFI responder, CONNECTCONF lane) stands down for it.  n287_1 flipped
+  0x7 (DAPI's CAM queue - the sensorfi mbx_7 stand-in is now OFF), 0x8, 0x1b,
+  0x1c, 0x33 and all procsds apps 0x1001..0x1005 automatically.  mbx_21
+  (SENSORFI 0x15) and mbx_36 (CSMA 0x24) still have NO waiter in any run -
+  those fabrications stay (and stay flag-gated).
+- tid hard-coding removed: HMI FSM thread id is published by the startup-step
+  probe (`HMI_FSM_TID`, consumed by the stall-dump) - with the extra
+  processes it moved 65 -> 120 -> 133.
+- n287_1 (era lottery winner): state 9 at 36.5 s with all eight processes,
+  first run since the era fixes where the property-completion clones walk the
+  FULL completer chain on the live path (`bhrfind res k[6]=0x1f` ->
+  `completer -> dispatch -> ev-entry -> bonr -> gnf-run -> vtick -> s9cascade
+  cmp1f svc=0x1f r0=1`).  Yet still no `sp2res`/`s9cascade final`, no removes
+  past key 0x19, and the FSM (tid-133) aborts 65 ms into state 9: lookup
+  `tbl=0x392dfb8 svc=0x1 key=0x5aa5 func=0xf02 optype=0x8` -> `found
+  entry=0x0` -> `handler_res=0x0` -> `open /dev/tty` -> `exit_group(0x7f)`.
+  GOOD (n264_11) has the SAME lookup shape (svc=0x1/0x5aa5/f02) x60 with
+  entry=0x0 misses AND 53 other `handler_res=0` in the same window and lives
+  - so the abort's real precondition sits behind the `lr=prochmi_out.out+
+  0x86f24` caller, currently being decoded (the on-disk prochmi_out.out is
+  encrypted at that offset; the Ghidra `prochmi_out.out` program holds the
+  runtime image and is the decoding source).

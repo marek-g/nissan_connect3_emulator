@@ -6346,7 +6346,10 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // (message.rs): its regid-3 svc-6 answers belong to the state-8
             // readiness entry, and answering the same request during the
             // member era collides with the members' pending transactions.
-            crate::libs::libosal_linux::message::note_hmi_fsm_state(state);
+            crate::libs::libosal_linux::message::note_hmi_fsm_state(
+                state,
+                uc.get_data().inner.thread_id(),
+            );
             log::warn!(
                 "PROCHMI startup-step t={}ms tid=[{}] proc={r0:#x} state={state}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
@@ -6393,7 +6396,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
     // sites, naming each site's service literal as decoded from the ROM:
     // site -> svc (0x17c63c8 takes 0x152 from the pc-pool at 0x17c7158).
     {
-        const SITES: [(u32, u16, &str); 38] = [
+        const SITES: [(u32, u16, &str); 41] = [
             (0x017c_6358, 0x01f, "cmp1f"),
             (0x017c_6368, 0x01e, "cmp1e-a"),
             (0x017c_6378, 0x01e, "cmp1e-b"),
@@ -6421,6 +6424,15 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // these sites pinpoint the departure.
             (0x017c_6758, 0x1f, "sp2o"),
             (0x017c_6774, 0x1f, "sp2g1"),
+            // r799n33zu: n284_3 (tid-264 walk) reached sp2g1 and never
+            // sp2i1 - the FIRST action's vfn+0x24 execute (0x17c6784) is
+            // where the walker departs forever.  These sites dump the
+            // action object (vtable, execute target, state, svc/func/req)
+            // right after each getter returns, to pin which object and
+            // which function the clone disappears into.
+            (0x017c_677c, 0x1f, "sp2act1"),
+            (0x017c_6790, 0x1f, "sp2act2"),
+            (0x017c_67a4, 0x1f, "sp2act3"),
             (0x017c_6788, 0x1f, "sp2i1"),
             (0x017c_678c, 0x1f, "sp2g2"),
             (0x017c_679c, 0x1f, "sp2i2"),
@@ -6473,6 +6485,23 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         "PROCHMI s9cascade {name} t={}ms tid=[{}] svc={svc:#06x} r0={r0} r5={r5:#x} outp={r9:#x}",
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         uc.get_data().inner.thread_id(),
+                    );
+                }
+                if matches!(name, "sp2act1" | "sp2act2" | "sp2act3") {
+                    // r799n33zu: dump the trio-2 action object the walker
+                    // is about to execute/poll (layout of the request
+                    // actions: vt@0, state@4, svc@8, func@0x22, req@0x28).
+                    let act = r0;
+                    let vt = read_u32(uc, act);
+                    let vfn24 = read_u32(uc, vt.wrapping_add(0x24)) & !1;
+                    log::warn!(
+                        "PROCHMI s9cascade {name} ACT t={}ms tid=[{}] act={act:#x} vt={vt:#x} vfn24={vfn24:#x} state={} svc={:#x} func={:#x} req={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        read_u32(uc, act.wrapping_add(4)),
+                        read_u16(uc, act.wrapping_add(8)),
+                        read_u16(uc, act.wrapping_add(0x22)),
+                        read_u32(uc, act.wrapping_add(0x28)),
                     );
                 }
                 if matches!(name, "sp1s1" | "sp2s1") {
@@ -13020,7 +13049,7 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                         },
                     };
                     *summary.entry(reason.clone()).or_default() += 1;
-                    if t.id == 65 {
+                    if t.id == crate::libs::libosal_linux::message::hmi_fsm_thread_id() {
                         tid65 = reason;
                     }
                 }
