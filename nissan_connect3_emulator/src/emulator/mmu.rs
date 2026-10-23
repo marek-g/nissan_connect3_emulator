@@ -65,6 +65,15 @@ pub struct Mmu {
     arena_end: u32,
     /// r799n33zr: first byte of the current arena (ring-wrap target).
     arena_base: u32,
+    /// r799n33zt: SOFT-unmap pool.  unicorn's QEMU never frees a
+    /// MemoryRegion, and a real `mem_unmap` followed by a re-map of the
+    /// same range still raises `sections_nb` (the procmapengine/PROCNAV
+    /// thread-stack churn - munmap on exit, mmap on next spawn - marched
+    /// the flatview to the 4096 assert at ~40 s).  So `unmap_internal`
+    /// only MOVES the range here (the QEMU mapping stays), and `map`
+    /// reuses an exactly-covering freed range without calling `mem_map`
+    /// again: churn converges instead of growing.
+    freed: Vec<(u32, u32, Prot)>,
     /// r799n33zż: see [`Mmu::defragment`] - counts down map calls after an
     /// unproductive merge pass (QEMU section leak protection).
     defrag_backoff: u32,
@@ -79,6 +88,7 @@ impl Mmu {
             arena_next: 0,
             arena_end: 0,
             arena_base: 0,
+            freed: Vec::new(),
             defrag_backoff: 0,
         }
     }
@@ -152,28 +162,32 @@ impl Mmu {
         self.remove_internal(unicorn, address, size);
 
         // fresh anonymous memory is zero-filled by the emulator (like a real kernel)
-        // r799n33zr: leak-budget watchdog.  unicorn's QEMU never frees a
-        // MemoryRegion: EVERY mem_map/mem_map_ptr ever performed raises
-        // `map->sections_nb`, and `phys_section_add` aborts the whole
-        // emulator at TARGET_PAGE_SIZE (4096).  Count every map so runs can
-        // see WHERE the budget went instead of dying mid-cascade.
-        {
-            static MAPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let n = MAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if n == 3000 || n == 3600 || n == 3900 {
-                log::warn!(
-                    "mmu MAP-BUDGET {n}/4096 vm={} regions={} desc={}",
-                    unicorn.get_data().elf_path.rsplit('/').next().unwrap_or("?"),
-                    self.regions.len(),
-                    description,
-                );
+        // r799n33zt: prefer a soft-freed covering range (no new QEMU
+        // section).  Only when the pool cannot serve the request do we pay
+        // for a fresh mem_map; `reuse_freed` has then already hard-unmapped
+        // any freed fragments overlapping the range.
+        if !self.reuse_freed(unicorn, address, size, perms) {
+            // r799n33zr: leak-budget watchdog.  unicorn's QEMU never frees a
+            // MemoryRegion: EVERY mem_map/mem_map_ptr ever performed raises
+            // `map->sections_nb`, and `phys_section_add` aborts the whole
+            // emulator at TARGET_PAGE_SIZE (4096).  Count every map so runs
+            // can see WHERE the budget went instead of dying mid-cascade.
+            {
+                static MAPS: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                let n = MAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if n % 100 == 0 {
+                    log::warn!(
+                        "mmu MAP-BUDGET {n} vm={} regions={} freed={} desc={}",
+                        unicorn.get_data().elf_path.rsplit('/').next().unwrap_or("?"),
+                        self.regions.len(),
+                        self.freed.len(),
+                        description,
+                    );
+                }
             }
-            if n > 3900 && n % 50 == 0 {
-                log::warn!("mmu MAP-BUDGET {n}/4096 vm={} desc={}",
-                    unicorn.get_data().elf_path.rsplit('/').next().unwrap_or("?"), description);
-            }
+            unicorn.mem_map(address as u64, size as u64, perms).unwrap();
         }
-        unicorn.mem_map(address as u64, size as u64, perms).unwrap();
 
         let desc = match description.len() {
             0 => String::from("[mapped]"),
@@ -217,9 +231,12 @@ impl Mmu {
     ) {
         self.defragment(unicorn);
         self.remove_internal(unicorn, address, size);
-
-        // r799n33zr: same leak budget as `Mmu::map` (mem_map_ptr registers
-        // a MemoryRegion too and unicorn never frees it).
+        // r799n33zt: `remove_internal` only SOFT-frees (the QEMU mapping
+        // stays alive); `mem_map_ptr` below would collide with it, so the
+        // overlapping freed fragments must be hard-unmapped here.
+        self.hard_purge(unicorn, address, size);
+        // r799n33zr: leak-budget watchdog (mem_map_ptr registers a
+        // MemoryRegion too and unicorn never frees it).
         {
             static MAPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let n = MAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -479,14 +496,104 @@ impl Mmu {
             return;
         }
 
+        // r799n33zt: SOFT unmap.  Keep the QEMU mapping alive and park the
+        // range in `freed`; a later `map` of the same range reuses it
+        // without a fresh `mem_map` (which would permanently raise
+        // `sections_nb`).  The guest-visible effect is identical: the range
+        // is no longer in `self.regions`, and reuse zero-fills it.
         for region in &regions_to_unmap {
-            unicorn
-                .mem_unmap(region.0 as u64, (region.1 - region.0 + 1) as u64)
-                .unwrap();
+            if let Some(item) = self
+                .regions
+                .iter()
+                .find(|r| r.memory_start == region.0 && r.memory_end == region.1)
+            {
+                if item.shared_key.is_some() {
+                    // shared ranges alias host memory: a re-map under a new
+                    // host pointer must not inherit them - hard-unmap.
+                    unicorn
+                        .mem_unmap(region.0 as u64, (region.1 - region.0 + 1) as u64)
+                        .unwrap();
+                } else {
+                    self.freed.push((region.0, region.1, item.memory_perms));
+                }
+            } else {
+                unicorn
+                    .mem_unmap(region.0 as u64, (region.1 - region.0 + 1) as u64)
+                    .unwrap();
+            }
         }
 
         self.regions
             .retain(|item| item.memory_end < address || item.memory_start >= address + size);
+    }
+
+    /// r799n33zt: try to service `map`'s request from the soft-freed pool.
+    /// On success the range is carved out of a covering freed block (the
+    /// block's head/tail stay freed and stay mapped) and zero-filled; the
+    /// caller must then skip `mem_map`.  On failure every freed block
+    /// overlapping the range is HARD-unmapped and removed from the pool so
+    /// the caller's fresh `mem_map` sees untouched address space.
+    fn reuse_freed(
+        &mut self,
+        unicorn: &mut Unicorn<'_, Context>,
+        address: u32,
+        size: u32,
+        perms: Prot,
+    ) -> bool {
+        let end = address + size - 1;
+        let cover = self
+            .freed
+            .iter()
+            .position(|(s, e, p)| *s <= address && *e >= end && *p == perms);
+        if let Some(i) = cover {
+            let (s, e, p) = self.freed.remove(i);
+            if s < address {
+                self.freed.push((s, address - 1, p));
+            }
+            if e > end {
+                self.freed.push((end + 1, e, p));
+            }
+            let zeros = vec![0u8; size as usize];
+            if unicorn.mem_write(address as u64, &zeros).is_err() {
+                // should not happen: the range is mapped - be conservative.
+                self.freed.push((address, end, p));
+                return false;
+            }
+            return true;
+        }
+        // partial overlaps only: hard-remove them from the flatview so a
+        // fresh mem_map cannot collide with a stale mapping.
+        self.hard_purge(unicorn, address, size);
+        false
+    }
+
+    /// r799n33zt: real `mem_unmap` of every soft-freed fragment overlapping
+    /// [address, address+size), keeping the freed pool consistent (head/tail
+    /// remnants of a partially purged block stay pool-resident - their
+    /// pages are still mapped and untouched).
+    fn hard_purge(&mut self, unicorn: &mut Unicorn<'_, Context>, address: u32, size: u32) {
+        let end = address + size - 1;
+        let overlaps: Vec<_> = self
+            .freed
+            .iter()
+            .enumerate()
+            .filter(|(_, (s, e, _))| *s <= end && *e >= address)
+            .map(|(i, f)| (i, *f))
+            .collect();
+        for (_, (s, e, _)) in &overlaps {
+            let lo = (*s).max(address);
+            let hi = (*e).min(end);
+            let _ = unicorn.mem_unmap(lo as u64, (hi - lo + 1) as u64);
+        }
+        for (i, (s, e, p)) in overlaps.into_iter().rev() {
+            self.freed.remove(i);
+            if s < address {
+                self.freed.push((s, address - 1, p));
+            }
+            if e > end {
+                self.freed.push((end + 1, e, p));
+            }
+        }
     }
 
     /// r620: unicorn caps the address space at 4096 sections
@@ -637,32 +744,16 @@ impl Mmu {
             .collect();
 
         for item in to_be_split {
-            let size = item.memory_end - item.memory_start + 1;
-            let left_size = address - item.memory_start;
-            let right_size = item.memory_end - address + 1;
-
-            // read the whole region's contents
-            let mut data = vec![0u8; size as usize];
-            unicorn
-                .mem_read(item.memory_start as u64, &mut data)
-                .unwrap();
-
-            // remove the old region from the VM and the bookkeeping
-            self.unmap_internal(unicorn, item.memory_start, size);
-
-            let split_offset = left_size as usize;
-
-            // left part
-            unicorn
-                .mem_map(
-                    item.memory_start as u64,
-                    left_size as u64,
-                    item.memory_perms,
-                )
-                .unwrap();
-            unicorn
-                .mem_write(item.memory_start as u64, &data[..split_offset])
-                .unwrap();
+            // r799n33zt: PURE BOOKKEEPING split.  The single QEMU mapping
+            // already covers [start, end] with one permission set, so the
+            // old read/unmap/map(x2)/write dance was pure self-harm: it
+            // leaked 2 flatview sections per split (unicorn never frees a
+            // MemoryRegion) and copied up to tens of MiB for arena-sized
+            // regions.  Only the region table changes.
+            let _ = unicorn;
+            self.regions.retain(|r| {
+                !(r.memory_start == item.memory_start && r.memory_end == item.memory_end)
+            });
             self.regions.push(MmuRegion {
                 memory_start: item.memory_start,
                 memory_end: address - 1,
@@ -671,21 +762,13 @@ impl Mmu {
                 filepath: item.filepath.clone(),
                 shared_key: item.shared_key.clone(),
             });
-
-            // right part
-            unicorn
-                .mem_map(address as u64, right_size as u64, item.memory_perms)
-                .unwrap();
-            unicorn
-                .mem_write(address as u64, &data[split_offset..])
-                .unwrap();
             self.regions.push(MmuRegion {
                 memory_start: address,
                 memory_end: item.memory_end,
                 memory_perms: item.memory_perms,
-                description: item.description.clone(),
-                filepath: item.filepath.clone(),
-                shared_key: item.shared_key.clone(),
+                description: item.description,
+                filepath: item.filepath,
+                shared_key: item.shared_key,
             });
         }
     }

@@ -4069,3 +4069,26 @@ svcdone/echo legs (those execute on guest-call clones and do not consume
 FSM passes).  The member-era (state 6) pulse wake stays - there the
 problem was the opposite (too few wakes before tid-65's f02 patience,
 n274_1).
+
+## r799n33zt: soft-unmap + bookkeeping splits kill the flatview-section death
+
+n281/n282: with the FSM pacing fixed, every state-9 survivor now lived to
+~38-40 s only to die inside `phys_section_add` again - and the MAP-BUDGET
+trajectory proved the budget is consumed by REMAP CHURN, not growth:
+PROCNAV.OUT's region count oscillated (444 -> 28 -> 102 between consecutive
+100-map checkpoints), i.e. munmap bursts (thread-stack teardown) followed
+by re-mmaps of the same ranges; in unicorn's QEMU every re-map permanently
+raises `sections_nb` while an unmap frees nothing.  Worse, `split_internal`
+did read+unmap+2x map+write per split - 2 leaked sections and up to 32 MiB
+of copying each time it touched the 16 MiB arena.
+
+Fixes in `Mmu`:
+- `unmap_internal` SOFT-frees non-shared ranges (QEMU mapping stays, range
+  parked in a new `freed` pool); `map` reuses an exactly-covering freed
+  range (zero-filled, perms-matched) without touching QEMU at all -
+  churn converges instead of growing.
+- `split_internal` is now pure bookkeeping (the single QEMU mapping already
+  covers both halves; no unmap, no re-map, no copy).
+- `map_shared` and the fresh-map fallback path hard-unmap overlapping freed
+  fragments first (`hard_purge`) so `mem_map`/`mem_map_ptr` never collide
+  with stale mappings; shared (host-ptr) regions are never soft-freed.
