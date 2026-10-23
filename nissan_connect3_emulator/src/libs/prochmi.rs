@@ -6458,7 +6458,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
     // sites, naming each site's service literal as decoded from the ROM:
     // site -> svc (0x17c63c8 takes 0x152 from the pc-pool at 0x17c7158).
     {
-        const SITES: [(u32, u16, &str); 41] = [
+        const SITES: [(u32, u16, &str); 52] = [
             (0x017c_6358, 0x01f, "cmp1f"),
             (0x017c_6368, 0x01e, "cmp1e-a"),
             (0x017c_6378, 0x01e, "cmp1e-b"),
@@ -6516,6 +6516,29 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // read [action+4] (the state word bIsComplete tests for ==2).
             (0x017c_67bc, 0x1f, "sp2s1"),
             (0x017c_6a88, 0x1f, "sp1s1"),
+            // r799n53: the svc-2c STEP block (cmp2c-a's `beq` target,
+            // 0x17c6670).  n328 broke through to cmp2c-a (3/3 boots, cmp1e-b
+            // +cmp1e-c too) but the cascade DIES inside this block: BAD
+            // re-enters it (7x) and never emits cmp1f-b/cmp0a/cmp300 or any
+            // sp2* - so it leaves through the silent exits (0x17c64bc on a
+            // failed poll, or the 0x17c6734 fallback).  Block layout (from
+            // disasm): singleton 0x161f754 -> trio=[obj+0x10] -> three
+            // getters (0x164dafc/db04/db2c), each vfn+0x24 (issue) then
+            // vfn+0x18 (bIsComplete, `!=0` required).  These sites name the
+            // departure.
+            (0x017c_6678, 0x2c, "st2c-acc"),
+            (0x017c_6684, 0x2c, "st2c-trio"),
+            (0x017c_66a4, 0x2c, "st2c-act1"),
+            (0x017c_66b8, 0x2c, "st2c-act2"),
+            (0x017c_66cc, 0x2c, "st2c-act3"),
+            (0x017c_66f0, 0x2c, "st2c-p1"),
+            (0x017c_670c, 0x2c, "st2c-p2"),
+            (0x017c_6728, 0x2c, "st2c-p3"),
+            (0x017c_6734, 0x2c, "st2c-fb"),
+            (0x017c_6744, 0x2c, "st2c-fb1f"),
+            // trio-2 entry singleton check (0x17c6750 `beq 0x17c680c`):
+            // tells whether BAD ever enters the step-2 issuer at all.
+            (0x017c_6750, 0x1f, "sp2acc"),
         ];
         let page = (base_address + 0x017c_6000u32 - ORIGINAL_BASE) & !0xfff;
         let _ = unicorn.add_code_hook(
@@ -6549,7 +6572,10 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         uc.get_data().inner.thread_id(),
                     );
                 }
-                if matches!(name, "sp2act1" | "sp2act2" | "sp2act3") {
+                if matches!(
+                    name,
+                    "sp2act1" | "sp2act2" | "sp2act3" | "st2c-act1" | "st2c-act2" | "st2c-act3"
+                ) {
                     // r799n33zu: dump the trio-2 action object the walker
                     // is about to execute/poll (layout of the request
                     // actions: vt@0, state@4, svc@8, func@0x22, req@0x28).
@@ -6564,6 +6590,16 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         read_u16(uc, act.wrapping_add(8)),
                         read_u16(uc, act.wrapping_add(0x22)),
                         read_u32(uc, act.wrapping_add(0x28)),
+                    );
+                }
+                if name == "st2c-trio" {
+                    // the generic line shows r0 (singleton); the decisive
+                    // value is r4 = [singleton+0x10] (the trio pointer).
+                    let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
+                    log::warn!(
+                        "PROCHMI s9cascade st2c-trio VAL t={}ms tid=[{}] trio={r4:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
                     );
                 }
                 if matches!(name, "sp1s1" | "sp2s1") {
