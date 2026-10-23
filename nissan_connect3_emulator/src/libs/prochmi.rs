@@ -448,6 +448,15 @@ pub static FSM_OWNER_TID: AtomicU32 = AtomicU32::new(0);
 pub static STARTUP_PAST_9: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// r799n58: set when the state-9 property cascade ran to completion
+/// (`s9cascade final`).  EMU_TOUCH_ANCHOR=final keys the scripted-tap
+/// rebase off this instead of state-9 entry: taps landing DURING the
+/// cascade interleave messages into the member queues and stall the whole
+/// walk (n337 0/3, n338B 0/2), while the cascade is the thing the taps are
+/// supposed to explore the aftermath of.
+pub static S9_CASCADE_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The prev-state value the device's OFF dwell would have left in the static
 /// `clFi_Navi` previous-state global when the first post-OFF NORMAL broadcast
 /// runs; 0 = nothing to reproduce.
@@ -6602,6 +6611,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     // GL-free afterwards, so drive a few host-side presents
                     // of what the guest rendered (presentation only).
                     arm_touch_present_window(4_000);
+                    S9_CASCADE_DONE.store(true, Ordering::SeqCst);
                 }
                 if matches!(
                     name,
@@ -15957,7 +15967,17 @@ fn inject_scripted_touch_test() {
     static TBASE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     let base = match TBASE.load(std::sync::atomic::Ordering::Relaxed) {
         u64::MAX => {
-            if !STARTUP_PAST_9.load(Ordering::Relaxed) {
+            // r799n58: EMU_TOUCH_ANCHOR=final rebases off the completed
+            // cascade instead of state-9 entry (taps must not land inside
+            // the member era - see S9_CASCADE_DONE).
+            let anchored = if std::env::var("EMU_TOUCH_ANCHOR").as_deref()
+                == Ok("final")
+            {
+                S9_CASCADE_DONE.load(Ordering::Relaxed)
+            } else {
+                STARTUP_PAST_9.load(Ordering::Relaxed)
+            };
+            if !anchored {
                 return;
             }
             let b = now.saturating_sub(due_ms);
