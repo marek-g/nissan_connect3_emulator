@@ -4596,3 +4596,40 @@ n310_1 state of the art (all fixes on):
   was caused by real-func-stamped host-ring bodies entering the orphan
   free leg - fixed in r799n42b (02eb66b) by keeping the legacy stamp on
   host-ring bodies only.
+
+## r799n44-46: kick storm, the shape-poison lesson, and the full-body svcdone lane
+
+- r799n44 (`f559a94`): s9-answer-kick - FUTEX_WAKE INT_MAX on every recorded
+  SHM-WAIT id-word after an answer (futex.rs records park-words). Guest
+  wake(val=1) pops ONE waiter FIFO from queues holding up to ~1300 re-fire
+  spawns; GOOD's winners were just a dense wake storm. n312: kicks fire but
+  only ~11 waiters are registered at store time - the herd parks AFTER the
+  kicks (1 Hz re-fires), so store-time kicking is inert for traffic.
+- n312 fact-graph updates:
+  * the traffic answers are byte-compatible with GOOD's own frames (len 0x98,
+    same header + gps wire payload, GOOD n264 dump `... 0a 00 03 00 02 0f 09
+    01 a5 5a ...`); the mbx_289 depth grows +1/s = our own re-pushes, nobody
+    pops that queue in the state-9 era (f-drop census = 0: never popped).
+  * GOOD's consumer burst (tid-60, 2483 lines/350 ms) is the mbx_1024<->IOSC
+    bridge pump - BAD's equivalent pump (tid-148/151) runs at 11k deliveries
+    per 10 s all through, so the bridge is NOT the gap. The gap is that GOOD
+    ran bHandleResponseSVCData legs on the REAL full answer object and those
+    legs complete+remove; BAD's 0x22-stub legs on a host heap_alloc ring
+    reach the miss path only.
+- n313_1 regression (fi-ready minimal body on mbx_289 for svc 0xa): traffic
+  handler leg freed a pointer INTO the live connector object -> glibc
+  "double free: 0x03939c70". Shapes matter: the leg decodes further on
+  svc-0x000a than on svc-0x1f and takes ownership of the buffer.
+- n314 regression (pump [1,slot] readiness event with ordinal at +0x1c):
+  all three boots degraded - the pump drain lookup aliases foreign live
+  keys. push_traffic_ready_pump parked (call removed, fn kept).
+- r799n46 (this): the GOOD-semantics delivery. svcdone optype-9 legs for
+  svc-0x000a traffic keys now run with the FULL 0x98 answer body
+  (traffic_status_answer_body) written into a guest-MALLOC'ed chunk (second
+  malloc-trampoline page, 8-cave ring in message.rs; monitor.rs picks the
+  chunk whenever body.len() > 0x3c). free() on such chunks is legal
+  (r799n35 rule), the body carries the REAL func (SVCDONE_PENDING now takes
+  the func from MINT_INFO for svc-0x000a), and the re-fire kick runs only
+  while a svc-0x000a key is pending (property-era kicks churned the wake
+  queues - n314 boots). Success markers: vfn10/completer hits for keys
+  0x2e.., removes past 0x2d, vOnUpdate*Traffic* > 0, `s9cascade final`.
