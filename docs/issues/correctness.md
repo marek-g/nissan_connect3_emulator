@@ -4542,3 +4542,30 @@ GOOD proves works.  Ghidra: LEG region 0x1c75110-0x1c7d1e4 wake site.
   the state-9 era; the only live pops are the 1 Hz connector kicks on the
   hosted pump queue. If a key's answer only ever rides mbx_289, it is
   parked forever: prefer `pump_push_completion` for every state-9 answer.
+
+## r799n43 (in progress): traffic answers are pump-posted correctly - the consumer pops only kicks
+
+n310_1 state of the art (all fixes on):
+- store-time recovery WORKS: gate lines `txn 46 func 0x102 ... txn 51
+  func 0x125` (decimal 46-51 == hex keys 0x2e-0x33) - every traffic conf
+  answered once with its own func.
+- pump route taken for 46/47 (bodies visible: `15 00 21 01 98 00 ... 0a
+  00 03 00 02 01 09 ...` posted to HMINavServerLib_1, slot 0x9199e000);
+  48-51 fell back to mbx (trampoline ring dry at that instant).
+- The pump consumer (f-accept, 0x17cb5ec) pops ONLY txn 3 (x7) and the
+  0x5aa5 kick (x4) over the whole run - our answer frames sit in the
+  hosted queue unconsumed. Same-shape frames ARE popped for the kick, so
+  the queue/mechanism is live; the discriminator (priority byte? msgid?
+  pool-index vs direct handle? per-tick pop budget?) is the open question.
+- GOOD contrast (n264_11): traffic bodies were posted with GUEST POOL
+  handles (0x95752300 = msg-pool entry, cf. MSG_POOL_* in message.rs) and
+  vfn10 ran 12x per key; BAD pump bodies carry materialize-arena handles
+  (0x9199exxx). Hypothesis for next session: the consumer's pop loop
+  resolves message refs through the OSAL type-2 pool, and non-pool handles
+  are skipped silently -> post traffic answers as POOL messages (reuse the
+  post8/pool lane) or read the guest pop leg at 0x17cb5ec in Ghidra to see
+  the filter.
+- n310_3 regression (glibc free(): invalid pointer @ t=38.9 s, body ring)
+  was caused by real-func-stamped host-ring bodies entering the orphan
+  free leg - fixed in r799n42b (02eb66b) by keeping the legacy stamp on
+  host-ring bodies only.
