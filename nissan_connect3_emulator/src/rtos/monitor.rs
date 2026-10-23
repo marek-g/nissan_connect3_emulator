@@ -2172,28 +2172,51 @@ pub fn guest_call_bhandle_svcdone(
         }
         return false;
     }
-    if holder == 0 || body.len() < 0x1e {
+    if holder == 0 || body.len() < 0x1e || body.len() > 0x3c {
         return false;
     }
     let mmu_arc = unicorn.get_data().mmu.clone();
-    let body_mem = mmu_arc.lock().unwrap().heap_alloc(
-        unicorn,
-        0x40,
-        Prot::READ | Prot::WRITE,
-        "[svcdone-body]",
-    );
-    let child = mmu_arc.lock().unwrap().heap_alloc(
-        unicorn,
-        0x4000,
-        Prot::READ | Prot::WRITE,
-        "[svcdone-stack]",
-    );
-    let tramp = mmu_arc.lock().unwrap().heap_alloc(
-        unicorn,
-        0x40,
-        Prot::READ | Prot::WRITE | Prot::EXEC,
-        "[svcdone-tramp]",
-    );
+    // r799n36: region-diet.  Every svcdone leg used to `heap_alloc` a fresh
+    // body+stack+tramp - ~1100 permanent unicorn memory regions in n299
+    // alone, until `phys_section_add`'s static 4096-section table overflowed
+    // (exec.c:837 assert -> SIGABRT, the silent "global coma" at t~39.5 s of
+    // every recent BAD run - the abort message was lost in the `tr` pipe).
+    // body and tramp now come from two 64-slot rings allocated ONCE (the
+    // wrap-around reuses slots whose ancient parked worker never completes
+    // anyway - same net effect as today's drop), and the child stack comes
+    // from the arena ring like every other guest call (r799n33zr).
+    thread_local! {
+        static SVCDONE_RING: std::cell::Cell<(u32, u32, u32)> = std::cell::Cell::new((0, 0, 0));
+    }
+    const DEPTH: u32 = 64;
+    let (body_mem, tramp) = SVCDONE_RING.with(|cell| {
+        let (b, t, rr) = cell.get();
+        let (b, t) = if b == 0 || t == 0 {
+            let mut mmu = mmu_arc.lock().unwrap();
+            let nb = mmu.heap_alloc(
+                unicorn,
+                DEPTH * 0x40,
+                Prot::READ | Prot::WRITE,
+                "[svcdone-body-ring]",
+            );
+            let nt = mmu.heap_alloc(
+                unicorn,
+                DEPTH * 0x40,
+                Prot::READ | Prot::WRITE | Prot::EXEC,
+                "[svcdone-tramp-ring]",
+            );
+            (nb, nt)
+        } else {
+            (b, t)
+        };
+        let slot = (rr + 1) % DEPTH;
+        cell.set((b, t, slot));
+        (b + slot * 0x40, t + slot * 0x40)
+    });
+    let child = mmu_arc
+        .lock()
+        .unwrap()
+        .arena_alloc(unicorn, 0x4000, "[svcdone-stack]");
     if body_mem == 0 || child == 0 || tramp == 0 {
         return false;
     }

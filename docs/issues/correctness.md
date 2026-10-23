@@ -4285,3 +4285,37 @@ Next step (fresh session): trace one GOOD f-accept frame end-to-end from
 its poster to the consumer's enChkErrInf leg and find the equivalent
 poster BAD lacks (CCS 0x0180 RegisterConf for the nav-server services vs
 `hosted` suppression of the CCS answer lane by the new provider procs).
+
+## r799n36b: the "global coma at t~39.5 s" was a Unicorn section overflow (SIGABRT), not a stall
+
+Every recent BAD run went 100% silent at t~39.5 s regardless of what the
+cascade did (n296/n297/n298 all cut logging at 39.1-39.6 s of 75/95 s
+budgets).  With stdout redirected to a FILE (no `tr -d '\0'` pipe - the pipe
+buffer swallowed the abort banner in the piped runs!) n299_1 caught it:
+
+```
+nissan_connect3_emulator: ./qemu/exec.c:837: phys_section_add:
+Assertion `map->sections_nb < TARGET_PAGE_SIZE' failed.   (SIGABRT, core)
+```
+
+Cause: `guest_call_bhandle_svcdone` heap_alloc'ed THREE fresh unicorn memory
+regions (body+stack+tramp) per retry; the svcdone pending-leg re-fires up to
+200x per key - 371 spawns in n299 ~= 1100 permanent regions, and unicorn's
+static section table caps at 4096 (regions are NEVER freed; r799n33zr already
+learned this for arena stacks).  The s9 tail - where svcdone retries pile up
+- always died right as it started, poisoning every tail measurement since the
+retry legs existed (era lottery partially included "did the poison key's
+retry storm hit 4096 early or late").
+
+Fix (fidelity-neutral, host-side): body + tramp now come from two 64-slot
+rings allocated ONCE (2 regions total; wrap reuses slots whose parked worker
+never completes anyway - same net effect as today's drops), the child stack
+comes from the existing arena RING (`arena_alloc`, r799n33zr).  Also tightened
+the leg's body-length guard (<0x1e || >0x3c -> skip).
+
+n300_1: full 94.9 s of logging, zero asserts, regions cap 485, wakes 10 (was
+2), rqadd max key 0x2d (was 0x26), removes max 0x1a (wall was 0x19; GOOD
+0x34), post-40 s the system is ALIVE (svcdone x53, f-accept x52, post8/notify
+x26, subhand reached reqid 0x26).  sp2res still 0 -> the next layer of the
+tail.  ALWAYS run BAD with `> file 2>&1` at least once per session - pipes
+hide SIGABRT banners.
