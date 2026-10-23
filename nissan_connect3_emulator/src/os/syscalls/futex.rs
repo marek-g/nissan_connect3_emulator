@@ -87,6 +87,13 @@ pub fn futex(
                         unicorn.get_data().thread_id(),
                         deadline.map(|d| d.duration_since(Instant::now()).as_millis() as u64),
                     );
+                    // r799n44: remember which id-words hosts waiters so the
+                    // state-9 answer lanes can kick exactly those words.
+                    if let Ok(mut w) = PARK_WORDS.lock() {
+                        if !w.contains(&uaddr) && w.len() < 48 {
+                            w.push(uaddr);
+                        }
+                    }
                     log_futex_backtrace(unicorn, uaddr);
                     // word is in shared memory: register globally so another
                     // process' FUTEX_WAKE can signal it; this process' host
@@ -192,6 +199,42 @@ pub fn futex(
     );
 
     res
+}
+
+/// r799n44: words on which some guest thread has registered a shared futex
+/// wait (SHM-WAIT).  The state-9 answer kick iterates these.
+static PARK_WORDS: std::sync::LazyLock<std::sync::Mutex<Vec<u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Snapshot of the id-words with known parked waiters.
+pub fn shm_parked_wait_words() -> Vec<u32> {
+    PARK_WORDS.lock().map(|w| w.clone()).unwrap_or_default()
+}
+
+/// r799n44: host-side kick used by the state-9 answer lanes - wakes every
+/// waiter parked on the given shared id-word (FUTEX_WAKE INT_MAX), mirroring
+/// GOOD's dense wake storm that the guest's wake(val=1) cannot reproduce
+/// through the emulator's spawn-herd wait queues.  Returns the waiter count
+/// (0 when the word is not shared memory in this VM).
+pub fn wake_all_shared_waiters(unicorn: &Unicorn<'_, Context>, uaddr: u32) -> usize {
+    let key = match shm_futex_key(unicorn, uaddr) {
+        Some(k) => k,
+        None => return 0,
+    };
+    let namespace = unicorn.get_data().namespace.clone();
+    let count = namespace.lock().unwrap().futex_wake_all_sh(&key);
+    if count > 0 {
+        log::warn!(
+            "futex: ANSWER-KICK word {:#x} key {:#?} woke-all {} t={} thread [{}]",
+            uaddr,
+            key,
+            count,
+            crate::libs::dapi::emu_t0_elapsed_ms(),
+            unicorn.get_data().thread_id(),
+        );
+        namespace.lock().unwrap().notify_waiters();
+    }
+    count
 }
 
 /// wake at most `val` blocked waiters of the futex at `uaddr`

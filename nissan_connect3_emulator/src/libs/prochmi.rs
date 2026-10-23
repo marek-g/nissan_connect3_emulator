@@ -830,6 +830,36 @@ pub fn rqkey_find(svc: u16, func: u16) -> Option<u16> {
     })
 }
 
+/// r799n44: after a fabricated state-9 answer lands, wake EVERY waiter parked
+/// on the shared id-words (FUTEX_WAKE INT_MAX).  The guest completer only
+/// wakes one waiter per completion; the re-fire lanes have parked hundreds of
+/// svcdone workers per key (GOOD: a dozen), so a single wake almost never
+/// pops the worker whose slot was just filled and the completion domino dies
+/// (n307-n311: 1300 parked, 18 woke=1 events, keys 0x2e-0x33 never removed).
+/// Waking all is legitimate futex semantics - every worker re-checks its own
+/// slot, the owner runs the leg, the rest re-park.  EMU_S9_ANSWER_WAKE=0 off.
+fn s9_answer_kick(uc: &mut Unicorn<'_, Context>) {
+    if std::env::var("EMU_S9_ANSWER_WAKE").map(|v| v == "0").unwrap_or(false) {
+        return;
+    }
+    if crate::libs::dapi::emu_t0_elapsed_ms() < 32_000 {
+        return;
+    }
+    let words = crate::os::syscalls::futex::shm_parked_wait_words();
+    let mut total = 0usize;
+    for w in &words {
+        total += crate::os::syscalls::futex::wake_all_shared_waiters(uc, *w);
+    }
+    if total > 0 {
+        log::warn!(
+            "PROCHMI s9-answer-kick: woke-all {total} waiter(s) on {} park-word(s) t={}ms tid=[{}]",
+            words.len(),
+            crate::libs::dapi::emu_t0_elapsed_ms(),
+            uc.get_data().thread_id(),
+        );
+    }
+}
+
 /// r799n33zf: set when a fresh member key entered `SVCDONE_PENDING`; the
 /// completion ticker (normally 1 Hz, the SENSORFI broadcast cadence) runs
 /// an extra round immediately so the answer + wake reach the parked enavi
@@ -7886,6 +7916,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             log::info!(
                                 "[LIBOSAL-MBX] gate svc 0x000a txn {ordinal} func {f18g:#x}: direct answer route {route}"
                             );
+                            s9_answer_kick(uc);
                         }
                     } else if matches!(svc, 0x0006 | 0x001e | 0x0018 | 0x001f | 0x002c | 0x000d | 0x0300) {
                         // one push per (service, transaction ordinal); a
@@ -7917,6 +7948,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                     uc, svc as u16, ordinal,
                                 );
                             }
+                            s9_answer_kick(uc);
                             // r799n30: members are REMOVEd from the request
                             // table only by optype-8 conf answers (n176:
                             // keys 4,5,a removed by DAPI's genuine confs,

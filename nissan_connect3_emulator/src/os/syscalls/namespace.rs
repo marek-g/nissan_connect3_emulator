@@ -148,6 +148,19 @@ impl SystemNamespace {
         Some(waiter.uaddr)
     }
 
+    /// r799n44: signal EVERY pending waiter of a shared futex word (the kernel
+    /// FUTEX_WAKE INT_MAX semantic).  The state-9 svcdone workers all park on
+    /// one id-word and the guest only ever wakes one per completion, so with
+    /// the emulator's re-fire spawn herds (hundreds of parked workers per
+    /// key, GOOD had a dozen) the single wake almost never pops the waiter
+    /// whose slot the completer just filled - the domino dies after ~18 hops
+    /// (n307-n311).  Kicking the whole word after a fabricated answer lets
+    /// every parked worker re-check its own slot, exactly like GOOD's dense
+    /// wake storm did; workers with an empty slot just re-park.
+    pub fn futex_wake_all_sh(&mut self, key: &(String, u32)) -> usize {
+        self.futex_wake_shared(key, usize::MAX)
+    }
+
     /// Signal up to `val` pending waiters of a shared futex word. Returns how
     /// many were marked; the caller rings the process doorbells (via
     /// `notify_waiters`) so the owners reap them.
