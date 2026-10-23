@@ -87,11 +87,23 @@ pub fn futex(
                         unicorn.get_data().thread_id(),
                         deadline.map(|d| d.duration_since(Instant::now()).as_millis() as u64),
                     );
-                    // r799n44: remember which id-words hosts waiters so the
-                    // state-9 answer lanes can kick exactly those words.
-                    if let Ok(mut w) = PARK_WORDS.lock() {
-                        if !w.contains(&uaddr) && w.len() < 48 {
-                            w.push(uaddr);
+                    // r799n44/r799n49d: remember which id-words hosts
+                    // waiters - but ONLY when the parker is a svcdone
+                    // worker (TIDKEY).  The unscoped recording let the
+                    // answer-kick storm the OSAL sync-pool parks (SpmEvEnd,
+                    // license, AE dispatch - the r776/r777 zero-word set
+                    // that keeps the state-6/8 lanes alive): n322/n323
+                    // boots died EARLIER the more the kick fired.  The
+                    // svcdone id-words are the only legitimate kick target.
+                    if TIDKEY
+                        .lock()
+                        .map(|m| m.contains_key(&thread_id))
+                        .unwrap_or(false)
+                    {
+                        if let Ok(mut w) = PARK_WORDS.lock() {
+                            if !w.contains(&uaddr) && w.len() < 48 {
+                                w.push(uaddr);
+                            }
                         }
                     }
                     log_futex_backtrace(unicorn, uaddr);
