@@ -4857,3 +4857,34 @@ n310_1 state of the art (all fixes on):
   lesson is untouched.  Success markers n330: no nosub on trio reqids,
   st2c-p1 r0=1, cmp1f-b/cmp0a/cmp300 + sp2* first firings, rqadd keys
   past 0x1a (traffic era), and eventually s9cascade final.
+
+## r799n54 RESULT (n330): trio passes, cmp1f-b + the sp2 ISSUER run; new walls = batch-2 conversion + procmapengine SQL storm
+
+- 2/3 boots (n330_1/3): st2c polls p1/p2/p3 pass (act1 completes - the
+  self-destruct is gone), **cmp1f-b fires** and the walk enters the trio-2
+  ISSUER (sp2acc->sp2o->sp2g*/sp2i*/sp2act*->sp2p1->sp2res->sp2s1->sp2a):
+  trio-2 registers the SECOND property batch, keys 0x1b-0x2f+ (svc-0x1f
+  funcs 0x106/0x121/0x103/0x141/0x105/0x143/0x122/0x1a1/0x181/0x152/... -
+  the map/traffic property set GOOD also registers; GOOD's own log ENDS at
+  ~45 s so beyond cmp1f-b/cmp2c-b there is NO golden reference anymore).
+  rqadd max 0x2d-0x2f (was 0x1a), removes uniq 39-46 (was 26).
+- New wall A: sp2 poll1 fails - the polled action (0x3a29348 = key 0x1b,
+  func 0x106) sits at state=1.  Keys 0x1b+ DO spawn legs (16-18 each =
+  refire churn) and ANSWER-EVENT kicks fire (26, escalating 4->252 woken),
+  but the batch-2 keys never reach bonr (bonr func census has NO
+  0x106/0x121/...; svc-1f bonr=20 are batch-1 keys).  Under investigation:
+  conversion of the later batch vs the VM-lock hog below.
+- New wall B (perf): procmapengine (tid-150) storms word 0x400195c8
+  (shm file:0x32 off 103880 = the procsql job queue) at ~6k wakes/s from
+  t~28 s on (401k total in n330_1, all `woke 0`, 5 log lines each).
+  n330_3 has NO storm - it correlates with the batch-2 map answers
+  actually landing (map-init SQL phase).  procsql_out.out is SPAWNED in
+  BAD (a genuine start-proc callback at t=15 s) while GOOD never spawned
+  it in its 45 s window - new territory, GOOD log cannot arbitrate.
+  procsql's worker parks on the SAME (file,off) key the storm wakes, so
+  it is not a key-string mismatch; the `woke 0` means the worker was
+  elsewhere at wake time (or the queue lane it consumes is not the one
+  procmapengine feeds).  TODO: trace one job end-to-end.
+- r799n55: SHM-WAKE zero-hit wakes throttled per word (5 s + dup count),
+  every productive wake still logged.  Pure log/VM-lock relief, no
+  behavior change.

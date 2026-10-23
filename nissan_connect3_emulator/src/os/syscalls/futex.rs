@@ -194,14 +194,43 @@ pub fn futex(
                     .lock()
                     .unwrap()
                     .futex_wake_shared(&key, val as usize);
-                log::info!(
-                    "futex: SHM-WAKE word {:#x} key {:#?} woke {} t={} thread [{}]",
-                    uaddr,
-                    key,
-                    count,
-                    crate::libs::dapi::emu_t0_elapsed_ms(),
-                    unicorn.get_data().thread_id(),
-                );
+                // r799n55: throttle repeated ZERO-hit wakes on the same
+                // word.  n330_1: procmapengine's SQL doorbell fired
+                // ~6k/s for 60 s straight (400k wakes) after the batch-2
+                // map init answered; each log record costs 5 lines (the
+                // multi-line {:#?} key blob) and serializes on the VM
+                // lock.  Keep every productive wake and one line per
+                // word per 5 s of the spam, with a dup count.
+                let now = crate::libs::dapi::emu_t0_elapsed_ms();
+                static WAKE0: std::sync::LazyLock<
+                    std::sync::Mutex<
+                        std::collections::HashMap<u32, (u64, u64)>,
+                    >,
+                > = std::sync::LazyLock::new(Default::default);
+                let mut show = count > 0;
+                let mut dup = 0u64;
+                if let Ok(mut m) = WAKE0.lock() {
+                    let e = m.entry(uaddr).or_insert((0, 0));
+                    if count == 0 && now.saturating_sub(e.0) < 5_000 {
+                        e.1 += 1;
+                    } else {
+                        dup = e.1;
+                        e.0 = now;
+                        e.1 = 0;
+                        show = true;
+                    }
+                }
+                if show {
+                    log::info!(
+                        "futex: SHM-WAKE word {:#x} key {:#?} woke {} (+{} dup) t={} thread [{}]",
+                        uaddr,
+                        key,
+                        count,
+                        dup,
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        unicorn.get_data().thread_id(),
+                    );
+                }
                 // ring every doorbell so each parked owner reaps its signaled waiter
                 namespace.lock().unwrap().notify_waiters();
                 count as u32
