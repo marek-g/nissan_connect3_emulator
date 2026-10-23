@@ -6596,6 +6596,13 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         uc.get_data().inner.thread_id(),
                     );
                 }
+                if name == "final" {
+                    // r799n58: the cascade leaving state 9 repaints the HMI
+                    // (popup state gone, main view final); the app idles
+                    // GL-free afterwards, so drive a few host-side presents
+                    // of what the guest rendered (presentation only).
+                    arm_touch_present_window(4_000);
+                }
                 if matches!(
                     name,
                     "sp2act1"
@@ -15598,6 +15605,7 @@ fn force_display_manager_dirty(unicorn: &mut Unicorn<'_, Context>, base_address:
 /// `forced` branches, which already arm their own guest call.
 fn drain_gui_touch_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
     inject_scripted_touch_test();
+    keep_touch_presents_flowing();
     if TOUCH_POST_DUMP.swap(0, Ordering::Relaxed) == 1 {
         let base = PROCHMI_BASE.load(Ordering::Relaxed);
         let slot = read_u32(unicorn, base + GOT_GUI_MENU_MANAGER_INSTANCE);
@@ -15964,10 +15972,35 @@ fn inject_scripted_touch_test() {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::input::push_touch(crate::input::TouchKind::Press, x, y);
     crate::input::push_touch(crate::input::TouchKind::Release, x, y);
+    // r799n58: once the startup cascades end the app idles GL-free (the
+    // r768 note), so a tap's widget repaint would never reach the window.
+    // Open a short re-arming window on the one-shot present flag -
+    // presentation only, the surface content stays exactly as the guest
+    // rendered it (same rule as the popup-uninit fix266 present).
+    arm_touch_present_window(1_500);
     log::info!(
         "PROCHMI: touch-test tap #{index} scheduled ({x},{y}) at {due_ms}ms (now {now}ms)"
     );
 }
+
+/// r799n58: re-arm the GPU thread's one-shot present flag while a post-tap
+/// presentation window is open (called from the GUI mainloop pump).
+pub fn keep_touch_presents_flowing() {
+    let until = TOUCH_PRESENT_UNTIL.load(std::sync::atomic::Ordering::Relaxed);
+    if until != 0
+        && (crate::libs::dapi::emu_t0_elapsed_ms() as u64) < until
+    {
+        crate::gpu::request_forced_present();
+    }
+}
+
+/// r799n58: open the presentation window after a scripted tap.
+pub fn arm_touch_present_window(ms: u64) {
+    let now = crate::libs::dapi::emu_t0_elapsed_ms() as u64;
+    TOUCH_PRESENT_UNTIL.store(now + ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+static TOUCH_PRESENT_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// All hardwired keys the host keyboard bridge supports, with the
 /// `EMU_KEY_TEST` / parse name for each.
