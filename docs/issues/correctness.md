@@ -4979,3 +4979,22 @@ n310_1 state of the art (all fixes on):
   +9 s (2x scale 704,458) - the tap pair also resolves the panel/widget
   coordinate-space question (the window dumps show the HMI in the top-left
   400x240 of the 800x480 framebuffer).
+
+## r799n59: the parked GUI mainloop never sees input - wake it like real HSI does
+
+- n339 (anchor=final): the scripted taps NEVER fired although the cascade
+  completed (final@51.3 s) - the last `clGUIWidgetEngine::bGUIMainloop`
+  iteration ran at t=39.5 s.  The EMU_TOUCH_TEST injector, the touch queue
+  drain AND live SDL clicks all hang off that loop's entry hook; once the
+  startup cascades end the loop parks (GetEvent-style sleep) and nobody
+  consumes input.  On the real device a touch sample arrives as an HSI
+  message whose queue-post WAKES the park, so the authentic emulator-side
+  counterpart is a wake, not a poll.
+- r799n59: `tick()` (scheduler-driven, alive past the loop) grew a
+  touch-wake lane: if S9_CASCADE_DONE and (input queued or a scripted tap
+  is due) and the loop has been silent >=700 ms, doorbell GUI_LOOP_TID via
+  scheduler::nudge_blocked_thread (fake lost-wake token on its futex word,
+  or force-post the OSAL event it waits on).  Same fabrication class as
+  s9-nudge, gated to post-final so it can never poison the member eras.
+  EMU_TOUCH_ANCHOR=final semantics tightened: schedule seconds are now
+  "after final" (base = S9_DONE_MS, stamped at the final site).
