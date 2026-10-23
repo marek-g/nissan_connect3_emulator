@@ -14162,6 +14162,8 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                         }
                         crate::emulator::scheduler::NudgeOutcome::NotBlocked =>
                             "not parked".into(),
+                        crate::emulator::scheduler::NudgeOutcome::TimedOut =>
+                            "osal-park timed-out".into(),
                     };
                     log::warn!(
                         "PROCHMI touch-wake: doorbell GUI loop tid {tid} t={}ms ({detail})",
@@ -14246,6 +14248,7 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                                     );
                                 }
                                 crate::emulator::scheduler::NudgeOutcome::NotBlocked => {}
+                                crate::emulator::scheduler::NudgeOutcome::TimedOut => {}
                             }
                         }
                     }

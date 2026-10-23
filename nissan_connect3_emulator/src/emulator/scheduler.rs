@@ -764,6 +764,11 @@ fn set_runnable(unicorn: &mut Unicorn<'_, Context>, tid: u32, result: Option<u32
 pub enum NudgeOutcome {
     NotBlocked,
     Nudged(Option<u32>),
+    /// r799n61: the thread sat in a host-backed OSAL queue receive; the
+    /// nudge armed a past deadline so the receive returns -ETIMEDOUT at the
+    /// next reap (exactly what a real timed GetEvent poll does between
+    /// messages on the device).
+    TimedOut,
 }
 
 pub fn nudge_blocked_thread(unicorn: &mut Unicorn<'_, Context>, tid: u32) -> NudgeOutcome {
@@ -790,6 +795,29 @@ pub fn nudge_blocked_thread(unicorn: &mut Unicorn<'_, Context>, tid: u32) -> Nud
                 thread.status = ThreadStatus::Runnable;
                 thread.pending_result = None;
                 shared_id = Some(id);
+            }
+            // r799n61: an OSAL queue park (the GUI mainloop's GetEvent) is
+            // not futex-nudgeable; arm an expired deadline instead - the
+            // next scheduler reap runs finish_guest_wait with `deadline <=
+            // now` and hands the guest an empty receive (-ETIMEDOUT), the
+            // same iteration a real timed poll performs between messages.
+            ThreadStatus::Blocked(BlockReason::OsalQueueReceive {
+                queue_id,
+                msg_ptr,
+                msg_len,
+                prio_ptr,
+                deadline: _,
+                materialize,
+            }) => {
+                thread.status = ThreadStatus::Blocked(BlockReason::OsalQueueReceive {
+                    queue_id,
+                    msg_ptr,
+                    msg_len,
+                    prio_ptr,
+                    deadline: Some(Instant::now()),
+                    materialize,
+                });
+                return NudgeOutcome::TimedOut;
             }
             _ => return NudgeOutcome::NotBlocked,
         }
