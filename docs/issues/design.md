@@ -3114,3 +3114,19 @@ frames); no execution inside guest processes. Feasible in 4 steps:
 What likely stays hooked regardless: nothing functional, unless a drain
 precondition turns out genuinely unfixable at wire level - each such
 case must be logged as a fidelity deviation in correctness.md.
+
+## GUI goal (user, 2026-10-23): Menu -> "New address" -> keyboard city entry
+
+Target interaction chain on the emulated HMI: tap the softkey "Menu" on the
+radio/main screen -> main menu screen -> Navigation section -> "New address"
+(may raise a popup) -> the address-entry keyboard screen must open and accept
+city-name text.  Input plumbing already genuine: SDL mouse -> panel 800x480
+-> GUI_TouchPad_vPressed/vReleased (guest code untouched), scripted taps via
+EMU_TOUCH_TEST="secs:x:y,..." rebased to the state-9 moment, host keyboard
+hardkeys via EMU_KEY_TEST.  r799n58 added the presentation windows (forced
+present re-arm after taps and after s9cascade final) so headless runs can
+OBSERVE what the taps did (EMU_MAP_DUMP_DIR PPM dumps).
+Open question n336: the widget-space scale - the window dumps show the radio
+screen rendered into the top-left 400x240 of the 800x480 framebuffer, while
+input.rs defines a 800x480 panel.  n336 taps the Menu button at BOTH scales
+(352,229 and 704,458) to find which one the hit-test accepts.
