@@ -4888,3 +4888,21 @@ n310_1 state of the art (all fixes on):
 - r799n55: SHM-WAKE zero-hit wakes throttled per word (5 s + dup count),
   every productive wake still logged.  Pure log/VM-lock relief, no
   behavior change.
+
+## r799n55 RESULT (n331): log throttle unlocked the traffic era - cmp0a reached
+
+- Pure logging relief (zero-hit SHM-WAKE 5s/dup throttle) flipped the
+  whole tail: n331_1 ran ALL THREE sp2 polls green (sp2p1/p2/p3 + sp2a/b/c
+  -> the trio-2 traffic actions complete now) and the walk reached
+  **cmp0a** (41x).  n331_3 even minted to key 0x41 with 65 unique removes
+  (GOOD's unique remove count is 52) and 24 batch-2 bonrs.  Storm records
+  400k -> 15-118 lines.  Wall A (batch-2 conversion) was largely VM-lock
+  starvation behind the log spam, plus refire racing.
+- Next silent exit: cmp0a r0=1 EVERY pass -> branches into the svc-0x0a
+  STEP (0x17c6820) and never returns to the chain (no cmp152/56/300/...).
+  Disasm: same shape as the 2c step but with SIX getters
+  (0x1617e64/edc/ee4/df8/0f8/108) - issue vfn+0x24 x6 then poll vfn+0x18
+  x6 (!=0), six[0] = [singleton+0x28]; failed poll -> silent 0x17c64bc.
+- r799n56: 15 st0a-* sites on the same live page hook (acc/hex/act1-6/
+  p1-p6/fb + ACT dumps for the six).  n332 will show which of the six
+  traffic-suite actions never completes and what svc/func they carry.
