@@ -7744,7 +7744,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         // anti-pre-empt rule r799n33zc imposed on mint
                         // pairing, now enforced per-transaction.
                         let f18s =
-                            (read_u32(uc, entry.wrapping_add(0x18)) & 0xffff) as u16;
+                            (read_u32(uc, entry.wrapping_add(0x22)) & 0xffff) as u16;
                         match rqkey_find(svc as u16, f18s).filter(|k| {
                             matches!(rqkey_owner(*k), Some((s, f)) if s == svc as u16 && f == f18s)
                         }) {
@@ -7826,11 +7826,17 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         // issued from the rqadd-recorded live binding when
                         // r1 does not carry it (traffic-era stores pass the
                         // owner back-pointer; n305 keys 46/48/50 got txn 0
-                        // and thus NO answer at all).  Trust the recovery
-                        // only while the key is live and still owned by
-                        // this very service (r799n33zc anti-pre-empt rule).
+                        // and thus NO answer at all).  The conf-store entry
+                        // IS the action object (rqadd act == store entry,
+                        // n306: 0x3a2b2f0), so the func sits at +0x22 next
+                        // to the svc at +0x20 - NOT at +0x18, which holds
+                        // the mint counter's tail (r799n42 lesson: f18
+                        // 0x9ab9.. was a counter, silently killing the
+                        // lookup).  Trust the recovery only while the key
+                        // is live and still owned by this very service
+                        // (r799n33zc anti-pre-empt rule).
                         let f18g =
-                            (read_u32(uc, entry.wrapping_add(0x18)) & 0xffff) as u16;
+                            (read_u32(uc, entry.wrapping_add(0x22)) & 0xffff) as u16;
                         let ordinal = rqkey_find(0x000a, f18g)
                             .filter(|k| matches!(rqkey_owner(*k), Some((0x000a, _))))
                             .unwrap_or(ordinal as u16) as u16;
@@ -7924,7 +7930,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             if svc != 0x000a
                                 && crate::libs::dapi::emu_t0_elapsed_ms() >= 32_000
                             {
-                                let f18 = read_u32(uc, entry.wrapping_add(0x18)) & 0xffff;
+                                let f18 = read_u32(uc, entry.wrapping_add(0x22)) & 0xffff;
                                 crate::libs::libosal_linux::message::fabricate_fi_conf_complete(
                                     uc, svc as u16, ordinal, f18 as u16,
                                 );
@@ -7954,7 +7960,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                     let holder =
                                         CL_TABLE_HOLDER.load(Ordering::Relaxed);
                                     let f18b =
-                                        read_u16(uc, entry.wrapping_add(0x18));
+                                        read_u16(uc, entry.wrapping_add(0x22));
                                     let mut bb = [0u8; 0x22];
                                     bb[0xb] = 0x45;
                                     bb[0x0e..0x10]
@@ -13377,8 +13383,21 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                     }
                 }
                 if !again.is_empty() {
+                    // r799n42 diag: are the answer frames sitting in the
+                    // queues while the consumers pop only the connector
+                    // kicks?  depth(usize::MAX)=queue missing.
+                    let (hdepth, mdepth) = {
+                        let st = unicorn.get_data().namespace.lock().unwrap();
+                        let d = |n: &str| {
+                            st.mq.queue_id_for_name(n)
+                                .and_then(|q| st.mq.queues.get(&q))
+                                .map(|q| q.messages.len())
+                                .unwrap_or(usize::MAX)
+                        };
+                        (d("HMINavServerLib_1"), d("mbx_289"))
+                    };
                     log::warn!(
-                        "PROCHMI s9-svcdone-refire: {} pending key(s) re-armed t={}ms ({})",
+                        "PROCHMI s9-svcdone-refire: {} pending key(s) re-armed t={}ms ({}) queue-depth HMINavServerLib_1={hdepth} mbx_289={mdepth}",
                         again.len(),
                         crate::libs::dapi::emu_t0_elapsed_ms(),
                         again.iter()
