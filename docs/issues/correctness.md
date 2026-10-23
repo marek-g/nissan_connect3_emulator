@@ -4687,3 +4687,23 @@ n310_1 state of the art (all fixes on):
   (namespace::futex_wake_slice), matching GOOD's ~46 wakes/s storm density.
   Success markers unchanged: removes past 0x21/0x2d, vfn10 for 1f keys,
   vOnUpdate*Traffic* > 0, s9cascade final.
+
+## r799n49b/c: the wake-engine model (n321/n322 corrected the drought theory)
+
+- n321 (slice-wake 48/word/round, owner-scoped, 1 Hz spawn): guest hand-off
+  wakes EXPLODED (n321_2: 454 woke=1 per 10 s at t=70 vs n320_on's 75 in 55
+  s) - the slice-kick seeds the storm and the legs chain it. removes 252
+  (x5 of n320_on) but all on re-registered <=0x1a keys of that boot's era.
+- n322 (spawn 1-in-4 to 'fix inflow'): 3/3 boots died EARLIER (state-8
+  svc-1e). Theory corrected: the parked herd is the completion WORKFORCE
+  (each woken leg self-completes its own key - GOOD tid-524 chain), not an
+  obstacle. Wakes are the fuel; spawns keep the tank full.
+- r799n49c: cadence back to every round; per-round kick now wakes the whole
+  prochmi-owned herd per recorded id-word (usize::MAX slice; owner scope
+  kept, priority scoping of r799n48b kept).
+- The remaining gap vs GOOD is virtual-TIME BANDWIDTH: GOOD finished the
+  whole cascade (0x2-0x33 + callbacks) inside ~6 virtual s after ctor
+  (37.6->44.0 s); BAD needs >60 s at 1 Hz rounds. If n323 still trickles,
+  next lever = round rate (100 ms pulse throttle lanes) or the watchdog
+  reaper (20 s) cutting legs out mid-chain (r799n47 made them re-register,
+  but each reap costs the leg its place in the storm).
