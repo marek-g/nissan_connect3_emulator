@@ -3940,3 +3940,21 @@ would re-arm the collision - the answer for our transaction already went
 missing once, completing it later with the wrong lifetime is not worth
 the risk).  Ownerless keys pass (f240 key-0 members).  EMU_FI_PUSH_OWNER-
 GUARD=0 restores unguarded pushes for diagnostics.
+
+## r799n33zd: the era fix exposed the QEMU section cap - guest-call stacks now arena-allocated
+
+With the state-6/9 chain healed (n33zc), runs walked 4->5->6->7->8->9 for
+the first time since the era chase began (n271: 4/6 reached state 9!) -
+and then the EMULATOR itself aborted mid-run:
+`phys_section_add: assert map->sections_nb < TARGET_PAGE_SIZE` at ~42 s
+(also present in the old GOOD reference n264_11, which is why GOOD eras
+never lived long enough to show their tail).  Diagnostics (TRIGGER log):
+the prochmi VM sits at ~528 permanently unmergeable regions (EXEC/shared)
+that sever the mergeable [heap] runs, while the state-9 cascade posts
+~one guest-call per completion leg - each `spawn_guest_call` mapped its
+stack as a FRESH mmu region, and the defragmenter (threshold 500, runs
+1081x in a crash run) cannot shrink past the fragments fast enough.
+
+Fix: `Mmu::arena_alloc` - one 16 MiB mapping per arena, stacks bump-cut
+from it (1 region per 1024 stacks); `spawn_guest_call` uses it.  Total new
+regions for the whole cascade: 2-3.

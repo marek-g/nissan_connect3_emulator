@@ -55,6 +55,14 @@ pub struct Mmu {
     regions: Vec<MmuRegion>,
     pub brk_mem_end: u32,
     pub heap_mem_end: u32,
+    /// r799n33zd: bump cursor inside the current guest-call stack arena (see
+    /// [`Mmu::arena_alloc`]); `arena_end` marks its last byte.  One arena is
+    /// ONE mmu region, so hundreds of `spawn_guest_call` invocations (the
+    /// state-9 svcdone cascade posts one per completion leg) no longer add
+    /// one QEMU section each - the n271/n272 runs blew the flatview cap
+    /// (`phys_section_add` assert) at ~42 s that way.
+    arena_next: u32,
+    arena_end: u32,
 }
 
 impl Mmu {
@@ -63,7 +71,41 @@ impl Mmu {
             regions: Vec::new(),
             brk_mem_end: 0u32,
             heap_mem_end: 0u32,
+            arena_next: 0,
+            arena_end: 0,
         }
+    }
+
+    /// r799n33zd: hand out `size` bytes from a bump arena carved out of ONE
+    /// 16 MiB mapping (a fresh arena is mapped through `heap_alloc` when the
+    /// current one runs dry).  Callers that allocate short-lived stacks per
+    /// fabricated guest-call must use this instead of `heap_alloc`: each
+    /// `heap_alloc` is a QEMU memory region, and the section cap (4096) is
+    /// reached long before the mmu-side defragment can keep the list small
+    /// enough (the merge cannot fuse runs severed by the ~500 permanent
+    /// EXEC/shared regions of a live process).
+    pub fn arena_alloc(
+        &mut self,
+        unicorn: &mut Unicorn<'_, Context>,
+        size: u32,
+        desc: &str,
+    ) -> u32 {
+        const ARENA_SIZE: u32 = 0x0100_0000; // 16 MiB = 1024 x 16 KiB stacks
+        let size = mem_align_up(size, None);
+        if size == 0 || size >= ARENA_SIZE {
+            return self.heap_alloc(unicorn, size, Prot::READ | Prot::WRITE, desc);
+        }
+        if self.arena_next == 0 || self.arena_end - self.arena_next < size {
+            let base = self.heap_alloc(unicorn, ARENA_SIZE, Prot::READ | Prot::WRITE, desc);
+            if base == 0 {
+                return 0;
+            }
+            self.arena_next = base;
+            self.arena_end = base + ARENA_SIZE;
+        }
+        let at = self.arena_next;
+        self.arena_next += size;
+        at
     }
 
     pub fn region_count(&self) -> usize {
@@ -397,6 +439,36 @@ impl Mmu {
     fn defragment(&mut self, unicorn: &mut Unicorn<'_, Context>) {
         if self.regions.len() < 500 {
             return;
+        }
+        // r799n33zd: crash diagnostics - n271 runs hit the flatview cap
+        // (`phys_section_add` assert) at ~42 s while the region list should
+        // have been kept near 500; log WHO is at the trigger and how much of
+        // the list the merger cannot touch (EXEC or shared_key regions are
+        // skipped) before merging anything.
+        {
+            let unmergeable = self
+                .regions
+                .iter()
+                .filter(|r| (r.memory_perms & Prot::EXEC) != Prot::NONE || r.shared_key.is_some())
+                .count();
+            let mut desc_counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for r in &self.regions {
+                *desc_counts.entry(r.description.as_str()).or_default() += 1;
+            }
+            let mut top: Vec<_> = desc_counts.into_iter().collect();
+            top.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            log::warn!(
+                "mmu defragment TRIGGER vm={} regions={} unmergeable={} top={}",
+                unicorn.get_data().elf_path.rsplit('/').next().unwrap_or("?"),
+                self.regions.len(),
+                unmergeable,
+                top.iter()
+                    .take(5)
+                    .map(|(d, n)| format!("{d}:{n}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
         }
         self.regions.sort_unstable_by_key(|r| r.memory_start);
         let mergeable = |r: &MmuRegion| {

@@ -2048,7 +2048,7 @@ pub fn spawn_guest_call(
     };
     let stack = {
         let mut mmu = mmu.lock().unwrap();
-        mmu.heap_alloc(unicorn, size, Prot::READ | Prot::WRITE, "guest-call-stack")
+        mmu.arena_alloc(unicorn, size, "guest-call-stack")
     };
     if stack == 0 {
         return 0xffff_ffff;
