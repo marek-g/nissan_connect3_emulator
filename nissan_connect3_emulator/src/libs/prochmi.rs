@@ -1480,6 +1480,30 @@ crate::os::code_stub::trap_site(unicorn, lua_prepare_call, crate::os::code_stub:
 
             if !forced {
             let gui = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            // r799n60: DIAGNOSTIC GUARD.  From t~38.3 s on (in GOOD too,
+            // n264_11 vs n340_2 identically) bGUIMainloop is entered with
+            // this=0xe - the static widget-engine object at singleton slot
+            // 0x2a18da4 (vtable clGUIWidgetEngine 0x401d34) has been
+            // overwritten with 0xe and its [r7,#0x3d] display_mode read
+            // then READ_UNMAPPED-kills the caller.  Until the writer is
+            // found: fingerprint the callers, skip OUR passes on the dead
+            // object (guest call into 0xe+... would fault the same way)
+            // and let the guest follow its own fate.
+            if gui < 0x1000 {
+                let lr = uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32;
+                static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
+                    log::warn!(
+                        "PROCHMI bGUIMainloop DEAD-THIS t={}ms tid=[{}] this={:#x} lr={:#x} sp={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        gui,
+                        lr,
+                        uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32,
+                    );
+                }
+                return 0;
+            }
             if gui != 0 {
                 GUI_ENGINE_ADDRESS.store(gui, Ordering::Relaxed);
             }
