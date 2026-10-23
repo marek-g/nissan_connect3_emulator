@@ -8095,9 +8095,34 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                     // live subscriber - only the owning
                                     // one flips (see alt_done_cookies).
                                     let mut cookies = vec![cookie];
-                                    cookies.extend(alt_done_cookies(
-                                        uc, holder, cookie,
-                                    ));
+                                    // r799n54: the alt-cookie fan-out is
+                                    // SELF-DESTRUCTIVE in state 9.  n329_1:
+                                    // key 0x18 (svc-0x2c func 0x1, the cmp
+                                    // gate's poll victim) got its entry
+                                    // REMOVED at t=42605 by the foreign
+                                    // cookie=0x2 optype-9 leg (nosub path:
+                                    // entry found, pFindSubscriber miss ->
+                                    // the leg still runs the completer and
+                                    // removes) 55 ms before the owner
+                                    // cookie=0x1 leg could complete -> the
+                                    // action stuck at state 1, st2c poll 1
+                                    // fails forever, the cascade cannot
+                                    // reach trio-2.  GOOD had NO nosub on
+                                    // trio keys: its holder saw a single
+                                    // live subscriber then, so GOOD never
+                                    // fired alt legs - the fan-out only
+                                    // ever fires in BAD's richer subscriber
+                                    // state and always into foreign slots.
+                                    // Other eras keep it (r799n33q/n254:
+                                    // the state-6 member plane needed the
+                                    // wide cookie net).
+                                    if crate::libs::libosal_linux::message::hmi_fsm_state()
+                                        != 9
+                                    {
+                                        cookies.extend(alt_done_cookies(
+                                            uc, holder, cookie,
+                                        ));
+                                    }
                                     // r799n46: legs run with the FULL GOOD
                                     // answer body and the REAL func bound
                                     // at rqadd time (MINT_INFO; f18b is the
@@ -13621,7 +13646,14 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                     // 16 legs hit nothing.  A leg against a cookie that
                     // owns no entry is a harmless pRetrieveRequest miss.
                     let mut cookies = vec![cookie];
-                    cookies.extend(alt_done_cookies(unicorn, holder, cookie));
+                    // r799n54: see the store-time lane - foreign alt
+                    // cookies run the completer through the nosub path and
+                    // REMOVE the owner's live entry (n329_1 key 0x18).  The
+                    // state-9 cascade owns unambiguous primary cookies, so
+                    // the net stays closed there; other eras keep it.
+                    if crate::libs::libosal_linux::message::hmi_fsm_state() != 9 {
+                        cookies.extend(alt_done_cookies(unicorn, holder, cookie));
+                    }
                     // r799n33s: the blind trio is for the state-6 member
                     // era ONLY.  Thrown during the state-9 cascade it hits
                     // foreign live slots (cookie space is per-dispatcher),
@@ -13729,10 +13761,11 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                         bb[0x1a] = 9;
                         bb[0x1c..0x1e]
                             .copy_from_slice(&(key as u16).to_le_bytes());
-                        // r799n33f: fan out to every live subscriber.
-                        let mut cookies = vec![cookie];
-                        cookies
-                            .extend(alt_done_cookies(unicorn, holder, cookie));
+                        // r799n54: NO alt fan-out here - this is the
+                        // state-9 sweep by definition, and foreign cookies
+                        // run the nosub completer path that REMOVES the
+                        // owner's live entry (n329_1 key 0x18 self-destruct).
+                        let cookies = [cookie];
                         for c in cookies.iter().copied() {
                             bb[0x0e..0x10]
                                 .copy_from_slice(&(c as u16).to_le_bytes());
