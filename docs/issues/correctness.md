@@ -4437,3 +4437,36 @@ Next: trace one GOOD svc-0xa func=0x102 answer from DAPI (which queue/frame
 carries it) and check whether the request even reaches DAPI in BAD (the
 conf request POST side), then fix the request delivery OR - if the member
 answers are Triton/SD-side data - provide them at wire level.
+
+## r799n38: what the six stuck svc-0xa keys actually are (GOOD worker-1012 trace)
+
+Decoding GOOD's completed member batch (n264_11 tid 1012/1013, t=43801-43844):
+- svcdone worker for key 0x2e/func 0x102 spawns, parks (SHM-WAIT), and 31 ms
+  later wakes with a REAL msgobj (0x9171e000 = DAPI heap page): the answer
+  frame arrived while the worker waited.
+- Its completer leg (lr 0x1c7c878) dispatches the traffic-status payload and
+  the client library runs FOUR callbacks (tag 0x2714):
+  vOnUpdateTrafficMessageSourceAvailable / vOnUpdateAllTrafficMessagesStatus /
+  vOnUpdateUserTrafficMessagesStatus / vOnUpdateTrafficMsgMemoryStatistics -
+  exactly the stuck func set 0x101/0x102/0x107/0x125.  0x8000/0x8001 are the
+  generic get/complete legs.
+- So svc 0xa carries the TMC/traffic-status domain (the same service also
+  carries GpsDataStatus 0x0f02, which the fabrication lane already fakes for
+  the state-8 f02 readiness).  The real answers came from DAPI's traffic
+  module - on the unit that module is fed by the TRITON tuner/RDS side
+  ("source NOT available" is a legitimate startup answer); nothing in the
+  emulator ever delivers tuner state, so BAD's DAPI never answers and its
+  svcdone workers burn 200 retries with msgobj-less confs (BAD completer
+  never even runs for 0x101/0x102/0x107/0x125 - it DID complete func 0x106).
+- The fc_sdp/fc_ts traces seen in BAD are procvoice boot-era init (t<9 s),
+  NOT the member request handlers - red herring.
+
+Next (Ghidra-backed): find the CCS svc-0xa func handlers in DAPIAPP.OUT and
+what gates their answer (tuner state word?).  If the gate is Triton-side
+state, the sanctioned move is a wire-level "traffic source unavailable"
+ServiceData+ConfComplete fabrication for funcs {0x101,0x102,0x107,0x125,
+0x8000,0x8001} of svc 0xa (flag-gated like EMU_FI_PUSH_SVC6, logged, off by
+default; enabled only after golden-run comparison proves no real answer
+ever arrives for them).  GOOD's own unfinished 9 keys (0x300/0x2c/0x6 batch)
+sit BEHIND this batch - clearing the six should expose the final trio and
+`s9cascade final`.
