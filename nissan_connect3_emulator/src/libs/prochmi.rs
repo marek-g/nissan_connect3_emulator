@@ -1558,6 +1558,26 @@ crate::os::code_stub::trap_site(unicorn, lua_prepare_call, crate::os::code_stub:
                     }
                     gui = saved0;
                 } else {
+                    // r799n60e: second repair source - the singleton slot
+                    // itself (the write-watch proved it stays LIVE; the
+                    // slot IS the value bExecute passes as `this` at
+                    // lr=0x133c1e4, so substituting it re-creates the
+                    // genuine call state).
+                    let slotv = read_u32(uc, base_address - ORIGINAL_BASE + 0x2a18_da4);
+                    if slotv > 0x1000 {
+                        let _ = uc.reg_write(RegisterARM::R0, slotv as u64);
+                        static REP2: std::sync::atomic::AtomicU32 =
+                            std::sync::atomic::AtomicU32::new(0);
+                        let r = REP2.fetch_add(1, Ordering::Relaxed);
+                        if r < 8 || r % 512 == 0 {
+                            log::warn!(
+                                "PROCHMI bGUIMainloop DEAD-THIS repaired-slot #{r} t={}ms tid=[{}] this={gui:#x} -> {slotv:#x} lr={lr:#x}",
+                                crate::libs::dapi::emu_t0_elapsed_ms(),
+                                uc.get_data().inner.thread_id(),
+                            );
+                        }
+                        gui = slotv;
+                    } else {
                     static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
                         log::warn!(
@@ -1573,6 +1593,7 @@ crate::os::code_stub::trap_site(unicorn, lua_prepare_call, crate::os::code_stub:
                         );
                     }
                     return 0;
+                    }
                 }
             }
             if gui != 0 {
