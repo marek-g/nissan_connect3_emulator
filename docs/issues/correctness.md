@@ -4135,3 +4135,32 @@ the fabrications behind them.
   0x86f24` caller, currently being decoded (the on-disk prochmi_out.out is
   encrypted at that offset; the Ghidra `prochmi_out.out` program holds the
   runtime image and is the decoding source).
+
+## r799n34b: startup crash sweep - short argv[0] revives procsql
+
+Boot audit after r799n34 showed procsql_out.out dying inside `main`:
+`sql::sem_t::init` -> `OSAL_s32EventCreate(name="sql:evt:/opt/bosch/processes/
+procsql_out.out")` -> assert `((0x07<<16)|(0x02<<12)|7) == OSAL_u32ErrorCode()`
+(expects 0x72007 ALREADY_EXISTS, sqlbase.hpp) + `invalid != handle` storm +
+WRITE_UNMAPPED.  Ghidra decompile of `OSAL_s32EventCreate` (libosal +0x2f1c8)
+shows the name is rejected with 0x7200b unless `strlen(name) < 32` - a FULL
+argv[0] makes every procsql sqldb IPC name (`sql:evt:`/`sql:sem:` + argv[0])
+over-long, so the create fails with the wrong code and sqldb asserts.  The
+unit's baselx execs the registry's `PROC_LOCATION` string (short:
+"procsql_out.out" -> name 23 chars), and `StartConfigDefault.reg` even ships
+the real boot list: `PROCESS\LINUX\ORDER` = PROCMWLX, PROCHMI, PROCSQL,
+PROCPHONE, PROCDAPI, PROCMAP, PROCVOICE, PROCSDSTS, PROCSDS, ...
+
+- `RtosBootConfig::default` now uses those PROC_LOCATION names in that ORDER
+  for the subset the emulator runs (PROCNAVI is not in LINUX ORDER - Triton
+  starts it - and keeps its absolute /opt/bosch/navbin path).
+- `process_launcher::spawn_process` passes the message's filename (not the
+  resolved elf path) as argv[0] - what `exec(PROC_LOCATION)` yields on the
+  unit.  n289_1: procsql alive at 49k passes, `invalid != handle` gone, all
+  eight processes heartbeat to the end of the run.
+- Remaining startup asserts are pre-existing GOOD-era noise: n264_11 (GOOD)
+  carries the same `osalevent ALWAYS`, `osaliosc`, `clGUIWidgetEngine:243`
+  assert set and ~900 tolerated Execution-error teardown races; the READ_-
+  UNMAPPED storms ride exit_group teardown of prochmi worker clones.  The
+  only real crash left is the FSM abort at prochmi+0x86f24 (state 9, 65 ms
+  in) - still the r799n34 decode target.

@@ -82,25 +82,22 @@ impl Default for RtosBootConfig {
             // process manager as far as the emulator depends on it (the HMI first,
             // the engine last so its hooks see the already-running services).
             commands: vec![
-                StartProcessCommand::start_proc("/opt/bosch/processes/prochmi_out.out"),
-                // r799n34: the navigation start-up has real provider peers on
-                // the unit - procmwlx (Bosch middleware: CCS/CSMA server, the
-                // app behind mbx_36 whose absent answers the EMU_FAKE_CONNECTCONF
-                // lane fabricates) and procsds (SD-card content service, the
-                // CL-domain/SDS data the popup chain and address entry read).
-                // Booting them lets those fabrications be retired one by one
-                // (fidelity rule: only partners NOT among emulated processes
-                // may be fabricated).
-                StartProcessCommand::start_proc("/opt/bosch/processes/procmwlx_out.out"),
-                StartProcessCommand::start_proc("/opt/bosch/processes/procsds.out"),
-                // r799n34b: procsql (SQL/DAO backend the nav data layer and
-                // SDS query against) and procvoice (voice-guidance service,
-                // a CCS peer of the guidance start-up) join the boot set.
-                StartProcessCommand::start_proc("/opt/bosch/processes/procsql_out.out"),
-                StartProcessCommand::start_proc("/opt/bosch/processes/procvoice_out.out"),
-                StartProcessCommand::start_proc("/opt/bosch/processes/DAPIAPP.OUT"),
+                // r799n34b: names are the registry's PROC_LOCATION strings and
+                // the order is PROCESS\LINUX\ORDER of StartConfigDefault.reg
+                // (PROCMWLX, PROCHMI, PROCSQL, [PROCPHONE], PROCDAPI, PROCMAP,
+                // PROCVOICE, [PROCSDSTS], PROCSDS) - the emulator boots the
+                // subset it can run.  PROCNAVI is not in the LINUX ORDER list
+                // (Triton-side start) and keeps its absolute navbin path.
+                // Short argv[0] is load-bearing: procsql/OSAL reject IPC names
+                // >= 32 chars (see process_launcher.rs).
+                StartProcessCommand::start_proc("procmwlx_out.out"),
+                StartProcessCommand::start_proc("prochmi_out.out"),
+                StartProcessCommand::start_proc("procsql_out.out"),
+                StartProcessCommand::start_proc("DAPIAPP.OUT"),
                 StartProcessCommand::start_proc("/opt/bosch/navbin/PROCNAV.OUT"),
-                StartProcessCommand::start_proc("/opt/bosch/processes/procmapengine.out"),
+                StartProcessCommand::start_proc("procmapengine.out"),
+                StartProcessCommand::start_proc("procvoice_out.out"),
+                StartProcessCommand::start_proc("procsds.out"),
             ],
             start_queue: queues::OSAL_CB_HDR_LI_MAIN.to_string(),
             queue_boot: true,

@@ -33,7 +33,13 @@ pub fn spawn_process(app_name: &str, filename: &str, cmdline: &str) -> Result<()
     };
 
     let elf_path = resolve_process_path(filename);
-    let args = process_args(&elf_path, cmdline);
+    // r799n34b: argv[0] is the filename AS GIVEN in the start message (the
+    // unit's baselx execs the PROC_LOCATION string, e.g. "procsql_out.out",
+    // not the resolved path).  procsql derives its OSAL IPC names from its
+    // argv ("sql:evt:"+argv[0]) and libosal rejects names >= 32 chars with
+    // 0x7200b, so a full path here makes procsql's sem/event create assert
+    // (n287: sql::sem_t::init "invalid != handle", process death at main).
+    let args = process_args(filename.trim(), cmdline);
     // The real head unit boots with the CRYPTNAV map medium already ACTIVE
     // before the map engine registers its DAPI service: the registration
     // snapshots the service state and a request answered while the entry is
@@ -106,7 +112,7 @@ fn resolve_process_path(filename: &str) -> String {
     format!("/opt/bosch/processes/{}", filename)
 }
 
-fn process_args(elf_path: &str, cmdline: &str) -> Vec<String> {
+fn process_args(name_for_argv0: &str, cmdline: &str) -> Vec<String> {
     let mut args: Vec<String> = cmdline
         .split_whitespace()
         .map(str::to_string)
@@ -114,7 +120,7 @@ fn process_args(elf_path: &str, cmdline: &str) -> Vec<String> {
         .collect();
 
     if args.is_empty() {
-        args.push(elf_path.to_string());
+        args.push(name_for_argv0.to_string());
     }
 
     args
