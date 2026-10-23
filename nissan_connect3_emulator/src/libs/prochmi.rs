@@ -6458,7 +6458,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
     // sites, naming each site's service literal as decoded from the ROM:
     // site -> svc (0x17c63c8 takes 0x152 from the pc-pool at 0x17c7158).
     {
-        const SITES: [(u32, u16, &str); 52] = [
+        const SITES: [(u32, u16, &str); 67] = [
             (0x017c_6358, 0x01f, "cmp1f"),
             (0x017c_6368, 0x01e, "cmp1e-a"),
             (0x017c_6378, 0x01e, "cmp1e-b"),
@@ -6539,6 +6539,30 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
             // trio-2 entry singleton check (0x17c6750 `beq 0x17c680c`):
             // tells whether BAD ever enters the step-2 issuer at all.
             (0x017c_6750, 0x1f, "sp2acc"),
+            // r799n56: the svc-0x0a STEP block (cmp0a's beq target
+            // 0x17c6820).  n331_1 broke through to cmp0a (41x, r0=1 every
+            // time -> it BRANCHES into the step and dies silently - no
+            // cmp152/cmp56/cmp300 ever fires).  Shape mirrors the 2c step:
+            // singleton -> six[0] = [obj+0x28] -> SIX getters (0x1617e64
+            // /0x1617edc/0x1617ee4/0x1617df8/0x16180f8/0x1618108), each
+            // issued via vfn+0x24 then polled via vfn+0x18 (must be !=0);
+            // ANY failed poll leaves via the silent 0x17c64bc.  Six is the
+            // full traffic-service suite, not a trio.
+            (0x017c_6828, 0x0a, "st0a-acc"),
+            (0x017c_6834, 0x0a, "st0a-hex"),
+            (0x017c_6854, 0x0a, "st0a-act1"),
+            (0x017c_6868, 0x0a, "st0a-act2"),
+            (0x017c_687c, 0x0a, "st0a-act3"),
+            (0x017c_6890, 0x0a, "st0a-act4"),
+            (0x017c_68a4, 0x0a, "st0a-act5"),
+            (0x017c_68b8, 0x0a, "st0a-act6"),
+            (0x017c_68dc, 0x0a, "st0a-p1"),
+            (0x017c_68f8, 0x0a, "st0a-p2"),
+            (0x017c_6918, 0x0a, "st0a-p3"),
+            (0x017c_6934, 0x0a, "st0a-p4"),
+            (0x017c_6950, 0x0a, "st0a-p5"),
+            (0x017c_696c, 0x0a, "st0a-p6"),
+            (0x017c_6974, 0x0a, "st0a-fb"),
         ];
         let page = (base_address + 0x017c_6000u32 - ORIGINAL_BASE) & !0xfff;
         let _ = unicorn.add_code_hook(
@@ -6574,7 +6598,18 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 }
                 if matches!(
                     name,
-                    "sp2act1" | "sp2act2" | "sp2act3" | "st2c-act1" | "st2c-act2" | "st2c-act3"
+                    "sp2act1"
+                        | "sp2act2"
+                        | "sp2act3"
+                        | "st2c-act1"
+                        | "st2c-act2"
+                        | "st2c-act3"
+                        | "st0a-act1"
+                        | "st0a-act2"
+                        | "st0a-act3"
+                        | "st0a-act4"
+                        | "st0a-act5"
+                        | "st0a-act6"
                 ) {
                     // r799n33zu: dump the trio-2 action object the walker
                     // is about to execute/poll (layout of the request
@@ -6592,7 +6627,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         read_u32(uc, act.wrapping_add(0x28)),
                     );
                 }
-                if name == "st2c-trio" {
+                if name == "st0a-hex" || name == "st2c-trio" {
                     // the generic line shows r0 (singleton); the decisive
                     // value is r4 = [singleton+0x10] (the trio pointer).
                     let r4 = uc.reg_read(RegisterARM::R4).unwrap_or(0) as u32;
