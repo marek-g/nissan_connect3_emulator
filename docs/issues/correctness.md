@@ -4707,3 +4707,30 @@ n310_1 state of the art (all fixes on):
   next lever = round rate (100 ms pulse throttle lanes) or the watchdog
   reaper (20 s) cutting legs out mid-chain (r799n47 made them re-register,
   but each reap costs the leg its place in the storm).
+
+## r799n49d/50: coverage without slot-fill is churn, not fuel (n323/n324)
+
+- n49d: PARK_WORDS now recorded only when the parker is a svcdone worker
+  (TIDKEY member) - the unscoped recording let the kick storm the OSAL
+  sync-pool/AE-dispatch parks (r776/r777 set); note_svcdone_tid_key is
+  gated by EMU_WAKE_PRIORITY, so with that flag OFF the kick goes silent
+  too (A/B runs disable both, semantics preserved).
+- n323 (unbounded kick): 3/3 boots died EARLIER (0xe/0xe/0x15). n324:
+  2/3 died in the svc-1e era, n324_3 passed it with sp2res=60 (first since
+  n315), single request table 0x3acf310 (no store/remove split in that
+  boot), svc-1f batch issued at t=18.7 s, then stalled as always.
+- n324_3 census killed the coverage theory: per 10 s the unbounded kick
+  woke ~41k waiters and the herd re-parked ~41k times, while genuine
+  guest wakes ran ~3/10 s. A woken leg re-reads an EMPTY dispatcher slot
+  and parks again - the churn consumes the VM lock (everything else is
+  serialized on it) and removes nothing. Removes only happen where a slot
+  got FILLED (BAD's filled lane = the mbx f-accept rx consumption for
+  svc-6/0x0a; GOOD's = its RTOS-side answer legs + native walker).
+- Ctor-vs-depth check: ctor times 15.6/20.9/36.1 s in n324_3/2/1, the
+  FASTEST boot went DEEPEST - fast-boot poisoning is not the regressor.
+- r799n50: kick slice 48/word/round restored (n320_on's mild profile
+  stayed the deepest all series). Next vector under A/B (n325 vs n326):
+  EMU_SVC_FULL_BODY=1 - refire legs carrying the FULL GOOD answer body
+  self-complete without needing any rx consumer to fill their slot. If
+  that converts the svc-1f batch, the slot-fill gap is retired for the
+  property era and the traffic era can reuse the same body lane.
