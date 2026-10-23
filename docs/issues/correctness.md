@@ -4004,3 +4004,25 @@ threads incl. tid-65 - n271..n275 survivors sit in state 9 with tid-65
 silent and its last calls (Wait(0)+GetFromMQ, timeout=0x8, both native
 paths that honour deadlines) rule out IOSC-event sleep; the dump names
 where it really is parked.
+
+## r799n33zq: the state-9 silence was a park dead-lock caused by the re-fire budget
+
+n277 (5/8 survive to the kill): state 9 reached, then 50+ s of total
+silence and NO stall-dump - because `prochmi::tick` itself stopped.  The
+park report settles it: the whole prochmi process loop parked with
+`65:blocked(sleep)` (the r753 60 s OSAL-event park, re-armed every wake,
+released only by a real OSAL_s32EventPost).  Chain: pending property keys
+spent the svcdone re-fire budget (n<8) within ~1 s of the (now 100 ms)
+rounds -> `svcdone_open` false -> the vSignalSelf wake lane stopped
+spawning -> zero runnable threads -> `run_process_loop` parked on its
+doorbell -> the tick that drives the echo rounds, RQ_PULSE and the wake
+lane is dead -> the confs that would end the wait can never be echoed.
+Self-starvation: OUR retry budget gated the very lane that delivers the
+completions the budget retries for.
+
+Fix: re-fire budget and `svcdone_open` threshold 8 -> 200 rounds (~20 s
+at the throttled cadence, entries retained <1000 anyway), vSignalSelf
+wake budget 30 -> 120.  While completions are pending the wake-lane
+guest-calls keep threads runnable, so the loop stays awake by
+construction - the park now only happens when the guest is legitimately
+idle.

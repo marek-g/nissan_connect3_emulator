@@ -13207,7 +13207,18 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                 let mut again: Vec<(u32, u32, u32, u32)> = Vec::new();
                 if let Ok(mut m) = SVCDONE_PENDING.lock() {
                     for (key, (holder, func, n)) in m.iter_mut() {
-                        if *n < 8 {
+                        // r799n33zq: budget 8 -> 200.  n277 survivors
+                        // proved the expiry is a SELF-STARVATION trap:
+                        // pending property keys hit n=8 within ~1 s
+                        // (throttled rounds), `svcdone_open` flipped
+                        // false, the vSignalSelf wake lane stopped, zero
+                        // threads stayed runnable and the whole prochmi
+                        // process loop PARKED (tid-65 in its 60 s OSAL
+                        // event park, tick dead) - and the state-9 echo
+                        // rounds that would consume the confs can only run
+                        // from that tick.  The 100 ms pulse throttle
+                        // (n33zż) keeps 200 rounds affordable (~20 s).
+                        if *n < 200 {
                             *n += 1;
                             // r799n33g: carry the mint's service so the
                             // leg stamps the dispatcher slot of the LIVE
@@ -13363,7 +13374,7 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             // events for the remaining 50 s while legs kept missing).
             let svcdone_open = SVCDONE_PENDING
                 .lock()
-                .map(|m| m.values().any(|(_, _, n)| *n < 8))
+                .map(|m| m.values().any(|(_, _, n)| *n < 200))
                 .unwrap_or(false);
             if vsig != 0
                 && unicorn.get_data().elf_path.contains("prochmi")
@@ -13373,7 +13384,10 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             {
                 static SIGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 let n = SIGS.fetch_add(1, Ordering::Relaxed);
-                if n < 30 {
+                // r799n33zq: 30 -> 120 wakes to match the longer
+                // completion-round budget (the wake also keeps the process
+                // loop off its park while completions are pending).
+                if n < 120 {
                     crate::rtos::monitor::spawn_guest_call(
                         unicorn,
                         vsig,
