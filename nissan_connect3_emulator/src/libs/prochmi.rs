@@ -1444,6 +1444,37 @@ crate::os::code_stub::trap_site(unicorn, lua_prepare_call, crate::os::code_stub:
         });
 
     let gui_mainloop = base_address + CL_GUI_MAINLOOP;
+    // r799n60: who kills the widget engine?  The static singleton pointer
+    // slot (resolved from the clGUIWidgetEngine GOT accessor: GOT base
+    // 0x2a12818 + 0x658c) starts reading back 0xe at t~38.3 s and every
+    // later bGUIMainloop entry dies on [this,#0x3d].  Watch the 4 slot
+    // bytes and log the writer's pc/lr (constructor writes the real
+    // pointer early, so the log stays short).
+    {
+        let slot = (base_address - ORIGINAL_BASE + 0x2a18_da4) as u64;
+        let res = unicorn.add_mem_hook(
+            unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+            slot,
+            slot + 3,
+            move |uc: &mut Unicorn<'_, Context>, _t, addr, size, value| {
+                static W: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if W.fetch_add(1, Ordering::Relaxed) < 24 {
+                    log::warn!(
+                        "PROCHMI gui-singleton-WRITE t={}ms tid=[{}] addr={:#x} size={size} value={value:#x} pc={:#x} lr={:#x}",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                        uc.get_data().inner.thread_id(),
+                        addr,
+                        uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32,
+                        uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                    );
+                }
+                true
+            },
+        );
+        if let Err(err) = res {
+            log::warn!("PROCHMI: gui-singleton watch install failed: {err}");
+        }
+    }
     crate::os::code_stub::trap_site(unicorn, gui_mainloop, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:606", move |uc: &mut Unicorn<'_, Context>| {
             let address = gui_mainloop;
             // A `drain_gui_touch_event` guest call just returned here: put
