@@ -4816,7 +4816,15 @@ fn bridge_mbx_queue(
                         );
                     }
                 }
-                if fresh {
+                if fresh && txn != 0 && !rqkey_owned_by_want(txn, service) {
+                    // r799n33ze: not answered yet (the key is live under a
+                    // foreign owner) - release the tuple so the client's
+                    // RE-ASK retries once the transaction is its own again.
+                    ANSWERED45
+                        .lock()
+                        .unwrap()
+                        .remove(&(service, reg_id, function, txn));
+                } else if fresh {
                     log::warn!(
                         "[LIBOSAL-MBX] EMU_FAKE_CONNECTCONF: standing in for mbx_36's absent CSMA provider (app 0x0024), answering ServiceData(svc {service:#06x} regid {reg_id:#04x} func {function:#06x} txn {txn}) from client {client:#06x} with a data+conf echo onto mbx_{client} (EMU_FAKE_CONNECTCONF=0 disables)"
                     );

@@ -810,6 +810,12 @@ pub fn rqkey_owner(key: u16) -> Option<(u16, u16)> {
     RQKEY_LIVE.lock().ok().and_then(|m| m.get(&key).copied())
 }
 
+/// r799n33zf: set when a fresh member key entered `SVCDONE_PENDING`; the
+/// completion ticker (normally 1 Hz, the SENSORFI broadcast cadence) runs
+/// an extra round immediately so the answer + wake reach the parked enavi
+/// thread before its round budget burns out.
+static RQ_PULSE: AtomicBool = AtomicBool::new(false);
+
 /// r799n29: the (svc, ordinal, entry) tuples the fi-ready leg already
 /// answered.  Formerly a function-local static; hoisted so the
 /// `navif-create` probe can clear it (together with `SVC6_TXN` and
@@ -8891,6 +8897,14 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                         if let Ok(mut m) = MINT_INFO.lock() {
                             m.insert(r1k, (svc, func));
                         }
+                        // r799n33zf: a fresh member key is pending NOW -
+                        // the 1 Hz completion ticker must not make tid 65
+                        // wait up to a full second for its first
+                        // svcdone/wake round (n274_1: key 3 (svc 0xa func
+                        // 0xf02) registered at 37.325 s, the ticker's next
+                        // pass was due 37.4 s+, prochmi exited at 37.99 s
+                        // with the answer posted but never relayed).
+                        RQ_PULSE.store(true, Ordering::Relaxed);
                         // r799n33j: the subscriber that owns this command
                         // IS the cookie pFindSubscriber matches (u16 at
                         // sub+4) - bind it so no leg ever fires with the
@@ -13078,7 +13092,10 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
         // re-fire) is merged into the svcdone_window() block below - that
         // window now includes state 6 and adds the reliable svcdone
         // guest-call lane for the starved member re-mints there.
-        if due
+        // r799n33zf: also run when a fresh member key pulsed (event-driven
+        // first round; the 1 Hz cadence alone missed it - n274_1).
+        let pulse = RQ_PULSE.swap(false, Ordering::Relaxed);
+        if (due || pulse)
             && svcdone_window()
             && std::env::var_os("EMU_FAKE_SENSORFI").map_or(true, |v| v != "0")
         {

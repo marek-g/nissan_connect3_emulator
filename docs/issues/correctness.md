@@ -3958,3 +3958,25 @@ stack as a FRESH mmu region, and the defragmenter (threshold 500, runs
 Fix: `Mmu::arena_alloc` - one 16 MiB mapping per arena, stacks bump-cut
 from it (1 region per 1024 stacks); `spawn_guest_call` uses it.  Total new
 regions for the whole cascade: 2-3.
+
+## r799n33zf: event-driven completion round (RQ_PULSE) + guarded mbx_36 echo lane
+
+n273 (freeze in place): 6/8 crossed state 6 and 5/8 reached state 9 -
+the flatview assert gone (arena fix), but the runs died ~2 s into state 9
+with the property answers frozen => the reject-freeze is out (n33ze).
+n274 (pure per-push owner guard): 4/6 reach state 9, `key 2` now closes
+LEGITIMATELY (rqadd owner + its own DAPI frame), and the survivor
+signature narrowed to one: the `svc 0x000a func 0xf02` member key
+registers (37.325 s), our GpsDataStatus answer posts with the RIGHT
+ordinal ~600 ms later (route mbx, `txn 3`) - but tid-65 parked and the
+svcdone-refire/vSignalSelf/gps-kick block runs only under the 1 Hz
+`TICKER_NEXT` pace: its next pass was due after prochmi's give-up
+(37.99 s).  A phase lottery on a 1 Hz clock.
+
+Fix: the svcdone/wake/ticker block now also fires on `RQ_PULSE`, set by
+the rqadd probe every time a fresh member key enters SVCDONE_PENDING -
+the completion round is event-driven (the 1 Hz SENSORFI cadence stays as
+the floor).  Also guarded the last unguarded fabrication lane: the
+mbx_36 class-0x45 echo stamps `txn` too; a foreign-owner key defers the
+echo and releases the ANSWERED45 tuple so the client's RE-ASK retries
+when the transaction is its own again.
