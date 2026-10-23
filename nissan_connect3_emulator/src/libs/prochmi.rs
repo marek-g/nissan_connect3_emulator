@@ -12927,6 +12927,27 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
         
 crate::os::code_stub::trap_site(unicorn, addr, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:1145", move |uc: &mut Unicorn<'_, Context>| {
                 let ptr = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+                // r799n60c: upstream fingerprint of the dead-this era (see
+                // the bGUIMainloop guard): bExecute also runs with this=0xe
+                // (n341_w t=27.5s) while singleton slot 0x2a18da4 only ever
+                // saw the LIVE pointer - log who calls bExecute with it.
+                if ptr < 0x1000
+                    && SM_HIDE_STATE.load(Ordering::Relaxed) == 0
+                {
+                    static W: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    if W.fetch_add(1, Ordering::Relaxed) < 12 {
+                        log::warn!(
+                            "PROCHMI bExecute DEAD-THIS t={}ms tid=[{}] this={:#x} lr={:#x} sp={:#x} slot={:#x}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            uc.get_data().inner.thread_id(),
+                            ptr,
+                            uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                            uc.reg_read(RegisterARM::R13).unwrap_or(0) as u32,
+                            read_u32(uc, base_address - ORIGINAL_BASE + 0x2a18_da4),
+                        );
+                    }
+                }
                 // r768: popup-uninit invalidate loop (see
                 // sm_hide_fire_or_restore).  State 2 = widgets hidden,
                 // targets pending; state 3 = a vInvalidate injected from
