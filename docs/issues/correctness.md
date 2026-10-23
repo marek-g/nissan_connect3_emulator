@@ -4954,3 +4954,28 @@ n310_1 state of the art (all fixes on):
   dynstack/popup silence after final in BAD matches GOOD's (no dynstack
   ops after 44.1 s in n264_11 either).  Next: EMU_MAP_DUMP_DIR window
   dumps (PPM) of the post-final GUI to see the actual HMI state.
+
+## r799n58/n58b: taps are poison DURING the member eras - anchor them to final
+
+- GUI goal set (design.md): Menu softkey -> main menu -> Navigation ->
+  "New address" -> keyboard screen with city entry.  First step was making
+  scripted taps OBSERVABLE headless: r799n58 re-arms the r768 forced-present
+  flag for 1.5 s after each EMU_TOUCH_TEST tap and 4 s after s9cascade final
+  (presentation only; EMU_MAP_DUMP_DIR dumps then show what the tap did).
+- n336 (2 s dump cadence, no taps reached): early-died.  n337 3/3: tap #0
+  (rebased to state-9 + 15 s = t~38.8 s, i.e. INSIDE the member era) and all
+  three walks stalled mid-cascade (max labels st2c-p1/sp2act3/sp2a, final 0);
+  tap #1 never fired - the pump that consumes EMU_TOUCH_TEST thins out once
+  the app idles, a second due must be armed relative to a LATE anchor.
+  n338: control A (no taps, no dumps) 2/2 final (52.5/54.1 s) vs B 0/2
+  (5 s dumps + taps rebased state-9+28 s) - and B1 was already stalling at
+  t=48.9 s, BEFORE its first tap fired: boot-era GL dumps at a hungry cadence
+  lower the startup lottery odds too.  Observability must therefore stay
+  OUT of the critical eras: dumps post-final only where possible, budget
+  small, taps anchored to the cascade's completion.
+- r799n58b: S9_CASCADE_DONE set by the final probe site + EMU_TOUCH_ANCHOR=
+  final rebases the tap schedule off that event (state-9 anchor kept as the
+  default).  n339: anchor=final, taps at +3 s (Menu at 1x scale 352,229) and
+  +9 s (2x scale 704,458) - the tap pair also resolves the panel/widget
+  coordinate-space question (the window dumps show the HMI in the top-left
+  400x240 of the 800x480 framebuffer).
