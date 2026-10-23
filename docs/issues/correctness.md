@@ -5068,3 +5068,21 @@ n310_1 state of the art (all fixes on):
   omit it (and omit EMU_FAKE_DESTENTRY, which posts the same event class).
 - r799n60d/e repairs stay in as a safety net (0 hits on clean runs).
 - n346: winning-config + dumps + scripted Menu tap (60,333) at final+3 s.
+
+## r799n61: the GUI loop parks in its OSAL GetEvent - nudge it with an expired deadline
+
+- n346 proved the scripted Menu tap WORKS: tap (60,333) at final+3 s opened
+  the MAP OPTIONS menu (screenshot: Enter Destination / Quick Stop POIs /
+  Route List / Avoid Road / Cancel Route / Next Page) - first genuine
+  interactive screen transition in the emulator.  Panel coords are 1:1
+  with the 800x480 dump; Enter Destination center = (200,152).
+- n347_2 then stalled after the first tap: the second scripted tap never
+  injected because the loop re-parked in an OSAL queue receive
+  (BlockReason::OsalQueueReceive - the GetEvent of the messaging plane);
+  all 30 touch-wakes reported 'not parked' (nudge_blocked_thread only
+  handles SleepUntil/FutexWait/FutexWaitShared).
+- r799n61: new TimedOut arm - the nudge re-arms the park with an expired
+  deadline, the scheduler reap runs finish_guest_wait which pops empty and
+  returns -ETIMEDOUT, and the loop performs its authentic between-messages
+  iteration (exactly what the device's timed poll does).  No message is
+  fabricated; the queue stays as-is.
