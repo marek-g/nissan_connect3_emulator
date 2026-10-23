@@ -4906,3 +4906,26 @@ n310_1 state of the art (all fixes on):
 - r799n56: 15 st0a-* sites on the same live page hook (acc/hex/act1-6/
   p1-p6/fb + ACT dumps for the six).  n332 will show which of the six
   traffic-suite actions never completes and what svc/func they carry.
+
+## r799n56 RESULT (n332) + r799n57: the svc-0a suite completes WITHOUT payload on the leg
+
+- st0a probes (n332 2/2): the SIX traffic-suite actions (0x3a2b2d8 func
+  0x102, 0x3a2c020 0x107, 0x3a2b380 0x101, 0x3a2c140 0x8001, 0x3a2c090
+  0x8000, 0x3a2c1a0 0x125 - the SAME objects GOOD registers as keys
+  0x2e-0x33) issue cleanly, BAD registers them too (key=0x2f-0x34
+  svc=0xa, rqc/reg-arg all fire, t=61.5 s), the store-time svc-0x0a lane
+  fires the full answer route (14 gate lines, mbx/pump)... yet 0 removes
+  and 0 bonrs: the six stick at state=1.
+- Per-leg trace (tid-722, key 0x32): GOOD-shaped walk vfn10 -> subpre ->
+  completer - and DEATH at the completer (no orca).  The completer's
+  data field: BAD legs carry data=[msgobj+4]=0x98 (the chunked
+  traffic_status_answer_body from r799n46), GOOD 248/248 legs show
+  data=0x0.  A payload-carrying frame routes to the app-data receiver
+  (r798 rule: only event=0/data=0 hits the entry-completion leg).  The
+  32 data=0x98 completer lines are exactly the 32 dead suite legs; the
+  116 data=0 legs complete normally.
+- r799n57: full_body() returns None for ALL svc-0x0a legs (store-time +
+  refire lanes) - the leg delivers the bare event, the 0x98 GOOD-shaped
+  wire answer still rides the mbx push lane.  Markers n333: suite keys
+  get orca1 HIT + bonr + remove; st2c-p*/st0a-p* all r0=1; cmp152/cmp56/
+  cmp300 first firings; possibly cmp1f-c/cmp2c-b/cmp06/final.
