@@ -7909,22 +7909,16 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                     uc, ordinal,
                                 )
                             } else {
-                                let r = crate::libs::libosal_linux::message::push_traffic_status_answer(
+                                // r799n46: push_traffic_ready_pump stays
+                                // OFF (r799n45b n314: its +0x1c ordinal
+                                // aliases foreign live keys via the pump
+                                // drain lookup - all three boots degraded).
+                                // Traffic answers ride the pump with the
+                                // full GOOD body AND the svcdone leg below
+                                // now carries that same full body.
+                                crate::libs::libosal_linux::message::push_traffic_status_answer(
                                     uc, f18g, ordinal,
-                                );
-                                // r799n45b: the minimal ServiceData now
-                                // rides the PUMP lane (malloc'ed guest slot
-                                // bodies).  n313_1 lesson: posting this
-                                // shape to mbx_289 let a consumer leg run
-                                // deeper and free() a pointer INTO the live
-                                // connector object (glibc "double free:
-                                // 0x03939c70", heap arena) - the completer
-                                // matched key only, but the leg's payload
-                                // deref on the shape decided the branch.
-                                crate::libs::libosal_linux::message::push_traffic_ready_pump(
-                                    uc, ordinal,
-                                );
-                                r
+                                )
                             };
                             log::info!(
                                 "[LIBOSAL-MBX] gate svc 0x000a txn {ordinal} func {f18g:#x}: direct answer route {route}"
@@ -8047,19 +8041,58 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                     cookies.extend(alt_done_cookies(
                                         uc, holder, cookie,
                                     ));
+                                    // r799n46: svc-0x000a traffic legs run
+                                    // with the FULL GOOD answer body and
+                                    // the REAL func bound at rqadd time
+                                    // (MINT_INFO; f18b is the counter tail
+                                    // there, r799n42 lesson).
+                                    let real_f = MINT_INFO
+                                        .lock()
+                                        .ok()
+                                        .and_then(|mi| {
+                                            mi.get(&(ordinal as u32))
+                                                .map(|(_, f)| *f)
+                                        })
+                                        .filter(|f| *f != 0x0f02);
+                                    let bb9_full: Option<Vec<u8>> =
+                                        if svc as u16 == 0x000a {
+                                            real_f.map(|f| {
+                                                crate::libs::libosal_linux::message::traffic_status_answer_body(
+                                                    f as u16,
+                                                    ordinal as u16,
+                                                )
+                                            })
+                                        } else {
+                                            None
+                                        };
                                     for c in cookies.iter().copied() {
                                         bb[0x0e..0x10].copy_from_slice(
                                             &(c as u16).to_le_bytes(),
                                         );
-                                        crate::rtos::monitor::guest_call_bhandle_svcdone(
-                                            uc,
-                                            holder,
-                                            c,
-                                            ordinal as u32,
-                                            f18b as u32,
-                                            9,
-                                            &bb,
-                                        );
+                                        match bb9_full.as_deref() {
+                                            Some(b9) => {
+                                                crate::rtos::monitor::guest_call_bhandle_svcdone(
+                                                    uc,
+                                                    holder,
+                                                    c,
+                                                    ordinal as u32,
+                                                    real_f.unwrap_or(f18b as u32),
+                                                    9,
+                                                    b9,
+                                                );
+                                            }
+                                            None => {
+                                                crate::rtos::monitor::guest_call_bhandle_svcdone(
+                                                    uc,
+                                                    holder,
+                                                    c,
+                                                    ordinal as u32,
+                                                    f18b as u32,
+                                                    9,
+                                                    &bb,
+                                                );
+                                            }
+                                        }
                                         bb[0x1a] = 8;
                                         crate::rtos::monitor::guest_call_bhandle_svcdone(
                                             uc,
@@ -8078,9 +8111,21 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                         if let Ok(mut m) =
                                             SVCDONE_PENDING.lock()
                                         {
+                                            // r799n46: the pending tuple's
+                                            // func feeds every re-fire -
+                                            // carry the REAL func for
+                                            // svc-0x000a (MINT_INFO), the
+                                            // store-time f18b is a counter
+                                            // tail there.
+                                            let pend_func =
+                                                if svc as u16 == 0x000a {
+                                                    real_f.unwrap_or(f18b as u32)
+                                                } else {
+                                                    f18b as u32
+                                                };
                                             m.insert(
                                                 ordinal as u32,
-                                                (holder, f18b as u32, 1),
+                                                (holder, pend_func, 1),
                                             );
                                         }
                                         if let Ok(mut m) = STATE9_MINTS.lock()
@@ -13403,6 +13448,24 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                         .copy_from_slice(&(func as u16).to_le_bytes());
                     bb[0x1a] = 9;
                     bb[0x1c..0x1e].copy_from_slice(&(key as u16).to_le_bytes());
+                    // r799n46: the svc-0x000a traffic keys re-fire with the
+                    // FULL GOOD answer body (0x98 = header + gps wire
+                    // payload, n264_11 byte-compatible).  GOOD's own
+                    // bHandleResponseSVCData legs ran on exactly this object
+                    // shape and completed; the 0x22 stub only ever reached
+                    // the miss path.  The malloc-chunk lane in monitor.rs
+                    // keeps the leg's free() legal.
+                    let bb9_full: Option<Vec<u8>> = if svc == 0x000a
+                        && (func as u16) != 0x0f02
+                    {
+                        Some(
+                            crate::libs::libosal_linux::message::traffic_status_answer_body(
+                                func as u16, key as u16,
+                            ),
+                        )
+                    } else {
+                        None
+                    };
                     // r799n33f: fan the pair out to every live subscriber
                     // (see alt_done_cookies - only the owner flips).
                     // r799n33q: also throw the low cookies {1,2,3} blind.
@@ -13429,9 +13492,18 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                     for c in cookies.iter().copied() {
                         bb[0x0e..0x10]
                             .copy_from_slice(&(c as u16).to_le_bytes());
-                        crate::rtos::monitor::guest_call_bhandle_svcdone(
-                            unicorn, holder, c, key, func, 9, &bb,
-                        );
+                        match bb9_full.as_deref() {
+                            Some(b9) => {
+                                crate::rtos::monitor::guest_call_bhandle_svcdone(
+                                    unicorn, holder, c, key, func, 9, b9,
+                                );
+                            }
+                            None => {
+                                crate::rtos::monitor::guest_call_bhandle_svcdone(
+                                    unicorn, holder, c, key, func, 9, &bb,
+                                );
+                            }
+                        }
                         bb[0x1a] = 8;
                         crate::rtos::monitor::guest_call_bhandle_svcdone(
                             unicorn, holder, c, key, func, 8, &bb,
@@ -13466,8 +13538,13 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                     // now - wake them so each re-checks its slot and runs
                     // the decode leg over whatever the lanes posted since
                     // (store-time answers land before the herd parks; the
-                    // kick storm is what makes GOOD's winners).
-                    s9_answer_kick(unicorn);
+                    // kick storm is what makes GOOD's winners).  r799n46:
+                    // only while a svc-0x000a (traffic) key is pending -
+                    // kicking through the PROPERTY era churned the wake
+                    // queues and degraded all three n314 boots.
+                    if again.iter().any(|(_, _, _, s)| *s == 0x000a) {
+                        s9_answer_kick(unicorn);
+                    }
                 }
                 // r799n33c: arm any state-9 mint the store-time svcdone
                 // never covered (missed pairing) after 300 ms (func 0:

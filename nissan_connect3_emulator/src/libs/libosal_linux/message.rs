@@ -3366,6 +3366,21 @@ fn pump_malloc_trampoline(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     if let Some(p) = TRAMP.get() {
         return *p;
     }
+    let page = malloc_trampoline_page(unicorn);
+    if page == 0 {
+        return 0;
+    }
+    log::info!(
+        "[LIBOSAL-MBX] pump completion: malloc trampoline at {page:#x} (8 slots, malloc={LIBC_MALLOC:#x})"
+    );
+    let _ = TRAMP.set(page);
+    page
+}
+
+/// r799n46: build one exec page of 8 malloc trampolines (each stores r0
+/// into its scratch word then exits); `SECOND` serves the svcdone chunk
+/// ring so the two rings never share caves.
+fn malloc_trampoline_page(unicorn: &mut Unicorn<'_, Context>) -> u32 {
     let page = {
         let mmu_arc = unicorn.get_data().mmu.clone();
         let mut mmu = mmu_arc.lock().unwrap();
@@ -3400,11 +3415,80 @@ fn pump_malloc_trampoline(unicorn: &mut Unicorn<'_, Context>) -> u32 {
             return 0;
         }
     }
-    log::info!(
-        "[LIBOSAL-MBX] pump completion: malloc trampoline at {page:#x} (8 slots, malloc={LIBC_MALLOC:#x})"
-    );
-    let _ = TRAMP.set(page);
     page
+}
+
+/// r799n46: copy `body` into a fresh guest-MALLOC'ed chunk and return its
+/// VA (the harvest pattern of `pump_push_completion`'s slot ring, on a
+/// private trampoline page).  Needed because the GOOD-shaped full answer
+/// makes `bHandleResponseSVCData` legs run deep enough to `free()` the
+/// message data - only a real glibc chunk survives that (r799n42b).
+/// `None` = ring dry (this round fed it) / foreign VM / oversized body.
+pub fn write_body_to_guest_chunk(
+    unicorn: &mut Unicorn<'_, Context>,
+    body: &[u8],
+) -> Option<u32> {
+    if !unicorn.get_data().elf_path.contains("prochmi") {
+        return None;
+    }
+    if body.len() >= 0x100 {
+        return None;
+    }
+    static TRAMP2: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if TRAMP2.get().is_none() {
+        let p = malloc_trampoline_page(unicorn);
+        if p == 0 {
+            return None;
+        }
+        let _ = TRAMP2.set(p);
+        log::info!("[LIBOSAL-MBX] svcdone chunk ring: trampoline at {p:#x}");
+    }
+    let tramp = TRAMP2.get().copied().unwrap_or(0);
+    static BUSY: AtomicU32 = AtomicU32::new(0);
+    static READY: std::sync::Mutex<std::collections::VecDeque<u32>> =
+        std::sync::Mutex::new(std::collections::VecDeque::new());
+    {
+        let mut mask = BUSY.load(Ordering::Relaxed);
+        for i in 0..8u32 {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
+            let addr = tramp + i * 0x20 + 0xc;
+            let mut w = [0u8; 4];
+            if unicorn.mem_read(addr as u64, &mut w).is_ok() {
+                let v = u32::from_le_bytes(w);
+                if v != 0 && v != 1 {
+                    let _ = unicorn.mem_write(addr as u64, &[0u8; 4]);
+                    mask &= !(1 << i);
+                    BUSY.store(mask, Ordering::Relaxed);
+                    READY.lock().unwrap().push_back(v);
+                }
+            }
+        }
+    }
+    let chunk = match READY.lock().unwrap().pop_front() {
+        Some(c) => c,
+        None => {
+            let mask = BUSY.load(Ordering::Relaxed);
+            if let Some(i) = (0..8u32).find(|i| mask & (1 << *i) == 0) {
+                BUSY.store(mask | (1 << i), Ordering::Relaxed);
+                let cave = tramp + i * 0x20;
+                let _ = unicorn.mem_write((cave + 0xc) as u64, &1u32.to_le_bytes());
+                crate::rtos::monitor::spawn_guest_call_lr(
+                    unicorn,
+                    LIBC_MALLOC,
+                    [0x100, 0, 0, 0],
+                    0x1000,
+                    cave,
+                );
+            }
+            return None;
+        }
+    };
+    unicorn
+        .mem_write(chunk as u64, body)
+        .map(|_| chunk)
+        .ok()
 }
 
 pub fn pump_push_completion(unicorn: &mut Unicorn<'_, Context>, mut body: Vec<u8>) -> bool {
@@ -3668,6 +3752,15 @@ pub fn push_gps_answer(unicorn: &mut Unicorn<'_, Context>, key: u16) -> &'static
 /// (n305: 60 pushes for key 0x31, zero `f-accept` pops), while the hosted
 /// pump queue has the single consumer that feeds the decode/completer leg
 /// (r799n30 lesson).  `EMU_FAKE_TMC_STATUS=0` disables; always logged.
+/// r799n46: the GOOD-shaped full traffic-status answer (GpsDataStatus wire
+/// body, func overwritten with the request's own func, len field 0x98 -
+/// n264_11's svc-0x0a optype-9 frames are byte-compatible with this shape).
+pub fn traffic_status_answer_body(func: u16, key: u16) -> Vec<u8> {
+    let mut body = gps_data_status_answer_body(key);
+    body[0x18..0x1a].copy_from_slice(&func.to_le_bytes());
+    body
+}
+
 pub fn push_traffic_status_answer(
     unicorn: &mut Unicorn<'_, Context>,
     func: u16,
@@ -3682,8 +3775,7 @@ pub fn push_traffic_status_answer(
     if !rqkey_owned_by_want(key, 0x000a) {
         return "none";
     }
-    let mut body = gps_data_status_answer_body(key);
-    body[0x18..0x1a].copy_from_slice(&func.to_le_bytes());
+    let body = traffic_status_answer_body(func, key);
     if pump_push_completion(unicorn, body.clone()) {
         note_fi_era_pending(0x000a, key, &body);
         return "pump";

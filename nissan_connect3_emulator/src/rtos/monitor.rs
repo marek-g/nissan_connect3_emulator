@@ -2172,9 +2172,22 @@ pub fn guest_call_bhandle_svcdone(
         }
         return false;
     }
-    if holder == 0 || body.len() < 0x1e || body.len() > 0x3c {
+    if holder == 0 || body.len() < 0x1e {
         return false;
     }
+    // r799n46: FULL-body legs (GOOD-shaped 0x98 traffic answers) must run
+    // over a guest-MALLOC'ed chunk - the deeper decode leg those bodies
+    // trigger reaches free() on the message data, which the host heap_alloc
+    // rings cannot take (glibc chunk headers).  Small stub bodies keep the
+    // legacy ring (proven since r799n36).
+    let full_body_chunk = if body.len() > 0x3c {
+        match crate::libs::libosal_linux::message::write_body_to_guest_chunk(unicorn, body) {
+            Some(c) => c,
+            None => return false, // ring dry this round, caller re-fires
+        }
+    } else {
+        0
+    };
     let mmu_arc = unicorn.get_data().mmu.clone();
     // r799n36: region-diet.  Every svcdone leg used to `heap_alloc` a fresh
     // body+stack+tramp - ~1100 permanent unicorn memory regions in n299
@@ -2213,6 +2226,7 @@ pub fn guest_call_bhandle_svcdone(
         cell.set((b, t, slot));
         (b + slot * 0x40, t + slot * 0x40)
     });
+    let body_mem = if full_body_chunk != 0 { full_body_chunk } else { body_mem };
     let child = mmu_arc
         .lock()
         .unwrap()
