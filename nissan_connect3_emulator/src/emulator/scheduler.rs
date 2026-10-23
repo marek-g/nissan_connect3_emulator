@@ -729,6 +729,67 @@ fn set_runnable(unicorn: &mut Unicorn<'_, Context>, tid: u32, result: Option<u32
     }
 }
 
+/// r799n37: doorbell a *specific* blocked thread back to Runnable - the
+/// scheduler-side equivalent of the OS handing the timeslice back.  Used by
+/// the state-9 tail nudge (prochmi.rs): the enavi startup-FSM owner parks in
+/// an OSAL sleep the synthetic vSignalSelf clone cannot reach (the clone
+/// signals its own action context, and the absent CSMA completion that would
+/// arm a real wake never arrives), so without this the poll/consume leg dies
+/// while genuine answer frames pile up unconsumed in the server mailbox.
+/// Only `SleepUntil`/`FutexWait`/`FutexWaitShared` are nudgeable:
+/// MonitorYield must keep its service contract, and a shared-futex nudge
+/// leaves the registry entry registered (the guest re-checks the word value
+/// on wake exactly as a timeout would, so no token is fabricated).
+/// Outcome of [`nudge_blocked_thread`]: whether the thread was actually
+/// re-scheduled, plus the futex word (if any) it was parked on - callers
+/// that fake a lost wake token need it to decide what to post.
+pub enum NudgeOutcome {
+    NotBlocked,
+    Nudged(Option<u32>),
+}
+
+pub fn nudge_blocked_thread(unicorn: &mut Unicorn<'_, Context>, tid: u32) -> NudgeOutcome {
+    let pid = unicorn.get_data().inner.process_id;
+    let mut shared_id: Option<usize> = None;
+    {
+        let mut threads = unicorn.get_data().threads.lock().unwrap();
+        let thread = match threads.iter_mut().find(|t| t.id == tid) {
+            Some(t) => t,
+            None => return NudgeOutcome::NotBlocked,
+        };
+        match thread.status {
+            ThreadStatus::Blocked(BlockReason::SleepUntil(_)) => {
+                thread.status = ThreadStatus::Runnable;
+                thread.pending_result = None;
+                return NudgeOutcome::Nudged(None);
+            }
+            ThreadStatus::Blocked(BlockReason::FutexWait { addr, .. }) => {
+                thread.status = ThreadStatus::Runnable;
+                thread.pending_result = None;
+                return NudgeOutcome::Nudged(Some(addr));
+            }
+            ThreadStatus::Blocked(BlockReason::FutexWaitShared { id, .. }) => {
+                thread.status = ThreadStatus::Runnable;
+                thread.pending_result = None;
+                shared_id = Some(id);
+            }
+            _ => return NudgeOutcome::NotBlocked,
+        }
+    }
+    // The registry lookup needs the namespace lock but NOT the thread list
+    // (already released above), so a poisoned/contended list can never
+    // deadlock this path.
+    let uaddr = shared_id.and_then(|id| {
+        unicorn
+            .get_data()
+            .namespace
+            .lock()
+            .ok()
+            .and_then(|ns| ns.futex_peek_shared(id, pid))
+    });
+    NudgeOutcome::Nudged(uaddr)
+}
+
 /// how long to park: the nearest blocked-thread deadline (clamped to
 /// `POLL_INTERVAL` so a missed cross-process wake costs at most one tick)
 fn park_duration(unicorn: &Unicorn<'_, Context>) -> Duration {

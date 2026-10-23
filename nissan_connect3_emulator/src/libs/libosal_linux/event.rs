@@ -432,6 +432,51 @@ fn wake_event_waiters(unicorn: &mut Unicorn<'_, Context>, event: u32) -> bool {
     true
 }
 
+/// r799n37: fabricated `OSAL_s32EventPost` driven by the waiter registry:
+/// find the event `tid` is currently parked on, OR the mask it requested
+/// into its bits, and run the library's own wake sequence for it.  Used by
+/// the state-9 tail nudge (prochmi.rs): the CSMA completion that posts the
+/// enavi startup event on the real unit does not exist here, and the
+/// vSignalSelf clone signals its own action context, so no genuine poster
+/// ever reaches that sleeper.  The guest still runs its own satisfaction
+/// branch and consumes the bits; only the POST itself is fabricated, and it
+/// is logged (WARN) in every run that enables it.
+pub fn force_post_event_for(unicorn: &mut Unicorn<'_, Context>, tid: u32) -> Option<String> {
+    let event = event_waiters()
+        .lock()
+        .ok()
+        .and_then(|waiters| {
+            waiters
+                .iter()
+                .find(|(_, list)| list.iter().any(|w| w.thread_id == tid))
+                .map(|(event, _)| *event)
+        })?;
+    if try_read_u32(unicorn, event)? != EVENT_MAGIC {
+        return None;
+    }
+    let mask = try_read_u32(unicorn, event.wrapping_add(EVENT_REQUESTED))?;
+    let mask = if mask == 0 { 1 } else { mask };
+    let old = try_read_u32(unicorn, event.wrapping_add(EVENT_BITS))?;
+    write_u32(unicorn, event.wrapping_add(EVENT_BITS), old | mask);
+    let name = read_event_name(unicorn, event);
+    // mirror handle_event_post's wake gate exactly
+    let in_wait = try_read_u32(unicorn, event.wrapping_add(EVENT_IN_WAIT)).unwrap_or(0) & 0xff;
+    let wait_mode = try_read_u32(unicorn, event.wrapping_add(EVENT_MODE)).unwrap_or(0);
+    let woke = if in_wait != 0 && wait_mode <= 1 {
+        wake_event_waiters(unicorn, event)
+    } else {
+        false
+    };
+    log::warn!(
+        "LIBOSAL: s9-nudge force-post event={} bits 0x{:08x}->0x{:08x} mask=0x{:08x} woke={woke} (fabricated post for the absent CSMA completion; EMU_S9_NUDGE_SECS gates it, EMU_FAKE_SENSORFI=0 runs forbid it)",
+        name,
+        old,
+        old | mask,
+        mask
+    );
+    Some(name)
+}
+
 fn register_waiter(event: u32, waiter: EventWaiter) {
     if let Ok(mut waiters) = event_waiters().lock() {
         let list = waiters.entry(event).or_default();

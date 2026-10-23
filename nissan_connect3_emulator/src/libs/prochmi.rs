@@ -434,6 +434,12 @@ pub static OFF_SEEN: AtomicU32 = AtomicU32::new(0);
 pub static F74_GATE: AtomicU32 = AtomicU32::new(0);
 pub static F74_STEP: AtomicU32 = AtomicU32::new(0);
 
+/// r799n37: tid of the thread that last changed an FSM state (the enavi
+/// startup-FSM *owner* - it also runs the sp2 trio poll/consume passes).
+/// The s9-wake clone cannot re-tick it (it signals its own action context),
+/// so the tail nudge doorbells this tid directly.
+pub static FSM_OWNER_TID: AtomicU32 = AtomicU32::new(0);
+
 /// r799i: set once the s9path page watch fetches the store-9 instruction
 /// (0x17c7c1c) - the f74 readiness step really advanced to state 9, i.e.
 /// startup is over and the keypad screen is up.  Unlike the fsm-watch's
@@ -6350,6 +6356,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 state,
                 uc.get_data().inner.thread_id(),
             );
+            FSM_OWNER_TID.store(uc.get_data().inner.thread_id(), Ordering::Relaxed);
             log::warn!(
                 "PROCHMI startup-step t={}ms tid=[{}] proc={r0:#x} state={state}",
                 crate::libs::dapi::emu_t0_elapsed_ms(),
@@ -13443,6 +13450,101 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                         );
                     }
                 }
+                }
+            }
+            // r799n37: state-9 tail NUDGE.  The synthesized vSignalSelf
+            // above signals the CLONE's own action context, so it never
+            // reaches the real FSM owner, and n301/n302 showed the tail
+            // dying exactly when that owner parks: after its last poll
+            // pass it sleeps (SleepUntil/forever), DAPI keeps genuinely
+            // posting class-0x45 answers into the server mailbox (213
+            // guest posts, never consumed), decodes->0, and every sp2
+            // round stops.  While real completions are still pending,
+            // doorbell the owner back to Runnable at a slow cadence - it
+            // runs its own poll leg natively and consumes the frames the
+            // real responder already produced.  No data is fabricated:
+            // the nudge only re-schedules the guest's own thread.
+            // Off by default: EMU_S9_NUDGE_SECS=<seconds> enables.
+            let nudge_secs: f64 = std::env::var("EMU_S9_NUDGE_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0);
+            if nudge_secs > 0.0
+                && unicorn.get_data().elf_path.contains("prochmi")
+                && crate::libs::libosal_linux::message::hmi_fsm_state() == 9
+            {
+                let pending = SVCDONE_PENDING
+                    .lock()
+                    .map(|m| m.values().any(|(_, _, n)| *n < 200))
+                    .unwrap_or(false)
+                    || STATE9_MINTS
+                        .lock()
+                        .map(|m| m.values().any(|(_, answered)| !*answered))
+                        .unwrap_or(false);
+                if pending {
+                    static LAST_NUDGE_MS: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let now_ms = crate::libs::dapi::emu_t0_elapsed_ms() as u64;
+                    let last = LAST_NUDGE_MS.load(Ordering::Relaxed);
+                    if now_ms.saturating_sub(last) >= (nudge_secs * 1000.0) as u64 {
+                        LAST_NUDGE_MS.store(now_ms, Ordering::Relaxed);
+                        let owner = FSM_OWNER_TID.load(Ordering::Relaxed);
+                        if owner != 0 {
+                            match crate::emulator::scheduler::nudge_blocked_thread(
+                                unicorn, owner,
+                            ) {
+                                crate::emulator::scheduler::NudgeOutcome::Nudged(
+                                    uaddr,
+                                ) => {
+                                    // The woken thread has not executed yet
+                                    // (VM loop is serialized), so posting a
+                                    // token before its value re-check is
+                                    // race-free.  A zero word means the
+                                    // absent CSMA completion never posted
+                                    // it: write the token exactly like a
+                                    // lost wake would have (the guest's own
+                                    // code consumes it).  Non-zero = token
+                                    // pending or mutex held: never touch.
+                                    let mut detail =
+                                        String::from("sleep-only, no wait word");
+                                    if let Some(w) = uaddr {
+                                        let mut b = [0u8; 4];
+                                        match unicorn
+                                            .mem_read(w as u64, &mut b)
+                                            .map(|_| u32::from_le_bytes(b))
+                                        {
+                                            Ok(0) => {
+                                                let _ = unicorn.mem_write(
+                                                    w as u64,
+                                                    &1u32.to_le_bytes(),
+                                                );
+                                                detail = format!(
+                                                    "word {w:#x} 0->1 (fake lost-wake token)"
+                                                );
+                                            }
+                                            Ok(v) => detail =
+                                                format!("word {w:#x}={v:#x} untouched"),
+                                            Err(_) => detail =
+                                                format!("word {w:#x} unreadable"),
+                                        }
+                                    } else if let Some(name) =
+                                        crate::libs::libosal_linux::event::force_post_event_for(
+                                            unicorn, owner,
+                                        )
+                                    {
+                                        detail = format!(
+                                            "OSAL event '{name}' force-posted"
+                                        );
+                                    }
+                                    log::warn!(
+                                        "PROCHMI s9-nudge: doorbell FSM owner tid {owner} t={}ms ({detail}; EMU_S9_NUDGE_SECS={nudge_secs})",
+                                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                                    );
+                                }
+                                crate::emulator::scheduler::NudgeOutcome::NotBlocked => {}
+                            }
+                        }
+                    }
                 }
             }
             static KICKN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

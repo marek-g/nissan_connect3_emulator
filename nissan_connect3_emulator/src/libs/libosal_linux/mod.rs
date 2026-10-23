@@ -1,4 +1,4 @@
-mod event;
+pub(crate) mod event;
 mod init;
 mod io;
 pub(crate) mod message;

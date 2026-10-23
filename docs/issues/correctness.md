@@ -4399,3 +4399,41 @@ Next session, surgical:
 3) once the watchdog repairs the word, the parked workers wake -> run the
    sp2 round -> decode -> wake cascade continues - that is the whole
    residual tail in one fix.
+
+## r799n37: state-9 tail NUDGE + OSAL-event force-post - the round machine runs to kill
+
+Root-caused why synthesized vSignalSelf wakes could not restart the tail:
+the wake clone signals its OWN action context (r0..r3 = 0), while the enavi
+startup-FSM owner sleeps in an OSAL event wait (libosal parks it as
+SleepUntil and r753 re-parks infinite waits) that NOTHING reaches - the CSMA
+completion that posts that event on the unit is absent.  The owner IS woken
+by pump traffic until ~t=50 s (35 polls in n301), then sleeps forever and
+the poll/consume leg dies while DAPI keeps genuinely posting answers (278
+guest posts, consumer never pops them, queue overflow x31).
+
+Implemented (EMU_S9_NUDGE_SECS=<sec>, default 0 = OFF, every fire logged):
+- scheduler::nudge_blocked_thread -> NudgeOutcome{NotBlocked,Nudged(Option<uaddr>)}
+  doorbells the FSM owner tid (new FSM_OWNER_TID published by the
+  startup-step probe) back to Runnable; SleepUntil nudge alone is useless
+  (the guest re-checks and re-parks), so on sleep-only parks we
+- libosal_linux::event::force_post_event_for(tid): find the event the owner
+  is registered on in the WAITER REGISTRY, OR its requested mask into
+  EVENT_BITS and run the library's own wake gate (in_wait && mode<=1) - a
+  fabricated OSAL_s32EventPost (absent-partner wake class, logged WARN with
+  event name + bit transition).  A futex-parked owner instead gets the
+  zero-word token poke (same lost-wake class).
+
+n305_1/2: sp2res x118/120 (GOOD 30!), sp2c rounds cycling to t=92.4 s,
+decodes 112/132 (GOOD 128), rqadd 0x33 - the round machine finally ALIVE
+for the whole run.  What remains: SIX keys, svc=0xa funcs 0x101/0x102/0x107/
+0x125/0x8000/0x8001 (the member-era confs, rqadded already at t=39.4 s),
+never removed: svcdone workers for them burn the full 200-retry budget
+without completing - their bHandleResponseSVCData leg never finds the real
+response BODY (member data).  GOOD's member confs got real answers: GOOD
+completed every func=0x10x (its own unfinished 9 are the NEXT batch, svc
+0x300/0x2c/0x6 - killed at 45 s mid-cascade).  So the residual is NOT a
+wake problem anymore: the member SERVICE RESPONSES must reach the client.
+Next: trace one GOOD svc-0xa func=0x102 answer from DAPI (which queue/frame
+carries it) and check whether the request even reaches DAPI in BAD (the
+conf request POST side), then fix the request delivery OR - if the member
+answers are Triton/SD-side data - provide them at wire level.
