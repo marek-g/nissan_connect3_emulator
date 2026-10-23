@@ -7930,7 +7930,19 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                             if svc != 0x000a
                                 && crate::libs::dapi::emu_t0_elapsed_ms() >= 32_000
                             {
-                                let f18 = read_u32(uc, entry.wrapping_add(0x22)) & 0xffff;
+                                // r799n42b: STAMP stays the legacy +0x18 read
+                                // on LEG bodies.  With the REAL func the
+                                // bHandle legs run deeper and their orphan
+                                // cleanup ("Request not found") calls free()
+                                // on the body pointer - which for these legs
+                                // is the host heap_alloc body ring -> glibc
+                                // "free(): invalid pointer" abort (n310_3,
+                                // tid-336 at t=38910).  The key-only
+                                // completer makes the func byte inert for
+                                // completion anyway.  Malloc-backed bodies
+                                // (pump slots, push_traffic_status_answer)
+                                // MAY carry the real func.
+                                let f18 = read_u32(uc, entry.wrapping_add(0x18)) & 0xffff;
                                 crate::libs::libosal_linux::message::fabricate_fi_conf_complete(
                                     uc, svc as u16, ordinal, f18 as u16,
                                 );
@@ -7960,7 +7972,7 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                                     let holder =
                                         CL_TABLE_HOLDER.load(Ordering::Relaxed);
                                     let f18b =
-                                        read_u16(uc, entry.wrapping_add(0x22));
+                                        read_u16(uc, entry.wrapping_add(0x18)); // r799n42b: legacy stamp, see f18 note (host-ring body must not carry the real func - orphan-leg free() would abort)
                                     let mut bb = [0u8; 0x22];
                                     bb[0xb] = 0x45;
                                     bb[0x0e..0x10]
