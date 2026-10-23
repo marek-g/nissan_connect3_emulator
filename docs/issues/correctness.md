@@ -4516,3 +4516,29 @@ ALREADY builds and posts the right frames:
 Next: instrument WHY svcdone workers never execute (spawn -> first fetch),
 and/or drive the consume leg from the mbx_1024/mbx_1 delivery lane that
 GOOD proves works.  Ghidra: LEG region 0x1c75110-0x1c7d1e4 wake site.
+
+## r799n40-42: deterministic pairing, pump-first traffic, and the func-offset bug
+
+- r799n40 (`696d152`): svc-0x000a store txn recovered from the RQKEY_LIVE
+  binding (GOOD's gate lines carried txn 46/48/50; BAD answered txn 0 =>
+  NO answer). n307: all six traffic gate answers now go out with true txns.
+- r799n41 (`67d50df`): property-plane pairing switched from the racy 30 ms
+  fresh-mint capture to the same reverse lookup; `push_traffic_status_answer`
+  delivers traffic answers pump-first (mbx_289 copies demonstrably die:
+  60 pushes, zero f-accept pops). n307_2: property batch completed to the
+  LAST key and the traffic era opened (first time since the coma fix).
+- r799n42 (`19289e8`): THE FUNC BUG. The conf-store entry IS the action
+  object (rqadd act == store entry), so func lives at +0x22 (svc at +0x20);
+  every f18/f18b reader had been reading +0x18 = the mint-counter tail
+  (stepprobe f18=0x98xx/0x9ab9.. increasing 1 per store). Silent fallout:
+  * rqkey_find(svc, func) could never match (func garbage) - the n40/n41
+    recoveries were inerts until this fix;
+  * the fi-conf-complete + svcdone store-time bodies were stamped with the
+    counter as func (the refire lane's MINT_INFO copy was fine, which is
+    why late re-fires looked correctly stamped).
+  All four sites now read +0x22.
+- New diag: `queue-depth` on the s9-refire line. mbx_289 fills
+  UNBOUNDED (91..93+ at 92 s, +1/s) - neither consumer ever pops there in
+  the state-9 era; the only live pops are the 1 Hz connector kicks on the
+  hosted pump queue. If a key's answer only ever rides mbx_289, it is
+  parked forever: prefer `pump_push_completion` for every state-9 answer.
