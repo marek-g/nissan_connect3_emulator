@@ -136,3 +136,12 @@ pub fn push_key(event: KeyEvent) {
 pub fn pop_key() -> Option<KeyEvent> {
     KEY_QUEUE.try_lock().ok()?.pop_front()
 }
+
+/// r799n59: number of queued touch + key events (input producers are the SDL
+/// GPU thread and the scripted injectors; the GUI mainloop parks between
+/// user interactions on the real device too, so the waker only needs to know
+/// whether anything is waiting).
+pub fn pending_events() -> usize {
+    QUEUE.try_lock().map(|q| q.len()).unwrap_or(0)
+        + KEY_QUEUE.try_lock().map(|q| q.len()).unwrap_or(0)
+}

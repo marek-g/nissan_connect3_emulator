@@ -457,6 +457,19 @@ pub static STARTUP_PAST_9: std::sync::atomic::AtomicBool =
 pub static S9_CASCADE_DONE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// r799n59: emu-t0 stamp (ms) of the `s9cascade final` site, the base of
+/// EMU_TOUCH_ANCHOR=final tap scheduling and of the touch-wake lane.
+pub static S9_DONE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// r799n59: the thread that last ran `clGUIWidgetEngine::bGUIMainloop` and
+/// the t0-stamp of that iteration.  On the real device the loop parks
+/// between user interactions too (a touch sample reaches it as an HSI
+/// message that wakes the park); the emulator must reproduce that wake,
+/// otherwise SDL clicks and scripted taps queue forever (n339: the loop's
+/// last iteration was at t=39.5 s while the cascade completed at 51.3 s).
+pub static GUI_LOOP_TID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static GUI_LOOP_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The prev-state value the device's OFF dwell would have left in the static
 /// `clFi_Navi` previous-state global when the first post-OFF NORMAL broadcast
 /// runs; 0 = nothing to reproduce.
@@ -1502,6 +1515,14 @@ crate::os::code_stub::trap_site(unicorn, lua_prepare_call, crate::os::code_stub:
                 "PROCHMI: clGUIWidgetEngine::bGUIMainloop this={:#x} display_mode={}",
                 gui,
                 mode
+            );
+            GUI_LOOP_TID.store(
+                uc.get_data().inner.thread_id() as u64,
+                Ordering::Relaxed,
+            );
+            GUI_LOOP_LAST_MS.store(
+                crate::libs::dapi::emu_t0_elapsed_ms() as u64,
+                Ordering::Relaxed,
             );
             drain_gui_touch_event(uc, address);
             }
@@ -6611,6 +6632,10 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     // GL-free afterwards, so drive a few host-side presents
                     // of what the guest rendered (presentation only).
                     arm_touch_present_window(4_000);
+                    S9_DONE_MS.store(
+                        crate::libs::dapi::emu_t0_elapsed_ms() as u64,
+                        Ordering::Relaxed,
+                    );
                     S9_CASCADE_DONE.store(true, Ordering::SeqCst);
                 }
                 if matches!(
@@ -13934,6 +13959,79 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             // real responder already produced.  No data is fabricated:
             // the nudge only re-schedules the guest's own thread.
             // Off by default: EMU_S9_NUDGE_SECS=<seconds> enables.
+            // r799n59: touch-wake lane.  On the real device the GUI
+            // mainloop also sleeps between user interactions - a touch
+            // sample reaches it as an HSI message whose post wakes the
+            // park.  We cannot replay the HSI side, so wake the parked
+            // loop the same way the s9-nudge doorbells the FSM owner:
+            // fake the lost wake token on its futex word (or post the
+            // OSAL event it waits on).  Presentation-free, data-free:
+            // the loop then drains the real touch queue itself.
+            // Gate on S9_CASCADE_DONE: a woken loop DURING the member
+            // eras interleaves messages into their queues and stalls the
+            // property walk (n337/n338B), and pre-final there is nothing
+            // to touch anyway.
+            {
+                let tid = GUI_LOOP_TID.load(Ordering::Relaxed) as u32;
+                let now_ms = crate::libs::dapi::emu_t0_elapsed_ms() as u64;
+                static LAST_WAKE_MS: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let loop_idle = now_ms
+                    .saturating_sub(GUI_LOOP_LAST_MS.load(Ordering::Relaxed))
+                    >= 700;
+                let wants = crate::input::pending_events() > 0
+                    || tap_schedule_pending();
+                if tid != 0
+                    && wants
+                    && loop_idle
+                    && S9_CASCADE_DONE.load(Ordering::Relaxed)
+                    && now_ms.saturating_sub(LAST_WAKE_MS.load(Ordering::Relaxed))
+                        >= 300
+                    && unicorn.get_data().elf_path.contains("prochmi")
+                {
+                    LAST_WAKE_MS.store(now_ms, Ordering::Relaxed);
+                    let detail = match crate::emulator::scheduler::nudge_blocked_thread(
+                        unicorn, tid,
+                    ) {
+                        crate::emulator::scheduler::NudgeOutcome::Nudged(
+                            Some(w),
+                        ) => {
+                            let mut b = [0u8; 4];
+                            match unicorn
+                                .mem_read(w as u64, &mut b)
+                                .map(|_| u32::from_le_bytes(b))
+                            {
+                                Ok(0) => {
+                                    let _ = unicorn.mem_write(
+                                        w as u64,
+                                        &1u32.to_le_bytes(),
+                                    );
+                                    format!("word {w:#x} 0->1")
+                                }
+                                Ok(v) => format!("word {w:#x}={v:#x}"),
+                                Err(_) => format!("word {w:#x} unreadable"),
+                            }
+                        }
+                        crate::emulator::scheduler::NudgeOutcome::Nudged(
+                            None,
+                        ) => {
+                            match crate::libs::libosal_linux::event::force_post_event_for(
+                                unicorn, tid,
+                            ) {
+                                Some(name) =>
+                                    format!("OSAL event '{name}' posted"),
+                                None => "no wait word, no event".into(),
+                            }
+                        }
+                        crate::emulator::scheduler::NudgeOutcome::NotBlocked =>
+                            "not parked".into(),
+                    };
+                    log::warn!(
+                        "PROCHMI touch-wake: doorbell GUI loop tid {tid} t={}ms ({detail})",
+                        crate::libs::dapi::emu_t0_elapsed_ms(),
+                    );
+                }
+            }
             let nudge_secs: f64 = std::env::var("EMU_S9_NUDGE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -15926,8 +16024,7 @@ fn drain_gui_touch_event(unicorn: &mut Unicorn<'_, Context>, resume_pc: u32) {
 /// identical with and without a display.  Each tap is a Press+Release pair
 /// consumed on two consecutive mainloop iterations (~35 ms apart).
 fn inject_scripted_touch_test() {
-    static SPEC: std::sync::OnceLock<Vec<(u64, u16, u16)>> = std::sync::OnceLock::new();
-    let spec = SPEC.get_or_init(|| {
+    let spec = TAP_SPEC.get_or_init(|| {
         std::env::var("EMU_TOUCH_TEST")
             .unwrap_or_default()
             .split(',')
@@ -15947,8 +16044,7 @@ fn inject_scripted_touch_test() {
     if spec.is_empty() {
         return;
     }
-    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let index = NEXT.load(std::sync::atomic::Ordering::Relaxed);
+    let index = TAP_NEXT.load(std::sync::atomic::Ordering::Relaxed);
     if index >= spec.len() {
         return;
     }
@@ -15980,7 +16076,17 @@ fn inject_scripted_touch_test() {
             if !anchored {
                 return;
             }
-            let b = now.saturating_sub(due_ms);
+            // r799n59: with the final anchor the schedule reads as
+            // "seconds AFTER the cascade completed" (base = the final's
+            // t0-stamp); the legacy state-9 anchor keeps f341's semantics
+            // (first tap fires at the anchor moment, spacing preserved).
+            let b = if std::env::var("EMU_TOUCH_ANCHOR").as_deref()
+                == Ok("final")
+            {
+                S9_DONE_MS.load(std::sync::atomic::Ordering::Relaxed)
+            } else {
+                now.saturating_sub(due_ms)
+            };
             TBASE.store(b, std::sync::atomic::Ordering::Relaxed);
             b
         }
@@ -15989,7 +16095,7 @@ fn inject_scripted_touch_test() {
     if now < due_ms + base {
         return;
     }
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TAP_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::input::push_touch(crate::input::TouchKind::Press, x, y);
     crate::input::push_touch(crate::input::TouchKind::Release, x, y);
     // r799n58: once the startup cascades end the app idles GL-free (the
@@ -16021,6 +16127,32 @@ pub fn arm_touch_present_window(ms: u64) {
 }
 
 static TOUCH_PRESENT_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// r799n59: EMU_TOUCH_TEST schedule (secs:x:y entries) and the next tap's
+/// index, lifted out of the injector so the tick() touch-wake lane can tell
+/// whether an injected tap is waiting on a bGUIMainloop iteration.
+static TAP_SPEC: std::sync::OnceLock<Vec<(u64, u16, u16)>> = std::sync::OnceLock::new();
+static TAP_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// True while a scripted tap's due moment has passed but its injection
+/// still waits for the GUI mainloop to iterate (n339: after the startup
+/// cascades the loop parks and never re-enters, so without a waker the
+/// taps - and live SDL clicks - are consumed by nobody).
+fn tap_schedule_pending() -> bool {
+    let Some(spec) = TAP_SPEC.get() else {
+        return false;
+    };
+    let Some(index) = spec.get(TAP_NEXT.load(std::sync::atomic::Ordering::Relaxed)) else {
+        return false;
+    };
+    let (due_ms, _, _) = index;
+    if std::env::var("EMU_TOUCH_ANCHOR").as_deref() == Ok("final") {
+        let done = S9_DONE_MS.load(std::sync::atomic::Ordering::Relaxed);
+        done != 0 && crate::libs::dapi::emu_t0_elapsed_ms() as u64 >= done + due_ms
+    } else {
+        STARTUP_PAST_9.load(Ordering::Relaxed)
+    }
+}
 
 /// All hardwired keys the host keyboard bridge supports, with the
 /// `EMU_KEY_TEST` / parse name for each.
