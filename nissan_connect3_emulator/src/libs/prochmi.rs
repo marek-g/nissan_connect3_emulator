@@ -14148,7 +14148,7 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
             // runs its own poll leg natively and consumes the frames the
             // real responder already produced.  No data is fabricated:
             // the nudge only re-schedules the guest's own thread.
-            // Off by default: EMU_S9_NUDGE_SECS=<seconds> enables.
+            // Default on since r799n64 (see the nudge_secs parse below).
             // r799n59: touch-wake lane.  On the real device the GUI
             // mainloop also sleeps between user interactions - a touch
             // sample reaches it as an HSI message whose post wakes the
@@ -14224,10 +14224,18 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                     );
                 }
             }
+            // r799n64: default ON (2 s).  The r799n5x answer-injection lanes
+            // create the lost-wake windows this doorbell compensates, so the
+            // safety net must ship with them, not behind an env var: the
+            // no-env boot lottery measured 1/3 finals (n351_1..3) and plain
+            // runs froze on screen while completions sat pending; with the
+            // default nudge it is 3/3 (n351_4..6, final@36-52 s, every hit a
+            // real 'ENAVI_EVENT' park with SVCDONE_PENDING outstanding).
+            // EMU_S9_NUDGE_SECS=0 disables, any value overrides the period.
             let nudge_secs: f64 = std::env::var("EMU_S9_NUDGE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0.0);
+                .unwrap_or(2.0);
             if nudge_secs > 0.0
                 && unicorn.get_data().elf_path.contains("prochmi")
                 && crate::libs::libosal_linux::message::hmi_fsm_state() == 9
