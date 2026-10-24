@@ -6382,6 +6382,59 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                 0
             });
         }
+        // r799n63: bRequestRefresh's bail guard.  Disassembly 0x162e428:
+        // poGetIEnaviServer() (0x161f754, the cascade singleton) -> r4 =
+        // [server+0x4c]; r4==0 -> return 0 WITHOUT the synchronous
+        // vOnRequestRefresh sink and without the enavi_tclEnaviThread
+        // action.  GOOD completed the refresh (evtqm event 0x78 + sink in
+        // the same ms, n264_11 t=39467) => GOOD had [server+0x4c] != 0.
+        // Measure it on every call.
+        let address = base_address + 0x0162_e46cu32 - ORIGINAL_BASE;
+        crate::os::code_stub::trap_site(unicorn, address, crate::os::code_stub::TrapMode::Arm, "libs/prochmi.rs:li-refresh-guard", move |uc: &mut Unicorn<'_, Context>| {
+            static HITS: AtomicU32 = AtomicU32::new(0);
+            if HITS.fetch_add(1, Ordering::Relaxed) >= 40 {
+                return 0;
+            }
+            let r0 = uc.reg_read(RegisterARM::R0).unwrap_or(0) as u32;
+            let c4c = if r0 > 0x1000 { read_u32(uc, r0.wrapping_add(0x4c)) } else { 0xdead_0000 };
+            log::warn!(
+                "PROCHMI li-refresh-guard t={}ms tid=[{}] server={r0:#x} c4c={c4c:#x}",
+                crate::libs::dapi::emu_t0_elapsed_ms(),
+                uc.get_data().inner.thread_id(),
+            );
+            0
+        });
+        // r799n63b: who instantiates the static ENAVI server object?
+        // poGetIEnaviServer 0x161f754 = [[0x2a139fc]] with the literal pool
+        // resolving to the .data instance at 0x2909a80; its [+0] word is the
+        // alive flag (vtable).  Watch it: zero hits = nobody constructs it
+        // and the refresh guard can never open (spinner stays up, the
+        // country/speller lists stay empty).
+        {
+            let base = base_address - ORIGINAL_BASE;
+            let res = unicorn.add_mem_hook(
+                unicorn_engine::unicorn_const::HookType::MEM_WRITE,
+                (base + 0x2909_a80u32) as u64,
+                (base + 0x2909_a80u32 + 3) as u64,
+                move |uc: &mut Unicorn<'_, Context>, _t, addr, size, value| {
+                    static W: AtomicU32 = AtomicU32::new(0);
+                    if W.fetch_add(1, Ordering::Relaxed) < 12 {
+                        log::warn!(
+                            "PROCHMI enavi-server-WRITE t={}ms tid=[{}] addr={:#x} size={size} value={value:#x} pc={:#x} lr={:#x}",
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            uc.get_data().inner.thread_id(),
+                            addr,
+                            uc.reg_read(RegisterARM::PC).unwrap_or(0) as u32,
+                            uc.reg_read(RegisterARM::R14).unwrap_or(0) as u32,
+                        );
+                    }
+                    true
+                },
+            );
+            if let Err(err) = res {
+                log::warn!("PROCHMI: enavi-server watch install failed: {err}");
+            }
+        }
     }
 
     // r788b: the enavi request engine.  vEnableElementListRequest only sets
