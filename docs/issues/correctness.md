@@ -5145,3 +5145,36 @@ n310_1 state of the art (all fixes on):
   site, near the enGetRequestRefreshErrorState accessor 0x162d5e4) and find
   the branch that decides local evtqm completion vs outbound request; dump
   the deciding field in GOOD (n264_11 era) vs BAD at tap time.
+
+## r799n64: plain-run "crash" diagnosed = lost-wake freeze; s9-nudge now DEFAULT ON
+
+- User report: no-env run "crashes" <40 s. n351 lottery (3 boots, only
+  RUST_LOG): n351_1 gui-loop dead at t=23.7 s (241 iters), everything
+  parked ~t=50 s, zero s9cascade -> screen frozen = the "crash".  n351_2
+  fine (final=1), n351_3 mid-dead.  1/3 finals plain vs ~2/3 recipe.
+- The recipe's functional delta was EMU_S9_NUDGE_SECS=2.  n351_4..6
+  (plain + nudge): 3/3 finals, and every nudge hit a REAL parked
+  ENAVI_EVENT wait on the FSM owner with SVCDONE_PENDING outstanding -
+  i.e. genuine lost wakes created by the r799n5x answer-injection
+  timing.  The doorbell only re-schedules the guest's own thread (no
+  data fabricated), so per the fidelity rule it ships enabled: default
+  2 s, EMU_S9_NUDGE_SECS=0 disables (commit 25d069c).
+- n352 (default build, no env): GUI loop ALIVE in 6/6 boots (1274-1438
+  iters, all ran to the 74 s timeout) - the early-GUI-death freeze is
+  gone.  Final rate unchanged (~3/6): the sp2/traffic-status cascade
+  lottery remains (n352_7: gate 0x3 only, max-remove 0xc, nudges=0;
+  n352_9: died mid-sp2 @60.7 s after `sp2a r0=0`, vOnUpdateAllTraffic
+  MessagesStatus legs absent).
+- Unified symptom theory (explains the user's persistent orange spinner
+  + empty country list on the address page): in final=0 boots the
+  traffic-status / state-9 member suite never completes, so the ENAVI
+  server never reaches the fully-ONLINE state the location-input
+  refresh waits on -> keyboard opens with spinner forever, country
+  list empty.  Fixing the sp2->traffic-status wall IS the spinner fix.
+- Evidence chain good-boot (n352_8, final@63.4 s): 4x trace-decoded
+  vOnUpdateAllTrafficMessagesStatus @62.81-62.96 s (HSI tag 0x2714),
+  sp2res=52, max-remove 0x4e, gate txns 0x3/0x47..0x52.  Losers skip
+  that leg entirely.
+- Next: n353 lottery w/ EMU_REG_CHASE+EMU_STAT_CHASE to catch a loser
+  and diff the sp2 answer leg (who must answer the traffic-status
+  member request and why it stays silent).
