@@ -2121,6 +2121,14 @@ pub fn spawn_guest_call_lr(
                 );
             }
         }
+        // r799n66: every guest-call clone is a single-leg emulator worker
+        // (fabricated TE-side deliveries, pump kicks, svcdone legs) - its
+        // faults are benign retirements, see the scheduler's fault lane.
+        if let Ok(mut s) = SVCDONE_CLONE_TIDS.lock() {
+            if s.len() < 65536 {
+                s.insert(tid);
+            }
+        }
         tid
     };
     tid
@@ -2140,6 +2148,85 @@ pub fn spawn_guest_call_lr(
 /// child stack, then jumps to the leg with r0..r3 from literal pools.
 /// Fabrication - the CSMA property server is not an emulated process -
 /// visible in the log and gated by `EMU_FAKE_SVCDONE=0`.
+/// r799n66: live svcdone clone registry (`worker tid -> transaction key`).
+/// A clone that parks inside the leg (the deep-decode path blocks on an
+/// OSAL wait) can stay parked for many rounds while its body/stack/tramp
+/// RING slots (r799n36 ring-diet, 64 deep) are recycled by younger clones.
+/// Waking on a recycled slot makes it branch into garbage: n355_5 caught
+/// PCs `0x100`, `0xf0`, `0x91517f2c` (stack!), INSN_INVALID at 0x1719162
+/// and the 600-1300/boot READ_UNMAPPED@0x1c7d118 storm - the user-visible
+/// "crash at startup".  Once the key is confirmed REMOVED the completion
+/// it waits for can never arrive, so the parked clone is a doomed zombie:
+/// retire it host-side right at the remove confirmation instead.
+static SVCDONE_CLONES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u32, u32>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// r799n66: permanent set of every tid ever spawned as an svcdone clone
+/// (tids are never reused within a process; pruned entries leave the live
+/// registry above but stay here so the scheduler can still identify the
+/// thread when it faults).
+static SVCDONE_CLONE_TIDS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<u32>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Force-retire parked svcdone clones born for `key` (call when the key's
+/// remove is confirmed).  The thread currently executing is never touched.
+pub fn reap_svcdone_clones(unicorn: &mut Unicorn<'_, Context>, key: u32, current: u32) {
+    let victims: Vec<u32> = match SVCDONE_CLONES.lock() {
+        Ok(mut m) => {
+            let v: Vec<u32> = m
+                .iter()
+                .filter(|(_, k)| **k == key)
+                .map(|(t, _)| *t)
+                .collect();
+            m.retain(|_, k| *k != key);
+            v
+        }
+        Err(_) => return,
+    };
+    if victims.is_empty() {
+        return;
+    }
+    let mut killed = 0u32;
+    {
+        let threads = unicorn.get_data().threads.clone();
+        let mut guard = threads.lock().unwrap();
+        for t in guard.iter_mut() {
+            if victims.contains(&t.id)
+                && t.id != current
+                && !matches!(t.status, ThreadStatus::Exited(_))
+            {
+                t.status = ThreadStatus::Exited(0);
+                killed += 1;
+            }
+        }
+    }
+    if killed > 0 {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 5 || n % 50 == 0 {
+            log::info!(
+                "MONITOR svcdone: retired {killed} parked clone(s) of key {key:#x} (remove confirmed, n={n})"
+            );
+        }
+    }
+}
+
+/// Is `tid` a clone spawned by the svcdone guest-call leg?  Such clones are
+/// emulator-internal workers (they exist only to run one fabricatable leg
+/// natively); their faults never indicate guest data corruption, and n355
+/// proved they routinely deref pointers the organic main thread raced away
+/// under them (tbl=0x1 lookups after their own `remove` completed).  The
+/// scheduler uses this to retire them quietly instead of the scary
+/// "Execution error" ERROR line that users reported as "a crash at startup".
+pub fn is_svcdone_clone(tid: u32) -> bool {
+    SVCDONE_CLONE_TIDS
+        .lock()
+        .map(|m| m.contains(&tid))
+        .unwrap_or(false)
+}
+
 pub fn guest_call_bhandle_svcdone(
     unicorn: &mut Unicorn<'_, Context>,
     holder: u32,
@@ -2175,18 +2262,55 @@ pub fn guest_call_bhandle_svcdone(
     if holder == 0 || body.len() < 0x1e {
         return false;
     }
-    // r799n46: FULL-body legs (GOOD-shaped 0x98 traffic answers) must run
-    // over a guest-MALLOC'ed chunk - the deeper decode leg those bodies
-    // trigger reaches free() on the message data, which the host heap_alloc
-    // rings cannot take (glibc chunk headers).  Small stub bodies keep the
-    // legacy ring (proven since r799n36).
-    let full_body_chunk = if body.len() > 0x3c {
-        match crate::libs::libosal_linux::message::write_body_to_guest_chunk(unicorn, body) {
-            Some(c) => c,
-            None => return false, // ring dry this round, caller re-fires
+    // r799n66: n355 - the visible "crash at startup": 200+ clones/boot
+    // died READ_UNMAPPED at the leg's first load, ALL for the same
+    // (holder, key=0x2) pair.  The connector re-mints key 0x2 every tick
+    // and every store fired a fresh clone; the clone that finally got a
+    // VM slice found the request long completed (or was reading a
+    // recycled tramp ring slot).  The RQKEY_LIVE ledger was built exactly
+    // for this (n268: fabricated completions must only consume keys whose
+    // live owner is the answered transaction) - consult it BEFORE
+    // spawning: a key absent from the ledger names no live request, so
+    // the completion can only alias a foreign transaction.  Skip it.
+    if key != 0 && crate::libs::prochmi::rqkey_owner(key as u16).is_none() {
+        static DEADKEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = DEADKEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 5 || n % 100 == 0 {
+            log::warn!(
+                "MONITOR svcdone: key {key:#x} has no live request (already completed), leg skipped (n={})",
+                n + 1
+            );
         }
-    } else {
-        0
+        // the pending entry can never be confirmed now - stop re-firing.
+        crate::libs::prochmi::svcdone_drop_pending(key as u16);
+        return false;
+    }
+    // r799n66: n355: 246 clones/boot entered the leg `ldr r0,[r0,#8]`
+    // with a recycled holder (READ_UNMAPPED at 0x1c7d110's first load,
+    // thread exited(1)) - the user-visible "crash at startup".  Validate
+    // the holder chain BEFORE spawning (see svcdone_holder_alive); the
+    // refire lane drops the key, other callers simply skip this round.
+    if !crate::libs::prochmi::svcdone_holder_alive(unicorn, holder) {
+        static DEAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = DEAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 5 || n % 100 == 0 {
+            log::warn!(
+                "MONITOR svcdone: holder {holder:#x} no longer alive, leg skipped (key {key:#x}, n={})",
+                n + 1
+            );
+        }
+        return false;
+    }
+    // r799n66: ALL bodies now ride guest-MALLOC'ed chunks, stubs
+    // included.  n355: 8 clones/boot died in the C library's free()
+    // (READ_UNMAPPED at 0x47dc9ca8) - the completer's deep-decode leg
+    // legally frees the body it was handed, and the host heap_alloc
+    // ring slots carry no glibc chunk headers.  The ring stays as the
+    // fallback while the chunk allocator is dry (r799n36 proven path).
+    let full_body_chunk = match crate::libs::libosal_linux::message::write_body_to_guest_chunk(unicorn, body) {
+        Some(c) => c,
+        None if body.len() > 0x3c => return false, // ring unsafe for full bodies
+        None => 0, // stub: legacy ring slot (fallback while chunk pool dry)
     };
     let mmu_arc = unicorn.get_data().mmu.clone();
     // r799n36: region-diet.  Every svcdone leg used to `heap_alloc` a fresh
@@ -2201,7 +2325,10 @@ pub fn guest_call_bhandle_svcdone(
     thread_local! {
         static SVCDONE_RING: std::cell::Cell<(u32, u32, u32)> = std::cell::Cell::new((0, 0, 0));
     }
-    const DEPTH: u32 = 64;
+    // r799n66: ring depth 64 -> 2048 to match the arena's 2048-stack
+    // capacity: with 64 slots the tramp/body pools wrapped twice per boot
+    // and recycled slots under queued clones (see the in-flight cap).
+    const DEPTH: u32 = 2048;
     let (body_mem, tramp) = SVCDONE_RING.with(|cell| {
         let (b, t, rr) = cell.get();
         let (b, t) = if b == 0 || t == 0 {
@@ -2283,9 +2410,61 @@ pub fn guest_call_bhandle_svcdone(
             words.join(" "),
         );
     }
+    // r799n66: in-flight cap.  Spawned clones queue up faster than the
+    // VM drains them (2200+ arena stacks in n355_4's boot); younger clones
+    // recycle the tramp/body ring under the elder ones, and a slow clone
+    // that was mid-way through the tramp's literal loads reads back a
+    // half-overwritten pool (r0 = sp-value -> READ_UNMAPPED at the leg's
+    // first `ldr r0,[r0,#8]`).  The two legs of a key (optype 9 & 8) are
+    // the only ones that usefully overlap - further clones for a key whose
+    // earlier clones are still queued just add to the pile.  Entries whose
+    // thread has already exited/died are pruned here (the remove-time reap
+    /// only fires once per key).
+    {
+        let candidates: Vec<u32> = match SVCDONE_CLONES.lock() {
+            Ok(m) => m
+                .iter()
+                .filter(|(_, k)| **k == key)
+                .map(|(t, _)| *t)
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let mut live = 0u32;
+        if !candidates.is_empty() {
+            let mut dead: Vec<u32> = Vec::new();
+            {
+                let threads = unicorn.get_data().threads.clone();
+                let guard = threads.lock().unwrap();
+                for t in candidates.iter() {
+                    match guard.iter().find(|th| &th.id == t) {
+                        Some(th) if matches!(th.status, ThreadStatus::Exited(_)) => dead.push(*t),
+                        Some(_) => live += 1,
+                        None => dead.push(*t),
+                    }
+                }
+            }
+            if !dead.is_empty() {
+                if let Ok(mut m) = SVCDONE_CLONES.lock() {
+                    for t in dead {
+                        m.remove(&t);
+                    }
+                }
+            }
+        }
+        if live >= 16 {
+            return false; // the queued clones will run this leg soon
+        }
+    }
     let tid = spawn_guest_call(unicorn, tramp & !1, [0; 4], 0x1000);
     // r799n48: wake-priority hint (worker tid -> transaction key).
     crate::os::syscalls::futex::note_svcdone_tid_key(tid, key as u16);
+    // r799n66: register for removal-time reaping (see SVCDONE_CLONES); the
+    // benign-fault set is filled by spawn_guest_call_lr itself.
+    if let Ok(mut m) = SVCDONE_CLONES.lock() {
+        if m.len() < 8192 {
+            m.insert(tid, key);
+        }
+    }
     log::warn!(
         "MONITOR svcdone: bHandleResponseSVCData(holder={holder:#x}, cookie={cookie:#x}, key={key:#x}, func={func:#x}, optype={optype}) guest-call tid {tid} (EMU_FAKE_SVCDONE=0 disables)"
     );

@@ -838,6 +838,15 @@ pub fn rqkey_owner(key: u16) -> Option<(u16, u16)> {
     RQKEY_LIVE.lock().ok().and_then(|m| m.get(&key).copied())
 }
 
+/// r799n66: retire a svcdone re-fire entry from outside the prochmi tick
+/// (the guest-call spawner uses it when a pending key turns out to name
+/// no live request - it can never be confirmed by a remove probe again).
+pub(crate) fn svcdone_drop_pending(key: u16) {
+    if let Ok(mut m) = SVCDONE_PENDING.lock() {
+        m.remove(&(key as u32));
+    }
+}
+
 /// r799n40: the live key currently owning the (svc, func) transaction
 /// (reverse of RQKEY_LIVE).  The state-9 svc-0x000a traffic stores pass an
 /// owner back-pointer (0) in r1 at the conf-store site - n305: three of six
@@ -1062,7 +1071,7 @@ fn cl_retrieve(
 /// early-return on 0: the entry can no longer complete, drop it) ->
 /// subscriber's vtable word.  Implausible at any step = stale, drop the
 /// pending entry instead of re-firing into freed memory.
-fn svcdone_holder_alive(unicorn: &Unicorn<'_, Context>, holder: u32) -> bool {
+pub(crate) fn svcdone_holder_alive(unicorn: &Unicorn<'_, Context>, holder: u32) -> bool {
     if holder <= 0x1000 || holder >= 0xf000_0000 {
         return false;
     }
@@ -9368,6 +9377,16 @@ crate::os::code_stub::trap_site(unicorn, state_add_transition, crate::os::code_s
                     if let Ok(mut m) = SVCDONE_PENDING.lock() {
                         m.remove(&(r1 & 0xffff));
                     }
+                    // r799n66: clones of this key still parked in a leg can
+                    // never complete now - retire them before their ring
+                    // slots get recycled under them (crash storm, see
+                    // monitor::SVCDONE_CLONES).
+                    let cur = uc.get_data().inner.thread_id();
+                    crate::rtos::monitor::reap_svcdone_clones(
+                        uc,
+                        (r1 & 0xffff) as u32,
+                        cur,
+                    );
                     if let Ok(mut m) = STATE9_MINTS.lock() {
                         m.remove(&(r1 & 0xffff));
                     }

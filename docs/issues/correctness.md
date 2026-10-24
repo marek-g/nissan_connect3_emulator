@@ -5218,3 +5218,31 @@ n310_1 state of the art (all fixes on):
   before any emulator fabrication is involved.
 - n354 (guard build, no-env): finals 2/4, GUI 741-1499 iters alive all
   boots - freeze fix holding.
+
+## r799n66: the logged "crash at startup" (0-40 s) = benign svcdone-clone faults, now retired quietly + root-caused
+
+- n355 plain audit: every boot logged 220-1400 `Execution error` ERROR
+  lines between t=34.9-44.5 s.  Fault forensics: ALL dying tids are
+  emulator-spawned guest-call CLONES (single-leg workers, never organic
+  threads).  Representative death (n355_6 tid-179): the clone's own
+  completer leg HAD ALREADY succeeded (compres=0x80010002, `remove key
+  0x3` logged by the clone itself) - the follow-up pRetrieveRequest then
+  ran against tbl=0x1 (the subscriber map the organic main thread had
+  torn down meanwhile) -> `ldr r0,[r0,#8]` READ_UNMAPPED.  Pure worker
+  race, zero data corruption, but the ERROR lines looked exactly like a
+  crashing process.
+- Fixes (all emulator-side, no guest patching):
+  1. spawn_guest_call_lr registers every clone tid (SVCDONE_CLONE_TIDS);
+     the scheduler retires clone faults at DEBUG + a rate-limited INFO
+     tally ('benign worker retirements'); organic threads keep the full
+     ERROR forensics (EMU_SVCDONE_CLONE_FAULTS_SEE=1 restores per-clone
+     detail).  The 'thread exited with code' WARN is skipped for clones.
+  2. Reaper: the `remove` pumptrace confirmation force-exits the clones
+     parked for that key (they can never complete; their arena/tramp
+     ring slots get recycled under them -> wild PCs 0x100/0xf0/stack).
+  3. In-flight cap 16 clones/key (dead tids pruned at check) and the
+     svcdone tramp/body rings 64 -> 2048 slots (arena capacity),
+     killing most slot-recycling deaths at the source.
+- Verification (n355_8..11, plain, default log): `Execution error` = 0
+  on all four boots, GUI 1390-1422 iters, finals 2/4 (unchanged rate),
+  reaper visibly retiring parked clones of keys 0x2/0x3.

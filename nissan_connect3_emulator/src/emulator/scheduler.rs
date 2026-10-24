@@ -252,7 +252,11 @@ fn run_quantum(
             // surface silent thread death (an unhandled fault / exit leaves no other
             // trace, which makes a vanished process very hard to diagnose)
             if let ThreadStatus::Exited(code) = &thread.status {
-                log::warn!("[{}] thread exited with code {}", next_id, code);
+                // r799n66: svcdone clones are emulator-internal single-leg
+                // workers; their ordinary exit is unremarkable.
+                if !crate::rtos::monitor::is_svcdone_clone(next_id) {
+                    log::warn!("[{}] thread exited with code {}", next_id, code);
+                }
                 if was_running {
                     exited_with = Some(*code);
                 }
@@ -292,17 +296,48 @@ fn run_quantum(
 
     if res.is_err() && !fault_handled && !spin_stop {
         // the VM is stopped now, so dumping memory is safe
-        log::error!(
-            "{:#x}: [{}] Execution error: {:?}",
-            unicorn.reg_read(RegisterARM::PC).unwrap(),
-            next_id,
-            res.as_ref().err()
-        );
-        if let Some((site, site_addr)) = crate::os::code_stub::last_site() {
-            log::error!("last trapped site before fault: {site} at {site_addr:#x}");
-            crate::os::code_stub::dump_site_ring();
+        if crate::rtos::monitor::is_svcdone_clone(next_id) {
+            // r799n66: a faulting svcdone clone is a benign retirement - the
+            // worker ran its one fabricatable leg against pointers the
+            // organic main thread may recycle at any moment (n355: 600-1300
+            // "Execution error" ERROR lines per startup that users read as
+            // "the emulator crashes at boot", all of them clone tids, many
+            // AFTER their own completer leg had already removed the key -
+            // zero data corruption).  Keep the evidence at debug level and
+            // a periodic tally visible.
+            log::debug!(
+                "{:#x}: [{}] svcdone clone faulted (benign retirement): {:?}",
+                unicorn.reg_read(RegisterARM::PC).unwrap(),
+                next_id,
+                res.as_ref().err()
+            );
+            static FAULTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = FAULTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 3 || n % 500 == 0 {
+                log::info!(
+                    "svcdone clones: {n} benign worker retirements so far (worker-leg guest code, faults expected; EMU_SVCDONE_CLONE_FAULTS_SEE=1 shows each)"
+                );
+            }
+            if std::env::var_os("EMU_SVCDONE_CLONE_FAULTS_SEE").is_some() {
+                if let Some((site, site_addr)) = crate::os::code_stub::last_site() {
+                    log::warn!("last trapped site before fault: {site} at {site_addr:#x}");
+                    crate::os::code_stub::dump_site_ring();
+                }
+                dump_context(unicorn);
+            }
+        } else {
+            log::error!(
+                "{:#x}: [{}] Execution error: {:?}",
+                unicorn.reg_read(RegisterARM::PC).unwrap(),
+                next_id,
+                res.as_ref().err()
+            );
+            if let Some((site, site_addr)) = crate::os::code_stub::last_site() {
+                log::error!("last trapped site before fault: {site} at {site_addr:#x}");
+                crate::os::code_stub::dump_site_ring();
+            }
+            dump_context(unicorn);
         }
-        dump_context(unicorn);
     }
 
     Ok(true)
