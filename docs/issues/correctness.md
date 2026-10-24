@@ -5178,3 +5178,43 @@ n310_1 state of the art (all fixes on):
 - Next: n353 lottery w/ EMU_REG_CHASE+EMU_STAT_CHASE to catch a loser
   and diff the sp2 answer leg (who must answer the traffic-status
   member request and why it stays silent).
+
+## r799n65: walker-death at bHandleResponseSVCData root-caused (stale holder); guard added; remaining modes mapped
+
+- n353 chase lottery (4 boots, REG/STAT_CHASE): final=0 x4, and the
+  vOnUpd metric proved env-noise (HSI trace decodes 366-473 in losers).
+  Real health = s9cascade progress + `Execution error` audit.
+- Loser mode A (n353_3, died mid-sp2 @66.5 s): the completer clone
+  worker for key 0x37 (tids 902/903 = svcdone guest-call clones, NOT
+  organic walkers) was re-fired from SVCDONE_PENDING with a holder
+  (mediator conn) whose era had ended and memory had been recycled:
+  `bHandleResponseSVCData` (0x1c7d110) prologue `ldr r0,[r0,#8]` hit
+  READ_UNMAPPED -> thread exited(1) -> key 0x37 removed twice (902 at
+  66542, 903 at 66544 - the double dispatch), cascade never resumed.
+  Same PC fires ~1100x/boot on EVERY boot incl. winners (disposable
+  clones, harmless) - the lethal variant is a clone carrying a key the
+  cascade still needs.
+- Fix: `svcdone_holder_alive()` validates the exact chain the leg
+  dereferences (holder -> [+8] subscriber -> vtable word) before every
+  re-fire; stale entries are dropped from SVCDONE_PENDING
+  ('s9-svcdone-drop' log).  n354: guard dormant (0 drops in 4 boots -
+  the fatal entry had a READABLE-but-recycled sub-object, plausible
+  vtable word), so it is a cheap net, not the lottery cure.  Keep.
+- Loser mode B (n353_2/n354_4, early death): FSM never leaves state 6.
+  The state-6 member suite (svc-0x0006 keys 0x5-0xa, rqadd'd e.g. at
+  44.4 s holder=0x39477d0) is never removed; refire legs fire every
+  tick (36 refire logs, keys listed) but MISS - the loser boots mint
+  funcs 0xd/0x5/0xc/0x8000 while winners mint func=0x3 for the same
+  keys and their clones remove all six within 90 ms (winner n354_1:
+  rqadd @35005 -> removes 35096-35141 by clone tids 191-227 -> FSM 8
+  (fsm-watch @35173) -> 9).  The mbx_7 regid-3 svc-6 'deferred' lane
+  is a DROP (r798b ordinal-collision guard), and the f74 REQUEST only
+  ever arrives once per boot and only if FSM reaches 8 - it is an
+  EFFECT of the transition, not the missing answer.
+- Causal chain confirmed: member-key removal CAUSES FSM 6->8.  Next
+  session: instrument resolve_done_cookie/completer for the svc-6
+  func=0xd era (why pRetrieveRequest misses there while func=03
+  completes) - the divergence starts in the GMF-issued request family,
+  before any emulator fabrication is involved.
+- n354 (guard build, no-env): finals 2/4, GUI 741-1499 iters alive all
+  boots - freeze fix holding.

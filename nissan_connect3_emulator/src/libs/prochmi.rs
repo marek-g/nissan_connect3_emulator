@@ -1050,6 +1050,33 @@ fn cl_retrieve(
     0
 }
 
+/// r799n65: is a svcdone `holder` still safe to fire a re-fire leg into?
+/// n353_3: a re-fire of key 0x37 at t=66.4 s reused a holder (mediator
+/// conn) whose era had ended and whose memory had been recycled: the leg
+/// enters `bHandleResponseSVCData` (0x1c7d110), whose first instruction
+/// after the prologue is `ldr r0,[r0,#8]` - READ_UNMAPPED killed the
+/// completer worker mid-cascade (its remove for key 0x37 had run, the
+/// paired worker's second dispatch crashed, and the state-9 cascade
+/// never recovered -> final=0).  Validate the exact pointer chain the
+/// leg itself dereferences: holder -> [+8] subscriber object (guest
+/// early-return on 0: the entry can no longer complete, drop it) ->
+/// subscriber's vtable word.  Implausible at any step = stale, drop the
+/// pending entry instead of re-firing into freed memory.
+fn svcdone_holder_alive(unicorn: &Unicorn<'_, Context>, holder: u32) -> bool {
+    if holder <= 0x1000 || holder >= 0xf000_0000 {
+        return false;
+    }
+    let sub = read_u32(unicorn, holder.wrapping_add(8));
+    if sub == 0 {
+        return false; // guest bails on null subscriber: entry is dead
+    }
+    if sub <= 0x1000 || sub >= 0xf000_0000 {
+        return false;
+    }
+    let vt = read_u32(unicorn, sub);
+    vt > 0x1000 && vt < 0xf000_0000
+}
+
 /// r799n33f: the state=2 flip happens in the action's OWN response
 /// handler (stspy caught pc=0x171aa54 for trio-1), which the dispatcher
 /// only reaches through the request's registered subscriber - the CL
@@ -13844,7 +13871,14 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                     }
                     m.retain(|_, (_, _, n)| *n < 1000);
                 }
+                let mut dropped: Vec<u32> = Vec::new();
                 for (key, holder, func, svc) in again.iter().copied() {
+                    // r799n65: never re-fire a leg into a holder whose
+                    // object is gone - see svcdone_holder_alive.
+                    if !svcdone_holder_alive(unicorn, holder) {
+                        dropped.push(key);
+                        continue;
+                    }
                     let cookie = resolve_done_cookie(unicorn, holder, 0, key);
                     // r799n46: legs carry the REAL rqadd func (MINT_INFO) -
                     // pending tuples stored the store-time counter tail for
@@ -13979,6 +14013,28 @@ pub fn tick(unicorn: &mut Unicorn<'_, Context>) {
                             }
                         }
                         bb[0x1a] = 9;
+                    }
+                }
+                if !dropped.is_empty() {
+                    if let Ok(mut m) = SVCDONE_PENDING.lock() {
+                        for k in dropped.iter() {
+                            m.remove(k);
+                        }
+                    }
+                    static DROP_N: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let n = DROP_N.fetch_add(1, Ordering::Relaxed);
+                    if n < 5 || n % 20 == 0 {
+                        log::warn!(
+                            "PROCHMI s9-svcdone-drop: {} pending key(s) dropped, holder no longer alive t={}ms ({})",
+                            dropped.len(),
+                            crate::libs::dapi::emu_t0_elapsed_ms(),
+                            dropped
+                                .iter()
+                                .map(|k| format!("{k:#x}"))
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        );
                     }
                 }
                 if !again.is_empty() {
